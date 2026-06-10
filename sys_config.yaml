@@ -1,0 +1,118 @@
+# ============================================================================
+# sys_config.yaml -- canonical NVMeService daemon config (single source of truth)
+#
+# Schema (post-L1-Commit-4b)
+# --------------------------
+# YAML expresses just three things now:
+#
+#   1. GPU enumeration + per-GPU view directories (symlink targets).
+#   2. NVMe enumeration + which GPUs may attach (NUMA / PCIe-switch ACL).
+#   3. Daemon policy: per-client default/max queues, lease cadence.
+#
+# The kernel owns all real queue accounting.  YAML does NOT carry a
+# total_queues budget, queue_groups[].count, queue_depth, or any
+# per-GPU queue ledger -- those were the pre-B3 design and have been
+# removed.
+#
+# Run `sudo scripts/pci_topology_check.sh` to discover NUMA / PCIe-
+# switch affinity between GPUs and NVMes; the resulting JSON in
+# /mnt/sys_GPU_NVMe_topology.json is the authoritative input for the
+# `allowed_gpus` ACL below.
+# ============================================================================
+
+grpc:
+  endpoint: "127.0.0.1:50051"
+
+# ---------------------------------------------------------------------------
+# GPUs known to the daemon.  `id` is the CUDA device index (matches
+# cudaSetDevice / nvidia-smi -L).  `mount_path` is the per-GPU view
+# directory; the daemon installs a symlink under it for every NVMe
+# whose `allowed_gpus` includes this GPU.  A GPU process attached to
+# this id will see "its" NVMe storage at <mount_path>/ssnvme<minor>.
+# ---------------------------------------------------------------------------
+gpus:
+  - id: 0
+    mount_path: "/mnt/gpu0"
+  # - id: 1
+  #   mount_path: "/mnt/gpu1"
+
+# ---------------------------------------------------------------------------
+# NVMe devices the daemon takes exclusive ownership of.
+#
+# Per-entry schema:
+#
+#   pci_addr        Canonical "DDDD:BB:DD.F".  Used by libnvm to call
+#                   SNVM_DEVICE_BIND on the matching pci_dev.
+#
+#   mount_path      Filesystem mount point for the real NVMe block
+#                   device.  The daemon mkdirs `<mount_path>/GPU<id>`
+#                   subdirs for every entry in allowed_gpus and
+#                   exposes those as symlinks under each consuming
+#                   GPU's view dir (gpus[].mount_path).
+#
+#   namespace_id    NVMe namespace (almost always 1).  Carried in
+#                   YAML because NVM_GET_DEV_INFO does not currently
+#                   ship it; tracked as a follow-up in Todolist.md.
+#
+#   kernel_ioq_cap  OPTIONAL (default 0).  NVM_SET_KERNEL_IOQ_CAP
+#                   pre-bind hint, in QueuePair units.  Set this
+#                   explicitly when the controller's MSI-X vector
+#                   budget is smaller than the host's vCPU count;
+#                   otherwise s_nvme_setup_io_queues falls back to
+#                   dma_alloc_coherent and the user-share path
+#                   silently misses GPU memory.  0 means "use kernel
+#                   default of num_possible_cpus()".  Rule of thumb:
+#                   `dmesg | grep "queue squeeze"` after bind.
+#
+#   allowed_gpus    OPTIONAL.  ACL: which gpus[].id values may
+#                   Connect to this NVMe (typically chosen for NUMA
+#                   / PCIe-switch affinity).  When omitted, every
+#                   GPU in `gpus` may attach.  Symlinks are installed
+#                   for every id in this list (or for all gpus if
+#                   omitted).
+# ---------------------------------------------------------------------------
+nvmes:
+  - pci_addr: "0000:4b:00.0"      # NVMe #0 (first of three)
+    mount_path: "/mnt/nvme1"
+    namespace_id: 1
+    kernel_ioq_cap: 32
+    allowed_gpus: [0]
+  - pci_addr: "0000:57:00.0"      # NVMe #1
+    mount_path: "/mnt/nvme2"
+    namespace_id: 1
+    kernel_ioq_cap: 32
+    allowed_gpus: [0]
+  - pci_addr: "0000:63:00.0"      # NVMe #2
+    mount_path: "/mnt/nvme3"
+    namespace_id: 1
+    kernel_ioq_cap: 32
+    allowed_gpus: [0]
+
+# ---------------------------------------------------------------------------
+# Per-client allocation policy (daemon-side guidance, NOT a kernel ledger).
+#
+#   default_per_client  ConnectRequest.num_queues == 0 -> use this.
+#   max_per_client      Hard cap; requests larger than this are clamped
+#                       (further clamped at runtime to the kernel's
+#                       max_queues_per_group reported via NVM_GET_DEV_INFO,
+#                       currently NVM_MAX_QUEUES_PER_GROUP=16).
+# ---------------------------------------------------------------------------
+queue_pool:
+  default_per_client: 16
+  max_per_client: 32
+
+# ---------------------------------------------------------------------------
+# Lease lifetime parameters.
+#
+#   heartbeat_interval_sec  Client bidi-stream heartbeat cadence.
+#                           Reaper scans at half this interval.
+#   timeout_sec             Silent allocations older than this are
+#                           candidates for reaping (subject to
+#                           kill(pid, 0) + /proc/<pid>/stat starttime
+#                           checks; see ServiceState::is_pid_dead).
+#
+# Rule of thumb: timeout_sec >= 2 * heartbeat_interval_sec.
+# ---------------------------------------------------------------------------
+lease:
+  heartbeat_interval_sec: 10
+  timeout_sec: 30

@@ -1,0 +1,177 @@
+// nvmeservice.proto -- gRPC contract between NVMeService daemon and GPU clients.
+//
+// Post-L1-Commit-4b
+// -----------------
+// The daemon is a *session broker*, not a queue host.  It owns the
+// chrdev / bind for each NVMe and hands out metadata so clients can
+// bring up their own libnvm controllers (nvm_ctrl_attach_client +
+// nvm_create_group + nvm_add_user_queue).  The kernel's user QID
+// pool is the single source of truth for queue accounting; the
+// daemon does NOT track a shadow ledger.
+//
+// Daemon responsibilities:
+//   1. Open / bind / hold the chrdev for every configured NVMe
+//      (NVM_SET_KERNEL_IOQ_CAP + SNVM_DEVICE_BIND + NVM_GET_DEV_INFO).
+//   2. Enforce a per-NVMe ACL (allowed_gpus -- NUMA / PCIe-switch
+//      affinity) on Connect requests.
+//   3. Hand out per-allocation metadata: snvme_dev_path, bar0_size,
+//      ns_id, queue_depth, mount_path symlink, lease parameters.
+//   4. Heartbeat-based lease cleanup: PID + /proc starttime check
+//      with grace timeout.  The kernel's snvm_dev_release fd-cascade
+//      already reclaims the dead client's queues; the daemon just
+//      drops the now-stale lease record.
+//
+// Client responsibilities (after Connect returns ok):
+//   - libnvm: nvm_ctrl_attach_client(snvme_dev_path)  [no chrdev_create,
+//     no bind, no GET_DEV_INFO -- those are owner-only].
+//   - libnvm: nvm_create_group()  -> per-fd group_id assigned by kernel.
+//   - libnvm: nvm_dma_map_ring_device + nvm_dma_map_data_device
+//     (rings cascade through destroy_group; DATA stays alive on the
+//     client fd until close).
+//   - libnvm: nvm_add_user_queue() up to `granted_queues` queues.
+//   - libnvm: nvm_destroy_group + nvm_ctrl_free_client on shutdown.
+//   - Send periodic Heartbeat keyed by allocation_id to keep lease.
+//   - Disconnect on graceful exit; crash falls back to PID reaper.
+//
+// Trust model: cooperative processes only.  No cryptographic auth.
+// Lease-based reclaim uses heartbeat + PID liveness + /proc/<pid>/stat
+// starttime to defeat PID reuse.
+
+syntax = "proto3";
+
+package nvmeservice;
+
+// -----------------------------------------------------------------
+// Service
+// -----------------------------------------------------------------
+service NvmeService {
+    rpc ListDevices    (Empty)               returns (DeviceListResponse);
+    rpc Connect        (ConnectRequest)      returns (ConnectResponse);
+    rpc Disconnect     (DisconnectRequest)   returns (DisconnectResponse);
+    rpc Heartbeat      (stream HeartbeatMsg) returns (stream HeartbeatMsg);
+}
+
+// -----------------------------------------------------------------
+// Common
+// -----------------------------------------------------------------
+
+message Empty {}
+
+// -----------------------------------------------------------------
+// ListDevices
+// -----------------------------------------------------------------
+
+message DeviceListResponse {
+    repeated DeviceInfo devices = 1;
+}
+
+message DeviceInfo {
+    int32   device_id            = 1;   // daemon-local index
+    string  pci_addr             = 2;   // e.g. "0000:50:00.0"
+    string  snvme_dev_path       = 3;   // e.g. "/dev/ssnvme0"
+    uint32  namespace_id         = 4;
+    uint32  page_size            = 5;   // NVMe page size (bytes)
+    uint32  blk_size             = 6;   // logical block size (bytes)
+    uint32  blk_size_log         = 7;   // log2(blk_size)
+    uint32  queue_depth          = 8;   // entries per queue (NVMe MQES+1)
+    uint32  dstrd                = 9;   // doorbell stride (encoded)
+    uint64  bar0_size            = 10;  // BAR0 region length (for client mmap)
+    uint32  max_user_qid         = 11;  // upper bound of kernel user-QID pool
+    uint32  max_queues_per_group = 12;  // kernel hard cap per fd
+
+    // Per-NVMe ACL: which cuda_device values may Connect to this
+    // device, plus the GPU-view symlink path daemon installed for
+    // each.  Empty mount_path means symlink installation failed.
+    repeated AllowedGpu allowed_gpus = 13;
+}
+
+message AllowedGpu {
+    int32  cuda_device = 1;
+    string mount_path  = 2;   // e.g. "/mnt/gpu0/ssnvme0"
+}
+
+// -----------------------------------------------------------------
+// Connect
+// -----------------------------------------------------------------
+
+message ConnectRequest {
+    int32   device_id   = 1;   // from ListDevices
+    int32   cuda_device = 2;   // must be present in DeviceInfo.allowed_gpus[]
+    int32   num_queues  = 3;   // 0 = use daemon default; capped by daemon policy
+                               //     and kernel max_queues_per_group
+    uint32  client_pid  = 4;   // for liveness checks on heartbeat timeout
+}
+
+message ConnectResponse {
+    string  allocation_id = 1;   // opaque session id; use in Disconnect / Heartbeat
+
+    // --- Device metadata for nvm_ctrl_attach_client ---
+    string  pci_addr        = 2;
+    string  snvme_dev_path  = 3;
+    uint64  bar0_size       = 4;
+
+    // --- Daemon's recommended queue count ---
+    // Client must not exceed this when calling nvm_add_user_queue.
+    // The kernel separately enforces NVM_MAX_QUEUES_PER_GROUP per
+    // client fd; granted_queues is the daemon's policy clamp.
+    int32   granted_queues  = 10;
+
+    // --- Controller metadata for IO submit ---
+    uint32  namespace_id    = 20;
+    uint32  page_size       = 21;
+    uint32  blk_size        = 22;
+    uint32  blk_size_log    = 23;
+    uint32  queue_depth     = 24;
+    uint32  dstrd           = 25;
+
+    // --- Lease parameters chosen by the daemon ---
+    uint32  heartbeat_interval_sec = 30;
+    uint32  lease_timeout_sec      = 31;
+
+    // --- GPU-view filesystem path for this allocation ---
+    // Daemon-installed symlink under the consuming GPU's mount_path,
+    // e.g. "/mnt/gpu0/ssnvme0", pointing at "/mnt/nvme0/GPU0".
+    // Empty string if symlink installation failed at init time.
+    string  mount_path      = 32;
+
+    // --- Error info; empty on success ---
+    string  error_message   = 99;
+}
+
+// -----------------------------------------------------------------
+// Disconnect
+// -----------------------------------------------------------------
+
+message DisconnectRequest {
+    string allocation_id = 1;
+    uint32 client_pid    = 2;   // sanity check
+}
+
+message DisconnectResponse {
+    bool   success       = 1;
+    string error_message = 2;
+}
+
+// -----------------------------------------------------------------
+// Heartbeat (bidi stream)
+// -----------------------------------------------------------------
+
+message HeartbeatMsg {
+    string allocation_id = 1;
+    uint64 timestamp_ns  = 2;
+
+    // Server -> client only: populated when the daemon wants to
+    // notify the client of a state change.
+    AdminNotice notice = 3;
+}
+
+message AdminNotice {
+    enum Kind {
+        NONE              = 0;
+        LEASE_EXPIRING    = 1;
+        LEASE_REVOKED     = 2;
+    }
+    Kind   kind              = 1;
+    uint32 seconds_remaining = 2;
+    string message           = 3;
+}

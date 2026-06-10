@@ -1,0 +1,46 @@
+# Build directory
+build/
+build/*
+
+# Third-party packages directory
+third_pkgs/
+third_pkgs/*
+
+# Reference / scratch upstream sources (e.g. linux kernel + nvme drivers
+# used as a baseline for snvme port work).  These are large, redistributed
+# upstream trees -- do not commit.
+temp/
+
+.venv/
+
+# IDE specific files
+.vscode/
+.idea/
+.ccls-cache/
+*.swp
+*~
+.clangd
+.cache
+db/
+temp/
+temp/*
+# CodeBuddy / IDE assistant local state -- per-developer, not source.
+.codebuddy/
+
+# CMake user presets are per-developer (toolchain/CUDA paths etc.).
+# Commit CMakePresets.json deliberately if you ever need a shared baseline.
+CMakeUserPresets.json
+CMakePresets.json
+
+# Smoke-test binaries built in-tree by the test/Makefile.  The .c/.cu
+# sources are committed; the binaries are not.
+backends/local/kernel_modules/test/snvme_smoke
+backends/local/kernel_modules/test/snvme_smoke_gpu
+backends/local/kernel_modules/test/snvme_smoke_addq
+backends/local/kernel_modules/test/snvme_smoke_qgroup
+backends/local/kernel_modules/test/snvme_smoke_recycle
+backends/local/kernel_modules/test/snvme_smoke_io
+
+# Nsight Systems profile output -- per-run, not source.
+*.nsys-rep
+*.sqlite
