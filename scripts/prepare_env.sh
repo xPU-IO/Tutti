@@ -479,10 +479,10 @@ generate_cmake_presets() {
     }
   ],
   "buildPresets": [
-    { "name": "default", "configurePreset": "default" },
-    { "name": "debug",   "configurePreset": "debug" },
-    { "name": "release", "configurePreset": "release" },
-    { "name": "system",  "configurePreset": "system" }
+    { "name": "default", "configurePreset": "default", "jobs": ${JOBS} },
+    { "name": "debug",   "configurePreset": "debug",   "jobs": ${JOBS} },
+    { "name": "release", "configurePreset": "release", "jobs": ${JOBS} },
+    { "name": "system",  "configurePreset": "system",  "jobs": ${JOBS} }
   ]
 }
 EOF
