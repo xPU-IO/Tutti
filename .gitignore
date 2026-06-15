@@ -40,6 +40,7 @@ backends/local/kernel_modules/test/snvme_smoke_addq
 backends/local/kernel_modules/test/snvme_smoke_qgroup
 backends/local/kernel_modules/test/snvme_smoke_recycle
 backends/local/kernel_modules/test/snvme_smoke_io
+backends/local/kernel_modules/test/snvme_ubind
 
 # Nsight Systems profile output -- per-run, not source.
 *.nsys-rep
