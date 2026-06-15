@@ -5454,6 +5454,101 @@ rollback_unlocked:
 			ret = 0;
 			break;
 		}
+		case NVM_RAW_ADMIN_CMD: {
+			/*
+			 * Pass-through admin SQE forwarder.  Used by userspace
+			 * (NVMeService, smoke tests) to drive per-queue recycle
+			 * (Delete + Create I/O SQ/CQ; NVMe 1.4 §5.4/§5.5) and
+			 * any other admin command that snvme does not need a
+			 * dedicated ioctl for.
+			 *
+			 * Restrictions:
+			 *   - controller must be probed/bound: ctrl->pdev's
+			 *     drvdata == valid struct nvme_dev with admin_q.
+			 *     We surface -ENODEV otherwise so userspace knows
+			 *     the bind step is missing.
+			 *   - data-buffer admin commands are NOT supported in
+			 *     this revision: we always hand __snvme_submit_sync_cmd
+			 *     buffer=NULL, bufflen=0.  Add a follow-up path if
+			 *     Get Log Page / Set Features with payload is ever
+			 *     needed (signal via reserved fields in the UAPI
+			 *     struct so the _IOC_SIZE stays stable).
+			 *
+			 * We do NOT inspect the opcode -- this is deliberately
+			 * a generic forwarder.  The caller is expected to be a
+			 * privileged daemon that knows what it is sending.
+			 */
+			struct nvm_ioctl_raw_admin admin_req;
+			struct nvme_command nvme_cmd;
+			union nvme_result nvme_res;
+			int admin_ret;
+			void __user *argp = (void __user *)arg;
+
+			if (copy_from_user(&admin_req, argp, sizeof(admin_req)))
+				return -EFAULT;
+
+			/*
+			 * Same liveness rule as NVM_ADD_USER_QUEUE: only forward
+			 * admin commands when snvme actually owns this BDF.
+			 * pci_get_drvdata alone would happily return the in-tree
+			 * nvme driver's nvme_dev pre-bind, which would be a
+			 * cross-driver admin_q hijack.
+			 */
+			ndev = snvm_ctrl_get_live_ndev(ctrl);
+			if (!ndev) {
+				pr_warn("snvme: NVM_RAW_ADMIN_CMD on unbound controller (BDF=%04x:%02x:%02x.%x)\n",
+					pci_domain_nr(ctrl->pdev->bus),
+					ctrl->pdev->bus->number,
+					PCI_SLOT(ctrl->pdev->devfn),
+					PCI_FUNC(ctrl->pdev->devfn));
+				return -ENODEV;
+			}
+
+			BUILD_BUG_ON(sizeof(admin_req.sqe) != sizeof(nvme_cmd));
+			memcpy(&nvme_cmd, admin_req.sqe, sizeof(nvme_cmd));
+			memset(&nvme_res, 0, sizeof(nvme_res));
+
+			/*
+			 * NOTE: the 5.15 __snvme_submit_sync_cmd has no trailing
+			 * `bool poll` argument (the 5.4 variant did) -- the admin
+			 * queue completion is delivered via interrupt here.
+			 */
+			admin_ret = __snvme_submit_sync_cmd(ndev->ctrl.admin_q,
+							   &nvme_cmd, &nvme_res,
+							   NULL, 0,
+							   0, NVME_QID_ANY, 0,
+							   0);
+			/*
+			 * Per __snvme_submit_sync_cmd contract:
+			 *   admin_ret == 0      -> success, result populated
+			 *   admin_ret < 0       -> Linux errno; CQE never arrived
+			 *   admin_ret > 0       -> NVMe spec status code
+			 *                          (SC|SCT|...); CQE arrived but
+			 *                          controller rejected the cmd
+			 *
+			 * We surface (>0) as ioctl success with nvme_status set
+			 * so userspace can pattern-match on NVMe SC values
+			 * (e.g. 0x01 "Invalid Command Opcode" for a controller
+			 * that does not implement an opcode we sent).  Negative
+			 * (transport) errors stay -errno.
+			 */
+			if (admin_ret < 0) {
+				admin_req.nvme_status = 0;
+				admin_req.result_dw0  = 0;
+				admin_req.result_dw1  = 0;
+				if (copy_to_user(argp, &admin_req, sizeof(admin_req)))
+					return -EFAULT;
+				return admin_ret;
+			}
+			admin_req.nvme_status = (uint16_t)(admin_ret & 0xFFFF);
+			admin_req.result_dw0  = le32_to_cpu(nvme_res.u32);
+			admin_req.result_dw1  = 0;     /* spec reserves DW1 for most admin cmds */
+
+			if (copy_to_user(argp, &admin_req, sizeof(admin_req)))
+				return -EFAULT;
+			ret = 0;
+			break;
+		}
         default:
             printk(KERN_NOTICE "Unknown ioctl command from process %d: %u\n",
                     current->pid, cmd);
