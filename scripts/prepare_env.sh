@@ -1,7 +1,8 @@
 #!/bin/bash
 # Tutti 一键环境准备脚本
 # 目标：在多种 Linux 发行版（Debian/Ubuntu/RHEL/CentOS/TencentOS/Fedora/openSUSE/Arch）
-#       上自动安装 protobuf/gRPC/uuid 等依赖（gRPC 在 RHEL/TencentOS 等仓库缺失时回退 vcpkg）。
+#       上自动安装编译依赖；系统未提供 grpc++ / grpc_cpp_plugin 时回退
+#       vcpkg，也可通过 --force-vcpkg 强制使用。脚本最后生成本机专用 preset。
 
 set -eu
 # 注意：不开启 pipefail，因为 install_pkg 中允许部分非致命失败被吞掉。
@@ -29,12 +30,14 @@ if command -v nproc >/dev/null 2>&1; then
 else
     JOBS=4
 fi
+FORCE_VCPKG=0
 
 show_help() {
     cat <<EOF
 用法: $0 [选项]
   -j N, --jobs N      并行编译线程数（用于 vcpkg 等后续编译，默认 ${JOBS} = nproc）
   -j=N, --jobs=N      同上
+  --force-vcpkg       即使检测到系统 gRPC，也强制使用 vcpkg 的 C++ 依赖
   -h, --help          显示帮助
 环境变量:
   VCPKG_ROOT          指定 vcpkg 安装路径（默认 \${PROJECT_ROOT}/third_pkgs/vcpkg）
@@ -53,6 +56,10 @@ while [ $# -gt 0 ]; do
             ;;
         -j=*|--jobs=*)
             JOBS="${1#*=}"
+            shift
+            ;;
+        --force-vcpkg)
+            FORCE_VCPKG=1
             shift
             ;;
         -h|--help)
@@ -203,7 +210,41 @@ echo "------------------------------------------------------------"
 #   Arch          : util-linux (自带 libuuid)
 install_pkg "uuid-dev" "libuuid-devel" "util-linux"
 
-# 安装 wget / unzip（后续步骤需要）
+# 根构建直接需要的基础工具和库。
+install_pkg "build-essential" "gcc-c++"              "base-devel"
+install_pkg "cmake"           "cmake"                "cmake"
+install_pkg "pkg-config"      "pkgconf-pkg-config"   "pkgconf"
+install_pkg "libyaml-cpp-dev" "yaml-cpp-devel"       "yaml-cpp"
+install_pkg "libunwind-dev"   "libunwind-devel"      "libunwind"
+
+# CMakePresets.json version 3 requires CMake 3.21+.  Some older supported
+# distro releases package an earlier CMake, so fail here with a focused error
+# instead of generating a preset file that the local cmake cannot read.
+require_cmake_presets_support() {
+    local cmake_version
+    local cmake_major
+    local cmake_minor
+
+    cmake_version="$(cmake --version | sed -n '1s/^cmake version //p')"
+    cmake_major="${cmake_version%%.*}"
+    cmake_minor="${cmake_version#*.}"
+    cmake_minor="${cmake_minor%%.*}"
+
+    if ! [[ "${cmake_major}" =~ ^[0-9]+$ && "${cmake_minor}" =~ ^[0-9]+$ ]]; then
+        echo "错误：无法解析 CMake 版本：${cmake_version:-unknown}" >&2
+        return 1
+    fi
+    if [ "${cmake_major}" -lt 3 ] \
+        || { [ "${cmake_major}" -eq 3 ] && [ "${cmake_minor}" -lt 21 ]; }; then
+        echo "错误：CMakePresets.json 需要 CMake >= 3.21，当前为 ${cmake_version}。" >&2
+        echo "请升级 CMake 后重新运行本脚本。" >&2
+        return 1
+    fi
+}
+
+require_cmake_presets_support
+
+# 安装 wget / unzip（vcpkg 等后续步骤需要）
 install_pkg "wget"  "wget"  "wget"
 install_pkg "unzip" "unzip" "unzip"
 
@@ -224,21 +265,28 @@ install_pkg "libgrpc++-dev"          "grpc-devel"   "grpc" optional
 install_pkg "protobuf-compiler-grpc" "grpc-plugins" "grpc" optional
 
 # ----- 通过 vcpkg 提供 C++ 依赖（grpc / yaml-cpp 等） -----
-# 触发逻辑：若系统未提供 gRPC（通过 pkg-config 与 grpc_cpp_plugin 检测），
-# 则启动 vcpkg 来安装 grpc + yaml-cpp 等需要的 C++ 库。
+# 保留原有自动判断：pkg-config 能找到 grpc++ 且 grpc_cpp_plugin 在 PATH
+# 时使用系统包，否则回退 vcpkg。--force-vcpkg 会跳过该判断。
 # 之所以把 yaml-cpp 一并放进 vcpkg：
 #   - RHEL/TencentOS 系统包仅 yaml-cpp 0.5.x，其 CMake config 缺少
 #     RelWithDebInfo 配置的 IMPORTED_LOCATION，触发 CMP0111 警告刷屏。
 #   - 由 vcpkg 统一安装可保证版本一致、CMake 集成干净。
 ensure_cpp_deps_via_vcpkg() {
-    if command -v pkg-config >/dev/null 2>&1 \
+    if [ "${FORCE_VCPKG}" -ne 1 ] \
+        && command -v pkg-config >/dev/null 2>&1 \
         && pkg-config --exists grpc++ 2>/dev/null \
         && command -v grpc_cpp_plugin >/dev/null 2>&1; then
+        CPP_DEPS_PROVIDER="system"
+        VCPKG_TOOLCHAIN_FILE=""
         echo "系统已提供 gRPC（grpc++ + grpc_cpp_plugin），跳过 vcpkg 安装。"
         return 0
     fi
 
-    echo "系统未提供 gRPC，回退到 vcpkg 安装方案。"
+    if [ "${FORCE_VCPKG}" -eq 1 ]; then
+        echo "已启用 --force-vcpkg：强制使用 vcpkg 的 grpc / yaml-cpp。"
+    else
+        echo "系统未提供 gRPC，回退到 vcpkg 安装方案。"
+    fi
 
     # 代理环境健康提示（vcpkg 经常因公司代理把 GitHub release 拦掉）
     if [ -n "${HTTPS_PROXY:-}" ] || [ -n "${https_proxy:-}" ]; then
@@ -328,6 +376,8 @@ ensure_cpp_deps_via_vcpkg() {
     echo "vcpkg 中 gRPC / yaml-cpp 安装校验通过。"
 
     VCPKG_TOOLCHAIN_FILE="${vcpkg_root}/scripts/buildsystems/vcpkg.cmake"
+    VCPKG_SELECTED_ROOT="${vcpkg_root}"
+    CPP_DEPS_PROVIDER="vcpkg"
     cat <<EOF
 
 ==============================================================
@@ -340,29 +390,219 @@ gRPC 已通过 vcpkg 安装到: ${vcpkg_root}
 
 可用 preset：default / debug / release / system
 查看完整列表：cmake --list-presets
-
-如果你的 CMake < 3.21 不支持 presets，可手动指定 toolchain：
-
-    cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=${VCPKG_TOOLCHAIN_FILE}
 ==============================================================
 EOF
     return 0
 }
 
-ensure_cpp_deps_via_vcpkg || {
-    echo "警告：通过 vcpkg 安装 C++ 依赖（grpc / yaml-cpp）失败，请参考 README 手工处理。"
+CPP_DEPS_PROVIDER=""
+VCPKG_TOOLCHAIN_FILE=""
+VCPKG_SELECTED_ROOT=""
+if ! ensure_cpp_deps_via_vcpkg; then
+    echo "错误：无法准备根构建所需的 C++ 依赖（grpc / yaml-cpp）。" >&2
+    echo "请检查上方安装日志、网络或代理配置后重试。" >&2
+    exit 1
+fi
+
+json_escape() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
-# 校验 protoc / grpc_cpp_plugin 是否真的可用
-if ! command -v protoc >/dev/null 2>&1; then
-    echo "警告：protoc 未在 PATH 中，CMake 阶段会失败。请确认 protobuf 编译器已正确安装。"
-fi
-if ! command -v grpc_cpp_plugin >/dev/null 2>&1; then
-    if [ -n "${VCPKG_TOOLCHAIN_FILE:-}" ]; then
-        echo "提示：grpc_cpp_plugin 通过 vcpkg 安装，CMake 会自动从 toolchain 找到，无需在 PATH 中。"
-    else
-        echo "警告：grpc_cpp_plugin 未在 PATH 中。若使用系统 grpc，请确认 grpc-plugins / protobuf-compiler-grpc 已安装。"
-    fi
-fi
+generate_cmake_presets() {
+    local presets_file="${PROJECT_ROOT}/CMakePresets.json"
+    local presets_tmp
+    local toolchain_entry=""
+    local provider_label="system packages"
 
-echo "操作完成！"
+    if [ "${CPP_DEPS_PROVIDER}" = "vcpkg" ]; then
+        if [ ! -f "${VCPKG_TOOLCHAIN_FILE}" ]; then
+            echo "错误：vcpkg toolchain 不存在：${VCPKG_TOOLCHAIN_FILE}" >&2
+            return 1
+        fi
+        provider_label="vcpkg"
+        toolchain_entry=",
+        \"CMAKE_TOOLCHAIN_FILE\": \"$(json_escape "${VCPKG_TOOLCHAIN_FILE}")\""
+    fi
+
+    presets_tmp="$(mktemp "${PROJECT_ROOT}/.CMakePresets.json.XXXXXX")" || return 1
+    cat >"${presets_tmp}" <<EOF
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "default",
+      "displayName": "Default RelWithDebInfo (${provider_label})",
+      "generator": "Unix Makefiles",
+      "binaryDir": "\${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"${toolchain_entry}
+      }
+    },
+    {
+      "name": "debug",
+      "displayName": "Debug (${provider_label})",
+      "generator": "Unix Makefiles",
+      "binaryDir": "\${sourceDir}/build/debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"${toolchain_entry}
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "Release (${provider_label})",
+      "generator": "Unix Makefiles",
+      "binaryDir": "\${sourceDir}/build/release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"${toolchain_entry}
+      }
+    },
+    {
+      "name": "system",
+      "displayName": "System packages (no vcpkg toolchain)",
+      "generator": "Unix Makefiles",
+      "binaryDir": "\${sourceDir}/build/system",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "default", "configurePreset": "default" },
+    { "name": "debug",   "configurePreset": "debug" },
+    { "name": "release", "configurePreset": "release" },
+    { "name": "system",  "configurePreset": "system" }
+  ]
+}
+EOF
+    mv -f -- "${presets_tmp}" "${presets_file}"
+    echo "已生成 CMake presets：${presets_file}（依赖提供方：${CPP_DEPS_PROVIDER}）"
+}
+
+generate_cmake_presets || {
+    echo "错误：生成 CMakePresets.json 失败。" >&2
+    exit 1
+}
+
+tsv_clean() {
+    printf '%s' "$1" | tr '\t\r\n' '   '
+}
+
+write_dependency_row() {
+    local output_file="$1"
+    local name="$2"
+    local version="$3"
+    local provider="$4"
+    local location="$5"
+
+    printf '%s\t%s\t%s\t%s\n' \
+        "$(tsv_clean "${name}")" \
+        "$(tsv_clean "${version}")" \
+        "$(tsv_clean "${provider}")" \
+        "$(tsv_clean "${location}")" >>"${output_file}"
+}
+
+write_pkg_config_dependency() {
+    local output_file="$1"
+    local name="$2"
+    local module="$3"
+    local version="missing"
+    local location="-"
+
+    if command -v pkg-config >/dev/null 2>&1 \
+        && pkg-config --exists "${module}" 2>/dev/null; then
+        version="$(pkg-config --modversion "${module}")"
+        location="$(pkg-config --variable=libdir "${module}")"
+    fi
+    write_dependency_row "${output_file}" "${name}" "${version}" "system" "${location}"
+}
+
+generate_dependency_manifest() {
+    local manifest_file="${PROJECT_ROOT}/build_dependencies.tsv"
+    local manifest_tmp
+    local cmake_version
+    local cxx_version
+    local cuda_version="missing"
+    local cuda_location="-"
+    local kernel_version
+    local kernel_location
+
+    manifest_tmp="$(mktemp "${PROJECT_ROOT}/.build_dependencies.tsv.XXXXXX")" || return 1
+    cmake_version="$(cmake --version | sed -n '1s/^cmake version //p')"
+    cxx_version="$(c++ -dumpfullversion -dumpversion 2>/dev/null || c++ --version | head -n1)"
+    kernel_version="$(uname -r)"
+    kernel_location="/lib/modules/${kernel_version}/build"
+
+    if command -v nvcc >/dev/null 2>&1; then
+        cuda_version="$(nvcc --version | sed -n 's/.*release \([^,]*\).*/\1/p' | tail -n1)"
+        cuda_location="$(dirname "$(dirname "$(readlink -f "$(command -v nvcc)")")")"
+    fi
+
+    {
+        echo "# Generated by scripts/prepare_env.sh; machine-local, do not commit."
+        echo "# generated_at_utc=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+        echo "# cpp_dependency_provider=${CPP_DEPS_PROVIDER}"
+        printf 'name\tversion\tprovider\tlocation\n'
+    } >"${manifest_tmp}"
+
+    write_dependency_row "${manifest_tmp}" "cmake" "${cmake_version}" "system" \
+        "$(readlink -f "$(command -v cmake)")"
+    write_dependency_row "${manifest_tmp}" "cxx-compiler" "${cxx_version}" "system" \
+        "$(readlink -f "$(command -v c++)")"
+    write_dependency_row "${manifest_tmp}" "cuda-toolkit" "${cuda_version}" "system" \
+        "${cuda_location}"
+    write_dependency_row "${manifest_tmp}" "linux-kernel-headers" "${kernel_version}" "system" \
+        "${kernel_location}"
+    write_pkg_config_dependency "${manifest_tmp}" "libunwind" "libunwind"
+
+    if [ "${CPP_DEPS_PROVIDER}" = "vcpkg" ]; then
+        local vcpkg_version
+        local spec
+        local version
+        local unused
+        local package_name
+        local triplet
+        local install_prefix
+        local package_location
+
+        vcpkg_version="$("${VCPKG_SELECTED_ROOT}/vcpkg" version \
+            | sed -n '1s/.*version //p')"
+        write_dependency_row "${manifest_tmp}" "vcpkg" "${vcpkg_version}" "vcpkg" \
+            "${VCPKG_SELECTED_ROOT}"
+
+        while read -r spec version unused; do
+            case "${spec}" in
+                *\[*\]*) continue ;;
+                *:*) ;;
+                *) continue ;;
+            esac
+            package_name="${spec%%:*}"
+            triplet="${spec#*:}"
+            install_prefix="${VCPKG_SELECTED_ROOT}/installed/${triplet}"
+            package_location="${install_prefix}/share/${package_name}"
+            if [ ! -d "${package_location}" ]; then
+                package_location="${install_prefix}"
+            fi
+            write_dependency_row "${manifest_tmp}" "${package_name}" "${version}" \
+                "vcpkg:${triplet}" "${package_location}"
+        done < <("${VCPKG_SELECTED_ROOT}/vcpkg" list)
+    else
+        write_pkg_config_dependency "${manifest_tmp}" "grpc" "grpc++"
+        write_pkg_config_dependency "${manifest_tmp}" "protobuf" "protobuf"
+        write_pkg_config_dependency "${manifest_tmp}" "yaml-cpp" "yaml-cpp"
+    fi
+
+    mv -f -- "${manifest_tmp}" "${manifest_file}"
+    echo "已生成依赖清单：${manifest_file}"
+}
+
+generate_dependency_manifest || {
+    echo "错误：生成 build_dependencies.tsv 失败。" >&2
+    exit 1
+}
+
+echo "操作完成！可运行：cmake --preset default && cmake --build --preset default"

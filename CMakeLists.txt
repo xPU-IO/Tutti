@@ -276,33 +276,52 @@ set (module_ccflags "-I${PROJECT_SOURCE_DIR}/tutti/device_manager/nvme/libnvm/in
 configure_file ("${module_root}/Makefile.in" "${module_output}/Makefile" @ONLY)
 message (STATUS "Configuring module build in ${module_output}")
 
+# The module Makefile recursively invokes the kernel build system.  Mark every
+# CMake-launched make as jobserver-aware so a parallel parent build shares its
+# token pool instead of warning and falling back to -j1.  JOB_SERVER_AWARE was
+# added in CMake 3.28; with older Makefile generators, the literal $(MAKE)
+# provides GNU Make's equivalent recursive-make marker.  Non-Makefile parent
+# generators do not own a GNU Make jobserver, so they launch make normally.
+find_program (SNVME_MAKE_EXECUTABLE NAMES gmake make REQUIRED)
+set (_snvme_make_command "${SNVME_MAKE_EXECUTABLE}")
+set (_snvme_jobserver_args "")
+if (CMAKE_VERSION VERSION_GREATER_EQUAL 3.28)
+    list (APPEND _snvme_jobserver_args JOB_SERVER_AWARE TRUE)
+elseif (CMAKE_GENERATOR MATCHES "Makefiles")
+    set (_snvme_make_command "$(MAKE)")
+endif ()
+
 add_custom_target(
     modules
     ALL
-    COMMAND make
+    COMMAND ${_snvme_make_command}
     WORKING_DIRECTORY ${module_output}
     COMMENT "Building kernel module"
+    ${_snvme_jobserver_args}
 )
 
 add_custom_target(
     clean_modules
-    COMMAND make clean
+    COMMAND ${_snvme_make_command} clean
     WORKING_DIRECTORY ${module_output}
     COMMENT "Cleaning kernel module"
+    ${_snvme_jobserver_args}
 )
 
 add_custom_target(
     insmod
-    COMMAND sudo make insmod
+    COMMAND sudo ${_snvme_make_command} insmod
     WORKING_DIRECTORY ${module_output}
     COMMENT "Inserting kernel module"
+    ${_snvme_jobserver_args}
 )
 
 add_custom_target(
     rmmod
-    COMMAND sudo make rmmod
+    COMMAND sudo ${_snvme_make_command} rmmod
     WORKING_DIRECTORY ${module_output}
     COMMENT "Removing kernel module"
+    ${_snvme_jobserver_args}
 )
 
 # Benchmarks
@@ -319,8 +338,10 @@ add_library(libnvm ${libnvm_source} ${libnvm_cuda_source} ${libnvm_linux_source}
 set_target_properties(libnvm PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 set_target_properties(libnvm PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 target_include_directories (libnvm PRIVATE "${libnvm_root}")
-target_link_libraries(libnvm CUDA::cudart)
-target_link_libraries (libnvm Threads::Threads)
+target_link_libraries(libnvm
+    PUBLIC tutti_cuda_like
+    PRIVATE CUDA::cudart Threads::Threads
+)
 message (STATUS "Configuring libnvm without SmartIO")
 
 
@@ -505,5 +526,4 @@ macro (make_samples_choice ctarget sisci_target other_target)
         set (sample_targets "${sample_targets}" PARENT_SCOPE)
     endif ()
 endmacro ()
-
 
