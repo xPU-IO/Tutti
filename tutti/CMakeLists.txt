@@ -22,6 +22,16 @@ if(NOT TUTTI_ACCELERATOR MATCHES "^(CUDA|HOST|MUSA|MACA)$")
         "(MUSA/MACA are framework stubs — see doc/gpu-porting-guide.md)")
 endif()
 
+# CMake initializes CMAKE_CUDA_ARCHITECTURES while enabling the CUDA
+# language in project().  Set Tutti's default beforehand so the compiler's
+# own default (for example sm_52 with some nvcc/CMake combinations) cannot
+# override the documented Hopper baseline.  An explicit -D value still wins.
+if(TUTTI_ACCELERATOR STREQUAL "CUDA" AND
+   NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES 90 CACHE STRING
+        "CUDA architectures for Tutti")
+endif()
+
 # ---------------------------------------------------------------------------
 # Project -- CUDA language only enabled for CUDA profile
 # ---------------------------------------------------------------------------
@@ -55,9 +65,6 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # CUDA architecture (default to Ada/Hopper, override with -DCMAKE_CUDA_ARCHITECTURES)
 if(TUTTI_ACCELERATOR STREQUAL "CUDA")
     set(CMAKE_CUDA_STANDARD 17)
-    if(NOT CMAKE_CUDA_ARCHITECTURES)
-        set(CMAKE_CUDA_ARCHITECTURES 90)
-    endif()
 endif()
 
 # ---------------------------------------------------------------------------

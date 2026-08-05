@@ -8,14 +8,31 @@
 #   3. is_mounted() against /proc/self/mountinfo
 #   4. mount_one/unmount_all lifecycle using a loopback tmpfs (no real NVMe)
 
+find_package(Threads REQUIRED)
+find_package(yaml-cpp REQUIRED)
+
+if(TARGET yaml-cpp::yaml-cpp)
+    set(_tutti_mount_manager_yaml_target yaml-cpp::yaml-cpp)
+elseif(TARGET yaml-cpp)
+    set(_tutti_mount_manager_yaml_target yaml-cpp)
+else()
+    set(_tutti_mount_manager_yaml_target ${YAML_CPP_LIBRARIES})
+endif()
+
 add_executable(tutti_mount_manager_contract_test
     mount_manager_contract_test.cpp
+    ${PROJECT_SOURCE_DIR}/device_manager/nvme/nvmeservice/src/mount_manager.cpp
+    ${PROJECT_SOURCE_DIR}/device_manager/nvme/nvmeservice/src/nvmeservice_config.cpp
 )
 
 target_link_libraries(tutti_mount_manager_contract_test PRIVATE
-    nvmeservice
-    ${TUTTI_YAML_CPP_TARGET}
+    ${_tutti_mount_manager_yaml_target}
     Threads::Threads
+)
+
+target_include_directories(tutti_mount_manager_contract_test PRIVATE
+    ${PROJECT_SOURCE_DIR}/device_manager/nvme/nvmeservice/src
+    ${PROJECT_SOURCE_DIR}/device_manager/nvme/libnvm/include
 )
 
 set_target_properties(tutti_mount_manager_contract_test PROPERTIES

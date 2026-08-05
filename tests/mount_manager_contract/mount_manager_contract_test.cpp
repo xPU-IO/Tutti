@@ -210,6 +210,12 @@ static void test_mount_lifecycle() {
     // Actually, mount_one() records ownership only if mount(2) succeeds.
     // Let's use a loop device or just test the unmount path with tmpfs:
     int mrc = ::mount("tmpfs", mnt_dir, "tmpfs", 0, nullptr);
+    if (mrc != 0 && (errno == EPERM || errno == EACCES)) {
+        std::fprintf(stderr,
+                     "SKIP: tmpfs mount requires CAP_SYS_ADMIN in this environment\n");
+        ::rmdir(mnt_dir);
+        return;
+    }
     CHECK(mrc == 0, "mount tmpfs");
     if (mrc != 0) { ::rmdir(mnt_dir); return; }
 
