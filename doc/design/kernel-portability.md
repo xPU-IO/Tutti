@@ -36,13 +36,12 @@ GPU page pinning and DMA mapping go through an ops table:
   direct `->entries` / `->dma_addresses` walks.
 - **One backend per vendor** — `peer_memory/nvidia.c` wraps
   `nvidia_p2p_get_pages` / `nvidia_p2p_dma_map_pages`; `peer_memory/metax.c`
-  is the symmetric Metax backend. The backend is selected at module load;
-  vendor symbols are resolved dynamically (`__symbol_get`), so the module
-  loads even when the vendor driver stack is absent (fail-closed at first
-  P2P use, not at insmod).
+  is the symmetric Metax backend. Exactly one backend is selected at compile
+  time through `TUTTI_P2P_BACKEND`; that backend resolves its vendor symbols
+  dynamically (`__symbol_get`) during module initialization.
 - **Build isolation** — only the backend `.c` includes vendor headers;
-  the build adds the vendor SDK path (`/usr/src/nvidia-*/nvidia`) to
-  ccflags, no stubs.
+  CMake discovers the selected backend's header directory and passes it to
+  Kbuild. CUDA defaults to `nvidia`; MUSA/MACA default to `metax`.
 
 ## 3. Userspace ABI handshake
 
@@ -53,8 +52,8 @@ The ioctl UAPI is versioned (`tutti/include/uapi/tutti_snvme.h`):
   silent fallback to mismatched layouts.
 - Consequence: swapping kernel modules requires rebuilding userspace
   (`libnvm`, `tutti_daemon`) against the matching headers. The root
-  production build (`cmake --build build --target libnvm tutti_daemon
-  modules`) produces the matched set together.
+  production build (`cmake --build --preset cuda-module --target libnvm
+  tutti_daemon modules`) produces the matched set together.
 - UAPI structs are plain-C layout-stable; `libnvm` compiles its device
   headers under both nvcc and plain C via layout-identical fallbacks for
   the GPU-side atomic fields.
@@ -84,9 +83,9 @@ a deliberate semantic: GPU-consumed ≠ spurious.
 
 ## 6. Build & test entry points
 
-- Production matched set: root `cmake --build build --target libnvm
-  tutti_daemon modules` → `build/module/snvme{,-core}.ko`,
-  `build/bin/tutti_daemon`.
+- Production matched set: `cmake --build --preset cuda-module --target
+  libnvm tutti_daemon modules` produces
+  `build/cuda-module/module/snvme{,-core}.ko` plus the CUDA userspace targets.
 - Baseline matrix: each tree compiles against its own headers;
   cross-compiling a tree against a different lineage's headers is a
   known-incompatible configuration (NVMe core API drift), not a compat

@@ -5,7 +5,7 @@
  * (not at link time), so snvme.ko has no build-time dependency on the
  * NVIDIA driver module -- only on its header (nv-p2p.h).
  *
- * Compile this backend with:  -DTUTTI_P2P_BACKEND_NVIDIA  (default)
+ * Compile this backend with: make TUTTI_P2P_BACKEND=nvidia (CUDA default)
  *
  * SPDX-License-Identifier: GPL-2.0
  */

@@ -30,7 +30,7 @@ function(tutti_configure_cuda_like target_name)
 
     target_include_directories(${target_name} INTERFACE
         ${MUSA_INCLUDE_DIR}
-        "${PROJECT_SOURCE_DIR}/include"
+        "${TUTTI_SOURCE_DIR}/include"
     )
 
     # MUSA runtime + driver libraries (Mooncake-confirmed: musa musart rt)

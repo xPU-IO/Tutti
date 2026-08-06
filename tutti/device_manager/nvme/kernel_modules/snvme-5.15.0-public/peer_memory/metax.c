@@ -3,14 +3,14 @@
  *
  * Resolves metax_p2p_* symbols at module-load time via __symbol_get
  * (symmetric to the NVIDIA backend), so snvme.ko has no build-time
- * dependency on the Metax driver module -- only on its header
- * (metax_p2p.h, shipped alongside this file).
+ * dependency on the Metax driver module -- only on its vendor-supplied
+ * metax_p2p.h header.
  *
  * If the Metax driver is not loaded, peer_init() fails gracefully and
  * the module load fails with an error message (same behavior as the
  * NVIDIA path when nvidia_p2p_* symbols are missing).
  *
- * Compile this backend with:  -DTUTTI_P2P_BACKEND_METAX
+ * Compile this backend with: make TUTTI_P2P_BACKEND=metax
  *
  * Wrapper structs (opaque to the rest of the module):
  *   struct peer_page_table { void *handle; struct sg_table *sgt; };

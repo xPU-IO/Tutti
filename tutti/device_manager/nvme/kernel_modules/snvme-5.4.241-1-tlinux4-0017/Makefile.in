@@ -29,8 +29,8 @@ snvme-core-$(CONFIG_NVME_MULTIPATH)	+= multipath.o
 # snvme.ko object list.
 #
 # peer_memory/ contains one .c per GPU P2P backend:
-#   nvidia.c  (default, -DTUTTI_P2P_BACKEND_NVIDIA)
-#   metax.c   (-DTUTTI_P2P_BACKEND_METAX)
+#   nvidia.c  (CUDA default)
+#   metax.c   (MUSA/MACA default)
 #
 # Select at build time:  make TUTTI_P2P_BACKEND=nvidia (or metax)
 # Default: nvidia

@@ -71,8 +71,8 @@ Build targets (CMake):
 | Target                          | What it is                          |
 |---------------------------------|--------------------------------------|
 | `nvmeservice`                   | static library: proto + state + server + client lib |
-| `nvmeservice_daemon_example`    | the daemon binary (`bin/nvmeservice_daemon`)        |
-| `nvmeservice_client_example`    | the reference client (`bin/nvmeservice_client`)     |
+| `nvmeservice_daemon_example`    | the daemon binary (`build/<preset>/tutti/device_manager/nvme/nvmeservice/examples/nvmeservice_daemon`) |
+| `nvmeservice_client_example`    | the reference client (`build/<preset>/tutti/device_manager/nvme/nvmeservice/examples/nvmeservice_client`) |
 
 ---
 
@@ -90,19 +90,22 @@ Prerequisites:
 Build:
 
 ```bash
-cd /data/home/ryeqiu/Geminifs/build
-cmake --build . --target nvmeservice_daemon_example nvmeservice_client_example -j
+cd /path/to/Tutti
+cmake --preset cuda-module
+cmake --build --preset cuda-module \
+    --target nvmeservice_daemon_example nvmeservice_client_example -j8
 ```
 
-Edit `build/bin/sys_config.yaml` (or copy from repo root) so
+Edit `build/cuda-module/bin/sys_config.yaml` (copied from the repository root
+during configuration) so
 `nvmes[].pci_addr` matches your card and `nvmes[].allowed_gpus`
 lists the GPUs you intend to test from.
 
 Terminal A (daemon):
 
 ```bash
-cd build/bin
-sudo ./nvmeservice_daemon --config ./sys_config.yaml
+sudo ./build/cuda-module/tutti/device_manager/nvme/nvmeservice/examples/nvmeservice_daemon \
+    --config ./build/cuda-module/bin/sys_config.yaml
 ```
 
 Expected lines (excerpt):
@@ -121,9 +124,10 @@ queue_pool: default=4 max=16
 Terminal B (client):
 
 ```bash
-cd build/bin
-./nvmeservice_client --list-only                 # enumerate
-./nvmeservice_client --device 0 --cuda 0 --count 4
+./build/cuda-module/tutti/device_manager/nvme/nvmeservice/examples/nvmeservice_client \
+    --list-only                                  # enumerate
+./build/cuda-module/tutti/device_manager/nvme/nvmeservice/examples/nvmeservice_client \
+    --device 0 --cuda 0 --count 4
 ```
 
 Expected client output (8-step IO smoke):

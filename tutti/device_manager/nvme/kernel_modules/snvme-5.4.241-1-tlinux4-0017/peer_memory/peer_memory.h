@@ -8,19 +8,17 @@
  * (nvidia_p2p_*, metax_p2p_*) or includes vendor headers directly.
  *
  * Backends:
- *   TUTTI_P2P_BACKEND_NVIDIA  (default) — NVIDIA nvidia_p2p_* via __symbol_get
- *   TUTTI_P2P_BACKEND_METAX             — Metax metax_p2p_* (stub, Metax fills)
- *   TUTTI_P2P_BACKEND_NONE              — no GPU P2P (compile-only stub)
+ *   nvidia (CUDA default)     — NVIDIA nvidia_p2p_* via __symbol_get
+ *   metax  (MUSA/MACA default) — Metax metax_p2p_* via __symbol_get
  *
- * The backend is selected at compile time via -DTUTTI_P2P_BACKEND=<NAME>.
- * peer_memory.c contains the selected backend's implementation; only one
- * backend is compiled into a given snvme.ko.
+ * The backend is selected at compile time through the Kbuild variable
+ * TUTTI_P2P_BACKEND=<name>. Only peer_memory/<name>.c is compiled into a
+ * given snvme.ko.
  *
  * Vendor porting:
  *   To add a new backend, implement every member of peer_memory_ops
- *   (including the accessors) in a new section of peer_memory.c guarded
- *   by `#elif defined(TUTTI_P2P_BACKEND_<NAME>)`.  See the existing
- *   NVIDIA / METAX / NONE sections for the pattern.  The opaque types
+ *   (including the accessors) in peer_memory/<name>.c. See the existing
+ *   NVIDIA / Metax files for the pattern. The opaque types
  *   peer_page_table / peer_dma_mapping can be typedef'd to whatever
  *   wrapper the backend needs (NVIDIA uses the raw vendor types; Metax
  *   uses a custom wrapper struct holding a handle + sg_table).
@@ -35,7 +33,7 @@
 struct pci_dev;
 
 /* Opaque handles for GPU P2P page-table / dma-mapping objects.
- * The actual type is defined by the selected backend in peer_memory.c;
+ * The actual type is defined by the selected backend source;
  * the rest of the module only sees these forward declarations. */
 struct peer_page_table;
 struct peer_dma_mapping;
@@ -103,7 +101,7 @@ struct peer_memory_ops {
 	const uint64_t *(*dm_addresses)(const struct peer_dma_mapping *dm);
 };
 
-/* The single ops instance, defined in peer_memory.c. */
+/* The single ops instance, defined by the selected backend source. */
 extern const struct peer_memory_ops peer_memory_ops;
 
 /*

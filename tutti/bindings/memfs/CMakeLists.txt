@@ -20,7 +20,7 @@ add_library(tutti_memfs_binding INTERFACE)
 # Workspace root so that <tutti/bindings/memfs/*.h> and
 # <tutti/resolvers/memfs/*.h> resolve.
 target_include_directories(tutti_memfs_binding INTERFACE
-    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/..>
+    $<BUILD_INTERFACE:${TUTTI_REPOSITORY_ROOT}>
 )
 
 target_link_libraries(tutti_memfs_binding INTERFACE
@@ -28,12 +28,12 @@ target_link_libraries(tutti_memfs_binding INTERFACE
 )
 
 # ---------------------------------------------------------------------------
-# Contract test (self-contained — no additional line in tutti/CMakeLists.txt)
+# Contract test (self-contained; no additional top-level registration)
 # ---------------------------------------------------------------------------
 
 if(BUILD_TESTING)
     add_subdirectory(
-        "${PROJECT_SOURCE_DIR}/../tests/memfs_sample_contract"
+        "${TUTTI_REPOSITORY_ROOT}/tests/memfs_sample_contract"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_memfs_sample_contract"
     )
     message(STATUS "Tutti: added tests/memfs_sample_contract (sample extension)")

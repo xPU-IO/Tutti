@@ -121,13 +121,13 @@ class MemfsResolver : public StorageTargetResolver {
 ```cmake
 add_library(tutti_memfs_binding INTERFACE)
 target_include_directories(tutti_memfs_binding INTERFACE
-    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/..>
+    $<BUILD_INTERFACE:${TUTTI_REPOSITORY_ROOT}>
 )
 target_link_libraries(tutti_memfs_binding INTERFACE tutti_spi)
 
 if(BUILD_TESTING)
     add_subdirectory(
-        "${PROJECT_SOURCE_DIR}/../tests/memfs_sample_contract"
+        "${TUTTI_REPOSITORY_ROOT}/tests/memfs_sample_contract"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_memfs_sample_contract")
 endif()
 ```

@@ -960,12 +960,23 @@ not the recommended path; new code should use B3.
 
 ## 6. Build & install
 
-`Makefile.in` is rendered by the top-level CMake (`CMakeLists.txt`,
-target `module_output`). To build the module out-of-tree by hand:
+`Makefile.in` is rendered by the repository-root CMake after it selects both
+the kernel baseline and one peer-memory backend. CUDA defaults to `nvidia`;
+MUSA/MACA default to `metax`. The equivalent explicit CUDA configuration is:
 
 ```bash
-cd build/module
-make KERNEL_SRC=/lib/modules/$(uname -r)/build
+cmake --preset cuda-module --fresh \
+  -DSNVME_KERNEL_VERSION=5.15.0-public \
+  -DTUTTI_P2P_BACKEND=nvidia
+cmake --build --preset cuda-module --target modules
+```
+
+To invoke the configured Kbuild wrapper directly, keep the same backend
+selection:
+
+```bash
+cd build/cuda-module/module
+make TUTTI_P2P_BACKEND=nvidia
 sudo insmod snvme-core.ko
 sudo insmod snvme.ko
 ls -l /dev/snvm_control          # should appear, mode 0666

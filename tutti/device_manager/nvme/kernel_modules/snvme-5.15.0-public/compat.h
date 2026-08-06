@@ -14,7 +14,7 @@
  *                               (back-ported into some 5.15 point releases).
  *                               Consumed in pci.c; probed in Makefile.in.
  *   HAVE_MODULE_MUTEX        -- module_mutex is directly extern-able.
- *                               Consumed in peer_memory.c.
+ *                               Consumed in peer_memory backend sources.
  *
  * SPDX-License-Identifier: GPL-2.0
  */

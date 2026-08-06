@@ -6566,8 +6566,8 @@ static int __init nvme_init(void)
 	snvm_registered = 0;
 
 	/*
-	 * Resolve peer_memory symbols from the NVIDIA GPU driver.  Failure
-	 * here is fatal: CUDA_QUEUE / CUDA memory mapping in map.c depends
+	 * Resolve peer_memory symbols from the selected GPU P2P backend. Failure
+	 * here is fatal: GPU queue/memory mapping in map.c depends
 	 * on these symbols, and without them libnvm's GPU-side registration
 	 * path would silently crash.
 	 */

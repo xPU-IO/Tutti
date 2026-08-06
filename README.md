@@ -71,12 +71,9 @@ symmetric per-vendor backends (nvidia done, metax symmetric).
 ## Running the KV Cache Example
 
 ```bash
-cmake -B build -S tutti \
-    -DTUTTI_ACCELERATOR=CUDA \
-    -DTUTTI_BUILD_HARDWARE_TESTS=ON \
-    -DCMAKE_TOOLCHAIN_FILE=../third_pkgs/vcpkg/scripts/buildsystems/vcpkg.cmake
-cmake --build build --target tutti_layerwise_kv_overlap -j8
-sudo ./build/bin/tutti_layerwise_kv_overlap          # 4-disk striped (default); --single for one drive
+cmake --preset cuda --fresh -DTUTTI_BUILD_HARDWARE_TESTS=ON
+cmake --build --preset cuda --target tutti_layerwise_kv_overlap -j8
+sudo ./build/cuda/bin/tutti_layerwise_kv_overlap     # 4-disk striped (default); --single for one drive
 ```
 
 `layerwise_kv_overlap` is Tutti's standard KV-cache reference workload
@@ -94,7 +91,9 @@ Two files, two roles — one topology source of truth:
 - **`config/local_nvme_config.yaml`** — the local-NVMe deployment fact file: NVMe controllers (`nvmes[]` with `allowed_gpus` ACL), GPU enumeration, mount points, queue/lease policy. Read by **both** the daemon (bring-up/mount) and the application loader (the CUDA↔ssd device map is derived from `nvmes[]` order + `allowed_gpus`). Daemon lookup: `--config` > `config/local_nvme_config.yaml` > legacy `sys_config.yaml` names (deprecation warnings).
 - **`config/tutti_config.yaml`** — the application's entry point: DataPath cache knobs (`handle_cache_capacity`, `prp_cache_capacity`, L2), capacity knobs (`max_in_flight_operations`, `max_batch_entries`, `num_user_queues`), `io_granularity`, and a `local_nvme_config` link key pointing at the file above. Priority: programmatic injection > config file > built-in defaults (`TUTTI_*_CACHE_CAP` env vars are test-only backdoors). Queue depth is *not* here — it is kernel-authoritative (`io_queue_depth` at module install).
 
-Two build entries: standalone `tutti/` for development and contract tests; the repository-root build for the daemon + kernel-module production set. Runtime is daemon-only.
+The repository root is the only supported CMake entry. All component
+`CMakeLists.txt` files are reached from that target graph and are not
+standalone project entries. Runtime is daemon-only.
 
 ## Deep Dive
 

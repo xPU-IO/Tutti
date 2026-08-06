@@ -383,12 +383,12 @@ ensure_cpp_deps_via_vcpkg() {
 ==============================================================
 gRPC 已通过 vcpkg 安装到: ${vcpkg_root}
 
-推荐使用 CMake Presets（一行搞定）：
+推荐使用按后端划分的 CMake Presets：
 
-    cmake --preset default
-    cmake --build --preset default
+    cmake --preset cuda
+    cmake --build --preset cuda
 
-可用 preset：default / debug / release / system
+可用 preset：host / cuda / cuda-module / musa / maca
 查看完整列表：cmake --list-presets
 ==============================================================
 EOF
@@ -421,7 +421,10 @@ generate_cmake_presets() {
         fi
         provider_label="vcpkg"
         toolchain_entry=",
-        \"CMAKE_TOOLCHAIN_FILE\": \"$(json_escape "${VCPKG_TOOLCHAIN_FILE}")\""
+        \"CMAKE_TOOLCHAIN_FILE\": {
+          \"type\": \"FILEPATH\",
+          \"value\": \"$(json_escape "${VCPKG_TOOLCHAIN_FILE}")\"
+        }"
     fi
 
     presets_tmp="$(mktemp "${PROJECT_ROOT}/.CMakePresets.json.XXXXXX")" || return 1
@@ -435,47 +438,111 @@ generate_cmake_presets() {
   },
   "configurePresets": [
     {
-      "name": "default",
-      "displayName": "Default RelWithDebInfo (${provider_label})",
+      "name": "_tutti-base",
+      "hidden": true,
       "generator": "Unix Makefiles",
-      "binaryDir": "\${sourceDir}/build",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "RelWithDebInfo"${toolchain_entry}
+        "CMAKE_BUILD_TYPE": { "type": "STRING", "value": "RelWithDebInfo" }${toolchain_entry}
       }
     },
     {
-      "name": "debug",
-      "displayName": "Debug (${provider_label})",
-      "generator": "Unix Makefiles",
-      "binaryDir": "\${sourceDir}/build/debug",
+      "name": "host",
+      "displayName": "HOST | contracts (${provider_label})",
+      "description": "Hardware-free HOST profile with contract tests enabled.",
+      "inherits": "_tutti-base",
+      "binaryDir": "\${sourceDir}/build/host",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Debug"${toolchain_entry}
+        "TUTTI_ACCELERATOR": { "type": "STRING", "value": "HOST" },
+        "BUILD_TESTING": { "type": "BOOL", "value": "ON" },
+        "TUTTI_FEATURE_MEMFS_SAMPLE": { "type": "BOOL", "value": "ON" },
+        "TUTTI_BUILD_HARDWARE_TESTS": { "type": "BOOL", "value": "OFF" },
+        "TUTTI_BUILD_KERNEL_MODULE": { "type": "BOOL", "value": "OFF" }
       }
     },
     {
-      "name": "release",
-      "displayName": "Release (${provider_label})",
-      "generator": "Unix Makefiles",
-      "binaryDir": "\${sourceDir}/build/release",
+      "name": "cuda",
+      "displayName": "CUDA | userspace (${provider_label})",
+      "description": "CUDA userspace stack and hardware-free contract tests; kernel module disabled.",
+      "inherits": "_tutti-base",
+      "binaryDir": "\${sourceDir}/build/cuda",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release"${toolchain_entry}
+        "TUTTI_ACCELERATOR": { "type": "STRING", "value": "CUDA" },
+        "CMAKE_CUDA_ARCHITECTURES": { "type": "STRING", "value": "90" },
+        "BUILD_TESTING": { "type": "BOOL", "value": "ON" },
+        "TUTTI_BUILD_HARDWARE_STACK": { "type": "BOOL", "value": "ON" },
+        "TUTTI_FEATURE_LOCAL_NVME": { "type": "BOOL", "value": "ON" },
+        "TUTTI_FEATURE_MEMFS_SAMPLE": { "type": "BOOL", "value": "ON" },
+        "TUTTI_BUILD_HARDWARE_TESTS": { "type": "BOOL", "value": "OFF" },
+        "TUTTI_BUILD_KERNEL_MODULE": { "type": "BOOL", "value": "OFF" }
       }
     },
     {
-      "name": "system",
-      "displayName": "System packages (no vcpkg toolchain)",
-      "generator": "Unix Makefiles",
-      "binaryDir": "\${sourceDir}/build/system",
+      "name": "cuda-module",
+      "displayName": "CUDA | userspace + snvme module (${provider_label})",
+      "description": "CUDA stack with kernel-specific snvme module targets enabled.",
+      "inherits": "cuda",
+      "binaryDir": "\${sourceDir}/build/cuda-module",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+        "TUTTI_BUILD_KERNEL_MODULE": { "type": "BOOL", "value": "ON" },
+        "TUTTI_P2P_BACKEND": { "type": "STRING", "value": "nvidia" },
+        "SNVME_KERNEL_VERSION": { "type": "STRING", "value": "" },
+        "SNVME_P2P_INCLUDE_DIR": { "type": "PATH", "value": "" }
+      }
+    },
+    {
+      "name": "musa",
+      "displayName": "MUSA | porting profile (${provider_label})",
+      "description": "MUSA framework profile; SDK/compiler integration remains vendor-dependent.",
+      "inherits": "_tutti-base",
+      "binaryDir": "\${sourceDir}/build/musa",
+      "cacheVariables": {
+        "TUTTI_ACCELERATOR": { "type": "STRING", "value": "MUSA" },
+        "BUILD_TESTING": { "type": "BOOL", "value": "ON" },
+        "TUTTI_BUILD_HARDWARE_STACK": { "type": "BOOL", "value": "ON" },
+        "TUTTI_FEATURE_LOCAL_NVME": { "type": "BOOL", "value": "ON" },
+        "TUTTI_BUILD_HARDWARE_TESTS": { "type": "BOOL", "value": "OFF" },
+        "TUTTI_BUILD_KERNEL_MODULE": { "type": "BOOL", "value": "OFF" },
+        "MUSA_INCLUDE_DIR": { "type": "PATH", "value": "/usr/local/musa/include" },
+        "MUSA_LIB_DIR": { "type": "PATH", "value": "/usr/local/musa/lib" }
+      }
+    },
+    {
+      "name": "maca",
+      "displayName": "MACA | porting profile (${provider_label})",
+      "description": "MACA framework profile; SDK/compiler integration remains vendor-dependent.",
+      "inherits": "_tutti-base",
+      "binaryDir": "\${sourceDir}/build/maca",
+      "cacheVariables": {
+        "TUTTI_ACCELERATOR": { "type": "STRING", "value": "MACA" },
+        "BUILD_TESTING": { "type": "BOOL", "value": "ON" },
+        "TUTTI_BUILD_HARDWARE_STACK": { "type": "BOOL", "value": "ON" },
+        "TUTTI_FEATURE_LOCAL_NVME": { "type": "BOOL", "value": "ON" },
+        "TUTTI_BUILD_HARDWARE_TESTS": { "type": "BOOL", "value": "OFF" },
+        "TUTTI_BUILD_KERNEL_MODULE": { "type": "BOOL", "value": "OFF" },
+        "MACA_ROOT": { "type": "PATH", "value": "/opt/maca" }
       }
     }
   ],
   "buildPresets": [
-    { "name": "default", "configurePreset": "default" },
-    { "name": "debug",   "configurePreset": "debug" },
-    { "name": "release", "configurePreset": "release" },
-    { "name": "system",  "configurePreset": "system" }
+    { "name": "host",        "configurePreset": "host" },
+    { "name": "cuda",        "configurePreset": "cuda" },
+    { "name": "cuda-module", "configurePreset": "cuda-module" },
+    { "name": "musa",        "configurePreset": "musa" },
+    { "name": "maca",        "configurePreset": "maca" }
+  ],
+  "testPresets": [
+    {
+      "name": "host",
+      "configurePreset": "host",
+      "output": { "outputOnFailure": true },
+      "execution": { "jobs": 16, "timeout": 60 }
+    },
+    {
+      "name": "cuda",
+      "configurePreset": "cuda",
+      "output": { "outputOnFailure": true },
+      "execution": { "jobs": 16, "timeout": 60 }
+    }
   ]
 }
 EOF
@@ -605,4 +672,4 @@ generate_dependency_manifest || {
     exit 1
 }
 
-echo "操作完成！可运行：cmake --preset default && cmake --build --preset default"
+echo "操作完成！可运行：cmake --preset cuda && cmake --build --preset cuda"

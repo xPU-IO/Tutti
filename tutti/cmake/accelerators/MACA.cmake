@@ -45,7 +45,7 @@ function(tutti_configure_cuda_like target_name)
 
     target_include_directories(${target_name} INTERFACE
         ${MACA_INCLUDE_DIR}
-        "${PROJECT_SOURCE_DIR}/include"
+        "${TUTTI_SOURCE_DIR}/include"
     )
 
     target_link_directories(${target_name} INTERFACE ${MACA_LIB_DIR})

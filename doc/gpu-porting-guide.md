@@ -211,16 +211,16 @@ internal Tutti fork.
 ## Kernel module P2P adaptation (Metax)
 
 The snvme kernel module (`tutti/device_manager/nvme/kernel_modules/`) uses
-the `peer_memory_ops` function-pointer table in `peer_memory.c` as the
+the `peer_memory_ops` function-pointer table in `peer_memory/peer_memory.h` as the
 single point of contact with the GPU driver's P2P API.
 
 ### Current state
 
-- **NVIDIA path** (default): `peer_memory.c` resolves `nvidia_p2p_*`
+- **NVIDIA path** (CUDA default): `peer_memory/nvidia.c` resolves `nvidia_p2p_*`
   symbols at module-load time via `__symbol_get` and routes calls through
   the `peer_memory_ops` table. The module body (`map.c`, `pci.c`) never
   touches NVIDIA types directly.
-- **Metax path** (`-DTUTTI_P2P_BACKEND_METAX`): `peer_memory.c` includes
+- **Metax path** (MUSA/MACA default): `peer_memory/metax.c` includes
   `metax_p2p.h` (ported from ljye2023/Tutti PR #1) and resolves
   `metax_p2p_*` symbols at module-load time via `__symbol_get` (symmetric
   to the NVIDIA path). The `peer_memory_ops` implementation is complete;
@@ -228,8 +228,9 @@ single point of contact with the GPU driver's P2P API.
 
 ### `metax_p2p.h` API (ported from Mooncake/Metax PR)
 
-The header (`tutti/device_manager/nvme/kernel_modules/snvme-*/metax_p2p.h`)
-defines these functions:
+The vendor-supplied `metax_p2p.h` defines these functions. Tutti does not
+currently vendor this header; provide its directory through
+`SNVME_P2P_INCLUDE_DIR`.
 
 | Function | Purpose | NVIDIA equivalent |
 |----------|---------|-------------------|
@@ -243,21 +244,20 @@ defines these functions:
 
 ### Metax integration steps
 
-1. Build snvme.ko with `-DTUTTI_P2P_BACKEND_METAX` ccflags.
+1. Configure with `-DTUTTI_BUILD_KERNEL_MODULE=ON`,
+   `-DTUTTI_P2P_BACKEND=metax`, and
+   `-DSNVME_P2P_INCLUDE_DIR=<directory-containing-metax_p2p.h>`.
 2. Load the Metax GPU driver (must export `metax_p2p_*` symbols to the
    kernel symbol namespace).
 3. `insmod snvme.ko` — `peer_init()` resolves the symbols via
    `__symbol_get`; if the Metax driver is not loaded, `peer_init()`
    fails gracefully (module load fails with an error message, same as
    the NVIDIA path when `nvidia_p2p_*` symbols are missing).
-4. No source changes needed — the METAX backend is already fully
-   implemented in `peer_memory.c`.
+4. No SNVMe common-source changes are needed — the backend implementation
+   lives in `peer_memory/metax.c`.
 
 The NVIDIA→Metax API mapping table is documented inline in
-`peer_memory.c` above the METAX backend section.
-
-The NVIDIA→Metax API mapping table is documented inline in
-`peer_memory.c` above the `#ifdef TUTTI_USE_METAX_P2P` block.
+`peer_memory/metax.c`.
 
 ### Note on `map.c` signature differences
 
@@ -278,7 +278,7 @@ A vendor port is complete when:
 2. **HOST profile**: `ctest -L host` passes (excluding the
    `mount_manager` test which depends on nvmeservice and is host-broken
    by design).
-3. **Vendor profile**: `cmake -B build -S tutti -DTUTTI_ACCELERATOR=<VENDOR>`
+3. **Vendor profile**: `cmake -S . -B build -DTUTTI_ACCELERATOR=<VENDOR>`
    configures successfully with the vendor's toolchain, and the
    stub-removal `#error`s in `<vendor>.h` no longer fire.
 4. **Vendor's device compiler** compiles the `__CUDACC__`-guarded section
@@ -329,6 +329,6 @@ Metax 选一种：
 
 ### 验证步骤
 
-1. `cmake -B build -S tutti -DTUTTI_ACCELERATOR=MUSA`（configure 应该成功，无 WARNING）
-2. `cmake --build build --target tutti_layerwise_kv_overlap`（如果链接成功且跑通，框架级通过）
-3. 跑 CUDA profile 回归确认零影响：`cmake -B build -S tutti -DTUTTI_ACCELERATOR=CUDA && ctest -LE "hardware|mount_manager"`
+1. `cmake -S . -B build -DTUTTI_ACCELERATOR=MUSA`（configure 应该成功，无 WARNING）
+2. `cmake --build --preset cuda --target tutti_layerwise_kv_overlap`（如果链接成功且跑通，框架级通过）
+3. 跑 CUDA profile 回归确认零影响：`cmake --preset cuda --fresh && ctest --preset cuda -LE "hardware|mount_manager"`

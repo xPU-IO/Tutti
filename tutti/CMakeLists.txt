@@ -1,4 +1,4 @@
-# tutti/CMakeLists.txt -- Tutti refactor root CMake
+# tutti/CMakeLists.txt -- Tutti target graph
 #
 # The active graph is organized around public API/SPI contracts, accelerator
 # profiles, target resolvers, bindings, and DataPath packages. The older
@@ -7,48 +7,17 @@
 #
 # Target baseline: Linux 5.15 and CUDA 12.6+ for the CUDA profile.
 
-cmake_minimum_required(VERSION 3.18)
-
-# ---------------------------------------------------------------------------
-# Accelerator profile (must be defined and validated before project())
-# ---------------------------------------------------------------------------
-
-set(TUTTI_ACCELERATOR "CUDA" CACHE STRING "Tutti accelerator profile: CUDA|HOST|MUSA|MACA")
-string(TOUPPER "${TUTTI_ACCELERATOR}" TUTTI_ACCELERATOR)
-if(NOT TUTTI_ACCELERATOR MATCHES "^(CUDA|HOST|MUSA|MACA)$")
+# This target graph is not a standalone CMake entry.
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     message(FATAL_ERROR
-        "TUTTI_ACCELERATOR='${TUTTI_ACCELERATOR}' is not supported. "
-        "Supported values: CUDA, HOST, MUSA, MACA "
-        "(MUSA/MACA are framework stubs — see doc/gpu-porting-guide.md)")
+        "Configure Tutti from the repository root: "
+        "cmake -S <repository-root> -B <build-dir>")
 endif()
 
-# CMake initializes CMAKE_CUDA_ARCHITECTURES while enabling the CUDA
-# language in project().  Set Tutti's default beforehand so the compiler's
-# own default (for example sm_52 with some nvcc/CMake combinations) cannot
-# override the documented Hopper baseline.  An explicit -D value still wins.
-if(TUTTI_ACCELERATOR STREQUAL "CUDA" AND
-   NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES 90 CACHE STRING
-        "CUDA architectures for Tutti")
-endif()
-
-# ---------------------------------------------------------------------------
-# Project -- CUDA language only enabled for CUDA profile
-# ---------------------------------------------------------------------------
-
-if(TUTTI_ACCELERATOR STREQUAL "CUDA")
-    project(Tutti VERSION 0.1.1 LANGUAGES C CXX CUDA)
-elseif(TUTTI_ACCELERATOR STREQUAL "MUSA" OR TUTTI_ACCELERATOR STREQUAL "MACA")
-    # MUSA/MACA toolchains: the device language is supplied by the Metax
-    # compiler.  By default we still enable CUDA language so that nvcc is
-    # picked up (many MUSA SDKs ship an nvcc-compatible front end).  Metax
-    # may override this in cmake/accelerators/MUSA.cmake via enable_language().
-    # If the toolchain does NOT provide nvcc, remove CUDA from LANGUAGES and
-    # enable the MUSA language explicitly — see doc/gpu-porting-guide.md.
-    project(Tutti VERSION 0.1.1 LANGUAGES C CXX CUDA)
-else()
-    project(Tutti VERSION 0.1.1 LANGUAGES C CXX)
-endif()
+# Stable paths for every child CMake file.  This file is entered only through
+# the repository-root CMakeLists.txt and intentionally does not call project().
+get_filename_component(TUTTI_SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}" ABSOLUTE)
+get_filename_component(TUTTI_REPOSITORY_ROOT "${TUTTI_SOURCE_DIR}/.." ABSOLUTE)
 
 # ---------------------------------------------------------------------------
 # Global settings (inherited from parent if included as subdirectory)
@@ -110,6 +79,8 @@ endif()
 
 option(TUTTI_FEATURE_LOCAL_NVME "Include local-NVMe DataPath and dependencies" ON)
 option(TUTTI_FEATURE_MEMFS_SAMPLE "Include memfs sample extension" ON)
+option(TUTTI_BUILD_KERNEL_MODULE
+    "Configure snvme kernel-module build/load targets" OFF)
 
 # ---------------------------------------------------------------------------
 # Include directories
@@ -120,14 +91,28 @@ option(TUTTI_FEATURE_MEMFS_SAMPLE "Include memfs sample extension" ON)
 # tree.  It has been moved inside the TUTTI_BUILD_HARDWARE_STACK guard below
 # so that only hardware-stack targets receive it.  Each hardware-stack layer
 # and test already declares its own target_include_directories with
-# $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>, so the global directive is a
+# $<BUILD_INTERFACE:${TUTTI_SOURCE_DIR}>, so the global directive is a
 # safety net for any edge case not yet audited.
 
 # ---------------------------------------------------------------------------
 # Accelerator profile module
 # ---------------------------------------------------------------------------
 
-include(cmake/accelerators/${TUTTI_ACCELERATOR}.cmake)
+include("${TUTTI_SOURCE_DIR}/cmake/accelerators/${TUTTI_ACCELERATOR}.cmake")
+
+if(TUTTI_BUILD_KERNEL_MODULE)
+    if(TUTTI_ACCELERATOR STREQUAL "HOST")
+        message(FATAL_ERROR
+            "TUTTI_BUILD_KERNEL_MODULE requires a GPU P2P backend; "
+            "use the CUDA, MUSA, or MACA accelerator profile")
+    elseif(NOT TUTTI_BUILD_HARDWARE_STACK)
+        message(FATAL_ERROR
+            "TUTTI_BUILD_KERNEL_MODULE requires TUTTI_BUILD_HARDWARE_STACK=ON")
+    elseif(NOT TUTTI_FEATURE_LOCAL_NVME)
+        message(FATAL_ERROR
+            "TUTTI_BUILD_KERNEL_MODULE requires TUTTI_FEATURE_LOCAL_NVME=ON")
+    endif()
+endif()
 
 # ---------------------------------------------------------------------------
 # tutti_cuda_like -- profile interface library
@@ -146,7 +131,7 @@ tutti_configure_cuda_like(tutti_cuda_like)
 
 add_library(tutti_api INTERFACE)
 target_include_directories(tutti_api INTERFACE
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${TUTTI_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
 target_link_libraries(tutti_api INTERFACE tutti_cuda_like)
@@ -168,7 +153,7 @@ target_link_libraries(tutti_api INTERFACE tutti_cuda_like)
 
 add_library(tutti_spi INTERFACE)
 target_include_directories(tutti_spi INTERFACE
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${TUTTI_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
 target_link_libraries(tutti_spi INTERFACE tutti_api)
@@ -204,7 +189,7 @@ add_subdirectory(resolvers/striped_file)
 
 add_library(tutti_types INTERFACE)
 target_include_directories(tutti_types INTERFACE
-    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${TUTTI_SOURCE_DIR}"
 )
 target_link_libraries(tutti_types INTERFACE tutti_cuda_like)
 
@@ -215,18 +200,14 @@ target_link_libraries(tutti_types INTERFACE tutti_cuda_like)
 if(TUTTI_BUILD_HARDWARE_STACK)
     # Make tutti/ headers available to all hardware-stack targets.
     # Phase 0 contract targets (built in all profiles) do NOT receive this.
-    include_directories("${CMAKE_CURRENT_SOURCE_DIR}")
+    include_directories("${TUTTI_SOURCE_DIR}")
 
     # Preset assembly layer (public API factory functions).
     add_subdirectory(presets)
 
-    # CUDA profile requires the CUDA Toolkit.  MUSA/MACA profiles supply
-    # their own SDK via cmake/accelerators/MUSA.cmake / MACA.cmake and do
-    # NOT need CUDAToolkit here (Metax may add an equivalent find_package
-    # in their cmake module).
-    if(TUTTI_ACCELERATOR STREQUAL "CUDA")
-        find_package(CUDAToolkit REQUIRED)
-    endif()
+    # The CUDA profile requires CUDAToolkit (including its minimum version)
+    # in cmake/accelerators/CUDA.cmake. MUSA/MACA profiles supply their own
+    # SDK through their profile modules.
     find_package(Threads REQUIRED)
 
     # gRPC: optional; when found, nvmeservice (daemon NVMe multi-process path) is
@@ -291,6 +272,10 @@ if(TUTTI_BUILD_HARDWARE_STACK)
     if(TUTTI_FEATURE_LOCAL_NVME)
         add_subdirectory(device_manager)   # libnvm + nvmeservice
 
+        if(TUTTI_BUILD_KERNEL_MODULE)
+            include("${TUTTI_SOURCE_DIR}/cmake/SNVMeModule.cmake")
+        endif()
+
         # LocalNvmeDataPath package — needs libnvm + binding + resolver,
         # all already defined upstream.
         add_subdirectory(data_paths/local_nvme)
@@ -313,11 +298,10 @@ endif()
 # ---------------------------------------------------------------------------
 # Tests
 #
-# Set -DBUILD_TESTING=ON to include the test suite in the build.
-# Default is OFF so a plain `cmake -S tutti -B tutti/build` stays lean.
+# Set -DBUILD_TESTING=ON to include the test suite in the build. The root
+# CMakeLists.txt owns include(CTest) so CTest discovers this subdirectory.
+# Default is OFF so a plain `cmake -S . -B build` stays lean.
 # ---------------------------------------------------------------------------
-
-option(BUILD_TESTING "Build Tutti tests" OFF)
 
 # Hardware tests (resolver on real FIEMAP mount, local-NVMe on real GPU+snvme)
 # are OFF by default.  When ON, they are registered with CTest labels
@@ -326,8 +310,6 @@ option(BUILD_TESTING "Build Tutti tests" OFF)
 option(TUTTI_BUILD_HARDWARE_TESTS "Register hardware-dependent tests" OFF)
 
 if(BUILD_TESTING)
-    include(CTest)
-
     # SAMPLE-ONLY: community extension sample (doc/extending_tutti.md).
     # Must live inside this block: add_test() only registers in directories
     # processed after include(CTest) has enabled testing.
@@ -340,21 +322,21 @@ if(BUILD_TESTING)
 
     # Contract test (runs in all profiles: CUDA and HOST)
     add_subdirectory(
-        "${CMAKE_CURRENT_SOURCE_DIR}/../tests/cuda_like"
+        "${TUTTI_REPOSITORY_ROOT}/tests/cuda_like"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_cuda_like"
     )
     message(STATUS "Tutti: added tests/cuda_like (contract test)")
 
     # Public API usage test (runs in all profiles: CUDA and HOST)
     add_subdirectory(
-        "${CMAKE_CURRENT_SOURCE_DIR}/../tests/public_api"
+        "${TUTTI_REPOSITORY_ROOT}/tests/public_api"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_public_api"
     )
     message(STATUS "Tutti: added tests/public_api (public API usage test)")
 
     # SPI usage-requirements consumer test (runs in all profiles: CUDA and HOST)
     add_subdirectory(
-        "${CMAKE_CURRENT_SOURCE_DIR}/../tests/spi_consumer"
+        "${TUTTI_REPOSITORY_ROOT}/tests/spi_consumer"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_spi_consumer"
     )
     message(STATUS "Tutti: added tests/spi_consumer (SPI usage-requirements test)")
@@ -363,11 +345,11 @@ if(BUILD_TESTING)
     # runnable under the HOST profile. Their fake components prove Runtime
     # routing does not require CUDA, libnvm, or a local-NVMe deployment.
     add_subdirectory(
-        "${CMAKE_CURRENT_SOURCE_DIR}/../tests/data_path_contract"
+        "${TUTTI_REPOSITORY_ROOT}/tests/data_path_contract"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_data_path_contract"
     )
     add_subdirectory(
-        "${CMAKE_CURRENT_SOURCE_DIR}/../tests/storage_runtime_contract"
+        "${TUTTI_REPOSITORY_ROOT}/tests/storage_runtime_contract"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_storage_runtime_contract"
     )
     message(STATUS "Tutti: added tests/data_path_contract and tests/storage_runtime_contract")
@@ -375,23 +357,23 @@ if(BUILD_TESTING)
     # Additional hardware-free contract tests (status, memory_types,
     # io_types, storage_target_resolver, binding).
     add_subdirectory(
-        "${CMAKE_CURRENT_SOURCE_DIR}/../tests/status_contract"
+        "${TUTTI_REPOSITORY_ROOT}/tests/status_contract"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_status_contract"
     )
     add_subdirectory(
-        "${CMAKE_CURRENT_SOURCE_DIR}/../tests/memory_types_contract"
+        "${TUTTI_REPOSITORY_ROOT}/tests/memory_types_contract"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_memory_types_contract"
     )
     add_subdirectory(
-        "${CMAKE_CURRENT_SOURCE_DIR}/../tests/io_types_contract"
+        "${TUTTI_REPOSITORY_ROOT}/tests/io_types_contract"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_io_types_contract"
     )
     add_subdirectory(
-        "${CMAKE_CURRENT_SOURCE_DIR}/../tests/storage_target_resolver_contract"
+        "${TUTTI_REPOSITORY_ROOT}/tests/storage_target_resolver_contract"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_storage_target_resolver_contract"
     )
     add_subdirectory(
-        "${CMAKE_CURRENT_SOURCE_DIR}/../tests/binding_contract"
+        "${TUTTI_REPOSITORY_ROOT}/tests/binding_contract"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_binding_contract"
     )
     message(STATUS "Tutti: added hardware-free contract tests (status, memory_types, io_types, storage_target_resolver, binding)")
@@ -399,14 +381,14 @@ if(BUILD_TESTING)
     # UAPI contract test (hardware-free; verifies shared tutti_snvme.h layout,
     # ABI version, capability bits, and static_assert locks).
     add_subdirectory(
-        "${CMAKE_CURRENT_SOURCE_DIR}/../tests/uapi_contract"
+        "${TUTTI_REPOSITORY_ROOT}/tests/uapi_contract"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_uapi_contract"
     )
     message(STATUS "Tutti: added tests/uapi_contract (hardware-free UAPI contract test)")
 
     # Striped resolver contract test (hardware-free; uses mock shard resolvers).
     add_subdirectory(
-        "${CMAKE_CURRENT_SOURCE_DIR}/../tests/striped_resolver"
+        "${TUTTI_REPOSITORY_ROOT}/tests/striped_resolver"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_striped_resolver"
     )
     message(STATUS "Tutti: added tests/striped_resolver (hardware-free striped resolver contract test)")
@@ -416,7 +398,7 @@ if(BUILD_TESTING)
     # private headers (libnvm, nvmeservice, snvme kernel, CUDA kernel) are
     # NOT reachable from the public include path.
     add_subdirectory(
-        "${CMAKE_CURRENT_SOURCE_DIR}/../tests/header_hygiene"
+        "${TUTTI_REPOSITORY_ROOT}/tests/header_hygiene"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_header_hygiene"
     )
     message(STATUS "Tutti: added tests/header_hygiene (Phase 3 header-hygiene consumer test)")
@@ -424,7 +406,7 @@ if(BUILD_TESTING)
     # MockDataPath kit contract test (hardware-free; proves the kit itself
     # satisfies the DataPath SPI as a reference implementation).
     add_subdirectory(
-        "${CMAKE_CURRENT_SOURCE_DIR}/../tests/mock_data_path_kit_contract"
+        "${TUTTI_REPOSITORY_ROOT}/tests/mock_data_path_kit_contract"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_mock_data_path_kit_contract"
     )
     message(STATUS "Tutti: added tests/mock_data_path_kit_contract (MockDataPath kit self-contract test)")
@@ -433,7 +415,7 @@ if(BUILD_TESTING)
     # Tests config parsing, /proc scanning, mount/unmount lifecycle
     # with tmpfs, and force-exit flag.  No real NVMe devices needed.
     add_subdirectory(
-        "${CMAKE_CURRENT_SOURCE_DIR}/../tests/mount_manager_contract"
+        "${TUTTI_REPOSITORY_ROOT}/tests/mount_manager_contract"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_mount_manager_contract"
     )
     message(STATUS "Tutti: added tests/mount_manager_contract (host;mount_manager)")
@@ -445,7 +427,7 @@ if(BUILD_TESTING)
         # Links tutti_local_file_resolver (always built, hardware-free header-only).
         # Needs TUTTI_BUILD_HARDWARE_TESTS=ON; labelled "hardware;resolver".
         add_subdirectory(
-            "${CMAKE_CURRENT_SOURCE_DIR}/../tests/resolver_contract"
+            "${TUTTI_REPOSITORY_ROOT}/tests/resolver_contract"
             "${CMAKE_CURRENT_BINARY_DIR}/tests_resolver_contract"
         )
         message(STATUS "Tutti: added tests/resolver_contract (hardware;resolver)")
@@ -457,7 +439,7 @@ if(BUILD_TESTING)
             # Local-NVMe DataPath test: needs GPU + snvme + libnvm.
             # Labelled "hardware;local_nvme".
             add_subdirectory(
-                "${CMAKE_CURRENT_SOURCE_DIR}/../tests/local_nvme_datapath_contract"
+                "${TUTTI_REPOSITORY_ROOT}/tests/local_nvme_datapath_contract"
                 "${CMAKE_CURRENT_BINARY_DIR}/tests_local_nvme_datapath_contract"
             )
             message(STATUS "Tutti: added tests/local_nvme_datapath_contract (hardware;local_nvme)")
@@ -465,7 +447,7 @@ if(BUILD_TESTING)
             # Public-Runtime → resolver → local-NVMe E2E acceptance gate.
             # Labelled "hardware;local_nvme;runtime_e2e".
             add_subdirectory(
-                "${CMAKE_CURRENT_SOURCE_DIR}/../tests/storage_runtime_local_nvme_contract"
+                "${TUTTI_REPOSITORY_ROOT}/tests/storage_runtime_local_nvme_contract"
                 "${CMAKE_CURRENT_BINARY_DIR}/tests_storage_runtime_local_nvme_contract"
             )
             message(STATUS "Tutti: added tests/storage_runtime_local_nvme_contract (hardware;local_nvme;runtime_e2e)")
@@ -473,7 +455,7 @@ if(BUILD_TESTING)
             # StripedDataPath test: needs 2 GPU-attached NVMe devices + libnvm.
             # Labelled "hardware;striped;runtime_e2e".
             add_subdirectory(
-                "${CMAKE_CURRENT_SOURCE_DIR}/../tests/striped_local_nvme_contract"
+                "${TUTTI_REPOSITORY_ROOT}/tests/striped_local_nvme_contract"
                 "${CMAKE_CURRENT_BINARY_DIR}/tests_striped_local_nvme_contract"
             )
             message(STATUS "Tutti: added tests/striped_local_nvme_contract (hardware;striped;runtime_e2e)")
@@ -481,7 +463,7 @@ if(BUILD_TESTING)
             # Round 19 S1: batch open performance microbenchmark.
             # Not a ctest (perf number, not pass/fail); manually invoked.
             add_subdirectory(
-                "${CMAKE_CURRENT_SOURCE_DIR}/../tests/batch_open_perf"
+                "${TUTTI_REPOSITORY_ROOT}/tests/batch_open_perf"
                 "${CMAKE_CURRENT_BINARY_DIR}/tests_batch_open_perf"
             )
 
@@ -489,20 +471,20 @@ if(BUILD_TESTING)
             # HY3-shaped 3-stream pipeline: read(L+1) || compute(L) || write(L-1).
             # Uses ONLY public StorageRuntime API + preset factory.
             add_subdirectory(
-                "${CMAKE_CURRENT_SOURCE_DIR}/../examples/layerwise_kv_overlap"
+                "${TUTTI_REPOSITORY_ROOT}/examples/layerwise_kv_overlap"
                 "${CMAKE_CURRENT_BINARY_DIR}/examples_layerwise_kv_overlap"
             )
 
             # Round 19 S3b: registration throughput microbenchmark.
             # Not a ctest (perf number, not pass/fail); manually invoked.
             add_subdirectory(
-                "${CMAKE_CURRENT_SOURCE_DIR}/../tests/register_perf"
+                "${TUTTI_REPOSITORY_ROOT}/tests/register_perf"
                 "${CMAKE_CURRENT_BINARY_DIR}/tests_register_perf"
             )
 
             # Round 20 S1: tutti_config loader unit test (ctest).
             add_subdirectory(
-                "${CMAKE_CURRENT_SOURCE_DIR}/../tests/config_loader"
+                "${TUTTI_REPOSITORY_ROOT}/tests/config_loader"
                 "${CMAKE_CURRENT_BINARY_DIR}/tests_config_loader"
             )
         else()
@@ -517,7 +499,7 @@ endif()
 # ---------------------------------------------------------------------------
 
 # Install cuda_like profile headers
-install(DIRECTORY include/tutti/ DESTINATION include/tutti
+install(DIRECTORY "${TUTTI_SOURCE_DIR}/include/tutti/" DESTINATION include/tutti
         FILES_MATCHING PATTERN "*.h")
 
 # Install tutti_cuda_like into the existing export set

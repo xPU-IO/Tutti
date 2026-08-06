@@ -78,8 +78,8 @@ install(TARGETS tutti_daemon DESTINATION "bin")
 
 # Copy the canonical sys_config.yaml from the repo root next to the
 # binaries so users can run them without figuring out a path.
-if(EXISTS "${CMAKE_SOURCE_DIR}/sys_config.yaml")
-    configure_file("${CMAKE_SOURCE_DIR}/sys_config.yaml"
+if(EXISTS "${TUTTI_REPOSITORY_ROOT}/sys_config.yaml")
+    configure_file("${TUTTI_REPOSITORY_ROOT}/sys_config.yaml"
                    "${CMAKE_BINARY_DIR}/bin/sys_config.yaml"
                    COPYONLY)
 endif()

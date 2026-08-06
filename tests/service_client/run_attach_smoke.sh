@@ -29,8 +29,8 @@ Usage:
   ./run_attach_smoke.sh --execute   run the non-I/O attach smoke
 
 Overrides:
-  DAEMON_BIN  daemon executable (default: build/bin/tutti_daemon)
-  CLIENT_BIN  client executable (default: build/bin/nvmeservice_client)
+  DAEMON_BIN  daemon executable (default: cuda-module preset's tutti_daemon)
+  CLIENT_BIN  client executable (default: cuda-module preset's nvmeservice_client)
   SUDO        privilege prefix, default: "sudo -n"
   ENDPOINT    gRPC endpoint, default: "127.0.0.1:50051"
 USAGE
@@ -51,8 +51,8 @@ fi
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 GENERATOR="$SCRIPT_DIR/generate_attach_config.py"
-DAEMON_BIN="${DAEMON_BIN-/data/home/ryeqiu/Tutti/build/bin/tutti_daemon}"
-CLIENT_BIN="${CLIENT_BIN-/data/home/ryeqiu/Tutti/build/bin/nvmeservice_client}"
+DAEMON_BIN="${DAEMON_BIN-$REPO_ROOT/build/cuda-module/tutti/device_manager/nvme/nvmeservice/examples/tutti_daemon}"
+CLIENT_BIN="${CLIENT_BIN-$REPO_ROOT/build/cuda-module/tutti/device_manager/nvme/nvmeservice/examples/nvmeservice_client}"
 SUDO="${SUDO-sudo -n}"
 ENDPOINT="${ENDPOINT-127.0.0.1:50051}"
 WORK_ROOT="$SCRIPT_DIR/.work"

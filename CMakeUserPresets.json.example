@@ -1,0 +1,79 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "host-local",
+      "displayName": "HOST | local overrides",
+      "inherits": "host",
+      "binaryDir": "${sourceDir}/build/host-local",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": { "type": "STRING", "value": "Debug" },
+        "BUILD_TESTING": { "type": "BOOL", "value": "ON" }
+      }
+    },
+    {
+      "name": "cuda-local",
+      "displayName": "CUDA | local overrides",
+      "inherits": "cuda",
+      "binaryDir": "${sourceDir}/build/cuda-local",
+      "cacheVariables": {
+        "CMAKE_CUDA_ARCHITECTURES": { "type": "STRING", "value": "90" },
+        "CMAKE_CUDA_COMPILER": { "type": "FILEPATH", "value": "/usr/local/cuda/bin/nvcc" },
+        "CUDAToolkit_ROOT": { "type": "PATH", "value": "/usr/local/cuda" },
+        "TUTTI_BUILD_HARDWARE_TESTS": { "type": "BOOL", "value": "OFF" }
+      }
+    },
+    {
+      "name": "cuda-module-local",
+      "displayName": "CUDA module | local kernel",
+      "description": "Build the NVIDIA SNVMe backend. An empty SNVME_P2P_INCLUDE_DIR auto-detects nv-p2p.h; set it to the directory containing nv-p2p.h only when an explicit driver-header version is required.",
+      "inherits": "cuda-module",
+      "binaryDir": "${sourceDir}/build/cuda-module-local",
+      "cacheVariables": {
+        "TUTTI_P2P_BACKEND": { "type": "STRING", "value": "nvidia" },
+        "SNVME_KERNEL_VERSION": { "type": "STRING", "value": "5.15.0-public" },
+        "SNVME_P2P_INCLUDE_DIR": { "type": "PATH", "value": "" }
+      }
+    },
+    {
+      "name": "musa-local",
+      "displayName": "MUSA | local SDK",
+      "inherits": "musa",
+      "binaryDir": "${sourceDir}/build/musa-local",
+      "cacheVariables": {
+        "MUSA_INCLUDE_DIR": { "type": "PATH", "value": "/usr/local/musa/include" },
+        "MUSA_LIB_DIR": { "type": "PATH", "value": "/usr/local/musa/lib" }
+      }
+    },
+    {
+      "name": "maca-local",
+      "displayName": "MACA | local SDK",
+      "inherits": "maca",
+      "binaryDir": "${sourceDir}/build/maca-local",
+      "cacheVariables": {
+        "MACA_ROOT": { "type": "PATH", "value": "/opt/maca" }
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "host-local",        "configurePreset": "host-local" },
+    { "name": "cuda-local",        "configurePreset": "cuda-local" },
+    { "name": "cuda-module-local", "configurePreset": "cuda-module-local" },
+    { "name": "musa-local",        "configurePreset": "musa-local" },
+    { "name": "maca-local",        "configurePreset": "maca-local" }
+  ],
+  "testPresets": [
+    {
+      "name": "host-local",
+      "configurePreset": "host-local",
+      "output": { "outputOnFailure": true },
+      "execution": { "jobs": 16, "timeout": 60 }
+    },
+    {
+      "name": "cuda-local",
+      "configurePreset": "cuda-local",
+      "output": { "outputOnFailure": true },
+      "execution": { "jobs": 16, "timeout": 60 }
+    }
+  ]
+}

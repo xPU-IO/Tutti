@@ -14,7 +14,7 @@ add_library(tutti_local_file_binding INTERFACE)
 
 # Workspace root so that <tutti/bindings/ext4_local_nvme/binding.h> resolves.
 target_include_directories(tutti_local_file_binding INTERFACE
-    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/..>
+    $<BUILD_INTERFACE:${TUTTI_REPOSITORY_ROOT}>
 )
 
 target_link_libraries(tutti_local_file_binding INTERFACE

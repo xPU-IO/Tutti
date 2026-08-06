@@ -28,7 +28,7 @@ set_target_properties(tutti_striped_local_nvme_datapath PROPERTIES
 
 # Workspace root for <tutti/data_paths/...> private headers.
 target_include_directories(tutti_striped_local_nvme_datapath PRIVATE
-    ${PROJECT_SOURCE_DIR}/..
+    ${TUTTI_REPOSITORY_ROOT}
 )
 
 target_link_libraries(tutti_striped_local_nvme_datapath

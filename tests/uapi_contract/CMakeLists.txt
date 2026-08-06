@@ -22,7 +22,7 @@ add_executable(tutti_uapi_contract_test
 # We add the path directly rather than linking libnvm (which pulls in
 # CUDA dependencies) to keep this test truly hardware-free.
 target_include_directories(tutti_uapi_contract_test PRIVATE
-    ${PROJECT_SOURCE_DIR}/include/uapi
+    ${TUTTI_SOURCE_DIR}/include/uapi
 )
 
 set_target_properties(tutti_uapi_contract_test PROPERTIES

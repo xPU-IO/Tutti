@@ -9,6 +9,10 @@
 set(TUTTI_BUILD_HARDWARE_STACK ON CACHE BOOL
     "Build hardware stack (accel/device_manager/backends/io_engine)")
 
+# Keep discovery at profile scope so CUDAToolkit_VERSION and include-path
+# variables remain available to the rest of tutti/CMakeLists.txt.
+find_package(CUDAToolkit 12.6 REQUIRED)
+
 # ---------------------------------------------------------------------------
 # tutti_configure_cuda_like(<target_name>)
 #
@@ -18,12 +22,10 @@ set(TUTTI_BUILD_HARDWARE_STACK ON CACHE BOOL
 #   - CUDA::cudart and CUDA::cuda_driver links
 # ---------------------------------------------------------------------------
 function(tutti_configure_cuda_like target_name)
-    find_package(CUDAToolkit REQUIRED)
-
     target_compile_definitions(${target_name} INTERFACE TUTTI_USE_CUDA=1)
 
     target_include_directories(${target_name} INTERFACE
-        "${PROJECT_SOURCE_DIR}/include"
+        "${TUTTI_SOURCE_DIR}/include"
     )
 
     target_link_libraries(${target_name} INTERFACE

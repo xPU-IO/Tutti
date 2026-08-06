@@ -13,7 +13,7 @@ target_link_libraries(tutti_data_path_contract_test PRIVATE
 )
 
 target_include_directories(tutti_data_path_contract_test PRIVATE
-    ${PROJECT_SOURCE_DIR}/..
+    ${TUTTI_REPOSITORY_ROOT}
 )
 
 set_target_properties(tutti_data_path_contract_test PROPERTIES

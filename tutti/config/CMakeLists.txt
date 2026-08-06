@@ -14,7 +14,7 @@ add_library(tutti_config_parse STATIC
 )
 
 target_include_directories(tutti_config_parse PUBLIC
-    "${PROJECT_SOURCE_DIR}/.."
+    "${TUTTI_REPOSITORY_ROOT}"
     "${CMAKE_CURRENT_SOURCE_DIR}"
 )
 
@@ -34,7 +34,7 @@ add_library(tutti_config STATIC
 )
 
 target_include_directories(tutti_config PUBLIC
-    "${PROJECT_SOURCE_DIR}/.."
+    "${TUTTI_REPOSITORY_ROOT}"
     "${CMAKE_CURRENT_SOURCE_DIR}"
 )
 

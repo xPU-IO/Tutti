@@ -18,20 +18,19 @@ read(L+1) ∥ SGEMM compute(L) ∥ write(L-1)
 
 ```bash
 cd /path/to/Tutti
-cmake -B build -S tutti \
-    -DTUTTI_ACCELERATOR=CUDA \
-    -DTUTTI_BUILD_HARDWARE_TESTS=ON \
-    -DCMAKE_TOOLCHAIN_FILE=../third_pkgs/vcpkg/scripts/buildsystems/vcpkg.cmake
-cmake --build build --target modules -j8
+cmake --preset cuda-module --fresh \
+    -DSNVME_KERNEL_VERSION=5.15.0-public \
+    -DTUTTI_BUILD_HARDWARE_TESTS=ON
+cmake --build --preset cuda-module --target modules -j8
 ```
 
-产物：`build/module/snvme.ko`、`build/module/snvme-core.ko`
+产物：`build/cuda-module/module/snvme.ko`、`build/cuda-module/module/snvme-core.ko`
 
 ### 2. 加载内核模块
 
 ```bash
-sudo insmod build/module/snvme-core.ko
-sudo insmod build/module/snvme.ko io_queue_depth=1024
+sudo insmod build/cuda-module/module/snvme-core.ko
+sudo insmod build/cuda-module/module/snvme.ko io_queue_depth=1024
 ```
 
 > **注意**：必须先加载 `snvme-core.ko`（依赖模块），再加载 `snvme.ko`。`io_queue_depth=1024` 是必需的——默认 64 会导致 striped4 大规模 "wait failed"（见 [FAQ](../../doc/build_and_test.md#faq)）。
@@ -39,8 +38,9 @@ sudo insmod build/module/snvme.ko io_queue_depth=1024
 ### 3. 编译并启动 tutti_daemon
 
 ```bash
-cmake --build build --target tutti_daemon -j8
-sudo ./build/bin/tutti_daemon --config sys_config.yaml &
+cmake --build --preset cuda-module --target tutti_daemon -j8
+sudo ./build/cuda-module/tutti/device_manager/nvme/nvmeservice/examples/tutti_daemon \
+    --config sys_config.yaml &
 ```
 
 daemon 启动后会：
@@ -77,29 +77,24 @@ sudo rmmod snvme snvme-core
 ## 编译
 
 ```bash
-cmake -B build -S tutti \
-    -DTUTTI_ACCELERATOR=CUDA \
-    -DBUILD_TESTING=ON \
-    -DTUTTI_BUILD_HARDWARE_TESTS=ON \
-    -DCMAKE_TOOLCHAIN_FILE=../third_pkgs/vcpkg/scripts/buildsystems/vcpkg.cmake
-
-cmake --build build --target tutti_layerwise_kv_overlap -j8
+cmake --preset cuda --fresh -DTUTTI_BUILD_HARDWARE_TESTS=ON
+cmake --build --preset cuda --target tutti_layerwise_kv_overlap -j8
 ```
 
-产物：`build/bin/tutti_layerwise_kv_overlap`
+产物：`build/cuda/bin/tutti_layerwise_kv_overlap`
 
 ## 运行
 
 ### 默认模式（4-disk striped）
 
 ```bash
-sudo ./build/bin/tutti_layerwise_kv_overlap
+sudo ./build/cuda/bin/tutti_layerwise_kv_overlap
 ```
 
 ### 单盘模式
 
 ```bash
-sudo ./build/bin/tutti_layerwise_kv_overlap --single
+sudo ./build/cuda/bin/tutti_layerwise_kv_overlap --single
 ```
 
 ### 可选参数

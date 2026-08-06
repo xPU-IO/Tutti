@@ -26,7 +26,7 @@ file(GLOB LIBNVM_PUBLIC_HEADERS
 # Library Target
 # =============================================================================
 
-add_library(libnvm ${LIBNVM_SOURCES} ${LIBNVM_CUDA_SOURCES})
+add_library(libnvm SHARED ${LIBNVM_SOURCES} ${LIBNVM_CUDA_SOURCES})
 
 set_target_properties(libnvm PROPERTIES
     OUTPUT_NAME "nvm"
@@ -48,7 +48,7 @@ set_target_properties(libnvm PROPERTIES
 target_include_directories(libnvm
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-        $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include/uapi>
+        $<BUILD_INTERFACE:${TUTTI_SOURCE_DIR}/include/uapi>
         $<INSTALL_INTERFACE:include/libnvm>
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src

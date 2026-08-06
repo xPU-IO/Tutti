@@ -72,7 +72,7 @@ file(GLOB NVMESERVICE_SOURCES
 # Library Target
 # =============================================================================
 
-add_library(nvmeservice
+add_library(nvmeservice SHARED
     ${NVMESERVICE_SOURCES}
     ${NVMESERVICE_PROTO_SRCS}
 )

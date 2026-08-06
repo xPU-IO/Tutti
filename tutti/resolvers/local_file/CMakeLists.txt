@@ -14,7 +14,7 @@ add_library(tutti_local_file_resolver INTERFACE)
 
 # Workspace root so that <tutti/resolvers/local_file/resolver.h> resolves.
 target_include_directories(tutti_local_file_resolver INTERFACE
-    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/..>
+    $<BUILD_INTERFACE:${TUTTI_REPOSITORY_ROOT}>
 )
 
 target_link_libraries(tutti_local_file_resolver INTERFACE
