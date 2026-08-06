@@ -542,7 +542,7 @@ int main(int argc, char** argv) {
         memset(&req, 0, sizeof(req));
         req.vaddr_start = (uint64_t)(uintptr_t)sq_buf[i];
         req.n_pages     = 1;
-        req.ioaddrs     = throwaway;
+        req.ioaddrs     = (uint64_t)(uintptr_t)throwaway;
         req.ioq_idx     = -1;
         req.is_cq       = -1;
         req.group_id    = group_id;
@@ -554,7 +554,7 @@ int main(int argc, char** argv) {
         memset(&req, 0, sizeof(req));
         req.vaddr_start = (uint64_t)(uintptr_t)cq_buf[i];
         req.n_pages     = 1;
-        req.ioaddrs     = throwaway;
+        req.ioaddrs     = (uint64_t)(uintptr_t)throwaway;
         req.ioq_idx     = -1;
         req.is_cq       = -1;
         req.group_id    = group_id;
@@ -573,7 +573,7 @@ int main(int argc, char** argv) {
         memset(&req, 0, sizeof(req));
         req.vaddr_start = (uint64_t)(uintptr_t)wbuf;
         req.n_pages     = 1;
-        req.ioaddrs     = &wbuf_ioaddr;
+        req.ioaddrs     = (uint64_t)(uintptr_t)&wbuf_ioaddr;
         req.ioq_idx     = -1;
         req.is_cq       = -1;
         req.group_id    = 0;
@@ -587,7 +587,7 @@ int main(int argc, char** argv) {
         memset(&req, 0, sizeof(req));
         req.vaddr_start = (uint64_t)(uintptr_t)rbuf;
         req.n_pages     = 1;
-        req.ioaddrs     = &rbuf_ioaddr;
+        req.ioaddrs     = (uint64_t)(uintptr_t)&rbuf_ioaddr;
         req.ioq_idx     = -1;
         req.is_cq       = -1;
         req.group_id    = 0;
@@ -785,7 +785,7 @@ int main(int argc, char** argv) {
         memset(&req, 0, sizeof(req));
         req.vaddr_start = (uint64_t)(uintptr_t)wbuf2;
         req.n_pages     = 2;
-        req.ioaddrs     = wbuf2_ioaddr;
+        req.ioaddrs     = (uint64_t)(uintptr_t)wbuf2_ioaddr;
         req.ioq_idx     = -1;
         req.is_cq       = -1;
         req.group_id    = 0;
@@ -797,7 +797,7 @@ int main(int argc, char** argv) {
         memset(&req, 0, sizeof(req));
         req.vaddr_start = (uint64_t)(uintptr_t)rbuf2;
         req.n_pages     = 2;
-        req.ioaddrs     = rbuf2_ioaddr;
+        req.ioaddrs     = (uint64_t)(uintptr_t)rbuf2_ioaddr;
         req.ioq_idx     = -1;
         req.is_cq       = -1;
         req.group_id    = 0;
@@ -917,7 +917,7 @@ int main(int argc, char** argv) {
         memset(&req, 0, sizeof(req));
         req.vaddr_start = (uint64_t)(uintptr_t)wbuf4;
         req.n_pages     = PRP_LIST_NR_DATA_PAGES;
-        req.ioaddrs     = wbuf4_ioaddr;
+        req.ioaddrs     = (uint64_t)(uintptr_t)wbuf4_ioaddr;
         req.ioq_idx     = -1;
         req.is_cq       = -1;
         req.group_id    = 0;
@@ -929,7 +929,7 @@ int main(int argc, char** argv) {
         memset(&req, 0, sizeof(req));
         req.vaddr_start = (uint64_t)(uintptr_t)rbuf4;
         req.n_pages     = PRP_LIST_NR_DATA_PAGES;
-        req.ioaddrs     = rbuf4_ioaddr;
+        req.ioaddrs     = (uint64_t)(uintptr_t)rbuf4_ioaddr;
         req.ioq_idx     = -1;
         req.is_cq       = -1;
         req.group_id    = 0;
@@ -941,7 +941,7 @@ int main(int argc, char** argv) {
         memset(&req, 0, sizeof(req));
         req.vaddr_start = (uint64_t)(uintptr_t)prp_list_w;
         req.n_pages     = 1;
-        req.ioaddrs     = &prp_list_w_ioaddr;
+        req.ioaddrs     = (uint64_t)(uintptr_t)&prp_list_w_ioaddr;
         req.ioq_idx     = -1;
         req.is_cq       = -1;
         req.group_id    = 0;
@@ -953,7 +953,7 @@ int main(int argc, char** argv) {
         memset(&req, 0, sizeof(req));
         req.vaddr_start = (uint64_t)(uintptr_t)prp_list_r;
         req.n_pages     = 1;
-        req.ioaddrs     = &prp_list_r_ioaddr;
+        req.ioaddrs     = (uint64_t)(uintptr_t)&prp_list_r_ioaddr;
         req.ioq_idx     = -1;
         req.is_cq       = -1;
         req.group_id    = 0;
@@ -1259,7 +1259,7 @@ int main(int argc, char** argv) {
             memset(&req, 0, sizeof(req));
             req.vaddr_start = (uint64_t)(uintptr_t)sq_buf_b6[i];
             req.n_pages     = 1;
-            req.ioaddrs     = throwaway;
+            req.ioaddrs     = (uint64_t)(uintptr_t)throwaway;
             req.ioq_idx     = -1;
             req.is_cq       = -1;
             req.group_id    = group_id_b6;
@@ -1271,7 +1271,7 @@ int main(int argc, char** argv) {
             memset(&req, 0, sizeof(req));
             req.vaddr_start = (uint64_t)(uintptr_t)cq_buf_b6[i];
             req.n_pages     = 1;
-            req.ioaddrs     = throwaway;
+            req.ioaddrs     = (uint64_t)(uintptr_t)throwaway;
             req.ioq_idx     = -1;
             req.is_cq       = -1;
             req.group_id    = group_id_b6;

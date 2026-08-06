@@ -14,7 +14,7 @@
  * in any partial state.
  *
  * Build:  make snvme_ubind
- *     or  cc -O2 -I../../nvme/libnvm/include -o snvme_ubind snvme_ubind.c
+ *     or  cc -O2 -I../../libnvm/include -o snvme_ubind snvme_ubind.c
  * Invoke: sudo ./snvme_ubind 0000:b1:00.0
  */
 #define _GNU_SOURCE

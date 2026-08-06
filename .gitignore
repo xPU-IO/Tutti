@@ -59,6 +59,7 @@ tutti/device_manager/nvme/kernel_modules/test/snvme_smoke_addq
 tutti/device_manager/nvme/kernel_modules/test/snvme_smoke_qgroup
 tutti/device_manager/nvme/kernel_modules/test/snvme_smoke_recycle
 tutti/device_manager/nvme/kernel_modules/test/snvme_smoke_io
+tutti/device_manager/nvme/kernel_modules/test/snvme_ubind
 
 # Nsight Systems profile output -- per-run, not source.
 *.nsys-rep

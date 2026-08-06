@@ -432,7 +432,7 @@ int main(int argc, char** argv) {
         memset(&req, 0, sizeof(req));
         req.vaddr_start = (uint64_t)(uintptr_t)host_buf;
         req.n_pages     = 1;
-        req.ioaddrs     = &io_addr;
+        req.ioaddrs     = (uint64_t)(uintptr_t)&io_addr;
         req.ioq_idx     = -1;        /* new mode: ioq_idx ignored */
         req.is_cq       = -1;
         req.group_id    = group_d;
@@ -466,7 +466,7 @@ int main(int argc, char** argv) {
         memset(&req, 0, sizeof(req));
         req.vaddr_start = (uint64_t)(uintptr_t)probe_buf;
         req.n_pages     = 1;
-        req.ioaddrs     = &throwaway_ioaddr;
+        req.ioaddrs     = (uint64_t)(uintptr_t)&throwaway_ioaddr;
         req.ioq_idx     = -1;
         req.is_cq       = -1;
         req.group_id    = group_d;
@@ -507,7 +507,7 @@ int main(int argc, char** argv) {
         memset(&req, 0, sizeof(req));
         req.vaddr_start = (uint64_t)(uintptr_t)probe_buf;
         req.n_pages     = 1;
-        req.ioaddrs     = &throwaway_ioaddr;
+        req.ioaddrs     = (uint64_t)(uintptr_t)&throwaway_ioaddr;
         req.ioq_idx     = -1;
         req.is_cq       = -1;
         req.group_id    = 0xdeadbeefU;   /* almost certainly never assigned */
@@ -541,7 +541,7 @@ int main(int argc, char** argv) {
         memset(&req, 0, sizeof(req));
         req.vaddr_start = (uint64_t)(uintptr_t)probe_buf;
         req.n_pages     = 1;
-        req.ioaddrs     = &throwaway_ioaddr;
+        req.ioaddrs     = (uint64_t)(uintptr_t)&throwaway_ioaddr;
         req.ioq_idx     = -1;
         req.is_cq       = -1;
         req.group_id    = group_d;     /* fd_a's group, used from fd_d */

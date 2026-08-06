@@ -401,7 +401,7 @@ int main(int argc, char** argv) {
         memset(&req, 0, sizeof(req));
         req.vaddr_start = (uint64_t)(uintptr_t)sq_buf[i];
         req.n_pages     = 1;
-        req.ioaddrs     = throwaway;
+        req.ioaddrs     = (uint64_t)(uintptr_t)throwaway;
         req.ioq_idx     = -1;
         req.is_cq       = -1;
         req.group_id    = group_id;
@@ -412,7 +412,7 @@ int main(int argc, char** argv) {
         memset(&req, 0, sizeof(req));
         req.vaddr_start = (uint64_t)(uintptr_t)cq_buf[i];
         req.n_pages     = 1;
-        req.ioaddrs     = throwaway;
+        req.ioaddrs     = (uint64_t)(uintptr_t)throwaway;
         req.ioq_idx     = -1;
         req.is_cq       = -1;
         req.group_id    = group_id;

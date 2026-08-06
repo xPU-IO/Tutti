@@ -187,11 +187,10 @@ To unload / reload, use `make rmmod` or the `scripts/reset_snvme.sh` helper (see
 ## 1.4 Build the test code
 
 ```bash
-cd tutti/device_manager/nvme/kernel_modules/test
-make -j$(nproc)
+make -C tutti/device_manager/nvme/kernel_modules/test -j"$(nproc)"
 ```
 
-The test binaries depend on the SNVMe UAPI header `tutti/include/uapi/tutti_snvme.h` (already pulled in via `-I` by the Makefile). The role of each binary is described in [Part 2 Step 3](#step-3--build-the-test-binaries).
+The test binaries depend on the SNVMe UAPI header `tutti/include/uapi/tutti_snvme.h` (already pulled in via the Makefile). The role of each binary is described in [Part 2 Step 3](#step-3--build-the-test-binaries).
 
 ---
 
@@ -255,11 +254,18 @@ sudo bash scripts/reset_snvme.sh            # unbind + rmmod + insmod
 ## Step 3 — Build the test binaries
 
 ```bash
-cd tutti/device_manager/nvme/kernel_modules/test
-make
+# Run from the project root. Builds all CPU binaries and, when nvcc is
+# available, the CUDA binary as well.
+make -C tutti/device_manager/nvme/kernel_modules/test
+
+# CPU-only build (does not invoke nvcc):
+make -C tutti/device_manager/nvme/kernel_modules/test cpu
+
+# CUDA test only; override the architecture when auto-detection is unavailable:
+make -C tutti/device_manager/nvme/kernel_modules/test gpu CUDA_ARCH=sm_80
 ```
 
-This builds 6 tests + 1 reset helper:
+This builds 5 tests + 1 reset helper:
 
 | Binary | Binds? | Writes? | What it does |
 | --- | --- | --- | --- |
@@ -267,7 +273,6 @@ This builds 6 tests + 1 reset helper:
 | `snvme_smoke_qgroup` | no | no | queue-group lifecycle (create/destroy + fd-close cascade) |
 | `snvme_smoke_gpu` | no/yes | no | adds `NVM_MAP_DEVICE_MEMORY` / p2p path (built only if `nvcc` is on `$PATH`) |
 | `snvme_smoke_addq` | **yes** | no | B3 `NVM_ADD_USER_QUEUE` end-to-end (Create I/O CQ+SQ + cascade destroy) |
-| `snvme_smoke_recycle` | **yes** | no | `NVM_RAW_ADMIN_CMD` pass-through: Delete+Create I/O SQ/CQ recycle |
 | `snvme_smoke_io` | **yes** | **yes** | B3 CPU end-to-end, 23 phases, byte-by-byte verification, **writes LBA** |
 | `snvme_ubind` | — | no | owner-side reset helper: `SNVM_DEVICE_UNBIND` + `SNVM_CHRDEV_REMOVE` |
 
@@ -319,10 +324,7 @@ Climb the rungs in order:
 # 6a. B3 bind + ADD_USER_QUEUE end-to-end (with host rings; binds, no LBA writes)
 sudo ./snvme_smoke_addq    $TGT
 
-# 6b. NVM_RAW_ADMIN_CMD pass-through: Delete+Create I/O SQ/CQ recycle (binds)
-sudo ./snvme_smoke_recycle $TGT
-
-# 6c. The big one — B3 CPU end-to-end, 23 phases:
+# 6b. The big one — B3 CPU end-to-end, 23 phases:
 #     PRP1 / PRP1+PRP2 / PRP_List / SGL (auto-skipped on PRP-only devices) + SQ-tail-wrap,
 #     byte-by-byte data verification on every IO. WRITES TO DISK.
 sudo ./snvme_smoke_io      $TGT

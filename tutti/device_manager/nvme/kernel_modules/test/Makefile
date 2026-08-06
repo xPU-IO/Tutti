@@ -1,6 +1,6 @@
 # Build the standalone SNVMe sanity tests.
 #
-# Five binaries:
+# Five tests plus one reset helper:
 #   snvme_smoke           -- UAPI smoke, libc-only. Always built.
 #   snvme_smoke_gpu       -- adds the NVM_MAP_DEVICE_*  GPU paths via CUDA.
 #                            Built automatically if `nvcc` is on PATH.
@@ -18,9 +18,10 @@
 #                            data integrity LBA-by-LBA on the live disk.
 #                            Always built; BINDS AND WRITES TO LBA
 #                            (destructive -- target disk must be empty).
+#   snvme_ubind           -- owner-side reset helper. Always built.
 #
 # All binaries depend on nothing but the SNVMe UAPI header
-#   ../../nvme/libnvm/include/ioctl.h
+#   ../../libnvm/include/ioctl.h
 #
 # Usage:
 #   make
@@ -51,10 +52,13 @@ TARGET_GPU      := snvme_smoke_gpu
 TARGET_QGROUP   := snvme_smoke_qgroup
 TARGET_ADDQ     := snvme_smoke_addq
 TARGET_IO       := snvme_smoke_io
+TARGET_UBIND    := snvme_ubind
 
-UAPI_INC := ../../libnvm/include
+UAPI_INC  := ../../libnvm/include
+TUTTI_INC := ../../../../include
 
-CFLAGS    ?= -O2 -Wall -Wextra -Wno-unused-parameter -std=c11 -I$(UAPI_INC)
+CFLAGS    ?= -O2 -Wall -Wextra -Wno-unused-parameter -std=c11 \
+             -I$(UAPI_INC) -I$(TUTTI_INC)
 LDFLAGS   ?=
 
 NVCC       ?= nvcc
@@ -66,8 +70,8 @@ NVCC       ?= nvcc
 # default below.
 DETECTED_CC := $(shell nvidia-smi --query-gpu=compute_cap \
                        --format=csv,noheader 2>/dev/null \
-                   | head -n1 \
-                   | sed -e 's/[[:space:]]//g' -e 's/\.//' )
+                   | awk '{ gsub(/[[:space:].]/, ""); \
+                            if ($$0 ~ /^[0-9]+$$/) { print; exit } }')
 ifneq ($(DETECTED_CC),)
 CUDA_ARCH  ?= sm_$(DETECTED_CC)
 else
@@ -77,7 +81,8 @@ else
 CUDA_ARCH  ?= sm_80
 endif
 
-NVCCFLAGS  ?= -O2 -std=c++17 -arch=$(CUDA_ARCH) -I$(UAPI_INC) \
+NVCCFLAGS  ?= -O2 -std=c++17 -arch=$(CUDA_ARCH) \
+              -DTUTTI_USE_CUDA=1 -I$(UAPI_INC) -I$(TUTTI_INC) \
               -Xcompiler=-Wall,-Wextra,-Wno-unused-parameter
 
 SRC         := snvme_smoke.c
@@ -85,19 +90,27 @@ SRC_GPU     := snvme_smoke_gpu.cu
 SRC_QGROUP  := snvme_smoke_qgroup.c
 SRC_ADDQ    := snvme_smoke_addq.c
 SRC_IO      := snvme_smoke_io.c
+SRC_UBIND   := snvme_ubind.c
+
+CPU_TARGETS := $(TARGET) $(TARGET_QGROUP) $(TARGET_ADDQ) $(TARGET_IO) \
+               $(TARGET_UBIND)
 
 # Build the GPU test only if nvcc is available.
 HAVE_NVCC := $(shell command -v $(NVCC) >/dev/null 2>&1 && echo yes || echo no)
 
-.PHONY: all clean run run-gpu run-qgroup run-addq run-io
+.PHONY: all cpu gpu clean run run-gpu run-qgroup run-addq run-io
 
 ifeq ($(HAVE_NVCC),yes)
-all: $(TARGET) $(TARGET_GPU) $(TARGET_QGROUP) $(TARGET_ADDQ) $(TARGET_IO)
+all: cpu gpu
 else
-all: $(TARGET) $(TARGET_QGROUP) $(TARGET_ADDQ) $(TARGET_IO)
+all: cpu
 	@echo "[i] nvcc not found; skipping $(TARGET_GPU)."
 	@echo "    Install CUDA Toolkit (or set NVCC=...) and re-run make to enable it."
 endif
+
+cpu: $(CPU_TARGETS)
+
+gpu: $(TARGET_GPU)
 
 $(TARGET): $(SRC)
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
@@ -115,8 +128,12 @@ $(TARGET_ADDQ): $(SRC_ADDQ)
 $(TARGET_IO): $(SRC_IO)
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
+$(TARGET_UBIND): $(SRC_UBIND)
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
 clean:
-	rm -f $(TARGET) $(TARGET_GPU) $(TARGET_QGROUP) $(TARGET_ADDQ) $(TARGET_IO)
+	rm -f $(TARGET) $(TARGET_GPU) $(TARGET_QGROUP) $(TARGET_ADDQ) $(TARGET_IO) \
+	      $(TARGET_UBIND)
 
 # Convenience: PCI=0000:50:00.0 make run [BIND=1]
 run: $(TARGET)

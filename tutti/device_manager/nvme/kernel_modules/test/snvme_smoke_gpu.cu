@@ -512,7 +512,7 @@ static void run_one_round(int fd_dev,
         memset(&req, 0, sizeof(req));
         req.vaddr_start = (uint64_t)(uintptr_t)gpu_va;
         req.n_pages     = n_pages;
-        req.ioaddrs     = ioaddrs_out;
+        req.ioaddrs     = (uint64_t)(uintptr_t)ioaddrs_out;
         req.ioq_idx     = -1;
         req.is_cq       = -1;
         req.group_id    = rr.group_id;
@@ -1119,7 +1119,7 @@ int main(int argc, char** argv) {
             memset(&req, 0, sizeof(req));
             req.vaddr_start = (uint64_t)(uintptr_t)gpu_va;
             req.n_pages     = 1;
-            req.ioaddrs     = ioaddrs_out;
+            req.ioaddrs     = (uint64_t)(uintptr_t)ioaddrs_out;
             req.ioq_idx     = -1;
             req.is_cq       = -1;
             req.group_id    = 0;                       /* fd-scoped */
