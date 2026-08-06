@@ -1,0 +1,3 @@
+# Host-local configuration files are intentionally not tracked.
+*.yaml
+*.yml

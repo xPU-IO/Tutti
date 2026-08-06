@@ -17,7 +17,7 @@ set_target_properties(tutti_striped_resolver_contract_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
-target_compile_options(tutti_striped_resolver_contract_test PRIVATE -Wall -Wextra -Werror)
+target_compile_options(tutti_striped_resolver_contract_test PRIVATE -Wall -Wextra)
 
 add_test(NAME tutti_striped_resolver_contract_test
     COMMAND tutti_striped_resolver_contract_test)

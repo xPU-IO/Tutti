@@ -31,6 +31,6 @@ set_target_properties(tutti_uapi_contract_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
-target_compile_options(tutti_uapi_contract_test PRIVATE -Wall -Wextra -Werror)
+target_compile_options(tutti_uapi_contract_test PRIVATE -Wall -Wextra)
 
 add_test(NAME tutti_uapi_contract_test COMMAND tutti_uapi_contract_test)

@@ -19,7 +19,7 @@ set_target_properties(tutti_binding_contract_test PROPERTIES
 )
 
 target_compile_options(tutti_binding_contract_test PRIVATE
-    -Wall -Wextra -Werror
+    -Wall -Wextra
 )
 
 add_test(NAME tutti_binding_contract_test

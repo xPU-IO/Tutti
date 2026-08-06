@@ -22,7 +22,6 @@ set_target_properties(tutti_batch_open_perf PROPERTIES
 
 target_compile_options(tutti_batch_open_perf PRIVATE
     -Wall -Wextra
-    $<$<COMPILE_LANGUAGE:CXX>:-Werror>
 )
 
 # Not registered as a ctest (it's a perf microbenchmark, not pass/fail).

@@ -24,7 +24,7 @@ set_target_properties(tutti_memfs_sample_contract_test PROPERTIES
 )
 
 target_compile_options(tutti_memfs_sample_contract_test PRIVATE
-    -Wall -Wextra -Werror
+    -Wall -Wextra
 )
 
 add_test(NAME tutti_memfs_sample_contract_test

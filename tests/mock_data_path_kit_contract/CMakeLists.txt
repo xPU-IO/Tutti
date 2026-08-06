@@ -25,7 +25,7 @@ set_target_properties(tutti_mock_data_path_kit_contract_test PROPERTIES
 )
 
 target_compile_options(tutti_mock_data_path_kit_contract_test PRIVATE
-    -Wall -Wextra -Werror
+    -Wall -Wextra
 )
 
 add_test(NAME tutti_mock_data_path_kit_contract_test

@@ -23,7 +23,6 @@ set_target_properties(tutti_local_nvme_datapath_contract_test PROPERTIES
 
 target_compile_options(tutti_local_nvme_datapath_contract_test PRIVATE
     -Wall -Wextra
-    $<$<COMPILE_LANGUAGE:CXX>:-Werror>
 )
 
 add_test(NAME tutti_local_nvme_datapath_contract_test

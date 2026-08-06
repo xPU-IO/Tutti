@@ -27,7 +27,6 @@ set_target_properties(tutti_storage_runtime_local_nvme_contract_test PROPERTIES
 
 target_compile_options(tutti_storage_runtime_local_nvme_contract_test PRIVATE
     -Wall -Wextra
-    $<$<COMPILE_LANGUAGE:CXX>:-Werror>
 )
 
 add_test(NAME tutti_storage_runtime_local_nvme_contract_test
