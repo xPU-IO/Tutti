@@ -70,7 +70,7 @@ Build targets (CMake):
 
 | Target                          | What it is                          |
 |---------------------------------|--------------------------------------|
-| `nvmeservice`                   | static library: proto + state + server + client lib |
+| `nvmeservice`                   | shared library: proto + state + server + client lib |
 | `nvmeservice_daemon_example`    | the daemon binary (`build/<preset>/tutti/device_manager/nvme/nvmeservice/examples/nvmeservice_daemon`) |
 | `nvmeservice_client_example`    | the reference client (`build/<preset>/tutti/device_manager/nvme/nvmeservice/examples/nvmeservice_client`) |
 
@@ -93,7 +93,7 @@ Build:
 cd /path/to/Tutti
 cmake --preset cuda-module
 cmake --build --preset cuda-module \
-    --target nvmeservice_daemon_example nvmeservice_client_example -j8
+    --target nvmeservice_daemon_example nvmeservice_client_example --parallel 8
 ```
 
 Edit `build/cuda-module/bin/sys_config.yaml` (copied from the repository root

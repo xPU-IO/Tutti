@@ -72,7 +72,7 @@ symmetric per-vendor backends (nvidia done, metax symmetric).
 
 ```bash
 cmake --preset cuda --fresh -DTUTTI_BUILD_HARDWARE_TESTS=ON
-cmake --build --preset cuda --target tutti_layerwise_kv_overlap -j8
+cmake --build --preset cuda --target tutti_layerwise_kv_overlap --parallel 8
 sudo ./build/cuda/bin/tutti_layerwise_kv_overlap     # 4-disk striped (default); --single for one drive
 ```
 

@@ -21,7 +21,7 @@ cd /path/to/Tutti
 cmake --preset cuda-module --fresh \
     -DSNVME_KERNEL_VERSION=5.15.0-public \
     -DTUTTI_BUILD_HARDWARE_TESTS=ON
-cmake --build --preset cuda-module --target modules -j8
+cmake --build --preset cuda-module --target modules --parallel 8
 ```
 
 产物：`build/cuda-module/module/snvme.ko`、`build/cuda-module/module/snvme-core.ko`
@@ -38,7 +38,7 @@ sudo insmod build/cuda-module/module/snvme.ko io_queue_depth=1024
 ### 3. 编译并启动 tutti_daemon
 
 ```bash
-cmake --build --preset cuda-module --target tutti_daemon -j8
+cmake --build --preset cuda-module --target tutti_daemon --parallel 8
 sudo ./build/cuda-module/tutti/device_manager/nvme/nvmeservice/examples/tutti_daemon \
     --config sys_config.yaml &
 ```
@@ -78,7 +78,7 @@ sudo rmmod snvme snvme-core
 
 ```bash
 cmake --preset cuda --fresh -DTUTTI_BUILD_HARDWARE_TESTS=ON
-cmake --build --preset cuda --target tutti_layerwise_kv_overlap -j8
+cmake --build --preset cuda --target tutti_layerwise_kv_overlap --parallel 8
 ```
 
 产物：`build/cuda/bin/tutti_layerwise_kv_overlap`
