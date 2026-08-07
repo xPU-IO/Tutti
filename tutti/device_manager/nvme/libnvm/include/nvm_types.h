@@ -331,6 +331,11 @@ typedef struct
     uint32_t                max_user_qid;        // top of user QID pool
     uint32_t                max_queues_per_group;// echoes NVM_MAX_QUEUES_PER_GROUP
     uint32_t                sgl_supported;       // Identify Controller SGLS dword
+
+    /* True only when this process registered mm_ptr with the accelerator
+     * runtime.  Owner-only daemon handles leave this false; standalone GPU
+     * owners and GPU clients set it after cudaHostRegister succeeds. */
+    uint8_t                 bar0_cuda_registered;
 } nvm_ctrl_t;
 
 /* Disk descriptor */

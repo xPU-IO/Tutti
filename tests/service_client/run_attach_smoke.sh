@@ -465,6 +465,36 @@ validate_attach_log() {
     return "$rc"
 }
 
+check_daemon_not_gpu_resident() {
+    local daemon_process_pid=""
+    local pid cmdline
+
+    # DAEMON_PID is normally the sudo wrapper.  Match the exact executable
+    # and generated config in the real child's NUL-separated command line.
+    while IFS= read -r pid; do
+        [[ -n "$pid" ]] || continue
+        cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+        if [[ "$cmdline" == "$DAEMON_BIN --config $CONFIG_PATH " ]]; then
+            daemon_process_pid="$pid"
+            break
+        fi
+    done < <(pgrep -x tutti_daemon 2>/dev/null || true)
+
+    if [[ -z "$daemon_process_pid" ]]; then
+        log_msg "GPU residency validation: could not resolve real tutti_daemon pid"
+        return 1
+    fi
+
+    if nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits \
+        2>/dev/null | tr -d ' ' | grep -Fxq "$daemon_process_pid"; then
+        log_msg "GPU residency validation: daemon pid=$daemon_process_pid unexpectedly owns a CUDA context"
+        return 1
+    fi
+
+    log_msg "GPU residency validation: PASS (daemon pid=$daemon_process_pid is absent from NVIDIA compute processes)"
+    return 0
+}
+
 check_symlink() {
     local gpu_work="$1"
     local nvme_work="$2"
@@ -576,6 +606,12 @@ if ! grep -Fq "Owned devices:" "$DAEMON_LOG" 2>/dev/null; then
     exit 1
 fi
 log_msg "Daemon device ownership report: PASS"
+
+# Owner-only bring-up must not initialize CUDA.  Run this before starting any
+# attach client so the process list cannot be confused with a client context.
+if ! check_daemon_not_gpu_resident; then
+    OVERALL_RC=1
+fi
 
 # ListDevices.
 LIST_CMD=("$CLIENT_BIN" --endpoint "$ENDPOINT" --list-only --skip-io)

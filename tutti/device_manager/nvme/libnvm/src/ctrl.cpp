@@ -222,7 +222,14 @@ int _nvm_ctrl_init(nvm_ctrl_t** handle, struct device* dev, const struct device_
 void nvm_ctrl_free(nvm_ctrl_t* ctrl)
 {
     if (ctrl != NULL)
-    {   
+    {
+        if (ctrl->bar0_cuda_registered && ctrl->mm_ptr != NULL) {
+            /* Paired with nvm_controller_init_b3_gpu() or the legacy
+             * nvm_controller_init() path.  Host-only daemon owners never
+             * enter the accelerator runtime here. */
+            (void) cudaHostUnregister((void*) ctrl->mm_ptr);
+            ctrl->bar0_cuda_registered = false;
+        }
         /* nvm_queue_clear() removed: kernel never implemented
          * NVM_CLEAR_IOQ_NUM, so the ioctl always failed with -EINVAL.
          * Cleanup is handled by nvm_device_unbind() + _nvm_ctrl_put()
@@ -241,4 +248,3 @@ int nvm_raw_ctrl_init(nvm_ctrl_t** ctrl)
 {
     return _nvm_ctrl_init(ctrl, NULL, NULL, DEVICE_TYPE_UNKNOWN,NULL,0);
 }
-

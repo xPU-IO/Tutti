@@ -94,8 +94,8 @@ struct controller* ctrl_to_controller(nvm_ctrl_t* ctrl);
  *
  * Sequence to bring a controller fully up:
  *
- *   nvm_controller_init_b3(&ctrl, "/dev/snvm_control", "0000:08:00.0",
- *                          36 /-* kernel_ioq_cap *-/, &disk);
+ *   nvm_controller_init_b3_gpu(&ctrl, "/dev/snvm_control", "0000:08:00.0",
+ *                              36 /-* kernel_ioq_cap *-/, &disk);
  *   nvm_create_group(ctrl, &group_id, &max_q);
  *
  * Then for each queue:
@@ -113,11 +113,24 @@ struct controller* ctrl_to_controller(nvm_ctrl_t* ctrl);
  *   nvm_destroy_group(ctrl, group_id);
  * =================================================================== */
 
-int nvm_controller_init_b3(nvm_ctrl_t** ctrl,
-                           const char* snvme_control_path,
-                           const char* pci_addr,
-                           uint32_t kernel_ioq_cap,
-                           struct disk* out_disk);
+/* Owner/control-plane bring-up.  Creates and binds the controller, maps BAR0
+ * for CPU metadata access, and keeps the owner fds alive.  It deliberately
+ * does not call any accelerator runtime API and is the interface daemons
+ * should use. */
+int nvm_controller_init_b3_owner(nvm_ctrl_t** ctrl,
+                                 const char* snvme_control_path,
+                                 const char* pci_addr,
+                                 uint32_t kernel_ioq_cap,
+                                 struct disk* out_disk);
+
+/* Standalone GPU-owner bring-up.  Performs the same owner lifecycle as the
+ * function above, then registers BAR0 as IO memory so this process can obtain
+ * GPU doorbell pointers with cudaHostGetDevicePointer(). */
+int nvm_controller_init_b3_gpu(nvm_ctrl_t** ctrl,
+                               const char* snvme_control_path,
+                               const char* pci_addr,
+                               uint32_t kernel_ioq_cap,
+                               struct disk* out_disk);
 
 int nvm_set_kernel_ioq_cap(nvm_ctrl_t* ctrl, uint32_t cap);
 int nvm_set_kernel_ioq_cap_fd(int fd_dev, uint32_t cap);
@@ -149,10 +162,13 @@ int nvm_wait_dev_info(nvm_ctrl_t* ctrl,
  * tear the device out from under every other client if invoked
  * from one of them.  We therefore expose two separate APIs:
  *
- *   nvm_controller_init_b3()  - owner-only, performs full B3
- *                               bring-up (chrdev_create + cap +
- *                               bind + probe wait + ctrl_init +
- *                               cudaHostRegister BAR0).
+ *   nvm_controller_init_b3_owner() - daemon owner path: performs full
+ *                               B3 control-plane bring-up without touching
+ *                               an accelerator runtime.
+ *
+ *   nvm_controller_init_b3_gpu() - standalone GPU-owner path: performs
+ *                               the same B3 bring-up and additionally
+ *                               cudaHostRegister's BAR0.
  *
  *   nvm_ctrl_attach_client()  - client-only, opens an already-
  *                               existing /dev/ssnvme<N>, mmaps
@@ -177,10 +193,9 @@ int nvm_wait_dev_info(nvm_ctrl_t* ctrl,
  *                               maps still attached to that fd.
  *                               No PCI driver state is touched.
  *
- * The CUDA host-register step is skipped from this header's contract
- * (it requires a CUDA-capable build).  nvm_ctrl_attach_client()
- * therefore cudaHostRegister's BAR0 internally on the same code path
- * as nvm_controller_init_b3() so the GPU view is consistent.
+ * nvm_ctrl_attach_client() cudaHostRegister's its own BAR0 mapping because
+ * CUDA registrations and virtual addresses are process-local; an owner's
+ * registration cannot be reused by a client process.
  * =================================================================== */
 
 int nvm_ctrl_attach_client(nvm_ctrl_t** ctrl,

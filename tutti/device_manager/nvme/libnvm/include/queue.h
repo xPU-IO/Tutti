@@ -200,7 +200,7 @@ struct QueuePair
         }
         if (ctrl->q_depth == 0) {
             throw error(string("QueuePair(B3): ctrl->q_depth == 0 -- did "
-                               "nvm_controller_init_b3 / NVM_GET_DEV_INFO "
+                               "B3 owner bring-up / NVM_GET_DEV_INFO "
                                "run successfully?"));
         }
 

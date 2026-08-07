@@ -124,14 +124,14 @@ void ServiceState::init_device(const NvmeEntry& nvme, int32_t device_id) {
     struct disk disk;
     std::memset(&disk, 0, sizeof(disk));
 
-    int rc = nvm_controller_init_b3(&ctrl,
-                                    kSnvmeControlPath,
-                                    nvme.pci_addr.c_str(),
-                                    nvme.kernel_ioq_cap,
-                                    &disk);
+    int rc = nvm_controller_init_b3_owner(&ctrl,
+                                          kSnvmeControlPath,
+                                          nvme.pci_addr.c_str(),
+                                          nvme.kernel_ioq_cap,
+                                          &disk);
     if (rc != 0) {
         throw std::runtime_error(
-            "nvm_controller_init_b3 failed for pci=" + nvme.pci_addr +
+            "nvm_controller_init_b3_owner failed for pci=" + nvme.pci_addr +
             " errno=" + std::to_string(rc));
     }
 

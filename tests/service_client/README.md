@@ -78,8 +78,10 @@ Exit codes:
 ### Execute (`--execute`)
 
 Generates config, starts daemon, runs `ListDevices` + four `--skip-io`
-attach groups, SIGTERMs daemon. Creates a timestamped log directory under
-`.work/logs/`.
+attach groups, SIGTERMs daemon. Before starting any client, it also asserts
+that the daemon PID is absent from `nvidia-smi`'s compute-process list; this
+guards the owner-only bring-up path against accidental CUDA initialization.
+Creates a timestamped log directory under `.work/logs/`.
 
 Exit codes:
 - `0` — all attach groups and daemon clean exit passed.
@@ -167,6 +169,8 @@ failure.
   not killed.
 - No interactive sudo; `sudo -n` is required.
 - Daemon is stopped with SIGTERM (20s wait); SIGKILL is last resort only.
+- Daemon owner bring-up must not create a CUDA context; the execute path fails
+  if the daemon appears in NVIDIA's compute-process list.
 
 ## Logs
 

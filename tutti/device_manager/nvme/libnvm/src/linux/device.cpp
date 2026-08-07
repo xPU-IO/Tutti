@@ -634,11 +634,10 @@ int nvm_wait_dev_info(nvm_ctrl_t* ctrl,
  * still functional for legacy Controller consumers and the
  * Controller class's init_queues() drives it.
  *
- * New B3 callers should use nvm_controller_init_b3() instead -- that
- * one performs the cap -> bind -> wait probe sequence in one shot,
- * matching the L0/L1 smoke ordering and the kernel's actual ABI
- * expectations.  The two coexist deliberately while Commit 3
- * migrates Controller::init_queues over.
+ * New B3 callers should use nvm_controller_init_b3_owner() or
+ * nvm_controller_init_b3_gpu() instead.  Both perform the cap -> bind ->
+ * wait probe sequence in one shot; only the explicitly GPU-capable entry
+ * point registers BAR0 with the accelerator runtime.
  */
 int nvm_controller_init(nvm_ctrl_t** ctrl, const char *snvme_control_path, const char *pci_addr){
     struct pci_device_addr device_addr, pdev_addr;
@@ -701,12 +700,13 @@ int nvm_controller_init(nvm_ctrl_t** ctrl, const char *snvme_control_path, const
         nvm_error("Failed to register device memory");
         return EFAULT;
     }
+    (*ctrl)->bar0_cuda_registered = true;
 
     return 0;
 }
 
 /*
- * B3 bring-up entry point.
+ * Shared B3 owner bring-up implementation.
  *
  * Performs the full B3 controller initialisation sequence in one call:
  *
@@ -723,9 +723,6 @@ int nvm_controller_init(nvm_ctrl_t** ctrl, const char *snvme_control_path, const
  *      legacy fields (start_cq_idx, dstrd, max_data_size,
  *      block_size, disk_name).
  *   7. nvm_ctrl_init (wraps fds + BAR0 mmap into a controller struct)
- *   8. cudaHostRegister(BAR0)  -- makes the doorbell page reachable
- *      from CUDA kernels via cudaHostGetDevicePointer.
- *
  * Out-params:
  *   *ctrl       Populated controller handle on success.  Caller must
  *               eventually nvm_ctrl_free(*ctrl) (which closes fds
@@ -738,17 +735,16 @@ int nvm_controller_init(nvm_ctrl_t** ctrl, const char *snvme_control_path, const
  *
  * Returns 0 on success or a positive errno-style code on failure.
  */
-int nvm_controller_init_b3(nvm_ctrl_t** ctrl,
-                           const char* snvme_control_path,
-                           const char* pci_addr,
-                           uint32_t kernel_ioq_cap,
-                           struct disk* out_disk)
+static int nvm_controller_init_b3_common(nvm_ctrl_t** ctrl,
+                                         const char* snvme_control_path,
+                                         const char* pci_addr,
+                                         uint32_t kernel_ioq_cap,
+                                         struct disk* out_disk)
 {
     struct pci_device_addr device_addr, pdev_addr;
     char snvme_path[256];
     int snvme_d_fd = -1, snvme_c_fd = -1;
     int status;
-    cudaError_t cerr;
 
     if (ctrl == NULL || snvme_control_path == NULL || pci_addr == NULL) {
         return EINVAL;
@@ -864,15 +860,6 @@ int nvm_controller_init_b3(nvm_ctrl_t** ctrl,
     close(snvme_d_fd);
     snvme_c_fd = snvme_d_fd = -1;
 
-    /* Step 8: BAR0 -> CUDA host registration for doorbell GPU access.  */
-    cerr = cudaHostRegister((void*) (*ctrl)->mm_ptr,
-                            NVM_CTRL_MEM_MINSIZE,
-                            cudaHostRegisterIoMemory);
-    if (cerr != cudaSuccess) {
-        nvm_error("cudaHostRegister(BAR0) failed: %s",
-                  cudaGetErrorString(cerr));
-        return EFAULT;
-    }
     return 0;
 
 fail_ctrl_free:
@@ -897,6 +884,45 @@ fail_close_dev:
     }
     if (snvme_c_fd >= 0) close(snvme_c_fd);
     return status ? status : EFAULT;
+}
+
+int nvm_controller_init_b3_owner(nvm_ctrl_t** ctrl,
+                                 const char* snvme_control_path,
+                                 const char* pci_addr,
+                                 uint32_t kernel_ioq_cap,
+                                 struct disk* out_disk)
+{
+    return nvm_controller_init_b3_common(ctrl, snvme_control_path, pci_addr,
+                                         kernel_ioq_cap, out_disk);
+}
+
+int nvm_controller_init_b3_gpu(nvm_ctrl_t** ctrl,
+                               const char* snvme_control_path,
+                               const char* pci_addr,
+                               uint32_t kernel_ioq_cap,
+                               struct disk* out_disk)
+{
+    int status = nvm_controller_init_b3_common(
+        ctrl, snvme_control_path, pci_addr, kernel_ioq_cap, out_disk);
+    if (status != 0) {
+        return status;
+    }
+
+    cudaError_t cerr = cudaHostRegister((void*) (*ctrl)->mm_ptr,
+                                        NVM_CTRL_MEM_MINSIZE,
+                                        cudaHostRegisterIoMemory);
+    if (cerr != cudaSuccess) {
+        nvm_error("cudaHostRegister(BAR0) failed: %s",
+                  cudaGetErrorString(cerr));
+        /* Registration is part of the GPU interface's contract.  Roll the
+         * owner lifecycle back instead of returning a live, bound handle on
+         * failure. */
+        nvm_ctrl_free(*ctrl);
+        *ctrl = NULL;
+        return EFAULT;
+    }
+    (*ctrl)->bar0_cuda_registered = true;
+    return 0;
 }
 
 /* ===================================================================
@@ -973,7 +999,7 @@ int nvm_ctrl_attach_client(nvm_ctrl_t** ctrl,
 
     /* Register BAR0 with CUDA so doorbells become reachable from
      * GPU kernels via cudaHostGetDevicePointer.  Same code path
-     * as nvm_controller_init_b3() takes; failure here is fatal
+     * as nvm_controller_init_b3_gpu() takes; failure here is fatal
      * because the only reason a client attaches in the first
      * place is to drive IO from the GPU. */
     cudaError_t cerr = cudaHostRegister(
@@ -989,6 +1015,7 @@ int nvm_ctrl_attach_client(nvm_ctrl_t** ctrl,
         *ctrl = NULL;
         return EFAULT;
     }
+    (*ctrl)->bar0_cuda_registered = true;
 
     /* Note: bar0_size is currently not stored on nvm_ctrl_t (mm_size
      * was set to NVM_CTRL_MEM_MINSIZE inside nvm_ctrl_init).  The
@@ -1011,12 +1038,12 @@ void nvm_ctrl_free_client(nvm_ctrl_t* ctrl)
      * and drop the libnvm refcount; release_device closes fd_dev,
      * which triggers the kernel's snvm_dev_release cascade for
      * any groups / DATA maps still attached. */
-    if (ctrl->mm_ptr != NULL) {
+    if (ctrl->bar0_cuda_registered && ctrl->mm_ptr != NULL) {
         /* Best-effort: ignore the return code.  If CUDA was already
          * shut down (process is exiting), unregister fails harmlessly. */
         (void) cudaHostUnregister((void*) ctrl->mm_ptr);
+        ctrl->bar0_cuda_registered = false;
     }
     extern void _nvm_ctrl_put(struct controller*);
     _nvm_ctrl_put(_nvm_container_of(ctrl, struct controller, handle));
 }
-

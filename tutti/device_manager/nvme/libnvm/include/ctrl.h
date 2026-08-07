@@ -170,7 +170,7 @@ inline Controller::Controller(const char* snvme_control_path,
 
     int status;
 
-    /* B3 bring-up: chrdev_create -> SET_KERNEL_IOQ_CAP -> BIND ->
+    /* GPU-capable B3 bring-up: chrdev_create -> SET_KERNEL_IOQ_CAP -> BIND ->
      * wait probe -> GET_DEV_INFO -> ctrl_init -> cudaHostRegister.
      *
      * kernel_ioq_cap=0 means "no cap, use upstream nvme default of
@@ -178,13 +178,13 @@ inline Controller::Controller(const char* snvme_control_path,
      * kernel-side IOQ count (e.g. Intel DC SSD: MSI-X=136 vs 192
      * vCPUs) should expose a separate Controller ctor / param;
      * for now the cap is left at 0 to match the upstream default. */
-    status = nvm_controller_init_b3(&ctrl,
-                                    snvme_control_path,
-                                    pci_addr,
-                                    /* kernel_ioq_cap */ 0,
-                                    &this->disk);
+    status = nvm_controller_init_b3_gpu(&ctrl,
+                                        snvme_control_path,
+                                        pci_addr,
+                                        /* kernel_ioq_cap */ 0,
+                                        &this->disk);
     if (status != 0){
-        nvm_throw_error("Failed to nvm_controller_init_b3", status);
+        nvm_throw_error("Failed to nvm_controller_init_b3_gpu", status);
     }
     this->disk.ns_id = ns_id;
 
@@ -231,7 +231,7 @@ inline int Controller::init_queues(uint32_t ns_id,
      *   -> nvm_device_init (BIND) -> init_userioq_device
      *
      * with the explicit B3 sequence (BIND already happened in the
-     * Controller ctor via nvm_controller_init_b3):
+     * Controller ctor via nvm_controller_init_b3_gpu):
      *
      *   1. nvm_create_group()                   -> group_id
      *   2. for each requested queue:
@@ -350,7 +350,7 @@ inline int Controller::init_queues(uint32_t ns_id,
     // host VA (ctrl->mm_ptr) to get the host-side doorbell address,
     // then translate to a GPU VA via cudaHostGetDevicePointer on the
     // current cudaDevice (which was already cudaHostRegister'd in
-    // nvm_controller_init_b3 via cudaHostRegisterIoMemory).
+    // nvm_controller_init_b3_gpu via cudaHostRegisterIoMemory).
     for (size_t i = 0; i < n_qps; i++) {
         const uint32_t per_queue_dev = queue_targets[i].cuda_device;
         cuda_err_chk(cudaSetDevice(per_queue_dev));
