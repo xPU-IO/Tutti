@@ -125,7 +125,7 @@ MountResult MountManager::mount_one(const std::string& block_device,
     // 2. Check if already mounted (by a previous operator or daemon).
     if (is_mounted(mount_path)) {
         res.already_mounted = true;
-        TUTTI_INFO("mount_manager: %s already mounted at %s (not taking ownership)",
+        TUTTI_INFO("mount_manager: %s already mounted at %s (not taking ownership)\n",
                    block_device.c_str(), mount_path.c_str());
         return res;
     }
@@ -135,14 +135,14 @@ MountResult MountManager::mount_one(const std::string& block_device,
     if (rc != 0) {
         res.error = "mount(" + block_device + ", " + mount_path +
                     ", ext4) failed: " + std::strerror(errno);
-        TUTTI_INFO("mount_manager: %s (continuing without mount)", res.error.c_str());
+        TUTTI_INFO("mount_manager: %s (continuing without mount)\n", res.error.c_str());
         return res;
     }
 
     // 4. Record ownership.
     res.mounted_by_daemon = true;
     owned_mounts_.push_back({block_device, mount_path});
-    TUTTI_INFO("mount_manager: mounted %s at %s (owned)",
+    TUTTI_INFO("mount_manager: mounted %s at %s (owned)\n",
                block_device.c_str(), mount_path.c_str());
     return res;
 }
@@ -278,14 +278,14 @@ int MountManager::unmount_all() {
 
             int err = try_umount_(m.mount_path);
             if (err == 0) {
-                TUTTI_INFO("mount_manager: unmounted %s", m.mount_path.c_str());
+                TUTTI_INFO("mount_manager: unmounted %s\n", m.mount_path.c_str());
                 unmounted = true;
                 break;
             }
 
             if (err == EINVAL) {
                 // Not a mount point anymore (already gone or never was).
-                TUTTI_INFO("mount_manager: %s not a mount point (EINVAL), skipping",
+                TUTTI_INFO("mount_manager: %s not a mount point (EINVAL), skipping\n",
                            m.mount_path.c_str());
                 unmounted = true;
                 break;
