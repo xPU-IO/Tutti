@@ -9,6 +9,7 @@
 #include <cstring>
 #include <dirent.h>
 #include <fcntl.h>
+#include <filesystem>
 #include <fstream>
 #include <mntent.h>
 #include <sstream>
@@ -100,20 +101,25 @@ MountResult MountManager::mount_one(const std::string& block_device,
     MountResult res;
     res.block_device = block_device;
 
-    // 1. Create mount point if it doesn't exist.
+    // 1. Create the mount point, including configured parent directories.
+    // ServiceState no longer creates <mount_path>/GPU<n> before mount(2), so
+    // mount-point preparation belongs entirely to MountManager.
+    std::error_code ec;
+    std::filesystem::create_directories(mount_path, ec);
+    if (ec) {
+        res.error = "mkdir " + mount_path + " failed: " + ec.message();
+        return res;
+    }
+
     struct stat st;
     if (::stat(mount_path.c_str(), &st) != 0) {
-        if (errno == ENOENT) {
-            if (::mkdir(mount_path.c_str(), 0755) != 0 && errno != EEXIST) {
-                res.error = "mkdir " + mount_path + " failed: " +
-                            std::strerror(errno);
-                return res;
-            }
-        } else {
-            res.error = "stat " + mount_path + " failed: " +
-                        std::strerror(errno);
-            return res;
-        }
+        res.error = "stat " + mount_path + " failed: " +
+                    std::strerror(errno);
+        return res;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        res.error = mount_path + " is not a directory";
+        return res;
     }
 
     // 2. Check if already mounted (by a previous operator or daemon).

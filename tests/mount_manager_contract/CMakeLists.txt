@@ -6,7 +6,8 @@
 #   1. config parsing (auto_mount field, unmount_retry block)
 #   2. /proc parsing helpers (scan_holders against the test process itself)
 #   3. is_mounted() against /proc/self/mountinfo
-#   4. mount_one/unmount_all lifecycle using a loopback tmpfs (no real NVMe)
+#   4. recursive mount-point preparation
+#   5. mount_one/unmount_all lifecycle using a loopback tmpfs (no real NVMe)
 
 find_package(Threads REQUIRED)
 find_package(yaml-cpp REQUIRED)

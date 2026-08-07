@@ -132,7 +132,8 @@ message ConnectResponse {
     // --- GPU-view filesystem path for this allocation ---
     // Daemon-installed symlink under the consuming GPU's mount_path,
     // e.g. "/mnt/gpu0/ssnvme0", pointing at "/mnt/nvme0/GPU0".
-    // Empty string if symlink installation failed at init time.
+    // Empty string if the backing filesystem was not mounted or view
+    // publication failed before the server started.
     string  mount_path      = 32;
 
     // --- Error info; empty on success ---

@@ -42,7 +42,8 @@
 namespace nvmeservice {
 
 // One ACL row from DeviceInfo.allowed_gpus[].  mount_path is the
-// GPU-view symlink the daemon installed; empty == install failed.
+// GPU-view symlink the daemon published; empty == mount not ready or
+// publication failed.
 struct ClientAllowedGpu {
     int32_t     cuda_device = -1;
     std::string mount_path;
@@ -105,8 +106,9 @@ public:
         // skips GET_DEV_INFO), so it arrives via RPC.
         uint64_t    max_data_size = 0;
 
-        // GPU-view symlink path the daemon installed for
-        // (cuda_device, NVMe).  Empty if symlink install failed.
+        // GPU-view symlink path the daemon published for
+        // (cuda_device, NVMe).  Empty if the mount was not ready or
+        // publication failed.
         std::string mount_path;
 
         // Lease parameters (informational; heartbeat thread uses these).

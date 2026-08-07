@@ -268,7 +268,8 @@ nvmeservice_client [--endpoint host:port] [--list-only]
 Daemon boot
   └─ for each nvmes[]:
        nvm_controller_init_b3()          → /dev/ssnvmeN, ctrl held forever
-       install /mnt/gpu<G>/ssnvmeN  →  /mnt/nvmeM/GPU<G>
+       mount /dev/snvmeMn<ns>            → /mnt/nvmeM
+       publish /mnt/gpu<G>/ssnvmeN       → /mnt/nvmeM/GPU<G>
 
 Client Connect
   Server::Connect:

@@ -3,12 +3,13 @@
  *
  * Reads sys_config.yaml, brings up every NVMe controller described
  * there as the *owner* (libnvm B3: chrdev_create + cap + bind + probe),
- * installs per-GPU view symlinks, starts the gRPC server, and runs
- * until SIGINT/SIGTERM.  No quota ledger is maintained -- the kernel
- * owns user QID accounting.
+ * publishes per-GPU view symlinks for filesystems already mounted by
+ * the operator, starts the gRPC server, and runs until SIGINT/SIGTERM.
+ * No quota ledger is maintained -- the kernel owns user QID accounting.
  */
 
 #include "nvmeservice_config.h"
+#include "mount_manager.h"
 #include "nvmeservice_server.h"
 #include "nvmeservice_state.h"
 
@@ -102,6 +103,21 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        // This example does not own the mount lifecycle.  Publish only views
+        // backed by a mount the operator prepared; never create GPU<n> on the
+        // host filesystem as a substitute for a missing mount.
+        for (size_t i = 0; i < cfg.nvmes.size(); ++i) {
+            const auto& nvme = cfg.nvmes[i];
+            if (!nvmeservice::MountManager::is_mounted(nvme.mount_path)) {
+                std::fprintf(stderr,
+                    "warning: %s is not mounted; GPU views for device_id=%zu "
+                    "will not be published\n",
+                    nvme.mount_path.c_str(), i);
+                continue;
+            }
+            state->publish_gpu_views(static_cast<int32_t>(i));
+        }
+
         state->start_reaper();
 
         nvmeservice::NvmeServiceImpl svc(state);
@@ -167,6 +183,7 @@ int main(int argc, char** argv) {
         server->Wait();
 
         state->stop_reaper();
+        state->unpublish_gpu_views();
         std::cout << "Daemon exited cleanly.\n";
     }
 

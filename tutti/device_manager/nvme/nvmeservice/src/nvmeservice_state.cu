@@ -97,8 +97,8 @@ ServiceState::ServiceState(const ServiceConfig& cfg) : cfg_(cfg) {
 
 ServiceState::~ServiceState() {
     stop_reaper();
+    unpublish_gpu_views();
     for (auto& dev : devices_) {
-        remove_gpu_symlinks(dev);
         if (dev.ctrl != nullptr) {
             // Owner-side teardown: nvm_ctrl_free cascades through
             // SNVM_DEVICE_UNBIND + SNVM_CHRDEV_REMOVE.
@@ -175,8 +175,6 @@ void ServiceState::init_device(const NvmeEntry& nvme, int32_t device_id) {
         for (int gid : nvme.allowed_gpus) dev.allowed_gpus.insert(gid);
     }
 
-    install_gpu_symlinks(dev);
-
     // Bring-up banner — info level, gated by TUTTI_VERBOSE.
     TUTTI_INFO(
         "nvmeservice: device=%d pci=%s snvme=%s ns=%u qdepth=%u "
@@ -200,8 +198,27 @@ void ServiceState::init_device(const NvmeEntry& nvme, int32_t device_id) {
 // GPU-view symlink lifecycle
 // ---------------------------------------------------------------------------
 
-void ServiceState::install_gpu_symlinks(DeviceState& dev) {
+bool ServiceState::publish_gpu_views(int32_t device_id) {
+    std::lock_guard<std::mutex> lock(state_mtx_);
+    if (device_id < 0 || device_id >= static_cast<int32_t>(devices_.size())) {
+        std::fprintf(stderr,
+            "warning: cannot publish GPU views for invalid device_id=%d\n",
+            device_id);
+        return false;
+    }
+    return install_gpu_symlinks(devices_[device_id]);
+}
+
+void ServiceState::unpublish_gpu_views() {
+    std::lock_guard<std::mutex> lock(state_mtx_);
+    for (auto& dev : devices_) {
+        remove_gpu_symlinks(dev);
+    }
+}
+
+bool ServiceState::install_gpu_symlinks(DeviceState& dev) {
     namespace fs = std::filesystem;
+    bool all_installed = true;
 
     // Symlink name under each consuming GPU's mount_path is the
     // basename of the snvme device node.
@@ -218,7 +235,13 @@ void ServiceState::install_gpu_symlinks(DeviceState& dev) {
 
     for (int gpu_id : dev.allowed_gpus) {
         const std::string* gpu_mount = gpu_mount_for(gpu_id);
-        if (gpu_mount == nullptr || gpu_mount->empty()) continue;
+        if (gpu_mount == nullptr || gpu_mount->empty()) {
+            std::fprintf(stderr,
+                "warning: no GPU view root configured for gpu_id=%d\n",
+                gpu_id);
+            all_installed = false;
+            continue;
+        }
 
         const fs::path nvme_subdir = fs::path(dev.mount_path) /
             ("GPU" + std::to_string(gpu_id));
@@ -230,11 +253,19 @@ void ServiceState::install_gpu_symlinks(DeviceState& dev) {
             std::fprintf(stderr,
                 "warning: mkdir %s failed: %s\n",
                 nvme_subdir.c_str(), ec.message().c_str());
+            all_installed = false;
             continue;
         }
         dev.created_nvme_subdirs.push_back(nvme_subdir.string());
 
         fs::create_directories(*gpu_mount, ec);
+        if (ec) {
+            std::fprintf(stderr,
+                "warning: mkdir %s failed: %s\n",
+                gpu_mount->c_str(), ec.message().c_str());
+            all_installed = false;
+            continue;
+        }
 
         std::error_code link_ec;
         const fs::file_status st = fs::symlink_status(link_path, link_ec);
@@ -250,6 +281,7 @@ void ServiceState::install_gpu_symlinks(DeviceState& dev) {
             std::fprintf(stderr,
                 "warning: %s exists and is not a symlink; refusing to overwrite\n",
                 link_path.c_str());
+            all_installed = false;
             continue;
         }
 
@@ -258,11 +290,13 @@ void ServiceState::install_gpu_symlinks(DeviceState& dev) {
             std::fprintf(stderr,
                 "warning: symlink %s -> %s failed: %s\n",
                 link_path.c_str(), nvme_subdir.c_str(), link_ec.message().c_str());
+            all_installed = false;
             continue;
         }
         dev.created_symlinks.push_back(link_path.string());
         dev.gpu_view_paths[gpu_id] = link_path.string();
     }
+    return all_installed;
 }
 
 void ServiceState::remove_gpu_symlinks(DeviceState& dev) {

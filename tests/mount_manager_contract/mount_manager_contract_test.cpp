@@ -6,9 +6,10 @@
 //   1. config parsing (auto_mount field, unmount_retry block, defaults)
 //   2. is_mounted() against /proc/self/mountinfo
 //   3. scan_holders() finds the test process itself when it holds an fd
-//   4. mount_one() + unmount_all() lifecycle using a loopback tmpfs
-//   5. force_exit_requested() short-circuits the retry loop
-//   6. path_is_prefix() edge cases (not directly exposed, but tested
+//   4. mount_one() recursively prepares a configured mount point
+//   5. mount_one() + unmount_all() lifecycle using a loopback tmpfs
+//   6. force_exit_requested() short-circuits the retry loop
+//   7. path_is_prefix() edge cases (not directly exposed, but tested
 //      indirectly via scan_holders with paths that share prefixes)
 
 #include "mount_manager.h"
@@ -183,10 +184,37 @@ static void test_scan_holders_self() {
 }
 
 // =====================================================================
-// Test 5: mount_one + unmount_all lifecycle with tmpfs
+// Test 5: mount_one owns recursive mount-point preparation
+// =====================================================================
+static void test_recursive_mount_point_creation() {
+    std::fprintf(stderr, "=== Test 5: recursive mount-point creation ===\n");
+
+    char base_template[] = "/tmp/tutti_mount_pathXXXXXX";
+    char* base_dir = ::mkdtemp(base_template);
+    CHECK(base_dir != nullptr, "mkdtemp for recursive mount point");
+    if (!base_dir) return;
+
+    const fs::path mount_path = fs::path(base_dir) / "nested" / "nvme0";
+    nvmeservice::UnmountRetryConfig rc;
+    nvmeservice::MountManager mgr(rc);
+
+    // The device intentionally does not exist.  mount(2) must fail, but the
+    // complete configured mount-point hierarchy must already have been made.
+    auto mr = mgr.mount_one("/dev/tutti_missing_block_device", mount_path.string());
+    CHECK(!mr.error.empty(), "missing block device fails mount");
+    CHECK(fs::is_directory(mount_path), "mount_one creates nested mount point");
+    CHECK(!mr.mounted_by_daemon, "failed mount is not daemon-owned");
+
+    std::error_code ec;
+    fs::remove_all(base_dir, ec);
+    CHECK(!ec, "remove recursive mount-point fixture");
+}
+
+// =====================================================================
+// Test 6: mount_one + unmount_all lifecycle with tmpfs
 // =====================================================================
 static void test_mount_lifecycle() {
-    std::fprintf(stderr, "=== Test 5: mount lifecycle (tmpfs) ===\n");
+    std::fprintf(stderr, "=== Test 6: mount lifecycle (tmpfs) ===\n");
 
     // Create a directory to use as mount point.
     char mnt_template[] = "/tmp/tutti_mntXXXXXX";
@@ -235,10 +263,10 @@ static void test_mount_lifecycle() {
 }
 
 // =====================================================================
-// Test 6: force_exit short-circuits retry loop
+// Test 7: force_exit short-circuits retry loop
 // =====================================================================
 static void test_force_exit() {
-    std::fprintf(stderr, "=== Test 6: force_exit ===\n");
+    std::fprintf(stderr, "=== Test 7: force_exit ===\n");
 
     nvmeservice::UnmountRetryConfig rc;
     rc.interval_ms = 10000;  // long sleep so force_exit triggers during wait
@@ -254,10 +282,10 @@ static void test_force_exit() {
 }
 
 // =====================================================================
-// Test 7: scan_holders with cwd — child process cd's into a mount
+// Test 8: scan_holders with cwd — child process cd's into a mount
 // =====================================================================
 static void test_scan_holders_cwd() {
-    std::fprintf(stderr, "=== Test 7: scan_holders (cwd) ===\n");
+    std::fprintf(stderr, "=== Test 8: scan_holders (cwd) ===\n");
 
     // Fork a child that cd's into /tmp and sleeps.
     pid_t pid = ::fork();
@@ -291,6 +319,7 @@ int main() {
     test_config_defaults();
     test_is_mounted();
     test_scan_holders_self();
+    test_recursive_mount_point_creation();
     test_mount_lifecycle();
     test_force_exit();
     test_scan_holders_cwd();

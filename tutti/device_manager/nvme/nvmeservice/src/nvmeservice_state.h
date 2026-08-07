@@ -19,7 +19,8 @@
  *     freed at daemon shutdown).
  *   * The kernel-reported metadata (max_user_qid, max_queues_per_group,
  *     queue_depth, dstrd, bar0_size) -- read once from NVM_GET_DEV_INFO.
- *   * Per-GPU mount-path symlinks installed at startup.
+ *   * Per-GPU mount-path symlinks published after the backing filesystems
+ *     are mounted.
  *   * Per-allocation lease (PID + starttime + last_heartbeat) for the
  *     reaper to clean up dead clients' bookkeeping.  No quota refund
  *     is needed -- the kernel's snvm_dev_release fd-cascade reclaims
@@ -56,7 +57,7 @@ namespace nvmeservice {
 
 // One row per allowed GPU on a device, telling clients where the
 // per-GPU view directory lives.  Empty mount_path means symlink
-// install failed at daemon startup.
+// publication failed after the backing filesystem was mounted.
 struct AllowedGpuView {
     int32_t     cuda_device = -1;
     std::string mount_path;
@@ -147,11 +148,12 @@ struct DeviceState {
     std::unordered_set<int>  allowed_gpus;
 
     // cuda_device -> per-GPU symlink path (e.g. "/mnt/gpu0/ssnvme0").
-    // Populated during install_gpu_symlinks; entries with empty
-    // string mean install failed for that GPU.
+    // Populated during publish_gpu_views(); a missing entry means
+    // publication failed or was skipped because the mount was not ready.
     std::unordered_map<int, std::string> gpu_view_paths;
 
-    // Symlinks created at init_device time, removed in dtor.
+    // Paths managed by publish_gpu_views(), removed by
+    // unpublish_gpu_views() (and defensively by the destructor).
     std::vector<std::string> created_symlinks;
     std::vector<std::string> created_nvme_subdirs;
 };
@@ -163,10 +165,11 @@ struct DeviceState {
 class ServiceState {
 public:
     /**
-     * Initialise all devices from config: bring up libnvm controller
-     * (owner role: chrdev_create + cap + bind + probe), install
-     * GPU-view symlinks for every allowed GPU.  Throws
-     * std::runtime_error on failure.
+     * Initialise all devices from config: bring up each libnvm controller
+     * (owner role: chrdev_create + cap + bind + probe).  GPU filesystem
+     * views are deliberately NOT created here: the block devices only exist
+     * after bring-up, so the daemon must mount them first and then call
+     * publish_gpu_views().  Throws std::runtime_error on bring-up failure.
      */
     explicit ServiceState(const ServiceConfig& cfg);
     ~ServiceState();
@@ -176,6 +179,24 @@ public:
 
     void start_reaper();
     void stop_reaper();
+
+    /**
+     * Publish the per-GPU filesystem views for one ready device.
+     *
+     * The caller must first verify that DeviceState::mount_path is a mounted
+     * filesystem.  Keeping that mount decision in the daemon prevents this
+     * class from creating GPU<n> directories on the host filesystem and then
+     * having a later mount hide them.
+     *
+     * Returns false for an invalid device id or if any directory/symlink
+     * could not be installed.  Successful views remain available when a
+     * different GPU view fails.
+     */
+    bool publish_gpu_views(int32_t device_id);
+
+    // Remove published GPU-view symlinks and empty subdirectories.
+    // Idempotent; the production daemon calls this before unmounting.
+    void unpublish_gpu_views();
 
     // --- Query ---
     std::vector<DeviceSnapshot> list_devices() const;
@@ -211,7 +232,7 @@ private:
     // --- Init helpers ---
     void init_device(const NvmeEntry& nvme, int32_t device_id);
 
-    void install_gpu_symlinks(DeviceState& dev);
+    bool install_gpu_symlinks(DeviceState& dev);
     void remove_gpu_symlinks(DeviceState& dev);
 
     // --- Reaper ---

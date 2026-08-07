@@ -4,7 +4,8 @@
  * The owner half of the SERVICE_CLIENT data plane.  This process is
  * the sole owner of every NVMe controller named in sys_config.yaml:
  * it does the libnvm B3 bring-up (chrdev_create + cap + bind + probe),
- * installs per-GPU view symlinks, and serves gRPC so that Coordinator
+ * mounts each block device, publishes per-GPU view symlinks, and serves
+ * gRPC so that Coordinator
  * instances running in SERVICE_CLIENT mode (see
  * coordinator/include/coordinator_config.h) can attach as libnvm
  * clients and build their own user queue groups.
@@ -195,6 +196,27 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Publish filesystem views only after the backing mount is visible.
+    // ServiceState bring-up creates the block device, but deliberately does
+    // not mkdir <mount>/GPU<n>: doing so before mount(2) would create the
+    // directory on the host filesystem and the mount would hide it.
+    for (size_t i = 0; i < cfg.nvmes.size(); ++i) {
+        const auto& nvme = cfg.nvmes[i];
+        if (!nvmeservice::MountManager::is_mounted(nvme.mount_path)) {
+            std::fprintf(stderr,
+                         "warning: %s is not mounted; GPU views for "
+                         "device_id=%zu will not be published\n",
+                         nvme.mount_path.c_str(), i);
+            continue;
+        }
+        if (!state->publish_gpu_views(static_cast<int32_t>(i))) {
+            std::fprintf(stderr,
+                         "warning: one or more GPU views for device_id=%zu "
+                         "could not be published\n",
+                         i);
+        }
+    }
+
     state->start_reaper();
 
     nvmeservice::NvmeServiceImpl svc(state);
@@ -211,6 +233,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "Failed to start gRPC server on %s\n",
                      cfg.grpc.endpoint.c_str());
         state->stop_reaper();
+        state->unpublish_gpu_views();
+        mount_mgr.unmount_all();
         return 1;
     }
 
@@ -248,6 +272,12 @@ int main(int argc, char** argv) {
     server->Shutdown();
     server->Wait();
     state->stop_reaper();
+
+    // Symlinks and empty GPU<n> directories belong to the mounted
+    // filesystem, so remove them before mount_manager hides that filesystem
+    // again.  The destructor repeats this defensively; the operation is
+    // idempotent.
+    state->unpublish_gpu_views();
 
     // Round 17 S1: auto-unmount with EBUSY diagnostics + retry.
     if (g_force_exit.load(std::memory_order_relaxed)) {
