@@ -1,7 +1,7 @@
 # tests/striped_local_nvme_contract/CMakeLists.txt
 #
 # E2E striped StorageRuntime hardware contract test.
-# Requires dual NVMe (snvme0 + snvme1) + CUDA + snvme module + tutti_daemon.
+# Requires 2 or 4 NVMe devices + CUDA + snvme module + tutti_daemon.
 # Test numbering starts at 82 (Round 15 S3's tests, not conflicting).
 
 cmake_minimum_required(VERSION 3.18)
@@ -34,6 +34,7 @@ add_test(NAME tutti_striped_local_nvme_contract_test
 
 set_tests_properties(tutti_striped_local_nvme_contract_test PROPERTIES
     LABELS "hardware;striped;runtime_e2e"
+    SKIP_RETURN_CODE 77
 )
 
 message(STATUS "Configured tutti_striped_local_nvme_contract_test (hardware;striped;runtime_e2e)")
