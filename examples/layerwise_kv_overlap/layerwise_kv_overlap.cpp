@@ -49,6 +49,7 @@
 #endif
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdint>
@@ -56,7 +57,9 @@
 #include <cstring>
 #include <fcntl.h>
 #include <functional>
+#include <limits>
 #include <string>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
@@ -73,6 +76,45 @@ static double sec_since(const std::chrono::steady_clock::time_point& t0) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count();
 }
 
+static bool ensure_nofile_limit(uint64_t required, uint64_t* previous) {
+    struct rlimit limit{};
+    if (::getrlimit(RLIMIT_NOFILE,&limit)!=0)return false;
+    *previous=limit.rlim_cur==RLIM_INFINITY
+        ? std::numeric_limits<uint64_t>::max()
+        : static_cast<uint64_t>(limit.rlim_cur);
+    if(*previous>=required)return true;
+    if(limit.rlim_max!=RLIM_INFINITY&&
+       static_cast<uint64_t>(limit.rlim_max)<required){
+        errno=EPERM;
+        return false;
+    }
+    limit.rlim_cur=static_cast<rlim_t>(required);
+    return ::setrlimit(RLIMIT_NOFILE,&limit)==0;
+}
+
+static bool parse_nvme_device(const char* value,
+                              presets::NvmeDeviceConfig* device) {
+    std::vector<std::string> fields;
+    std::string input(value);
+    size_t begin = 0;
+    while (begin <= input.size()) {
+        size_t comma = input.find(',', begin);
+        fields.push_back(input.substr(begin, comma - begin));
+        if (comma == std::string::npos) break;
+        begin = comma + 1;
+    }
+    if (fields.size() != 4 ||
+        std::any_of(fields.begin(), fields.end(),
+                    [](const std::string& field) { return field.empty(); })) {
+        return false;
+    }
+    device->ssnvme_path = std::move(fields[0]);
+    device->pci_bdf = std::move(fields[1]);
+    device->backing_device = std::move(fields[2]);
+    device->mount_path = std::move(fields[3]);
+    return true;
+}
+
 bool create_file(const std::string& path, uint64_t size) {
     // Project policy: ALL file opens carry O_DIRECT (no page-cache pollution).
     int f=::open(path.c_str(),O_CREAT|O_RDWR|O_TRUNC|O_DIRECT,0644);
@@ -85,22 +127,8 @@ bool create_file(const std::string& path, uint64_t size) {
     ::fsync(f);::close(f);return true;
 }
 
-constexpr const char* kSnvme="/dev/ssnvme0";
-constexpr uint32_t kBar0=16384;
 // Round 16 S3: GPU selection via env TUTTI_TEST_GPU (default 0).
 inline int32_t test_gpu_id(){const char*e=std::getenv("TUTTI_TEST_GPU");int v=e?std::atoi(e):0;int dc=0;if(cudaGetDeviceCount(&dc)!=cudaSuccess||dc==0)return 0;return(v>=0&&v<dc)?v:0;}
-constexpr const char* kDPKey="local-nvme-ext4";
-
-// Round 16 S3: multi-GPU device→PCI BDF mapping table (seam only).
-// To actually run on GPU 1-3, sys_config allowed_gpus must be extended +
-// daemon restarted. This table is a placeholder for future multi-GPU testing.
-struct GpuNvmeMapping { int gpu_id; const char* pci_bdf; const char* nvme_dev; };
-static const GpuNvmeMapping kGpuNvmeMap[] = {
-    {0, "0000:08:00.0", "/dev/ssnvme0"},  // 06:00 ↔ 08:00
-    {1, "0000:4b:00.0", "/dev/ssnvme1"},  // 49:00 ↔ 4b:00
-    {2, "0000:57:00.0", "/dev/ssnvme2"},  // 56:00 ↔ 57:00
-    {3, "0000:63:00.0", "/dev/ssnvme3"},  // 62:00 ↔ 63:00
-};
 
 // ---------------------------------------------------------------------------
 // DpSeam — abstracts test-seam counters so windowed_submit_wait
@@ -245,8 +273,15 @@ int main(int argc,char**argv){
     uint32_t gemm_n=1024, compute_sms=64;
     uint64_t ctx_tokens=131072, compute_us=0;
     std::string data_dir="/mnt/nvme0/GPU0";
+    std::vector<presets::NvmeDeviceConfig> nvme_devices = {
+        {"/dev/ssnvme0","0000:08:00.0","/dev/snvme0n1","/mnt/nvme0"},
+        {"/dev/ssnvme1","0000:4b:00.0","/dev/snvme1n1","/mnt/nvme1"},
+        {"/dev/ssnvme2","0000:57:00.0","/dev/snvme2n1","/mnt/nvme2"},
+        {"/dev/ssnvme3","0000:63:00.0","/dev/snvme3n1","/mnt/nvme3"},
+    };
+    bool nvme_overridden=false;
     bool verify=true;
-    bool striped4=true;  // Round 16 S7: 4-disk striped is the DEFAULT mode
+    bool striped=true;
     for(int i=1;i<argc;){
         const char*a=argv[i];
         if(!std::strcmp(a,"--layers")&&i+1<argc){n_layers=(uint32_t)std::strtoul(argv[++i],0,10);++i;}
@@ -259,10 +294,21 @@ int main(int argc,char**argv){
         else if(!std::strcmp(a,"--gemm-n")&&i+1<argc){gemm_n=(uint32_t)std::strtoul(argv[++i],0,10);++i;}
         else if(!std::strcmp(a,"--compute-sms")&&i+1<argc){compute_sms=(uint32_t)std::strtoul(argv[++i],0,10);++i;}
         else if(!std::strcmp(a,"--data-dir")&&i+1<argc){data_dir=argv[++i];++i;}
+        else if(!std::strcmp(a,"--nvme")&&i+1<argc){
+            presets::NvmeDeviceConfig device;
+            if(!parse_nvme_device(argv[++i],&device)){
+                std::fprintf(stderr,
+                    "invalid --nvme: expected ssnvme_path,pci_bdf,backing_device,mount_path\n");
+                return 1;
+            }
+            if(!nvme_overridden){nvme_devices.clear();nvme_overridden=true;}
+            nvme_devices.push_back(std::move(device));
+            ++i;
+        }
         else if(!std::strcmp(a,"--verify")){verify=true;++i;}
         else if(!std::strcmp(a,"--no-verify")){verify=false;++i;}
-        else if(!std::strcmp(a,"--striped4")){striped4=true;++i;}  // explicit (default)
-        else if(!std::strcmp(a,"--single")){striped4=false;++i;}  // Round 16 S7: opt out of striped
+        else if(!std::strcmp(a,"--striped")){striped=true;++i;}
+        else if(!std::strcmp(a,"--single")){striped=false;++i;}
         else{std::fprintf(stderr,"unknown: %s\n",a);return 1;}
     }
     const uint64_t ts=(uint64_t)tensor_kb*1024;
@@ -270,10 +316,34 @@ int main(int argc,char**argv){
     const uint64_t n_hit=n_chunks*hit_pct/100, n_miss=n_chunks-n_hit;
     const uint64_t file_total=2ull*n_layers*ts;
     if(!n_chunks||!n_hit||!n_miss)STEP_FAIL("bad geometry");
+    if(!ts||ts%4096)STEP_FAIL("--tensor-kb must produce a positive 4 KiB-aligned tensor size");
+    if(nvme_devices.empty())STEP_FAIL("no NVMe devices configured");
+    const size_t ndev=nvme_devices.size();
+    if(striped&&(ndev<2||(ndev&(ndev-1))!=0))
+        STEP_FAIL("striped mode requires a power-of-two --nvme device count >= 2 (got %lu)",
+                  (unsigned long)ndev);
+    constexpr uint64_t kFdHeadroom=256;
+    const uint64_t fds_per_target=striped?ndev:1;
+    if(n_chunks>(std::numeric_limits<uint64_t>::max()-kFdHeadroom)/fds_per_target)
+        STEP_FAIL("open-file requirement overflow");
+    const uint64_t required_fds=n_chunks*fds_per_target+kFdHeadroom;
+    uint64_t previous_nofile=0;
+    if(!ensure_nofile_limit(required_fds,&previous_nofile))
+        STEP_FAIL("need RLIMIT_NOFILE >= %lu for %lu targets x %lu file(s) plus headroom: %s",
+                  (unsigned long)required_fds,(unsigned long)n_chunks,
+                  (unsigned long)fds_per_target,std::strerror(errno));
+    if(previous_nofile<required_fds)
+        STEP_OK("RLIMIT_NOFILE raised from %lu to %lu",
+                (unsigned long)previous_nofile,(unsigned long)required_fds);
+
+    std::string striped_devs;
+    for(size_t i=0;i<nvme_devices.size();++i){
+        if(i)striped_devs+=',';
+        striped_devs+=nvme_devices[i].mount_path;
+    }
 
     CUDA_OK(cudaFree(0));
     int32_t gpu=test_gpu_id();
-    (void)kGpuNvmeMap;  // Round 16 S3: multi-GPU seam (suppress unused warning)
     CUDA_OK(cudaSetDevice(gpu));
     STEP_OK("cudaSetDevice(%d)",gpu);
 
@@ -284,14 +354,9 @@ int main(int argc,char**argv){
     DpSeam seam;
     std::unique_ptr<StorageRuntime> rt;
 
-    if (striped4) {
+    if (striped) {
         presets::StripedNvmePreset preset;
-        preset.devices = {
-            {"/dev/ssnvme0","0000:08:00.0","/dev/snvme0n1","/mnt/nvme0"},
-            {"/dev/ssnvme1","0000:4b:00.0","/dev/snvme1n1","/mnt/nvme1"},
-            {"/dev/ssnvme2","0000:57:00.0","/dev/snvme2n1","/mnt/nvme2"},
-            {"/dev/ssnvme3","0000:63:00.0","/dev/snvme3n1","/mnt/nvme3"},
-        };
+        preset.devices = nvme_devices;
         preset.gpu_id = gpu;
         preset.num_queues = 32;
         preset.stripe_unit = ts;  // Round 16 S7: unit=ts (512KiB, tensor-aligned)
@@ -303,10 +368,11 @@ int main(int argc,char**argv){
         if (!rwt.runtime) STEP_FAIL("create striped runtime");
         rt = std::move(rwt.runtime);
         seam = make_dp_seam(rwt.telemetry);
-        STEP_OK("StorageRuntime created (StripedDataPath, N=4)");
+        STEP_OK("StorageRuntime created (StripedDataPath, N=%lu)",
+                (unsigned long)ndev);
     } else {
         presets::LocalNvmePreset preset;
-        preset.device = {"/dev/ssnvme0","0000:08:00.0","/dev/snvme0n1","/mnt/nvme0"};
+        preset.device = nvme_devices.front();
         preset.gpu_id = gpu;
         preset.num_queues = 16;
         preset.max_batch_entries = 4096;
@@ -324,28 +390,27 @@ int main(int argc,char**argv){
     // ---- Phase A: create files ----
     auto t0=std::chrono::steady_clock::now();
     std::vector<std::string> paths(n_chunks);
-    if (striped4) {
-        // Round 16 S4: 4 backing files per chunk (one per device/shard).
+    if (striped) {
+        // One backing file per chunk and device/shard.
         // StripedResolver path: <mount>/striped/<name>.shard<i>
-        // Each shard file = file_total / 4 bytes.
-        const uint64_t shard_size = file_total / 4;
-        const char* mounts[] = {"/mnt/nvme0","/mnt/nvme1","/mnt/nvme2","/mnt/nvme3"};
-        for (int d = 0; d < 4; ++d) {
-            std::string sdir = std::string(mounts[d]) + "/striped";
+        const uint64_t total_stripes = 2ull * n_layers;
+        const uint64_t shard_size = ((total_stripes + ndev - 1) / ndev) * ts;
+        for (size_t d = 0; d < ndev; ++d) {
+            std::string sdir = nvme_devices[d].mount_path + "/striped";
             ::mkdir(sdir.c_str(), 0755);
         }
         for(uint64_t i=0;i<n_chunks;++i){
             char nm[128];
             std::snprintf(nm,sizeof(nm),"kvlw_%lu",(unsigned long)i);
             paths[i]=nm;  // store the name (not path) for striped:// URI
-            for(int d=0;d<4;++d){
-                char sp[256];
-                std::snprintf(sp,sizeof(sp),"%s/striped/%s.shard%d",mounts[d],nm,d);
-                if(!create_file(sp,shard_size))STEP_FAIL("create_file %s",sp);
+            for(size_t d=0;d<ndev;++d){
+                std::string sp=nvme_devices[d].mount_path+"/striped/"+nm+
+                               ".shard"+std::to_string(d);
+                if(!create_file(sp,shard_size))STEP_FAIL("create_file %s",sp.c_str());
             }
         }
-        STEP_OK("Phase A (striped4): %lu targets x 4 shards (%.1f GB) in %.2fs",
-                (unsigned long)n_chunks,
+        STEP_OK("Phase A (striped): %lu targets x %lu shards (%.1f GB) in %.2fs",
+                (unsigned long)n_chunks,(unsigned long)ndev,
                 (double)(n_chunks*file_total)/(1024*1024*1024),sec_since(t0));
     } else {
         for(uint64_t i=0;i<n_chunks;++i){
@@ -396,8 +461,8 @@ int main(int argc,char**argv){
     for(uint64_t i=0;i<n_chunks;++i){
         std::string uri;
         OpenOptions opts;
-        if (striped4) {
-            // Round 16 S7: per-chunk shard rotation (rot=i%4), mirroring
+        if (striped) {
+            // Round 16 S7: per-chunk shard rotation (rot=i%N), mirroring
             // legacy's shard_placement (kv_cache_layerwise_overlap.cu:293):
             //     shard_placement = {coord_devs[(2i)%ndev],
             //                        coord_devs[(2i+1)% ndev]}
@@ -406,19 +471,15 @@ int main(int argc,char**argv){
             // nvme_batch_xfer_kernel drives all N NVMes concurrently".
             //
             // Without rotation, every request in a layer shares
-            // target_offset = L*ts, so shard = (L*ts/ts) % 4 = L % 4 is
+            // target_offset = L*ts, so shard = (L*ts/ts) % N = L % N is
             // CONSTANT across the whole batch -> the entire layer lands on
-            // ONE disk and 4-disk aggregation degenerates to single-disk
-            // bandwidth (measured: 6.9 GB/s == single-disk).  With
-            // rot=i%4, chunk i's shard (L%4) maps to device
-            // ((L%4)+i)%4, so a layer's 460 chunks spread evenly over all
-            // 4 devices within one fused kernel launch.
-            char rq[64];
-            std::snprintf(rq, sizeof(rq), "&rot=%llu",
-                          (unsigned long long)(i % 4));
+            // ONE disk and aggregation degenerates to single-disk bandwidth.
+            // With rot=i%N, chunk i's shard (L%N) maps to device
+            // ((L%N)+i)%N, so a layer's chunks spread evenly over all devices
+            // within one fused kernel launch.
             uri = std::string("striped://") + paths[i] +
-                  "?devs=/mnt/nvme0,/mnt/nvme1,/mnt/nvme2,/mnt/nvme3"
-                  "&unit=524288" + rq;
+                  "?devs=" + striped_devs + "&unit=" +
+                  std::to_string(ts) + "&rot=" + std::to_string(i % ndev);
             opts = OpenOptions{"striped"};
         } else {
             uri = std::string("file://") + paths[i];
@@ -429,7 +490,7 @@ int main(int argc,char**argv){
         tgt[i]=o.value();
     }
     STEP_OK("Phase C: opened %lu targets (%s)",(unsigned long)n_chunks,
-            striped4?"striped4":"file");
+            striped?"striped":"file");
 
     // ---- Phase D: 3 streams ----
     int pl=0,ph=0;CUDA_OK(cudaDeviceGetStreamPriorityRange(&pl,&ph));
@@ -712,12 +773,12 @@ int main(int argc,char**argv){
     for(void* p:_raw_ptrs)CUDA_OK(cudaFree(p));
     for(uint64_t i=0;i<n_chunks;++i){
         RT_STATUS(rt->close(tgt[i]));
-        if (striped4) {
-            for(int d=0;d<4;++d){
-                char sp[256];
-                std::snprintf(sp,sizeof(sp),"/mnt/nvme%d/striped/%s.shard%d",
-                              d+1,paths[i].c_str(),d);
-                ::unlink(sp);
+        if (striped) {
+            for(size_t d=0;d<ndev;++d){
+                std::string sp=nvme_devices[d].mount_path+"/striped/"+paths[i]+
+                               ".shard"+std::to_string(d);
+                if(::unlink(sp.c_str())!=0)
+                    STEP_FAIL("unlink %s failed",sp.c_str());
             }
         } else {
             ::unlink(paths[i].c_str());

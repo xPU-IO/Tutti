@@ -4686,6 +4686,7 @@ static int __init nvme_core_init(void)
 		goto unregister_generic_ns;
 	}
 
+	pr_info("snvme_core: module loaded successfully\n");
 	return 0;
 
 unregister_generic_ns:
@@ -4718,6 +4719,7 @@ static void __exit nvme_core_exit(void)
 	destroy_workqueue(s_nvme_wq);
 	ida_destroy(&nvme_ns_chr_minor_ida);
 	ida_destroy(&nvme_instance_ida);
+	pr_info("snvme_core: module unloaded successfully\n");
 }
 
 MODULE_LICENSE("GPL");

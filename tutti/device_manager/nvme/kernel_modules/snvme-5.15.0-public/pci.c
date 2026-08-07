@@ -5679,6 +5679,8 @@ static int __init nvme_init(void)
     ret = snvm_cdev_init();
 	if(ret)
 		return ret;
+	pr_info("snvme: module loaded successfully (io_queue_depth=%u)\n",
+		io_queue_depth);
     return 0;
 }
 
@@ -5722,6 +5724,7 @@ static void __exit nvme_exit(void)
 	if(ret!=curr_ctrls)
 		printk("release ctrl error!, cur is %d, release %d",curr_ctrls,ret);
     snvm_cdev_release();
+	pr_info("snvme: module unloaded successfully\n");
 
 }
 
