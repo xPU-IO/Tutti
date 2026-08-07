@@ -33,6 +33,8 @@
 #include <tutti/spi/storage_target_resolver.h>
 #include <tutti/bindings/ext4_local_nvme/binding.h>
 
+#include "../hardware_test_directory.h"
+
 #include <cerrno>
 #include <cctype>
 #include <cstdint>
@@ -55,10 +57,10 @@ namespace resolver_ns = tutti::resolvers::local_file;
 // Test environment
 // =====================================================================
 
-static std::string test_dir() {
+static std::string test_parent_dir() {
     const char* env = std::getenv("TUTTI_RESOLVER_TEST_DIR");
     if (env && env[0]) return env;
-    return "/mnt/nvme0/GPU0/resolver_test";
+    return "/mnt/nvme0/GPU0";
 }
 
 static bool dir_writable(const std::string& dir) {
@@ -968,15 +970,24 @@ static void test_payload_compatibility(const std::string& dir) {
 // =====================================================================
 
 int main() {
-    std::string dir = test_dir();
+    std::string parent_dir = test_parent_dir();
 
-    if (!dir_writable(dir)) {
+    if (!dir_writable(parent_dir)) {
         std::fprintf(stderr,
-            "ERROR: test directory not writable: %s\n"
+            "ERROR: test parent directory not writable: %s\n"
             "Need operator to mount snvme device first.\n",
-            dir.c_str());
+            parent_dir.c_str());
         return 1;
     }
+
+    tutti::test_support::UniqueTestDirectory run_dir;
+    std::string dir_error;
+    if (!tutti::test_support::UniqueTestDirectory::create(
+            parent_dir, "tutti_resolver_contract", run_dir, dir_error)) {
+        std::fprintf(stderr, "ERROR: %s\n", dir_error.c_str());
+        return 1;
+    }
+    const std::string dir = run_dir.path();
 
     std::printf("Test directory: %s\n", dir.c_str());
     std::printf("Block size: %u\n", kBlockSize);
@@ -1006,5 +1017,15 @@ int main() {
     test_payload_compatibility(dir);
 
     std::printf("\n%d/%d tests passed.\n", pass_count, test_count);
-    return (pass_count == test_count) ? 0 : 1;
+    if (pass_count != test_count) {
+        std::printf("Preserving failed-test artifacts: %s\n", dir.c_str());
+        return 1;
+    }
+
+    if (!run_dir.cleanup(dir_error)) {
+        std::fprintf(stderr, "ERROR: test passed but cleanup failed: %s\n",
+                     dir_error.c_str());
+        return 1;
+    }
+    return 0;
 }

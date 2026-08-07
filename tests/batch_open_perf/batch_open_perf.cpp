@@ -31,6 +31,8 @@
 #include "tutti/data_paths/local_nvme/local_nvme_data_path.h"
 #include <tutti/resolvers/local_file/resolver.h>
 
+#include "../hardware_test_directory.h"
+
 using namespace tutti;
 using tutti::data_paths::local_nvme::LocalNvmeDataPath;
 using tutti::resolvers::local_file::BackingDeviceConfig;
@@ -41,7 +43,6 @@ static constexpr std::uint64_t kBar0  = 16384;
 static constexpr std::uint32_t  kQueues = 16;
 static constexpr std::uint32_t  kNsId   = 1;
 static constexpr std::uint32_t  kBs     = 4096;
-static constexpr const char* kDir      = "/mnt/nvme0/GPU0/resolver_test";
 static constexpr const char* kDataPathKey = "local-nvme-ext4";
 
 static bool create_file(const std::string& path, std::uint64_t size,
@@ -66,11 +67,22 @@ int main(int argc, char** argv) {
     std::int32_t gpu = 0;
     cudaGetDevice(&gpu);
 
+    tutti::test_support::UniqueTestDirectory run_dir;
+    std::string dir_error;
+    if (!tutti::test_support::UniqueTestDirectory::create(
+            "/mnt/nvme0/GPU0", "tutti_batch_open_perf",
+            run_dir, dir_error)) {
+        std::fprintf(stderr, "ERROR: %s\n", dir_error.c_str());
+        return 1;
+    }
+    const std::string& test_dir = run_dir.path();
+    std::printf("Test directory: %s\n", test_dir.c_str());
+
     // Create N files.
     std::vector<std::string> paths;
     paths.reserve(N);
     for (int i = 0; i < N; ++i) {
-        std::string p = std::string(kDir) + "/perf_" + std::to_string(i) + ".bin";
+        std::string p = test_dir + "/perf_" + std::to_string(i) + ".bin";
         if (!create_file(p, kBs, (unsigned char)(i & 0xFF))) {
             std::printf("FAIL: create %s\n", p.c_str());
             return 1;
@@ -139,5 +151,10 @@ int main(int argc, char** argv) {
     std::printf("[perf] batch open:    %.2f ms (%.3f ms/file)\n",
                 batch_ms,  batch_ms / N);
     std::printf("[perf] speedup:       %.2fx\n", speedup);
+    if (!run_dir.cleanup(dir_error)) {
+        std::fprintf(stderr, "ERROR: benchmark passed but cleanup failed: %s\n",
+                     dir_error.c_str());
+        return 1;
+    }
     return 0;
 }

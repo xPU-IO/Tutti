@@ -15,6 +15,8 @@
 #include "tutti/data_paths/local_nvme/io/submit_one.cuh"
 #include "tutti/resolvers/local_file/resolver.h"
 
+#include "../hardware_test_directory.h"
+
 #include <tutti/cuda_like.h>
 #include <nvm_types.h>
 
@@ -22,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
+#include <map>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -37,11 +40,54 @@ using namespace tutti::binding::ext4_local_nvme;
 
 static int g_pass = 0;
 static int g_fail = 0;
+static std::map<
+    std::string,
+    std::unique_ptr<tutti::test_support::UniqueTestDirectory>> g_test_dirs;
 
 #define TEST_CASE(name) printf("--- %s ---\n", name)
 #define PASS() do { printf("  PASS\n"); ++g_pass; } while(0)
 #define FAIL(msg) do { printf("  FAIL: %s\n", msg); ++g_fail; } while(0)
 #define CHECK(cond, msg) do { if (cond) { PASS(); } else { FAIL(msg); } } while(0)
+
+static const std::string* test_dir_under(const std::string& parent) {
+    auto found = g_test_dirs.find(parent);
+    if (found != g_test_dirs.end()) return &found->second->path();
+
+    auto dir = std::make_unique<tutti::test_support::UniqueTestDirectory>();
+    std::string error;
+    if (!tutti::test_support::UniqueTestDirectory::create(
+            parent, "tutti_local_nvme_datapath", *dir, error)) {
+        std::fprintf(stderr, "ERROR: %s\n", error.c_str());
+        return nullptr;
+    }
+
+    std::printf("Test directory: %s\n", dir->path().c_str());
+    const std::string* path = &dir->path();
+    g_test_dirs.emplace(parent, std::move(dir));
+    return path;
+}
+
+static bool cleanup_test_dirs() {
+    bool ok = true;
+    for (auto& entry : g_test_dirs) {
+        std::string error;
+        if (!entry.second->cleanup(error)) {
+            std::fprintf(stderr, "ERROR: test passed but cleanup failed: %s\n",
+                         error.c_str());
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+static void print_preserved_test_dirs() {
+    for (const auto& entry : g_test_dirs) {
+        if (entry.second->valid()) {
+            std::printf("Preserving failed-test artifacts: %s\n",
+                        entry.second->path().c_str());
+        }
+    }
+}
 
 static tutti::resolvers::local_file::BackingDeviceConfig
 resolver_backing_config() {
@@ -122,12 +168,16 @@ static ResolvedFile make_resolved_file(const char* name,
     // Round 20 S1: mount path follows TUTTI_TEST_GPU (GPU i ↔ /mnt/nvme{i}).
     const char* gpu_env = std::getenv("TUTTI_TEST_GPU");
     int test_gpu = gpu_env ? std::atoi(gpu_env) : 0;
-    static char kDirBuf[64];
-    std::snprintf(kDirBuf, sizeof(kDirBuf),
-                  "/mnt/nvme%d/GPU%d/resolver_test", test_gpu, test_gpu);
-    const char* kDir = kDirBuf;
-    ::mkdir(kDir, 0755);
-    std::string path = std::string(kDir) + "/" + name;
+    char parent[64];
+    std::snprintf(parent, sizeof(parent),
+                  "/mnt/nvme%d/GPU%d", test_gpu, test_gpu);
+    const std::string* dir = test_dir_under(parent);
+    if (dir == nullptr) {
+        return ResolvedFile{"", Result<ResolvedTarget>::Failure(
+            Status(StatusCode::INTERNAL,
+                   "make_resolved_file: cannot create unique test directory"))};
+    }
+    std::string path = *dir + "/" + name;
 
     // Project policy: ALL file opens carry O_DIRECT (no page-cache pollution).
     int fd = ::open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC | O_DIRECT, 0644);
@@ -202,10 +252,16 @@ static ResolvedFileOnDevice make_resolved_file_on_device(
     std::string_view pci_addr,
     std::string_view backing_dev)
 {
-    std::string dir = std::string(mount_dir) + "/GPU0/resolver_test";
-    ::mkdir((std::string(mount_dir) + "/GPU0").c_str(), 0755);
-    ::mkdir(dir.c_str(), 0755);
-    std::string path = dir + "/" + name;
+    // The mount itself is the stable hardware-owned parent. The test creates
+    // only its unique child, so a passing run can remove everything it owns.
+    std::string parent = mount_dir;
+    const std::string* dir = test_dir_under(parent);
+    if (dir == nullptr) {
+        return ResolvedFileOnDevice{"", Result<ResolvedTarget>::Failure(
+            Status(StatusCode::INTERNAL,
+                   "make_resolved_file_on_device: cannot create unique test directory"))};
+    }
+    std::string path = *dir + "/" + name;
 
     // Project policy: ALL file opens carry O_DIRECT (no page-cache pollution).
     int fd = ::open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC | O_DIRECT, 0644);
@@ -776,9 +832,13 @@ int main() {
     std::snprintf(snvme_path, sizeof(snvme_path),
                   "/dev/ssnvme%d", test_gpu);
     const char* kSnvmeDevPath = snvme_path;
-    char mount_dir[64];
-    std::snprintf(mount_dir, sizeof(mount_dir),
-                  "/mnt/nvme%d/GPU%d/resolver_test", test_gpu, test_gpu);
+    char test_parent[64];
+    std::snprintf(test_parent, sizeof(test_parent),
+                  "/mnt/nvme%d/GPU%d", test_gpu, test_gpu);
+    if (test_dir_under(test_parent) == nullptr) {
+        std::printf("RESULT: FAIL (test directory)\n");
+        return 1;
+    }
     const std::uint32_t kBar0Size = 16384;
     const std::size_t kBufSize = 1 * 1024 * 1024;  // 1 MiB
 
@@ -1364,11 +1424,11 @@ int main() {
     // =====================================================================
     TEST_CASE("26. E2E 4KiB write/read/verify");
     {
-        const char* kMountDir = "/mnt/nvme0/GPU0/resolver_test";
-        const char* kTestFile = "/mnt/nvme0/GPU0/resolver_test/round8_e2e.bin";
+        const std::string* fixed_dir = test_dir_under("/mnt/nvme0/GPU0");
+        if (fixed_dir == nullptr) { FAIL("create unique test directory"); goto e2e_skip; }
+        const std::string test_file = *fixed_dir + "/round8_e2e.bin";
+        const char* kTestFile = test_file.c_str();
 
-        // Create test directory + file.
-        ::mkdir(kMountDir, 0755);
         // Project policy: O_DIRECT on all file opens.
         int fd = ::open(kTestFile, O_CREAT | O_RDWR | O_TRUNC | O_DIRECT, 0644);
         CHECK(fd >= 0, "create test file");
@@ -1801,9 +1861,10 @@ int main() {
         // ext4 primary superblock (byte offset 1024 lives in LBA 0).
         // Resolve a real file instead so the write lands inside the
         // file's own extent.
-        const char* kInflightFile =
-            "/mnt/nvme0/GPU0/resolver_test/round8_inflight.bin";
-        ::mkdir("/mnt/nvme0/GPU0/resolver_test", 0755);
+        const std::string* fixed_dir = test_dir_under("/mnt/nvme0/GPU0");
+        if (fixed_dir == nullptr) { FAIL("create unique test directory"); goto next_test31; }
+        const std::string inflight_file = *fixed_dir + "/round8_inflight.bin";
+        const char* kInflightFile = inflight_file.c_str();
         {
             int fd = ::open(kInflightFile, O_CREAT | O_RDWR | O_TRUNC | O_DIRECT, 0644);
             if (fd >= 0) {
@@ -3462,10 +3523,11 @@ int main() {
         LocalNvmeDataPath dp = make_qg_dp();
         CHECK(init_dp(dp).ok(), "initialize");
 
-        const std::string dir = "/mnt/nvme0/GPU0/resolver_test";
+        const std::string* fixed_dir = test_dir_under("/mnt/nvme0/GPU0");
+        if (fixed_dir == nullptr) { FAIL("create unique test directory"); goto next_t48; }
+        const std::string& dir = *fixed_dir;
         const std::string pathA = dir + "/round8_t48A.bin";
         const std::string pathB = dir + "/round8_t48B.bin";
-        ::mkdir(dir.c_str(), 0755);
         const uint64_t m4 = 4 * 1024 * 1024;
         const uint64_t m8 = 8 * 1024 * 1024;
 
@@ -7188,15 +7250,6 @@ int main() {
         // Runtime::shutdown() calls shutdown() on each DataPath.
         runtime->shutdown(1);
 
-        // Clean up all test files on both devices.
-        ::unlink("/mnt/nvme0/GPU0/resolver_test/round15_t72_dev0.bin");
-        ::unlink("/mnt/nvme1/GPU0/resolver_test/round15_t72_dev1.bin");
-        ::unlink("/mnt/nvme0/GPU0/resolver_test/round15_t73_dev0.bin");
-        ::unlink("/mnt/nvme1/GPU0/resolver_test/round15_t73_dev1.bin");
-        ::unlink("/mnt/nvme0/GPU0/resolver_test/round15_t74_dev0.bin");
-        ::unlink("/mnt/nvme1/GPU0/resolver_test/round15_t74_dev1.bin");
-        ::unlink("/mnt/nvme0/GPU0/resolver_test/round15_t75_dev0.bin");
-        ::unlink("/mnt/nvme1/GPU0/resolver_test/round15_t75_dev1.bin");
     }
 
     // =====================================================================
@@ -7502,8 +7555,10 @@ int main() {
 
     if (g_fail > 0) {
         printf("RESULT: FAIL\n");
+        print_preserved_test_dirs();
         return 1;
     }
+    if (!cleanup_test_dirs()) return 1;
     printf("RESULT: PASS\n");
     return 0;
 }

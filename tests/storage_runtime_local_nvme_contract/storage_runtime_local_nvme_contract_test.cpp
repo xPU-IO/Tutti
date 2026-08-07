@@ -30,6 +30,8 @@
 #include "tutti/data_paths/local_nvme/io/submit_one.cuh"
 #include <tutti/resolvers/local_file/resolver.h>
 
+#include "../hardware_test_directory.h"
+
 #include <tutti/cuda_like.h>
 
 #include <atomic>
@@ -67,7 +69,7 @@ constexpr std::uint32_t kNumQueues = 16;
 constexpr std::uint32_t kNsId = 1;
 constexpr std::uint32_t kBlockSize = 4096;
 constexpr const char* kDataPathKey = "local-nvme-ext4";
-constexpr const char* kDir = "/mnt/nvme0/GPU0/resolver_test";  // R17 path scheme: device 0 -> /mnt/nvme0
+std::string kDir;
 
 int g_pass = 0;
 int g_fail = 0;
@@ -167,7 +169,17 @@ int main() {
     // Round 16 S3: GPU selection via env TUTTI_TEST_GPU.
     kCudaDev = test_gpu_id();
     cudaSetDevice(kCudaDev);
-    ::mkdir(kDir, 0755);
+
+    tutti::test_support::UniqueTestDirectory run_dir;
+    std::string dir_error;
+    if (!tutti::test_support::UniqueTestDirectory::create(
+            "/mnt/nvme0/GPU0", "tutti_storage_runtime_local_nvme",
+            run_dir, dir_error)) {
+        std::fprintf(stderr, "ERROR: %s\n", dir_error.c_str());
+        return 1;
+    }
+    kDir = run_dir.path();
+    std::printf("Test directory: %s\n", kDir.c_str());
 
     // =====================================================================
     // 1. Assembly / open
@@ -997,7 +1009,16 @@ int main() {
     }
 
     printf("\n=== Summary ===\n  passed: %d\n  failed: %d\n", g_pass, g_fail);
-    if (g_fail > 0) { printf("RESULT: FAIL\n"); return 1; }
+    if (g_fail > 0) {
+        printf("RESULT: FAIL\n");
+        printf("Preserving failed-test artifacts: %s\n", kDir.c_str());
+        return 1;
+    }
+    if (!run_dir.cleanup(dir_error)) {
+        std::fprintf(stderr, "ERROR: test passed but cleanup failed: %s\n",
+                     dir_error.c_str());
+        return 1;
+    }
     printf("RESULT: PASS\n");
     return 0;
 }
