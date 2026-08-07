@@ -43,8 +43,6 @@
 #include <tutti/memory_types.h>
 #include <tutti/presets/local_nvme.h>
 
-#include "../../tests/hardware_test_directory.h"
-
 #include <tutti/cuda_like.h>
 #if defined(TUTTI_USE_CUDA)
 #include <cuda_profiler_api.h>
@@ -279,35 +277,6 @@ int main(int argc,char**argv){
     CUDA_OK(cudaSetDevice(gpu));
     STEP_OK("cudaSetDevice(%d)",gpu);
 
-    // Create only run-scoped directories below the hardware-owned parents.
-    // STEP_FAIL uses _Exit(), so failures intentionally retain these paths.
-    std::vector<tutti::test_support::UniqueTestDirectory> run_dirs;
-    std::vector<std::string> run_mounts;
-    auto add_run_dir = [&](const std::string& parent) {
-        tutti::test_support::UniqueTestDirectory dir;
-        std::string error;
-        if (!tutti::test_support::UniqueTestDirectory::create(
-                parent, "tutti_layerwise_kv_overlap", dir, error)) {
-            STEP_FAIL("%s", error.c_str());
-        }
-        STEP_OK("test directory: %s", dir.path().c_str());
-        run_mounts.push_back(dir.path());
-        run_dirs.push_back(std::move(dir));
-    };
-    if (striped4) {
-        for (int d = 0; d < 4; ++d)
-            add_run_dir("/mnt/nvme" + std::to_string(d));
-    } else {
-        add_run_dir(data_dir);
-        data_dir = run_mounts.front();
-    }
-
-    std::string striped_devs;
-    for (std::size_t i = 0; i < run_mounts.size(); ++i) {
-        if (i != 0) striped_devs += ',';
-        striped_devs += run_mounts[i];
-    }
-
     // ---- Runtime ----
     // R20 S2: uses public preset factory (no private headers).
     // Capacity knobs: in-flight=4, batch_entries=4096 (single) or 8192 (striped)
@@ -360,8 +329,9 @@ int main(int argc,char**argv){
         // StripedResolver path: <mount>/striped/<name>.shard<i>
         // Each shard file = file_total / 4 bytes.
         const uint64_t shard_size = file_total / 4;
+        const char* mounts[] = {"/mnt/nvme0","/mnt/nvme1","/mnt/nvme2","/mnt/nvme3"};
         for (int d = 0; d < 4; ++d) {
-            std::string sdir = run_mounts[d] + "/striped";
+            std::string sdir = std::string(mounts[d]) + "/striped";
             ::mkdir(sdir.c_str(), 0755);
         }
         for(uint64_t i=0;i<n_chunks;++i){
@@ -369,9 +339,9 @@ int main(int argc,char**argv){
             std::snprintf(nm,sizeof(nm),"kvlw_%lu",(unsigned long)i);
             paths[i]=nm;  // store the name (not path) for striped:// URI
             for(int d=0;d<4;++d){
-                std::string sp = run_mounts[d] + "/striped/" + nm +
-                                 ".shard" + std::to_string(d);
-                if(!create_file(sp,shard_size))STEP_FAIL("create_file %s",sp.c_str());
+                char sp[256];
+                std::snprintf(sp,sizeof(sp),"%s/striped/%s.shard%d",mounts[d],nm,d);
+                if(!create_file(sp,shard_size))STEP_FAIL("create_file %s",sp);
             }
         }
         STEP_OK("Phase A (striped4): %lu targets x 4 shards (%.1f GB) in %.2fs",
@@ -447,7 +417,8 @@ int main(int argc,char**argv){
             std::snprintf(rq, sizeof(rq), "&rot=%llu",
                           (unsigned long long)(i % 4));
             uri = std::string("striped://") + paths[i] +
-                  "?devs=" + striped_devs + "&unit=524288" + rq;
+                  "?devs=/mnt/nvme0,/mnt/nvme1,/mnt/nvme2,/mnt/nvme3"
+                  "&unit=524288" + rq;
             opts = OpenOptions{"striped"};
         } else {
             uri = std::string("file://") + paths[i];
@@ -741,13 +712,19 @@ int main(int argc,char**argv){
     for(void* p:_raw_ptrs)CUDA_OK(cudaFree(p));
     for(uint64_t i=0;i<n_chunks;++i){
         RT_STATUS(rt->close(tgt[i]));
+        if (striped4) {
+            for(int d=0;d<4;++d){
+                char sp[256];
+                std::snprintf(sp,sizeof(sp),"/mnt/nvme%d/striped/%s.shard%d",
+                              d+1,paths[i].c_str(),d);
+                ::unlink(sp);
+            }
+        } else {
+            ::unlink(paths[i].c_str());
+        }
     }
     CUDA_OK(cudaStreamDestroy(s_r));CUDA_OK(cudaStreamDestroy(s_c));CUDA_OK(cudaStreamDestroy(s_w));
     RT_STATUS(rt->shutdown(5000));
-    for (auto& dir : run_dirs) {
-        std::string error;
-        if (!dir.cleanup(error)) STEP_FAIL("cleanup: %s", error.c_str());
-    }
     std::fprintf(stderr,"\n=== layerwise_kv_overlap: PASSED ===\n");
     return 0;
 }
