@@ -1,5 +1,4 @@
 #define pr_fmt(fmt) "snvme: " fmt
-#define dev_fmt(fmt) "snvme: " fmt
 
 #include "ctrl.h"
 #include "linux/idr.h"

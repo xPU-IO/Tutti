@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
 #define pr_fmt(fmt) "snvme: " fmt
-#define dev_fmt(fmt) "snvme: " fmt
 
 /*
  * Modified NVM Express device driver
