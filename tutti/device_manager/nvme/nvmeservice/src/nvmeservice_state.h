@@ -69,8 +69,8 @@ struct DeviceSnapshot {
     std::string snvme_dev_path;
     uint32_t    namespace_id         = 0;
     uint32_t    page_size            = 0;
-    uint32_t    blk_size             = 0;
-    uint32_t    blk_size_log         = 0;
+    uint32_t    blk_size             = 0;   // Namespace logical block size in bytes, sourced from NVM_GET_DEV_INFO (1 << Identify Namespace LBA shift).
+    uint32_t    blk_size_log         = 0;   // log2(blk_size)
     uint32_t    queue_depth          = 0;
     uint32_t    dstrd                = 0;
     uint64_t    bar0_size            = 0;
@@ -169,7 +169,8 @@ public:
      * (owner role: chrdev_create + cap + bind + probe).  GPU filesystem
      * views are deliberately NOT created here: the block devices only exist
      * after bring-up, so the daemon must mount them first and then call
-     * publish_gpu_views().  Throws std::runtime_error on bring-up failure.
+     * publish_gpu_views().  Throws std::runtime_error on bring-up failure or
+     * when controller-reported block sizes are not uniform.
      */
     explicit ServiceState(const ServiceConfig& cfg);
     ~ServiceState();

@@ -40,6 +40,11 @@ ServiceState bring-up
         └── /dev/snvme<N>n<NSID> 块设备，供 ext4 mount 使用
         │
         ▼
+检查每个 namespace 报告的 logical block size
+  多盘必须统一；不统一时在 mount/gRPC 前拒绝启动
+  非 4 KiB 的统一值输出 WARNING（当前 striped 假设仍为 4 KiB）
+        │
+        ▼
 MountManager 创建 mount_path 并挂载 ext4
         │
         ▼
@@ -261,7 +266,7 @@ nvmeservice: device=0 pci=0000:31:00.0 snvme=/dev/ssnvme0 ns=1 ...
 mount_manager: mounted /dev/snvme0n1 at /mnt/nvme0 (owned)
 tutti_daemon listening on 127.0.0.1:50051 (port 50051)
 Owned devices:
-  device_id=0 pci=0000:31:00.0 snvme=/dev/ssnvme0 ns=1 ...
+  device_id=0 pci=0000:31:00.0 snvme=/dev/ssnvme0 ns=1 block_size=4096 ...
 ```
 
 `tutti_daemon listening` 只说明 gRPC 已启动。完整成功还必须确认 mount 和 GPU view，
@@ -271,6 +276,16 @@ Owned devices:
 warning: auto-mount ... failed
 warning: ... is not mounted; GPU views ... will not be published
 ```
+
+这里的 block size 指 namespace logical block size，也就是 NVMe Identify Namespace
+中 LBA format 的数据大小：`1 << lba_shift`，单位是 bytes。它不是 controller-wide
+的统一属性，也不是 ext4/filesystem block size 或 physical block size。当前代码保留
+`block_size`/`blk_size` 这一历史字段名；`blk_size_log` 存的是 `log2(blk_size)`，
+也就是对应的 LBA shift。该值来自 controller bring-up 返回的 namespace 信息，不需要在
+YAML 中重复填写。多盘配置若出现例如 `4096` 和 `512` 的混合值，daemon 会输出
+`NVMe block sizes are not uniform` 并在挂载前退出。若所有盘都是同一个非 4 KiB 值，
+daemon 会输出 `WARNING` 后继续启动；这表示该配置不符合当前 striped 4 KiB 假设，
+应在运行 striped workload 前更换为 4 KiB namespace。
 
 在另一个终端执行：
 

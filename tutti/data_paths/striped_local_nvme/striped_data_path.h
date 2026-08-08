@@ -82,7 +82,9 @@ using tutti::Result;
 // -------------------------------------------------------------------------
 // DeviceDescriptor — one NVMe device's configuration.
 //
-// All N devices must share the same block_size (validated in initialize());
+// All N namespaces must share the same logical block size in bytes
+// (block_size, validated in initialize()); this is the NVMe LBA data size, not a
+// filesystem or physical block size.
 // this is a documented assumption, not an SPI constraint.
 // -------------------------------------------------------------------------
 struct DeviceDescriptor {

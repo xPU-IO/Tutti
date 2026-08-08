@@ -90,8 +90,50 @@ const std::string* ServiceState::gpu_mount_for(int gpu_id) const {
 ServiceState::ServiceState(const ServiceConfig& cfg) : cfg_(cfg) {
     devices_.reserve(cfg_.nvmes.size());
 
-    for (size_t i = 0; i < cfg_.nvmes.size(); ++i) {
-        init_device(cfg_.nvmes[i], static_cast<int32_t>(i));
+    auto release_brought_up_devices = [&]() {
+        for (auto& dev : devices_) {
+            if (dev.ctrl != nullptr) {
+                nvm_ctrl_free(dev.ctrl);
+                dev.ctrl = nullptr;
+            }
+        }
+    };
+
+    try {
+        for (size_t i = 0; i < cfg_.nvmes.size(); ++i) {
+            init_device(cfg_.nvmes[i], static_cast<int32_t>(i));
+        }
+
+        // disk.block_size is the logical block size of each configured
+        // namespace, in bytes (1 << namespace LBA shift), not a
+        // controller-wide or filesystem block size.
+        std::vector<uint32_t> block_sizes;
+        block_sizes.reserve(devices_.size());
+        for (const auto& dev : devices_) {
+            block_sizes.push_back(dev.blk_size);
+        }
+        std::string block_size_error;
+        if (!validate_uniform_block_size(block_sizes, &block_size_error)) {
+            // Keep the 4 KiB warning visible even when the same startup is
+            // rejected for a mixed-size topology.
+            for (const auto& dev : devices_) {
+                if (dev.blk_size != kExpectedNvmeBlockSize) {
+                    std::fprintf(stderr,
+                                 "WARNING: NVMe device_id=%d pci=%s reports "
+                                 "block_size=%u bytes; expected %u bytes "
+                                 "for striped operation\n",
+                                 dev.device_id, dev.pci_addr.c_str(),
+                                 dev.blk_size, kExpectedNvmeBlockSize);
+                }
+            }
+            throw std::runtime_error(block_size_error);
+        }
+    } catch (...) {
+        // A constructor that fails does not run ServiceState::~ServiceState.
+        // Release controllers already brought up before propagating the
+        // original error, including a later block-size validation failure.
+        release_brought_up_devices();
+        throw;
     }
 }
 

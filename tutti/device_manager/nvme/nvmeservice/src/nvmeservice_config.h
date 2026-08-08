@@ -59,6 +59,13 @@
 
 namespace nvmeservice {
 
+// The striped data path currently assumes 4 KiB namespace logical blocks.
+// The controller reports the value for each namespace during bring-up; this
+// constant is only the value used for the daemon's operator-facing warning.
+// It is not a controller-wide format setting, a filesystem block size, or a
+// physical block size.  Values are bytes (1 << Identify Namespace LBA shift).
+constexpr uint32_t kExpectedNvmeBlockSize = 4096;
+
 struct GrpcConfig {
     std::string endpoint = "127.0.0.1:50051";
 };
@@ -141,6 +148,14 @@ std::optional<ServiceConfig> parse_config_file(const std::string& path,
  * lives in the kernel now.
  */
 bool validate_config(const ServiceConfig& cfg, std::string* error = nullptr);
+
+// Validate the invariant required by striped operation: every namespace
+// brought up by one daemon must report the same logical block size in bytes.
+// A non-4 KiB value is intentionally not rejected here; callers warn about it
+// separately so a uniform non-default namespace remains usable for
+// non-striped workloads.
+bool validate_uniform_block_size(const std::vector<uint32_t>& block_sizes,
+                                 std::string* error = nullptr);
 
 } // namespace nvmeservice
 

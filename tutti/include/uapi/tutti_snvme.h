@@ -245,7 +245,7 @@ struct nvm_ioctl_dev
     uint32_t    start_cq_idx;       /* first QID available to user IOQs */
     uint8_t     dstrd;              /* CAP.DSTRD: doorbell stride exponent */
     uint64_t    max_data_size;      /* was size_t; CTRL.MDTS in bytes */
-    uint64_t    block_size;         /* was size_t; 1 << ns->lba_shift */
+    uint64_t    block_size;         /* was size_t; Namespace logical block size in bytes: 1 << ns->lba_shift. */
     char        disk_name[DISK_NAME_LEN];
 
     /* === B3 fields === */

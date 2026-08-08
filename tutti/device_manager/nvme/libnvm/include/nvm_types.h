@@ -344,7 +344,7 @@ struct disk
     size_t      page_size;
     size_t      max_data_size;
     uint32_t    ns_id;
-    size_t      block_size;
+    size_t      block_size;     // Namespace logical block size in bytes (1 << ns->lba_shift)
     char       disk_name[32];
 };
 

@@ -71,8 +71,8 @@ message DeviceInfo {
     string  snvme_dev_path       = 3;   // e.g. "/dev/ssnvme0"
     uint32  namespace_id         = 4;
     uint32  page_size            = 5;   // NVMe page size (bytes)
-    uint32  blk_size             = 6;   // logical block size (bytes)
-    uint32  blk_size_log         = 7;   // log2(blk_size)
+    uint32  blk_size             = 6;   // Namespace logical block size (bytes)
+    uint32  blk_size_log         = 7;   // log2(blk_size), i.e. LBA shift
     uint32  queue_depth          = 8;   // entries per queue (NVMe MQES+1)
     uint32  dstrd                = 9;   // doorbell stride (encoded)
     uint64  bar0_size            = 10;  // BAR0 region length (for client mmap)

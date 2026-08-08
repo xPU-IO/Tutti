@@ -4,13 +4,15 @@
 // These tests do NOT touch the running daemon or real NVMe devices.
 // They verify:
 //   1. config parsing (auto_mount field, unmount_retry block, defaults)
-//   2. is_mounted() against /proc/self/mountinfo
-//   3. scan_holders() finds the test process itself when it holds an fd
-//   4. mount_one() recursively prepares a configured mount point
-//   5. mount_one() + unmount_all() lifecycle using a loopback tmpfs
-//   6. force_exit_requested() short-circuits the retry loop
-//   7. path_is_prefix() edge cases (not directly exposed, but tested
+//   2. controller-reported block-size uniformity policy
+//   3. is_mounted() against /proc/self/mountinfo
+//   4. scan_holders() finds the test process itself when it holds an fd
+//   5. mount_one() recursively prepares a configured mount point
+//   6. mount_one() + unmount_all() lifecycle using a loopback tmpfs
+//   7. force_exit_requested() short-circuits the retry loop
+//   8. path_is_prefix() edge cases (not directly exposed, but tested
 //      indirectly via scan_holders with paths that share prefixes)
+//   9. scan_holders() finds a child process cwd
 
 #include "mount_manager.h"
 #include "nvmeservice_config.h"
@@ -140,10 +142,33 @@ static void test_config_defaults() {
 }
 
 // =====================================================================
-// Test 3: is_mounted — /proc/self/mountinfo should list /proc, /sys, etc.
+// Test 3: block-size policy — uniformity is required, 4 KiB is a warning
+// =====================================================================
+static void test_block_size_policy() {
+    std::fprintf(stderr, "=== Test 3: block-size policy ===\n");
+
+    std::string error;
+    CHECK(nvmeservice::validate_uniform_block_size({4096, 4096}, &error),
+          "uniform 4 KiB block sizes are accepted");
+    CHECK(nvmeservice::validate_uniform_block_size({512, 512}, &error),
+          "uniform non-4 KiB block sizes are accepted for warning-only policy");
+
+    error.clear();
+    CHECK(!nvmeservice::validate_uniform_block_size({4096, 512}, &error),
+          "mixed block sizes are rejected");
+    CHECK(error.find("not uniform") != std::string::npos,
+          "mixed block size error identifies uniformity violation");
+
+    error.clear();
+    CHECK(!nvmeservice::validate_uniform_block_size({}, &error),
+          "missing block sizes are rejected");
+}
+
+// =====================================================================
+// Test 4: is_mounted — /proc/self/mountinfo should list /proc, /sys, etc.
 // =====================================================================
 static void test_is_mounted() {
-    std::fprintf(stderr, "=== Test 3: is_mounted ===\n");
+    std::fprintf(stderr, "=== Test 4: is_mounted ===\n");
 
     // /proc is always mounted on Linux.
     CHECK(nvmeservice::MountManager::is_mounted("/proc"), "/proc is mounted");
@@ -156,10 +181,10 @@ static void test_is_mounted() {
 }
 
 // =====================================================================
-// Test 4: scan_holders — the test process holds an fd on /tmp
+// Test 5: scan_holders — the test process holds an fd on /tmp
 // =====================================================================
 static void test_scan_holders_self() {
-    std::fprintf(stderr, "=== Test 4: scan_holders (self) ===\n");
+    std::fprintf(stderr, "=== Test 5: scan_holders (self) ===\n");
 
     // Open a file under /tmp and keep the fd open while scanning.
     char tmpl[] = "/tmp/tutti_holderXXXXXX";
@@ -184,10 +209,10 @@ static void test_scan_holders_self() {
 }
 
 // =====================================================================
-// Test 5: mount_one owns recursive mount-point preparation
+// Test 6: mount_one owns recursive mount-point preparation
 // =====================================================================
 static void test_recursive_mount_point_creation() {
-    std::fprintf(stderr, "=== Test 5: recursive mount-point creation ===\n");
+    std::fprintf(stderr, "=== Test 6: recursive mount-point creation ===\n");
 
     char base_template[] = "/tmp/tutti_mount_pathXXXXXX";
     char* base_dir = ::mkdtemp(base_template);
@@ -211,10 +236,10 @@ static void test_recursive_mount_point_creation() {
 }
 
 // =====================================================================
-// Test 6: mount_one + unmount_all lifecycle with tmpfs
+// Test 7: mount_one + unmount_all lifecycle with tmpfs
 // =====================================================================
 static void test_mount_lifecycle() {
-    std::fprintf(stderr, "=== Test 6: mount lifecycle (tmpfs) ===\n");
+    std::fprintf(stderr, "=== Test 7: mount lifecycle (tmpfs) ===\n");
 
     // Create a directory to use as mount point.
     char mnt_template[] = "/tmp/tutti_mntXXXXXX";
@@ -263,10 +288,10 @@ static void test_mount_lifecycle() {
 }
 
 // =====================================================================
-// Test 7: force_exit short-circuits retry loop
+// Test 8: force_exit short-circuits retry loop
 // =====================================================================
 static void test_force_exit() {
-    std::fprintf(stderr, "=== Test 7: force_exit ===\n");
+    std::fprintf(stderr, "=== Test 8: force_exit ===\n");
 
     nvmeservice::UnmountRetryConfig rc;
     rc.interval_ms = 10000;  // long sleep so force_exit triggers during wait
@@ -282,10 +307,10 @@ static void test_force_exit() {
 }
 
 // =====================================================================
-// Test 8: scan_holders with cwd — child process cd's into a mount
+// Test 9: scan_holders with cwd — child process cd's into a mount
 // =====================================================================
 static void test_scan_holders_cwd() {
-    std::fprintf(stderr, "=== Test 8: scan_holders (cwd) ===\n");
+    std::fprintf(stderr, "=== Test 9: scan_holders (cwd) ===\n");
 
     // Fork a child that cd's into /tmp and sleeps.
     pid_t pid = ::fork();
@@ -317,6 +342,7 @@ static void test_scan_holders_cwd() {
 int main() {
     test_config_parsing();
     test_config_defaults();
+    test_block_size_policy();
     test_is_mounted();
     test_scan_holders_self();
     test_recursive_mount_point_creation();

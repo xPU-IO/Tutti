@@ -226,7 +226,9 @@ int ioctl_get_dev_info(nvm_ctrl_t* ctrl, struct disk* d)
      * code only got away with on controllers whose MDTS happens to be
      * 0 or whose IO never exceeded the bogus inflated cap. */
     d->max_data_size = dev_info.max_data_size;
-    d->block_size = dev_info.block_size; // ns->lba_shift
+    // NVM_GET_DEV_INFO returns the namespace logical block size in bytes:
+    // 1 << Identify Namespace LBA shift.  It is not the shift value itself.
+    d->block_size = dev_info.block_size;
     memcpy(d->disk_name, dev_info.disk_name, DISK_NAME_LEN * sizeof(char));
     nvm_debug("Disk info: start cq idx=%u q_depth=%u max_user_qid=%u "
               "max_data_size=%zu block_size=%zu sgls=0x%x",

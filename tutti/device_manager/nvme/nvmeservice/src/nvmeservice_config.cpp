@@ -193,4 +193,27 @@ bool validate_config(const ServiceConfig& cfg, std::string* error) {
     return true;
 }
 
+bool validate_uniform_block_size(const std::vector<uint32_t>& block_sizes,
+                                 std::string* error) {
+    if (block_sizes.empty()) {
+        if (error) *error = "no NVMe block sizes were reported";
+        return false;
+    }
+
+    const uint32_t expected = block_sizes.front();
+    for (size_t i = 1; i < block_sizes.size(); ++i) {
+        if (block_sizes[i] == expected) continue;
+
+        if (error) {
+            std::ostringstream ss;
+            ss << "NVMe block sizes are not uniform: device 0 reports "
+               << expected << " bytes, device " << i << " reports "
+               << block_sizes[i] << " bytes";
+            *error = ss.str();
+        }
+        return false;
+    }
+    return true;
+}
+
 } // namespace nvmeservice
