@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
+#define pr_fmt(fmt) "snvme: " fmt
+#define dev_fmt(fmt) "snvme: " fmt
+
 /*
  * Modified NVM Express device driver
  */
@@ -366,7 +369,7 @@ static void nvme_dbbuf_init(struct nvme_dev *dev,
 {
 	if (!dev->dbbuf_dbs || !qid)
 		return;
-	printk("nvme_dbbuf_init\n");
+	pr_info("nvme_dbbuf_init\n");
 	nvmeq->dbbuf_sq_db = &dev->dbbuf_dbs[sq_idx(qid, dev->db_stride)];
 	nvmeq->dbbuf_cq_db = &dev->dbbuf_dbs[cq_idx(qid, dev->db_stride)];
 	nvmeq->dbbuf_sq_ei = &dev->dbbuf_eis[sq_idx(qid, dev->db_stride)];
@@ -478,8 +481,10 @@ static int nvme_admin_init_hctx(struct blk_mq_hw_ctx *hctx, void *data,
 	struct nvme_dev *dev = data;
 	struct nvme_queue *nvmeq = &dev->queues[0];
 
-	WARN_ON(hctx_idx != 0);
-	WARN_ON(dev->admin_tagset.tags[0] != hctx->tags);
+	WARN(hctx_idx != 0, "snvme: unexpected admin hctx index %u\n",
+	     hctx_idx);
+	WARN(dev->admin_tagset.tags[0] != hctx->tags,
+	     "snvme: admin tagset mismatch\n");
 
 	hctx->driver_data = nvmeq;
 	return 0;
@@ -491,7 +496,8 @@ static int nvme_init_hctx(struct blk_mq_hw_ctx *hctx, void *data,
 	struct nvme_dev *dev = data;
 	struct nvme_queue *nvmeq = &dev->queues[hctx_idx + 1];
 
-	WARN_ON(dev->tagset.tags[hctx_idx] != hctx->tags);
+	WARN(dev->tagset.tags[hctx_idx] != hctx->tags,
+	     "snvme: tagset mismatch for hctx %u\n", hctx_idx);
 	hctx->driver_data = nvmeq;
 	return 0;
 }
@@ -790,7 +796,7 @@ free_prps:
 	return BLK_STS_RESOURCE;
 bad_sgl:
 	WARN(DO_ONCE(nvme_print_sgl, iod->sg, iod->nents),
-			"Invalid SGL for payload:%d nents:%d\n",
+			"snvme: Invalid SGL for payload:%d nents:%d\n",
 			blk_rq_payload_bytes(req), iod->nents);
 	return BLK_STS_IOERR;
 }
@@ -1838,7 +1844,7 @@ static int nvme_remap_bar(struct nvme_dev *dev, unsigned long size)
 		return 0;
 	if (size > pci_resource_len(pdev, 0))
 		return -ENOMEM;
-	printk("nvme_remap_bar bar size is %llx\n", pci_resource_len(pdev, 0));
+	pr_info("nvme_remap_bar bar size is %llx\n", pci_resource_len(pdev, 0));
 	if (dev->bar)
 		iounmap(dev->bar);
 	dev->bar = ioremap(pci_resource_start(pdev, 0), size);
@@ -2436,7 +2442,7 @@ static int s_nvme_setup_io_queues(struct nvme_dev *dev)
 	 */
 	if (dev->cap_kernel_ioq &&
 	    nr_io_queues > dev->cap_kernel_ioq) {
-		pr_info("snvme: capping kernel-side IOQ count from %u to %u "
+		pr_info("capping kernel-side IOQ count from %u to %u "
 			"(ctrl_max=%u, user pool gets [%u..%u])\n",
 			nr_io_queues, dev->cap_kernel_ioq,
 			dev->ctrl_max_io_queues,
@@ -2500,8 +2506,8 @@ static int s_nvme_setup_io_queues(struct nvme_dev *dev)
 	dev->num_vecs = result;
 	result = max(result - 1, 1);
 	dev->max_qid = result + dev->io_queues[HCTX_TYPE_POLL];
-	printk("nvme_setup_io_queues max_id is %d\n",dev->max_qid);
-	printk("nvme_setup_io_queues online_queues is %d\n",dev->online_queues);
+	pr_info("nvme_setup_io_queues max_id is %d\n",dev->max_qid);
+	pr_info("nvme_setup_io_queues online_queues is %d\n",dev->online_queues);
 	/*
 	 * Should investigate if there's a performance win from allocating
 	 * more queues than interrupt vectors; it might allow the submission
@@ -2515,7 +2521,7 @@ static int s_nvme_setup_io_queues(struct nvme_dev *dev)
 	mutex_unlock(&dev->shutdown_lock);
 
 	result = nvme_create_io_queues(dev);
-	printk("create io queue finish max_id is %d, online_queues is %d\n",dev->max_qid,dev->online_queues);
+	pr_info("create io queue finish max_id is %d, online_queues is %d\n",dev->max_qid,dev->online_queues);
 
 	if (result || dev->online_queues < 2)
 		return result;
@@ -2689,7 +2695,7 @@ static int nvme_pci_enable(struct nvme_dev *dev)
 	dev->db_stride = 1 << NVME_CAP_STRIDE(dev->ctrl.cap);
 	
 	dev->dbs = dev->bar + 4096;
-	printk("nvme_pci_enable is dev->q_depth %u\n",dev->q_depth);
+	pr_info("nvme_pci_enable is dev->q_depth %u\n",dev->q_depth);
 	/*
 	 * Some Apple controllers require a non-standard SQE size.
 	 * Interestingly they also seem to ignore the CC:IOSQES register
@@ -2907,7 +2913,7 @@ static void nvme_reset_work(struct work_struct *work)
 	result = nvme_pci_enable(dev);
 	if (result)
 		goto out_unlock;
-	printk("dev->db_stride is %u\n",dev->db_stride);
+	pr_info("dev->db_stride is %u\n",dev->db_stride);
 	result = nvme_pci_configure_admin_queue(dev);
 	if (result)
 		goto out_unlock;
@@ -3172,7 +3178,7 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	ctrl = ctrl_find_by_pci_dev(&ctrl_list, pdev);
 	if (ctrl == NULL) {
 		dev_info(&pdev->dev,
-		         "snvme: no ctrl registered for this BDF, skipping probe "
+		         "no ctrl registered for this BDF, skipping probe "
 		         "(user must call SNVM_CHRDEV_CREATE first)\n");
 		return -ENODEV;
 	}
@@ -3822,7 +3828,7 @@ static int snvm_user_qid_pool_init_locked(struct ctrl *ctrl,
 	 * nr_allocated_queues-1 estimate.
 	 */
 	if (!ndev->ctrl_max_io_queues) {
-		pr_warn("snvme: user QID pool: ctrl_max_io_queues=0 "
+		pr_warn("user QID pool: ctrl_max_io_queues=0 "
 			"(probe did not complete the Set-Features negotiation?)\n");
 		return -ENODEV;
 	}
@@ -3830,7 +3836,7 @@ static int snvm_user_qid_pool_init_locked(struct ctrl *ctrl,
 	first = ndev->online_queues;
 	last  = ndev->ctrl_max_io_queues;
 	if (first > last) {
-		pr_warn("snvme: user QID pool empty (online=%u, ctrl_max=%u); "
+		pr_warn("user QID pool empty (online=%u, ctrl_max=%u); "
 			"controller refused to leave room for user IOQs.  "
 			"Lower cap_kernel_ioq via NVM_SET_IOQ_NUM before bind, "
 			"or attach to a controller with a larger MSI-X grant.\n",
@@ -3847,7 +3853,7 @@ static int snvm_user_qid_pool_init_locked(struct ctrl *ctrl,
 	ctrl->user_qid_last   = last;
 	ctrl->user_qid_bitmap = bm;
 
-	pr_info("snvme: user QID pool initialised: [%u..%u] (%u QIDs)\n",
+	pr_info("user QID pool initialised: [%u..%u] (%u QIDs)\n",
 		first, last, count);
 	return 0;
 }
@@ -3899,13 +3905,13 @@ static void snvm_user_qid_free_locked(struct ctrl *ctrl, uint16_t qid)
 	unsigned int bit;
 
 	if (qid < ctrl->user_qid_first || qid > ctrl->user_qid_last) {
-		pr_warn("snvme: user_qid_free: qid %u outside pool [%u..%u]\n",
+		pr_warn("user_qid_free: qid %u outside pool [%u..%u]\n",
 			qid, ctrl->user_qid_first, ctrl->user_qid_last);
 		return;
 	}
 	bit = qid - ctrl->user_qid_first;
 	if (!test_and_clear_bit(bit, ctrl->user_qid_bitmap))
-		pr_warn("snvme: user_qid_free: qid %u was already free\n", qid);
+		pr_warn("user_qid_free: qid %u was already free\n", qid);
 }
 
 /*
@@ -3999,12 +4005,12 @@ static void destroy_qgroup_locked(struct snvm_qgroup *g, struct ctrl *ctrl)
 			int rc;
 			rc = adapter_delete_sq(ndev, uq->qid);
 			if (rc)
-				pr_warn("snvme: destroy_qgroup id=%u: "
+				pr_warn("destroy_qgroup id=%u: "
 					"Delete I/O SQ qid=%u failed: %d\n",
 					g->group_id, uq->qid, rc);
 			rc = adapter_delete_cq(ndev, uq->qid);
 			if (rc)
-				pr_warn("snvme: destroy_qgroup id=%u: "
+				pr_warn("destroy_qgroup id=%u: "
 					"Delete I/O CQ qid=%u failed: %d\n",
 					g->group_id, uq->qid, rc);
 		}
@@ -4019,7 +4025,7 @@ static void destroy_qgroup_locked(struct snvm_qgroup *g, struct ctrl *ctrl)
 		n_queues++;
 	}
 	if (n_queues)
-		pr_info("snvme: destroy_qgroup id=%u drained %u user queue(s)\n",
+		pr_info("destroy_qgroup id=%u drained %u user queue(s)\n",
 			g->group_id, n_queues);
 	g->cur_queues = 0;
 
@@ -4036,7 +4042,7 @@ static void destroy_qgroup_locked(struct snvm_qgroup *g, struct ctrl *ctrl)
 		n_drained++;
 	}
 	if (n_drained)
-		pr_info("snvme: destroy_qgroup id=%u drained %u map(s)\n",
+		pr_info("destroy_qgroup id=%u drained %u map(s)\n",
 			g->group_id, n_drained);
 
 	g->nr_maps = 0;
@@ -4127,7 +4133,7 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
     ctrl = ctrl_find_by_inode(&ctrl_list, file->f_inode);
     if (ctrl == NULL)
     {
-        printk(KERN_CRIT "Unknown controller reference snvm_dev_map_ioctl\n");
+        pr_crit("Unknown controller reference snvm_dev_map_ioctl\n");
         return -EBADF;
     }
     switch (cmd)
@@ -4426,7 +4432,7 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
                 break;
             }
             ret = -EINVAL;
-            printk(KERN_WARNING "NVM_UNMAP_HOST_MEMORY Mapping for address %llx not found\n", addr);
+            pr_warn("NVM_UNMAP_HOST_MEMORY Mapping for address %llx not found\n", addr);
             break;
 		}
         case NVM_UNMAP_DEVICE_MEMORY:
@@ -4469,7 +4475,7 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
                 break;
             }
             ret = -EINVAL;
-            printk(KERN_WARNING "NVM_UNMAP_DEVICE_MEMORY Mapping for address %llx not found\n", addr);
+            pr_warn("NVM_UNMAP_DEVICE_MEMORY Mapping for address %llx not found\n", addr);
             break;
 		}
         case NVM_UNMAP_DEVICE_QUEUE_MEMORY:
@@ -4487,7 +4493,7 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
                 break;
             }
             ret = -EINVAL;
-            printk(KERN_WARNING "NVM_UNMAP_DEVICE_QUEUE_MEMORY Mapping for address %llx not found\n", addr);
+            pr_warn("NVM_UNMAP_DEVICE_QUEUE_MEMORY Mapping for address %llx not found\n", addr);
             break;
 		}
 		case NVM_GET_DEV_INFO:
@@ -4514,7 +4520,7 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
 
 			ndev = pci_get_drvdata(ctrl->pdev);
 			if (ndev == NULL) {
-				printk(" pci_get_drvdata error\n");
+				pr_info(" pci_get_drvdata error\n");
 				return -EFAULT;
 			}
 
@@ -4530,11 +4536,11 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
 					ns = snvme_find_get_ns(&ndev->ctrl, 1);
 				}
 				if (!ns) {
-					pr_err("snvme: snvme_find_get_ns(nsid=1) failed after %u ms wait (state=%d)\n",
+					pr_err("snvme_find_get_ns(nsid=1) failed after %u ms wait (state=%d)\n",
 					       wait_ms, ndev->ctrl.state);
 					return -EFAULT;
 				}
-				pr_info("snvme: NVM_GET_DEV_INFO: nsid=1 ready after %u ms scan wait\n",
+				pr_info("NVM_GET_DEV_INFO: nsid=1 ready after %u ms scan wait\n",
 					wait_ms);
 			}
 
@@ -4714,7 +4720,7 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
 				return -EFAULT;
 			}
 
-			pr_debug("snvme: NVM_CREATE_QUEUE_GROUP id=%u max_queues=%u pid=%d\n",
+			pr_debug("NVM_CREATE_QUEUE_GROUP id=%u max_queues=%u pid=%d\n",
 				 g->group_id, g->max_queues, current->pid);
 			ret = 0;
 			break;
@@ -4755,12 +4761,12 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
 			mutex_unlock(&own->groups_lock);
 
 			if (!found) {
-				pr_debug("snvme: NVM_DESTROY_QUEUE_GROUP id=%u not found on fd (pid=%d)\n",
+				pr_debug("NVM_DESTROY_QUEUE_GROUP id=%u not found on fd (pid=%d)\n",
 					 group_id, current->pid);
 				return -ENOENT;
 			}
 
-			pr_debug("snvme: NVM_DESTROY_QUEUE_GROUP id=%u pid=%d\n",
+			pr_debug("NVM_DESTROY_QUEUE_GROUP id=%u pid=%d\n",
 				 group_id, current->pid);
 			ret = 0;
 			break;
@@ -4985,13 +4991,13 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
 			for (i = 0; i < req->nr_pairs; i++) {
 				rc = adapter_alloc_cq_user(uq_ndev, cq_maps[i], qids[i]);
 				if (rc) {
-					pr_warn("snvme: NVM_ADD_USER_QUEUE: Create I/O CQ qid=%u rc=%d\n",
+					pr_warn("NVM_ADD_USER_QUEUE: Create I/O CQ qid=%u rc=%d\n",
 						qids[i], rc);
 					goto rollback_unlocked;
 				}
 				rc = adapter_alloc_sq_user(uq_ndev, sq_maps[i], qids[i]);
 				if (rc) {
-					pr_warn("snvme: NVM_ADD_USER_QUEUE: Create I/O SQ qid=%u rc=%d\n",
+					pr_warn("NVM_ADD_USER_QUEUE: Create I/O SQ qid=%u rc=%d\n",
 						qids[i], rc);
 					/*
 					 * SQ failed but CQ for this i was already
@@ -5052,7 +5058,7 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
 				return -EFAULT;
 			}
 
-			pr_info("snvme: NVM_ADD_USER_QUEUE group=%u created %u queue(s) (qids %u..%u)\n",
+			pr_info("NVM_ADD_USER_QUEUE group=%u created %u queue(s) (qids %u..%u)\n",
 				req->group_id, req->nr_pairs,
 				qids[0], qids[req->nr_pairs - 1]);
 			kfree(req);
@@ -5100,12 +5106,12 @@ rollback_unlocked:
 			ctrl->setup.cap_kernel_ioq = cap;
 			ctrl->setup.valid          = 1;
 
-			pr_info("snvme: NVM_SET_KERNEL_IOQ_CAP cap=%u\n", cap);
+			pr_info("NVM_SET_KERNEL_IOQ_CAP cap=%u\n", cap);
 			ret = 0;
 			break;
 		}
         default:
-            printk(KERN_NOTICE "Unknown ioctl command from process %d: %u\n",
+            pr_notice("Unknown ioctl command from process %d: %u\n",
                     current->pid, cmd);
             ret = -EINVAL;
             break;
@@ -5119,13 +5125,13 @@ static int svm_mmap_registers(struct file* file, struct vm_area_struct* vma)
     ctrl = ctrl_find_by_inode(&ctrl_list, file->f_inode);
     if (ctrl == NULL || ctrl->pdev == NULL)
     {
-        printk(KERN_CRIT "Unknown controller reference svm_mmap_registers\n");
+        pr_crit("Unknown controller reference svm_mmap_registers\n");
         return -EBADF;
     }
 
     if (vma->vm_end - vma->vm_start > pci_resource_len(ctrl->pdev, 0))
     {
-        printk(KERN_WARNING "Invalid range size\n");
+        pr_warn("Invalid range size\n");
         return -EINVAL;
     }
 	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
@@ -5140,7 +5146,7 @@ static int snvm_dev_open(struct inode *inode, struct file *file)
 
 	ctrl = ctrl_find_by_inode(&ctrl_list, inode);
 	if (!ctrl) {
-		pr_err("snvme: snvm_dev_open: no ctrl for inode\n");
+		pr_err("snvm_dev_open: no ctrl for inode\n");
 		return -ENODEV;
 	}
 
@@ -5200,7 +5206,7 @@ static int snvm_dev_release(struct inode *inode, struct file *file)
 	mutex_unlock(&own->groups_lock);
 
 	if (n_groups)
-		pr_info("snvme: snvm_dev_release: cascade-destroyed %u orphan group(s) for pid=%d\n",
+		pr_info("snvm_dev_release: cascade-destroyed %u orphan group(s) for pid=%d\n",
 			n_groups, owner ? owner->pid : -1);
 
 	/*
@@ -5228,7 +5234,7 @@ static int snvm_dev_release(struct inode *inode, struct file *file)
 		mutex_unlock(&own->data_maps_lock);
 
 		if (n_data)
-			pr_info("snvme: snvm_dev_release: cascade-released %u DATA map(s) for pid=%d\n",
+			pr_info("snvm_dev_release: cascade-released %u DATA map(s) for pid=%d\n",
 				n_data, owner ? owner->pid : -1);
 	}
 
@@ -5238,7 +5244,7 @@ static int snvm_dev_release(struct inode *inode, struct file *file)
 	n_devq = map_purge_by_owner(&device_queue_list, owner);
 
 	if (n_host || n_dev || n_devq)
-		pr_info("snvme: snvm_dev_release: reclaimed host=%lu dev=%lu devq=%lu for pid=%d\n",
+		pr_info("snvm_dev_release: reclaimed host=%lu dev=%lu devq=%lu for pid=%d\n",
 			n_host, n_dev, n_devq,
 			owner ? owner->pid : -1);
 
@@ -5263,7 +5269,7 @@ static int snvm_chrdev_create(struct pci_dev *pdev, unsigned int class){
 	struct ctrl* ctrl = NULL;
 	int minor, err;
 	if (pdev->class != class) {
-		printk("unexpected pci class mismatch, abort path find!\n");
+		pr_info("unexpected pci class mismatch, abort path find!\n");
 		return -1;
 	}
 	minor = ida_simple_get(&snvm_chrdev_minor_ida, 0, 0, GFP_KERNEL);
@@ -5363,7 +5369,7 @@ static int register_driver(void){
 	if (!dev_drv && !snvm_registered){
 		ret = snvm_register_driver();
 		if (ret){
-			printk("snvm register driver error\n");
+			pr_info("snvm register driver error\n");
 		}else{
 			snvm_registered = 1;
 		}
@@ -5379,18 +5385,18 @@ static int clean_driver(void){
 	//clear device mem map
 	remaining = clear_map_list(&device_list);
 	if (remaining){
-		printk(KERN_NOTICE "%lu GPU memory mappings were still in use on unload\n", remaining);
+		pr_notice("%lu GPU memory mappings were still in use on unload\n", remaining);
 	}
 
 	//clear device io queue map
 	remaining = clear_map_list(&device_queue_list);
 	if (remaining){
-		printk(KERN_NOTICE "%lu GPU memory mappings were still in use on unload\n", remaining);
+		pr_notice("%lu GPU memory mappings were still in use on unload\n", remaining);
 	}
 
 	remaining = clear_map_list(&host_list);
 	if (remaining){
-		printk(KERN_NOTICE "%lu host memory mappings were still in use on unload\n", remaining);
+		pr_notice("%lu host memory mappings were still in use on unload\n", remaining);
 	}
 
 	mutex_lock(&snvm_control_lock);
@@ -5410,7 +5416,7 @@ static int snvm_rebind_driver(struct pci_device_addr dev_addr){
 	pdev = TO_PCI_DEV(dev_addr);
 
 	if (!pdev) {
-		printk("pci_get_domain_bus_and_slot failed\n");
+		pr_info("pci_get_domain_bus_and_slot failed\n");
 		return -ENODEV;
 	}
 	// fixme
@@ -5418,12 +5424,12 @@ static int snvm_rebind_driver(struct pci_device_addr dev_addr){
 	if (dev_drv && dev_drv->name) { // whatever driver is binded to aviod automatic binding
 		if (pci_is_enabled(pdev)){
 			pci_disable_device(pdev);
-			printk("(%s): disable device for bind new driver\n", __func__);
+			pr_info("(%s): disable device for bind new driver\n", __func__);
 		}
 		device_release_driver(&pdev->dev);
 	}
 
-	printk("start to bind nvme device to snvme: pci %x:%x:%x.%x\n",
+	pr_info("start to bind nvme device to snvme: pci %x:%x:%x.%x\n",
 														dev_addr.domain,
 														dev_addr.bus, 
 														dev_addr.slot, 
@@ -5432,7 +5438,7 @@ static int snvm_rebind_driver(struct pci_device_addr dev_addr){
 	// fixme: wait for new driver binding
 
 	if (register_driver()){
-		printk("register driver error\n");
+		pr_info("register driver error\n");
 		pci_dev_put(pdev);
 		return -EFAULT;
 	}
@@ -5440,12 +5446,12 @@ static int snvm_rebind_driver(struct pci_device_addr dev_addr){
 	// double check to avoid driver automatic binding
 	dev_drv = pdev->dev.driver;
 	if (dev_drv){
-		printk("device driver name: %s\n", dev_drv->name);
+		pr_info("device driver name: %s\n", dev_drv->name);
 	}
 	if (!dev_drv){
 		ret = device_driver_attach(&snvme_driver.driver, &pdev->dev);
 		if (ret){
-			printk("%s: device driver attach %d", __func__, ret);
+			pr_info("%s: device driver attach %d", __func__, ret);
 		}
 	}
 	pci_dev_put(pdev);
@@ -5458,24 +5464,24 @@ static int snvm_unbind_driver(struct pci_device_addr dev_addr){
 
 	pdev = TO_PCI_DEV(dev_addr);
 	if (!pdev) {
-		printk("(%s): pci_get_domain_bus_and_slot failed\n", __func__);
+		pr_info("(%s): pci_get_domain_bus_and_slot failed\n", __func__);
 		return -EFAULT;
 	}
 
 	dev_drv = pdev->dev.driver;
 	if (!dev_drv){
-		printk("(%s): device do not have driver\n", __func__);
+		pr_info("(%s): device do not have driver\n", __func__);
 		return -EFAULT;
 	}
 
 	if (!dev_drv->name || strcmp(dev_drv->name, PCI_DRIVER_NAME) != 0){
-		printk("(%s): device's driver is not %s\n", __func__, PCI_DRIVER_NAME);
+		pr_info("(%s): device's driver is not %s\n", __func__, PCI_DRIVER_NAME);
 		return -EFAULT;
 	}
 
 	if (pci_is_enabled(pdev)){
 		pci_disable_device(pdev);
-		printk("(%s): disable device for unbind driver\n", __func__);
+		pr_info("(%s): disable device for unbind driver\n", __func__);
 	}
 	pr_info("Unbinding device from driver %s\n", pdev->driver->name);
 	device_release_driver(&pdev->dev);
@@ -5503,7 +5509,7 @@ static int snvm_chrdev_helper(struct pci_device_addr* dev_addr, int create){
 	pdev_addr = *dev_addr;
 	pdev = TO_PCI_DEV(pdev_addr);
 	if (!pdev){
-		printk("(%s): pci_get_domain_bus_and_slot failed\n", __func__);
+		pr_info("(%s): pci_get_domain_bus_and_slot failed\n", __func__);
 		return -EFAULT;
 	}
 
@@ -5560,7 +5566,7 @@ static long snvm_ioctl(struct file *file, unsigned int cmd,
 	int ret;
 
 	if (copy_from_user(&dev_addr, argp, sizeof(dev_addr))){
-		printk("(%s): copy from user error\n", __func__);
+		pr_info("(%s): copy from user error\n", __func__);
 		return -EFAULT;
 	}
 
@@ -5648,7 +5654,7 @@ static void snvm_cdev_release(void)
 	class_destroy(dev_class);
     mutex_destroy(&snvm_control_lock);
 	ida_destroy(&snvm_chrdev_minor_ida);
-	printk("snvme_helpers_cdev_release success!\n");
+	pr_info("snvme_helpers_cdev_release success!\n");
 }
 
 
@@ -5657,7 +5663,7 @@ static int __init nvme_init(void)
     int ret;
     snvm_registered = 0;
 	if(peer_memory_ops.init()) {
-		printk("Could not load peer_memory symbols\n");
+		pr_info("Could not load peer_memory symbols\n");
 		ret = -EOPNOTSUPP;
 		return ret;
 	}
@@ -5679,7 +5685,7 @@ static int __init nvme_init(void)
     ret = snvm_cdev_init();
 	if(ret)
 		return ret;
-	pr_info("snvme: module loaded successfully (io_queue_depth=%u)\n",
+	pr_info("module loaded successfully (io_queue_depth=%u)\n",
 		io_queue_depth);
     return 0;
 }
@@ -5695,19 +5701,19 @@ static void __exit nvme_exit(void)
     remaining = clear_map_list(&device_list);
     if (remaining != 0)
     {
-        printk(KERN_NOTICE "%lu GPU memory mappings were still in use on unload\n", remaining);
+        pr_notice("%lu GPU memory mappings were still in use on unload\n", remaining);
     }
 	//clear device io queue map
     remaining = clear_map_list(&device_queue_list);
     if (remaining != 0)
     {
-        printk(KERN_NOTICE "%lu GPU memory mappings were still in use on unload\n", remaining);
+        pr_notice("%lu GPU memory mappings were still in use on unload\n", remaining);
     }
 
     remaining = clear_map_list(&host_list);
     if (remaining != 0)
     {
-        printk(KERN_NOTICE "%lu host memory mappings were still in use on unload\n", remaining);
+        pr_notice("%lu host memory mappings were still in use on unload\n", remaining);
     }
 
 	/*
@@ -5722,9 +5728,9 @@ static void __exit nvme_exit(void)
 	peer_memory_ops.exit();
 	ret = clear_ctrl_list(&ctrl_list);
 	if(ret!=curr_ctrls)
-		printk("release ctrl error!, cur is %d, release %d",curr_ctrls,ret);
+		pr_info("release ctrl error!, cur is %d, release %d",curr_ctrls,ret);
     snvm_cdev_release();
-	pr_info("snvme: module unloaded successfully\n");
+	pr_info("module unloaded successfully\n");
 
 }
 

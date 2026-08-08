@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
+#define pr_fmt(fmt) "snvme-core: " fmt
+#define dev_fmt(fmt) "snvme-core: " fmt
+
 /*
  * Copyright (c) 2011-2014, Intel Corporation.
  * Copyright (c) 2017-2021 Christoph Hellwig.

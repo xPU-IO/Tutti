@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
+#define pr_fmt(fmt) "snvme-core: " fmt
+#define dev_fmt(fmt) "snvme-core: " fmt
+
 /*
  * Modified NVM Express device driver -- snvme baseline for Linux 5.4
  * Copyright (c) 2011-2014, Intel Corporation.
@@ -465,7 +468,8 @@ static bool nvme_state_terminal(struct nvme_ctrl *ctrl)
 	case NVME_CTRL_DEAD:
 		return true;
 	default:
-		WARN_ONCE(1, "Unhandled ctrl state:%d", ctrl->state);
+		WARN_ONCE(1, "snvme-core: unhandled ctrl state: %d\n",
+			  ctrl->state);
 		return true;
 	}
 }
@@ -3187,8 +3191,7 @@ static ssize_t uuid_show(struct device *dev, struct device_attribute *attr,
 	 * we have no UUID set
 	 */
 	if (uuid_is_null(&ids->uuid)) {
-		printk_ratelimited(KERN_WARNING
-				   "No UUID available providing old NGUID\n");
+		pr_warn_ratelimited("No UUID available providing old NGUID\n");
 		return sprintf(buf, "%pU\n", ids->nguid);
 	}
 	return sprintf(buf, "%pU\n", &ids->uuid);
@@ -4453,6 +4456,8 @@ static int __init nvme_core_init(void)
 		result = PTR_ERR(nvme_subsys_class);
 		goto destroy_class;
 	}
+
+	pr_info("module loaded successfully\n");
 	return 0;
 
 destroy_class:
@@ -4477,6 +4482,7 @@ static void __exit nvme_core_exit(void)
 	destroy_workqueue(s_nvme_delete_wq);
 	destroy_workqueue(s_nvme_reset_wq);
 	destroy_workqueue(s_nvme_wq);
+	pr_info("module unloaded successfully\n");
 }
 
 MODULE_LICENSE("GPL");

@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
+#define pr_fmt(fmt) "snvme-core: " fmt
+#define dev_fmt(fmt) "snvme-core: " fmt
+
 /*
  * Copyright (c) 2017-2018 Christoph Hellwig.
  */
@@ -809,4 +812,3 @@ void nvme_mpath_uninit(struct nvme_ctrl *ctrl)
 	kfree(ctrl->ana_log_buf);
 	ctrl->ana_log_buf = NULL;
 }
-

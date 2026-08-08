@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
+#define pr_fmt(fmt) "snvme-core: " fmt
+#define dev_fmt(fmt) "snvme-core: " fmt
+
 /*
  * NVM Express device driver
  * Copyright (c) 2011-2014, Intel Corporation.
@@ -557,7 +560,8 @@ static bool nvme_state_terminal(struct nvme_ctrl *ctrl)
 	case NVME_CTRL_DEAD:
 		return true;
 	default:
-		WARN_ONCE(1, "Unhandled ctrl state:%d", ctrl->state);
+		WARN_ONCE(1, "snvme-core: unhandled ctrl state: %d\n",
+			  ctrl->state);
 		return true;
 	}
 }
@@ -1538,7 +1542,7 @@ int snvme_set_queue_count(struct nvme_ctrl *ctrl, int *count)
 	status = snvme_set_features(ctrl, NVME_FEAT_NUM_QUEUES, q_count, NULL, 0,
 			&result);
 	nr_io_sq = result & 0x00ff;
-	printk(" snvme_set_queue_count result is %x, nr_io_sq is %u\n", result, nr_io_sq);
+	pr_info(" snvme_set_queue_count result is %x, nr_io_sq is %u\n", result, nr_io_sq);
 	if (status < 0)
 		return status;
 
@@ -3195,8 +3199,7 @@ static ssize_t uuid_show(struct device *dev, struct device_attribute *attr,
 	 * we have no UUID set
 	 */
 	if (uuid_is_null(&ids->uuid)) {
-		printk_ratelimited(KERN_WARNING
-				   "No UUID available providing old NGUID\n");
+		pr_warn_ratelimited("No UUID available providing old NGUID\n");
 		return sysfs_emit(buf, "%pU\n", ids->nguid);
 	}
 	return sysfs_emit(buf, "%pU\n", &ids->uuid);
@@ -4686,7 +4689,7 @@ static int __init nvme_core_init(void)
 		goto unregister_generic_ns;
 	}
 
-	pr_info("snvme_core: module loaded successfully\n");
+	pr_info("module loaded successfully\n");
 	return 0;
 
 unregister_generic_ns:
@@ -4719,7 +4722,7 @@ static void __exit nvme_core_exit(void)
 	destroy_workqueue(s_nvme_wq);
 	ida_destroy(&nvme_ns_chr_minor_ida);
 	ida_destroy(&nvme_instance_ida);
-	pr_info("snvme_core: module unloaded successfully\n");
+	pr_info("module unloaded successfully\n");
 }
 
 MODULE_LICENSE("GPL");

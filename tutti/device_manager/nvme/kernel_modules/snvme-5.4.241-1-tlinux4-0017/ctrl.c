@@ -1,3 +1,6 @@
+#define pr_fmt(fmt) "snvme: " fmt
+#define dev_fmt(fmt) "snvme: " fmt
+
 #include "ctrl.h"
 #include "linux/idr.h"
 #include "list.h"
@@ -17,7 +20,7 @@ struct ctrl* ctrl_get(struct list* list, struct class* cls, struct pci_dev* pdev
     ctrl = kmalloc(sizeof(struct ctrl), GFP_KERNEL | GFP_NOWAIT);
     if (ctrl == NULL)
     {
-        printk(KERN_CRIT "Failed to allocate controller reference\n");
+        pr_crit("Failed to allocate controller reference\n");
         return ERR_PTR(-ENOMEM);
     }
 
@@ -145,7 +148,7 @@ static void ctrl_cdev_release(struct kobject *kobj)
 {
 
     struct ctrl *ctrl = container_of(kobj, struct ctrl, cdev.kobj);
-    printk(KERN_INFO "ctrl_cdev_release %s %p\n", ctrl->name, (void *)kobj);
+    pr_info("ctrl_cdev_release %s %p\n", ctrl->name, (void *)kobj);
     kfree(ctrl->user_qid_bitmap);
     ctrl->user_qid_bitmap = NULL;
     mutex_destroy(&ctrl->user_qid_lock);
@@ -162,19 +165,19 @@ int ctrl_chrdev_create(struct ctrl* ctrl, dev_t first,
 
     if (ctrl->chrdev != NULL)
     {
-        printk(KERN_WARNING "Character device is already created\n");
+        pr_warn("Character device is already created\n");
         return 0;
     }
 
     ctrl->rdev = MKDEV(MAJOR(first), ctrl->number);
-    printk("nuo is %d\n", ctrl->rdev);
+    pr_info("nuo is %d\n", ctrl->rdev);
 
     cdev_init(&ctrl->cdev, fops);
     ctrl->cdev.kobj.ktype = &ctrl_ktype;
 
     err = cdev_add(&ctrl->cdev, ctrl->rdev, 1);
     if (err != 0) {
-        printk(KERN_ERR "Failed to add cdev\n");
+        pr_err("Failed to add cdev\n");
         /* cdev never mapped -> no fd can hold it, refcount == 1.
          * Take ownership of teardown; caller must NOT ctrl_put(). */
         list_remove(&ctrl->list);
@@ -184,7 +187,7 @@ int ctrl_chrdev_create(struct ctrl* ctrl, dev_t first,
 
     chrdev = device_create(ctrl->cls, NULL, ctrl->rdev, NULL, ctrl->name);
     if (IS_ERR(chrdev)) {
-        printk(KERN_ERR "Failed to create character device\n");
+        pr_err("Failed to create character device\n");
         err = PTR_ERR(chrdev);
         list_remove(&ctrl->list);
         cdev_del(&ctrl->cdev);           /* drops ref -> may kfree(ctrl) */
@@ -193,7 +196,7 @@ int ctrl_chrdev_create(struct ctrl* ctrl, dev_t first,
 
     ctrl->chrdev = chrdev;
 
-    printk(KERN_INFO "Character device /dev/%s created (%d.%d)\n",
+    pr_info("Character device /dev/%s created (%d.%d)\n",
             ctrl->name, MAJOR(ctrl->rdev), MINOR(ctrl->rdev));
 
     return 0;
@@ -220,14 +223,13 @@ void ctrl_chrdev_remove(struct ctrl* ctrl)
         strscpy(name, ctrl->name, sizeof(name));
 
         // pci_dev_put(ctrl->pdev);
-        printk("ctrl_chrdev_remove pci_dev_put\n");
+        pr_info("ctrl_chrdev_remove pci_dev_put\n");
         ctrl->chrdev = NULL;
         cdev_del(&ctrl->cdev);       /* may kfree(ctrl) here */
         device_destroy(cls, rdev);   /* use saved values */
 
-        printk(KERN_DEBUG "Character device /dev/%s removed (%d.%d)\n",
+        pr_debug("Character device /dev/%s removed (%d.%d)\n",
                 name, MAJOR(rdev), MINOR(rdev));
     }
 }
 EXPORT_SYMBOL_GPL(ctrl_chrdev_remove);
-

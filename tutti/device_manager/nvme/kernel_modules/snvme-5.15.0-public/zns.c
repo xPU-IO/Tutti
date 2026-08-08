@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
+#define pr_fmt(fmt) "snvme-core: " fmt
+#define dev_fmt(fmt) "snvme-core: " fmt
+
 /*
  * Copyright (C) 2020 Western Digital Corporation or its affiliates.
  */

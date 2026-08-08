@@ -1,3 +1,6 @@
+#define pr_fmt(fmt) "snvme: " fmt
+#define dev_fmt(fmt) "snvme: " fmt
+
 #include "map.h"
 #include "list.h"
 #include "ctrl.h"
@@ -71,7 +74,7 @@ void map_p2p_service_probe(void)
 
     if (phx_register_fn != NULL && phx_deregister_fn != NULL)
     {
-        printk(KERN_INFO "snvme: phoenix P2P service detected, using it for GPU memory registration\n");
+        pr_info("phoenix P2P service detected, using it for GPU memory registration\n");
     }
     else
     {
@@ -112,7 +115,7 @@ static struct map* create_descriptor(const struct ctrl* ctrl, u64 vaddr, unsigne
     map = kvmalloc(sizeof(struct map) + (n_pages - 1) * sizeof(uint64_t), GFP_KERNEL);
     if (map == NULL)
     {
-        printk(KERN_CRIT "Failed to allocate mapping descriptor\n");
+        pr_crit("Failed to allocate mapping descriptor\n");
         return ERR_PTR(-ENOMEM);
     }
 
@@ -294,7 +297,7 @@ static long map_user_pages(struct map* map)
     pages = (struct page**) kvcalloc(map->n_addrs, sizeof(struct page*), GFP_KERNEL);
     if (pages == NULL)
     {
-        printk(KERN_CRIT "Failed to allocate page array\n");
+        pr_crit("Failed to allocate page array\n");
         return -ENOMEM;
     }
 
@@ -302,13 +305,13 @@ static long map_user_pages(struct map* map)
     if (retval <= 0)
     {
         kfree(pages);
-        printk(KERN_ERR "get_user_pages() failed: %ld\n", retval);
+        pr_err("get_user_pages() failed: %ld\n", retval);
         return retval;
     }
 
     if (map->n_addrs != retval)
     {
-        printk(KERN_WARNING "Requested %lu GPU pages, but only got %ld\n", map->n_addrs, retval);
+        pr_warn("Requested %lu GPU pages, but only got %ld\n", map->n_addrs, retval);
     }
     map->n_addrs = retval;
     map->page_size = PAGE_SIZE;
@@ -323,7 +326,7 @@ static long map_user_pages(struct map* map)
         retval = dma_mapping_error(dev, map->addrs[i]);
         if (retval != 0)
         {
-            printk(KERN_ERR "Failed to map page for some reason\n");
+            pr_err("Failed to map page for some reason\n");
             return retval;
         }
        // printk("map_user_page: device: %02x:%02x.%1x\tvaddr: %llx\ti: %lu\tdma_addr: %llx\n", map->pdev->bus->number, PCI_SLOT(map->pdev->devfn), PCI_FUNC(map->pdev->devfn), (uint64_t) map->vaddr, i, map->addrs[i]);
@@ -383,7 +386,7 @@ static void force_release_gpu_memory(struct map* map)
      */
     if (gd != NULL && gd->phx_handle != NULL)
     {
-        WARN_ON(1);
+        WARN(1, "snvme: Phoenix GPU mapping reached native force-release path\n");
         release_gpu_memory(map);
         unmap_and_release(map);
         return;
@@ -417,7 +420,7 @@ static void force_release_gpu_memory(struct map* map)
         kfree(gd);
         map->data = NULL;
 
-        printk(KERN_DEBUG "Nvidia driver forcefully reclaimed %lu GPU pages\n", map->n_addrs);
+        pr_debug("Nvidia driver forcefully reclaimed %lu GPU pages\n", map->n_addrs);
     }
 
     unmap_and_release(map);
@@ -442,7 +445,7 @@ static void force_release_gpu_ioqueue_memory(struct map* map)
         }
         kfree(gd);
         map->data = NULL;
-        printk(KERN_DEBUG "Nvidia driver forcefully reclaimed %lu GPU pages\n", map->n_addrs);
+        pr_debug("Nvidia driver forcefully reclaimed %lu GPU pages\n", map->n_addrs);
     }
 
     unmap_and_release(map);
@@ -546,7 +549,7 @@ int map_gpu_memory(struct map* map, struct list* list)
     gd = kmalloc(sizeof(struct gpu_region), GFP_KERNEL);
     if (gd == NULL)
     {
-        printk(KERN_CRIT "Failed to allocate mapping descriptor\n");
+        pr_crit("Failed to allocate mapping descriptor\n");
         return -ENOMEM;
     }
 
@@ -593,7 +596,7 @@ int map_gpu_memory(struct map* map, struct list* list)
 
     if (gd->mappings == NULL)
     {
-        printk(KERN_CRIT "Failed to allocate mapping descriptor\n");
+        pr_crit("Failed to allocate mapping descriptor\n");
         /* gd is freed by release_gpu_memory via unmap_and_release */
         return -ENOMEM;
     }
@@ -605,7 +608,7 @@ int map_gpu_memory(struct map* map, struct list* list)
             (void (*)(void*)) force_release_gpu_memory, map);
     if (err != 0)
     {
-        printk(KERN_ERR "peer_memory_ops.get_pages() failed: %d\n", err);
+        pr_err("peer_memory_ops.get_pages() failed: %d\n", err);
         return err;
     }
 
@@ -644,7 +647,7 @@ int map_gpu_memory(struct map* map, struct list* list)
 
     if (map->n_addrs != peer_memory_pt_entries(gd->pages))
     {
-        printk(KERN_WARNING "Requested %lu GPU pages, but only got %u\n", map->n_addrs, peer_memory_pt_entries(gd->pages));
+        pr_warn("Requested %lu GPU pages, but only got %u\n", map->n_addrs, peer_memory_pt_entries(gd->pages));
     }
 
     map->n_addrs = peer_memory_pt_entries(gd->pages);
@@ -664,7 +667,7 @@ int map_gpu_ioqueue_memory(struct map* map)
     gd = kmalloc(sizeof(struct gpu_region), GFP_KERNEL);
     if (gd == NULL)
     {
-        printk(KERN_CRIT "Failed to allocate mapping descriptor\n");
+        pr_crit("Failed to allocate mapping descriptor\n");
         return -ENOMEM;
     }
 
@@ -672,7 +675,7 @@ int map_gpu_ioqueue_memory(struct map* map)
 
     if (gd->mappings == NULL)
     {
-        printk(KERN_CRIT "Failed to allocate mapping descriptor\n");
+        pr_crit("Failed to allocate mapping descriptor\n");
         kfree(gd);
         return -ENOMEM;
     }
@@ -689,7 +692,7 @@ int map_gpu_ioqueue_memory(struct map* map)
             (void (*)(void*)) force_release_gpu_ioqueue_memory, map);
     if (err != 0)
     {
-        printk(KERN_ERR "peer_memory_ops.get_pages() failed: %d\n", err);
+        pr_err("peer_memory_ops.get_pages() failed: %d\n", err);
         return err;
     }
 
@@ -709,7 +712,7 @@ int map_gpu_ioqueue_memory(struct map* map)
 
     if (map->n_addrs != peer_memory_pt_entries(gd->pages))
     {
-        printk(KERN_WARNING "Requested %lu GPU pages, but only got %u\n", map->n_addrs, peer_memory_pt_entries(gd->pages));
+        pr_warn("Requested %lu GPU pages, but only got %u\n", map->n_addrs, peer_memory_pt_entries(gd->pages));
     }
 
     map->n_addrs = peer_memory_pt_entries(gd->pages);
