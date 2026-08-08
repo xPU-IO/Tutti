@@ -31,6 +31,7 @@
 #include <tutti/resolvers/local_file/resolver.h>
 
 #include "../hardware_test_directory.h"
+#include "../nvme_test_cli.h"
 
 #include <tutti/cuda_like.h>
 
@@ -38,6 +39,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <thread>
 #include <vector>
@@ -49,11 +51,11 @@
 using namespace tutti;
 using namespace tutti::data_paths::local_nvme;
 using namespace tutti::resolvers::local_file;
+using namespace tutti::test_support;
 
 namespace {
 
-constexpr const char* kSnvme = "/dev/ssnvme0";
-constexpr std::uint32_t kBar0 = 16384;
+NvmeTestDevice g_device = default_nvme_test_devices().front();
 // Round 16 S3: GPU selection via env TUTTI_TEST_GPU (default 0).
 // kCudaDev is initialized in main(); used as int32_t in MemoryView/HostSubmitContext.
 inline std::int32_t test_gpu_id() {
@@ -66,7 +68,7 @@ inline std::int32_t test_gpu_id() {
 static std::int32_t kCudaDev = 0;  // set in main() from test_gpu_id()
 // Round 16 S3: num_user_queues 2 -> 16.
 constexpr std::uint32_t kNumQueues = 16;
-constexpr std::uint32_t kNsId = 1;
+// This is the test's I/O granularity, not the namespace LBA size.
 constexpr std::uint32_t kBlockSize = 4096;
 constexpr const char* kDataPathKey = "local-nvme-ext4";
 std::string kDir;
@@ -84,8 +86,54 @@ void* alloc_gpu(std::size_t size, void** raw_out) {
 }
 
 LocalFileResolver make_resolver() {
-    return LocalFileResolver("0000:08:00.0", 1, 4096,
-                             BackingDeviceConfig{"/dev/snvme0n1", 0});
+    return LocalFileResolver(g_device.pci_bdf, g_device.namespace_id,
+                             g_device.block_size,
+                             BackingDeviceConfig{g_device.backing_device, 0});
+}
+
+void print_usage(const char* program) {
+    std::fprintf(stderr,
+                 "Usage: %s [--gpu ID] [--nvme %s]\n",
+                 program, nvme_test_device_format().c_str());
+}
+
+bool parse_args(int argc, char** argv) {
+    bool nvme_overridden = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--help") == 0 ||
+            std::strcmp(argv[i], "-h") == 0) {
+            print_usage(argv[0]);
+            return false;
+        }
+        if (std::strcmp(argv[i], "--gpu") == 0 && i + 1 < argc) {
+            std::uint32_t gpu = 0;
+            if (!parse_u32(argv[++i], &gpu) ||
+                gpu > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
+                std::fprintf(stderr, "invalid --gpu value: %s\n", argv[i]);
+                return false;
+            }
+            kCudaDev = static_cast<std::int32_t>(gpu);
+            continue;
+        }
+        if (std::strcmp(argv[i], "--nvme") == 0 && i + 1 < argc) {
+            if (nvme_overridden) {
+                std::fprintf(stderr, "this single-device test accepts exactly one --nvme\n");
+                return false;
+            }
+            std::string error;
+            if (!parse_nvme_test_device(argv[++i], &g_device, &error)) {
+                std::fprintf(stderr, "invalid --nvme: %s; expected %s\n",
+                             error.c_str(), nvme_test_device_format().c_str());
+                return false;
+            }
+            nvme_overridden = true;
+            continue;
+        }
+        std::fprintf(stderr, "unknown or incomplete argument: %s\n", argv[i]);
+        print_usage(argv[0]);
+        return false;
+    }
+    return true;
 }
 
 std::unique_ptr<StorageRuntime> make_runtime(LocalNvmeDataPath& dp,
@@ -165,15 +213,25 @@ bool public_read_verify(StorageRuntime& rt, const MemoryHandle& mem, const Targe
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && (std::strcmp(argv[1], "--help") == 0 ||
+                      std::strcmp(argv[1], "-h") == 0)) {
+        print_usage(argv[0]);
+        return 0;
+    }
     // Round 16 S3: GPU selection via env TUTTI_TEST_GPU.
     kCudaDev = test_gpu_id();
-    cudaSetDevice(kCudaDev);
+    if (!parse_args(argc, argv)) return 2;
+    if (cudaSetDevice(kCudaDev) != cudaSuccess) {
+        std::fprintf(stderr, "ERROR: CUDA device %d is unavailable\n", kCudaDev);
+        return 1;
+    }
 
     tutti::test_support::UniqueTestDirectory run_dir;
     std::string dir_error;
     if (!tutti::test_support::UniqueTestDirectory::create(
-            "/mnt/nvme0/GPU0", "tutti_storage_runtime_local_nvme",
+            g_device.mount_path + "/GPU" + std::to_string(kCudaDev),
+            "tutti_storage_runtime_local_nvme",
             run_dir, dir_error)) {
         std::fprintf(stderr, "ERROR: %s\n", dir_error.c_str());
         return 1;
@@ -186,7 +244,8 @@ int main() {
     // =====================================================================
     printf("--- 1. assembly/open ---\n");
     {
-        LocalNvmeDataPath dp(kSnvme, kBar0, kCudaDev, kNumQueues, kNsId, kBlockSize);
+        LocalNvmeDataPath dp(g_device.ssnvme_path, g_device.bar0_size, kCudaDev,
+                             kNumQueues, g_device.namespace_id, g_device.block_size);
         auto resolver = make_resolver();
         auto rt = make_runtime(dp, resolver);
         CHECK(rt != nullptr, "create component-backed runtime");
@@ -209,7 +268,9 @@ int main() {
         // DataPath key mismatch: resolver sets key "local-nvme-ext4"; inject a
         // runtime whose only DataPath has a different key → no route.
         {
-            LocalNvmeDataPath dp2(kSnvme, kBar0, kCudaDev, kNumQueues, kNsId, kBlockSize);
+            LocalNvmeDataPath dp2(g_device.ssnvme_path, g_device.bar0_size, kCudaDev,
+                                  kNumQueues, g_device.namespace_id,
+                                  g_device.block_size);
             auto resolver2 = make_resolver();
             RuntimeComponents comp;
             comp.resolvers.push_back({"file", &resolver2});
@@ -234,7 +295,8 @@ int main() {
     // =====================================================================
     printf("--- 2. memory / lazy registration ---\n");
     {
-        LocalNvmeDataPath dp(kSnvme, kBar0, kCudaDev, kNumQueues, kNsId, kBlockSize);
+        LocalNvmeDataPath dp(g_device.ssnvme_path, g_device.bar0_size, kCudaDev,
+                             kNumQueues, g_device.namespace_id, g_device.block_size);
         auto resolver = make_resolver();
         auto rt = make_runtime(dp, resolver);
         CHECK(rt != nullptr, "create runtime");
@@ -281,7 +343,8 @@ int main() {
     // =====================================================================
     printf("--- 3. real data SINGLE/DUAL/LIST/cross-segment ---\n");
     {
-        LocalNvmeDataPath dp(kSnvme, kBar0, kCudaDev, kNumQueues, kNsId, kBlockSize);
+        LocalNvmeDataPath dp(g_device.ssnvme_path, g_device.bar0_size, kCudaDev,
+                             kNumQueues, g_device.namespace_id, g_device.block_size);
         auto resolver = make_resolver();
         auto rt = make_runtime(dp, resolver);
         CHECK(rt != nullptr, "create runtime");
@@ -388,7 +451,8 @@ int main() {
     // =====================================================================
     printf("--- 4. batch / mixed / partial commit ---\n");
     {
-        LocalNvmeDataPath dp(kSnvme, kBar0, kCudaDev, kNumQueues, kNsId, kBlockSize);
+        LocalNvmeDataPath dp(g_device.ssnvme_path, g_device.bar0_size, kCudaDev,
+                             kNumQueues, g_device.namespace_id, g_device.block_size);
         auto resolver = make_resolver();
         auto rt = make_runtime(dp, resolver);
         CHECK(rt != nullptr, "create runtime");
@@ -473,7 +537,8 @@ int main() {
     // =====================================================================
     printf("--- 5. order/concurrency ---\n");
     {
-        LocalNvmeDataPath dp(kSnvme, kBar0, kCudaDev, kNumQueues, kNsId, kBlockSize);
+        LocalNvmeDataPath dp(g_device.ssnvme_path, g_device.bar0_size, kCudaDev,
+                             kNumQueues, g_device.namespace_id, g_device.block_size);
         auto resolver = make_resolver();
         auto rt = make_runtime(dp, resolver);
         CHECK(rt != nullptr, "create runtime");
@@ -592,7 +657,8 @@ int main() {
     // =====================================================================
     printf("--- 6. failure/timeout ---\n");
     {
-        LocalNvmeDataPath dp(kSnvme, kBar0, kCudaDev, kNumQueues, kNsId, kBlockSize);
+        LocalNvmeDataPath dp(g_device.ssnvme_path, g_device.bar0_size, kCudaDev,
+                             kNumQueues, g_device.namespace_id, g_device.block_size);
         auto resolver = make_resolver();
         auto rt = make_runtime(dp, resolver);
         CHECK(rt != nullptr, "create runtime");
@@ -661,7 +727,9 @@ int main() {
     printf("--- 7. teardown / repeat lifecycle ---\n");
     {
         for (int round = 0; round < 2; ++round) {
-            LocalNvmeDataPath dp(kSnvme, kBar0, kCudaDev, kNumQueues, kNsId, kBlockSize);
+            LocalNvmeDataPath dp(g_device.ssnvme_path, g_device.bar0_size, kCudaDev,
+                                 kNumQueues, g_device.namespace_id,
+                                 g_device.block_size);
             auto resolver = make_resolver();
             auto rt = make_runtime(dp, resolver);
             CHECK(rt != nullptr, "teardown: create runtime");
@@ -709,8 +777,9 @@ int main() {
         // in-flight=8, batch_entries=4096 (both >= task minimums); the
         // other two new knobs (max_batch_requests, max_request_bytes_override)
         // are left at 0 (follow entries / entries*MDTS).
-        LocalNvmeDataPath dp_big(kSnvme, kBar0, kCudaDev, kNumQueues,
-                                 kNsId, kBlockSize,
+        LocalNvmeDataPath dp_big(g_device.ssnvme_path, g_device.bar0_size,
+                                 kCudaDev, kNumQueues, g_device.namespace_id,
+                                 g_device.block_size,
                                  /*mdts_bytes=*/0, /*max_batch_entries=*/4096,
                                  /*cq_poll_budget=*/0, /*handle_cache_capacity=*/0,
                                  /*prp_cache_capacity=*/0,
@@ -870,7 +939,8 @@ int main() {
     // =====================================================================
     printf("--- 9. default capacity regression: oversized batch fail-closed ---\n");
     {
-        LocalNvmeDataPath dp(kSnvme, kBar0, kCudaDev, kNumQueues, kNsId, kBlockSize);
+        LocalNvmeDataPath dp(g_device.ssnvme_path, g_device.bar0_size, kCudaDev,
+                             kNumQueues, g_device.namespace_id, g_device.block_size);
         auto resolver = make_resolver();
         auto rt = make_runtime(dp, resolver);
         CHECK(rt != nullptr, "create default-capacity runtime");
@@ -916,7 +986,8 @@ int main() {
     // =====================================================================
     printf("--- 10. batch open: mixed scenarios + byte verify ---\n");
     {
-        LocalNvmeDataPath dp(kSnvme, kBar0, kCudaDev, kNumQueues, kNsId, kBlockSize);
+        LocalNvmeDataPath dp(g_device.ssnvme_path, g_device.bar0_size, kCudaDev,
+                             kNumQueues, g_device.namespace_id, g_device.block_size);
         auto resolver = make_resolver();
         auto rt = make_runtime(dp, resolver);
         CHECK(rt != nullptr, "create runtime for batch open");

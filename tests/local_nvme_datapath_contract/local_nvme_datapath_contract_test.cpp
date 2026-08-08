@@ -16,19 +16,23 @@
 #include "tutti/resolvers/local_file/resolver.h"
 
 #include "../hardware_test_directory.h"
+#include "../nvme_test_cli.h"
 
 #include <tutti/cuda_like.h>
 #include <nvm_types.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
+#include <limits>
 #include <map>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -37,9 +41,14 @@
 using namespace tutti;
 using namespace tutti::data_paths::local_nvme;
 using namespace tutti::binding::ext4_local_nvme;
+using namespace tutti::test_support;
 
 static int g_pass = 0;
 static int g_fail = 0;
+static std::vector<NvmeTestDevice> g_devices = default_nvme_test_devices();
+static std::int32_t g_test_gpu = 0;
+static std::size_t g_primary_device = 0;
+static bool g_nvme_overridden = false;
 static std::map<
     std::string,
     std::unique_ptr<tutti::test_support::UniqueTestDirectory>> g_test_dirs;
@@ -48,6 +57,86 @@ static std::map<
 #define PASS() do { printf("  PASS\n"); ++g_pass; } while(0)
 #define FAIL(msg) do { printf("  FAIL: %s\n", msg); ++g_fail; } while(0)
 #define CHECK(cond, msg) do { if (cond) { PASS(); } else { FAIL(msg); } } while(0)
+
+static const NvmeTestDevice& primary_device() {
+    return g_devices.at(g_primary_device);
+}
+
+static std::string primary_test_parent() {
+    return primary_device().mount_path + "/GPU" + std::to_string(g_test_gpu);
+}
+
+static RegistrationDomainKey primary_registration_domain() {
+    return RegistrationDomainKey{
+        "local_nvme:" + primary_device().pci_bdf + ":ns" +
+        std::to_string(primary_device().namespace_id)};
+}
+
+static void print_usage(const char* program) {
+    std::fprintf(stderr,
+                 "Usage: %s [--gpu ID] [--device-index INDEX] [--nvme %s]...\n",
+                 program, nvme_test_device_format().c_str());
+}
+
+static bool parse_args(int argc, char** argv) {
+    bool primary_overridden = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--gpu") == 0 && i + 1 < argc) {
+            std::uint32_t gpu = 0;
+            if (!parse_u32(argv[++i], &gpu) ||
+                gpu > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
+                std::fprintf(stderr, "invalid --gpu value: %s\n", argv[i]);
+                return false;
+            }
+            g_test_gpu = static_cast<std::int32_t>(gpu);
+            continue;
+        }
+        if (std::strcmp(argv[i], "--device-index") == 0 && i + 1 < argc) {
+            std::uint32_t index = 0;
+            if (!parse_u32(argv[++i], &index)) {
+                std::fprintf(stderr, "invalid --device-index value: %s\n", argv[i]);
+                return false;
+            }
+            g_primary_device = index;
+            primary_overridden = true;
+            continue;
+        }
+        if (std::strcmp(argv[i], "--nvme") == 0 && i + 1 < argc) {
+            NvmeTestDevice device;
+            std::string error;
+            if (!parse_nvme_test_device(argv[++i], &device, &error)) {
+                std::fprintf(stderr, "invalid --nvme: %s; expected %s\n",
+                             error.c_str(), nvme_test_device_format().c_str());
+                return false;
+            }
+            if (!g_nvme_overridden) {
+                g_devices.clear();
+                g_nvme_overridden = true;
+            }
+            g_devices.push_back(std::move(device));
+            continue;
+        }
+        std::fprintf(stderr, "unknown or incomplete argument: %s\n", argv[i]);
+        return false;
+    }
+
+    if (g_devices.empty() || g_devices.size() > 4) {
+        std::fprintf(stderr, "local contract requires 1 to 4 NVMe devices\n");
+        return false;
+    }
+    if (!primary_overridden) {
+        g_primary_device = g_nvme_overridden
+            ? 0
+            : std::min<std::size_t>(static_cast<std::size_t>(g_test_gpu),
+                                    g_devices.size() - 1);
+    }
+    if (g_primary_device >= g_devices.size()) {
+        std::fprintf(stderr, "--device-index %zu is outside the %zu-device table\n",
+                     g_primary_device, g_devices.size());
+        return false;
+    }
+    return true;
+}
 
 static const std::string* test_dir_under(const std::string& parent) {
     auto found = g_test_dirs.find(parent);
@@ -91,33 +180,25 @@ static void print_preserved_test_dirs() {
 
 static tutti::resolvers::local_file::BackingDeviceConfig
 resolver_backing_config() {
-    const char* configured = std::getenv("TUTTI_RESOLVER_BACKING_DEVICE");
-    if (configured && configured[0]) {
+    const char* configured = g_nvme_overridden
+        ? nullptr
+        : std::getenv("TUTTI_RESOLVER_BACKING_DEVICE");
+    if (configured != nullptr && configured[0]) {
         return tutti::resolvers::local_file::BackingDeviceConfig{configured, 0};
     }
-    // Round 20 S1: backing device follows TUTTI_TEST_GPU.
-    const char* gpu_env = std::getenv("TUTTI_TEST_GPU");
-    int g = gpu_env ? std::atoi(gpu_env) : 0;
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "/dev/snvme%dn1", g);
-    return tutti::resolvers::local_file::BackingDeviceConfig{buf, 0};
+    return tutti::resolvers::local_file::BackingDeviceConfig{
+        primary_device().backing_device, 0};
 }
 
-// Round 20 S1: PCI address follows TUTTI_TEST_GPU (GPU i ↔ NVMe i BDF).
 static const char* pci_addr_for_test_gpu() {
-    const char* gpu_env = std::getenv("TUTTI_TEST_GPU");
-    int g = gpu_env ? std::atoi(gpu_env) : 0;
-    static const char* kAddrs[4] = {
-        "0000:08:00.0", "0000:4b:00.0", "0000:57:00.0", "0000:63:00.0"
-    };
-    if (g < 0 || g > 3) g = 0;
-    return kAddrs[g];
+    return primary_device().pci_bdf.c_str();
 }
 
 static tutti::resolvers::local_file::LocalFileResolver
 make_local_file_resolver() {
     return tutti::resolvers::local_file::LocalFileResolver(
-        pci_addr_for_test_gpu(), 1, 4096, resolver_backing_config());
+        pci_addr_for_test_gpu(), primary_device().namespace_id,
+        primary_device().block_size, resolver_backing_config());
 }
 
 // Helper: allocate a 64 KiB-aligned GPU buffer.
@@ -165,13 +246,7 @@ static ResolvedFile make_resolved_file(const char* name,
                                         uint64_t size_bytes,
                                         unsigned char fill = 0xAB)
 {
-    // Round 20 S1: mount path follows TUTTI_TEST_GPU (GPU i ↔ /mnt/nvme{i}).
-    const char* gpu_env = std::getenv("TUTTI_TEST_GPU");
-    int test_gpu = gpu_env ? std::atoi(gpu_env) : 0;
-    char parent[64];
-    std::snprintf(parent, sizeof(parent),
-                  "/mnt/nvme%d/GPU%d", test_gpu, test_gpu);
-    const std::string* dir = test_dir_under(parent);
+    const std::string* dir = test_dir_under(primary_test_parent());
     if (dir == nullptr) {
         return ResolvedFile{"", Result<ResolvedTarget>::Failure(
             Status(StatusCode::INTERNAL,
@@ -218,18 +293,20 @@ static ResolvedFile make_resolved_file(const char* name,
 // keep the payload alive for the lifetime of the wrapper.
 // -------------------------------------------------------------------------
 
-// Round 16 S3: Check how many NVMe devices are available (1..4).
-// /mnt/nvme0 always required; /mnt/nvme{1,2,3} optional.
+// Check how many configured NVMe devices are available (1..4).
 static int count_available_devices() {
-    int n = 1;  // /mnt/nvme0 is the primary, always required
-    for (int i = 1; i <= 3; ++i) {
-        char path[32];
-        std::snprintf(path, sizeof(path), "/mnt/nvme%d", i);
+    int n = 0;
+    for (const auto& device : g_devices) {
         struct stat st{};
-        if (::stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) break;
+        if (::stat(device.ssnvme_path.c_str(), &st) != 0) break;
+        if (::stat(device.mount_path.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) break;
+        const std::size_t slash = device.mount_path.find_last_of('/');
+        const std::string parent = slash == 0
+            ? "/"
+            : device.mount_path.substr(0, slash == std::string::npos ? 0 : slash);
         struct stat parent_st{};
-        if (::stat("/mnt", &parent_st) != 0) break;
-        if (st.st_dev == parent_st.st_dev) break;
+        if (parent.empty() || ::stat(parent.c_str(), &parent_st) != 0 ||
+            st.st_dev == parent_st.st_dev) break;
         ++n;
     }
     return n;
@@ -248,13 +325,11 @@ static ResolvedFileOnDevice make_resolved_file_on_device(
     const char* name,
     std::uint64_t size_bytes,
     unsigned char fill,
-    const char* mount_dir,
-    std::string_view pci_addr,
-    std::string_view backing_dev)
+    const NvmeTestDevice& device)
 {
     // The mount itself is the stable hardware-owned parent. The test creates
     // only its unique child, so a passing run can remove everything it owns.
-    std::string parent = mount_dir;
+    std::string parent = device.mount_path;
     const std::string* dir = test_dir_under(parent);
     if (dir == nullptr) {
         return ResolvedFileOnDevice{"", Result<ResolvedTarget>::Failure(
@@ -285,9 +360,9 @@ static ResolvedFileOnDevice make_resolved_file_on_device(
 
     // Resolve via a LocalFileResolver configured for this device.
     tutti::resolvers::local_file::LocalFileResolver resolver(
-        std::string(pci_addr), 1, 4096,
+        device.pci_bdf, device.namespace_id, device.block_size,
         tutti::resolvers::local_file::BackingDeviceConfig{
-            std::string(backing_dev), 0});
+            device.backing_device, 0});
 
     ResolveOptions opts;
     opts.scheme = tutti::resolvers::local_file::kScheme;
@@ -371,36 +446,32 @@ private:
     std::vector<ResolvedTarget> inner_results_;  // keep payloads alive
 };
 
-// Helper: create a real file on device 0 (/mnt/nvme0).
+// Helper: create a real file on configured device 0.
 static ResolvedFileOnDevice make_resolved_file_dev0(
     const char* name, std::uint64_t size_bytes, unsigned char fill = 0xAB)
 {
-    return make_resolved_file_on_device(
-        name, size_bytes, fill, "/mnt/nvme0", "0000:08:00.0", "/dev/snvme0n1");
+    return make_resolved_file_on_device(name, size_bytes, fill, g_devices.at(0));
 }
 
-// Helper: create a real file on device 1 (/mnt/nvme1).
+// Helper: create a real file on configured device 1.
 static ResolvedFileOnDevice make_resolved_file_dev1(
     const char* name, std::uint64_t size_bytes, unsigned char fill = 0xCD)
 {
-    return make_resolved_file_on_device(
-        name, size_bytes, fill, "/mnt/nvme1", "0000:4b:00.0", "/dev/snvme1n1");
+    return make_resolved_file_on_device(name, size_bytes, fill, g_devices.at(1));
 }
 
 // Round 16 S3: Helper: create a real file on device 2 (/mnt/nvme2).
 static ResolvedFileOnDevice make_resolved_file_dev2(
     const char* name, std::uint64_t size_bytes, unsigned char fill = 0xEF)
 {
-    return make_resolved_file_on_device(
-        name, size_bytes, fill, "/mnt/nvme2", "0000:57:00.0", "/dev/snvme2n1");
+    return make_resolved_file_on_device(name, size_bytes, fill, g_devices.at(2));
 }
 
 // Round 16 S3: Helper: create a real file on device 3 (/mnt/nvme3).
 static ResolvedFileOnDevice make_resolved_file_dev3(
     const char* name, std::uint64_t size_bytes, unsigned char fill = 0x55)
 {
-    return make_resolved_file_on_device(
-        name, size_bytes, fill, "/mnt/nvme3", "0000:63:00.0", "/dev/snvme3n1");
+    return make_resolved_file_on_device(name, size_bytes, fill, g_devices.at(3));
 }
 //
 // WARNING: extents use device_offset = 0 => start_lba = 0, which is the
@@ -461,7 +532,20 @@ static bool verify_dev_region(void* dev_buf, std::uint64_t off,
     return true;
 }
 
-int main() {
+int main(int argc, char** argv) {
+    const char* gpu_env = std::getenv("TUTTI_TEST_GPU");
+    const int env_gpu = gpu_env ? std::atoi(gpu_env) : 0;
+    g_test_gpu = env_gpu >= 0 ? env_gpu : 0;
+    if (argc == 2 && (std::strcmp(argv[1], "--help") == 0 ||
+                      std::strcmp(argv[1], "-h") == 0)) {
+        print_usage(argv[0]);
+        return 0;
+    }
+    if (!parse_args(argc, argv)) {
+        print_usage(argv[0]);
+        return 2;
+    }
+
     // =====================================================================
     // 1. capabilities honest
     // =====================================================================
@@ -801,12 +885,12 @@ int main() {
     // Session 3: DMA Registration Tests (real libnvm + CUDA)
     // =====================================================================
 
-    // Environment self-check: /dev/ssnvme0 must exist and be openable.
+    // Environment self-check: the configured primary ssnvme must be openable.
     {
-        FILE* f = fopen("/dev/ssnvme0", "r");
+        FILE* f = fopen(primary_device().ssnvme_path.c_str(), "r");
         if (!f) {
-            printf("\nERROR: /dev/ssnvme0 not openable — "
-                   "need operator to start daemon.\n");
+            printf("\nERROR: %s not openable; need operator to start daemon.\n",
+                   primary_device().ssnvme_path.c_str());
             printf("RESULT: FAIL (environment)\n");
             return 1;
         }
@@ -820,26 +904,17 @@ int main() {
         printf("RESULT: FAIL (environment)\n");
         return 1;
     }
-    // Round 16 S3: GPU selection via env TUTTI_TEST_GPU (default 0).
-    const char* gpu_env = std::getenv("TUTTI_TEST_GPU");
-    int test_gpu = gpu_env ? std::atoi(gpu_env) : 0;
+    int test_gpu = g_test_gpu;
     if (test_gpu < 0 || test_gpu >= cuda_dev_count) test_gpu = 0;
+    g_test_gpu = test_gpu;
     cudaSetDevice(test_gpu);
 
-    // Round 20 S1: ssnvme device + mount path follow TUTTI_TEST_GPU
-    // (GPU i ↔ NVMe i ↔ /dev/ssnvme{i} ↔ /mnt/nvme{i}).
-    char snvme_path[32];
-    std::snprintf(snvme_path, sizeof(snvme_path),
-                  "/dev/ssnvme%d", test_gpu);
-    const char* kSnvmeDevPath = snvme_path;
-    char test_parent[64];
-    std::snprintf(test_parent, sizeof(test_parent),
-                  "/mnt/nvme%d/GPU%d", test_gpu, test_gpu);
-    if (test_dir_under(test_parent) == nullptr) {
+    const char* kSnvmeDevPath = primary_device().ssnvme_path.c_str();
+    if (test_dir_under(primary_test_parent()) == nullptr) {
         std::printf("RESULT: FAIL (test directory)\n");
         return 1;
     }
-    const std::uint32_t kBar0Size = 16384;
+    const std::uint32_t kBar0Size = primary_device().bar0_size;
     const std::size_t kBufSize = 1 * 1024 * 1024;  // 1 MiB
 
     // Helper lambda for DP with real device.
@@ -869,7 +944,7 @@ int main() {
 
         {
             DataPathMemoryView view{host_buf, kBufSize, -1, DataPathMemoryKind::HOST};
-            RegistrationDomainKey domain{"local_nvme:0000:08:00.0:ns1"};
+            RegistrationDomainKey domain = primary_registration_domain();
             auto rm = dp.register_memory(view, domain);
             CHECK(rm.ok(), "register_memory HOST");
             CHECK(rm.value().valid(), "memory identity valid");
@@ -907,7 +982,7 @@ int main() {
 
         {
             DataPathMemoryView view{dev_buf, kBufSize, 0, DataPathMemoryKind::DEVICE};
-            RegistrationDomainKey domain{"local_nvme:0000:08:00.0:ns1"};
+            RegistrationDomainKey domain = primary_registration_domain();
             auto rm = dp.register_memory(view, domain);
             CHECK(rm.ok(), "register_memory DEVICE");
             CHECK(rm.value().valid(), "memory identity valid");
@@ -1085,7 +1160,7 @@ int main() {
 
         {
             DataPathMemoryView view{dev_buf, 65536, 0, DataPathMemoryKind::DEVICE};
-            RegistrationDomainKey domain{"local_nvme:0000:08:00.0:ns1"};
+            RegistrationDomainKey domain = primary_registration_domain();
             auto rm = dp.register_memory(view, domain);
             CHECK(rm.ok(), "register DEVICE 64K");
 
@@ -1112,13 +1187,15 @@ int main() {
     // Round 16 S3: kNumQueues 2 -> 16; kCudaDevice from env TUTTI_TEST_GPU.
     const std::uint32_t kCudaDevice = (std::uint32_t)test_gpu;
     const std::uint32_t kNumQueues = 16;
-    const std::uint32_t kNamespaceId = 1;
+    const std::uint32_t kNamespaceId = primary_device().namespace_id;
+    const std::uint32_t kDeviceBlockSize = primary_device().block_size;
+    // Test requests stay 4 KiB even when one namespace LBA is 512 bytes.
     const std::uint32_t kBlockSize = 4096;
 
     auto make_qg_dp = [&]() {
         return LocalNvmeDataPath(kSnvmeDevPath, kBar0Size,
                                   kCudaDevice, kNumQueues,
-                                  kNamespaceId, kBlockSize);
+                                  kNamespaceId, kDeviceBlockSize);
     };
 
     // Shared CUDA stream for batch tests.
@@ -1399,7 +1476,7 @@ int main() {
 
         {
             DataPathMemoryView view{dev_buf, 65536, 0, DataPathMemoryKind::DEVICE};
-            RegistrationDomainKey domain{"local_nvme:0000:08:00.0:ns1"};
+            RegistrationDomainKey domain = primary_registration_domain();
             auto rm = dp.register_memory(view, domain);
             CHECK(rm.ok(), "register DEVICE 64K with queue group");
 
@@ -1424,7 +1501,7 @@ int main() {
     // =====================================================================
     TEST_CASE("26. E2E 4KiB write/read/verify");
     {
-        const std::string* fixed_dir = test_dir_under("/mnt/nvme0/GPU0");
+        const std::string* fixed_dir = test_dir_under(primary_test_parent());
         if (fixed_dir == nullptr) { FAIL("create unique test directory"); goto e2e_skip; }
         const std::string test_file = *fixed_dir + "/round8_e2e.bin";
         const char* kTestFile = test_file.c_str();
@@ -1459,7 +1536,7 @@ int main() {
             // Create DataPath with queue group.
             LocalNvmeDataPath dp(kSnvmeDevPath, kBar0Size,
                                  kCudaDevice, kNumQueues,
-                                 kNamespaceId, kBlockSize);
+                                 kNamespaceId, kDeviceBlockSize);
             Status init_status = init_dp(dp);
             CHECK(init_status.ok(), "initialize E2E datapath");
             if (!init_status.ok()) { ::unlink(kTestFile); goto e2e_skip; }
@@ -1492,7 +1569,7 @@ int main() {
 
             // Register write buffer.
             DataPathMemoryView wview{write_buf, 65536, 0, DataPathMemoryKind::DEVICE};
-            RegistrationDomainKey dom{"local_nvme:0000:08:00.0:ns1"};
+            RegistrationDomainKey dom = primary_registration_domain();
             auto wmem = dp.register_memory(wview, dom);
             CHECK(wmem.ok(), "register write memory");
             if (!wmem.ok()) { cudaFree(write_raw); dp.close(open_r.value()); dp.shutdown(0); ::unlink(kTestFile); goto e2e_skip; }
@@ -1747,7 +1824,7 @@ int main() {
         void* buf_raw = nullptr;
         void* buf = cuda_malloc_aligned_64k(65536, &buf_raw);
         DataPathMemoryView view{buf, 65536, 0, DataPathMemoryKind::DEVICE};
-        auto mem = dp.register_memory(view, {"local_nvme:0000:08:00.0:ns1"});
+        auto mem = dp.register_memory(view, primary_registration_domain());
 
         cudaStream_t s; cudaStreamCreate(&s);
         IoRequest intent;
@@ -1824,7 +1901,7 @@ int main() {
         void* hbuf = nullptr;
         cudaHostAlloc(&hbuf, 65536, cudaHostAllocDefault);
         DataPathMemoryView view{hbuf, 65536, -1, DataPathMemoryKind::HOST};
-        auto mem = dp.register_memory(view, {"local_nvme:0000:08:00.0:ns1"});
+        auto mem = dp.register_memory(view, primary_registration_domain());
         CHECK(mem.ok(), "register HOST memory");
 
         cudaStream_t s; cudaStreamCreate(&s);
@@ -1861,7 +1938,7 @@ int main() {
         // ext4 primary superblock (byte offset 1024 lives in LBA 0).
         // Resolve a real file instead so the write lands inside the
         // file's own extent.
-        const std::string* fixed_dir = test_dir_under("/mnt/nvme0/GPU0");
+        const std::string* fixed_dir = test_dir_under(primary_test_parent());
         if (fixed_dir == nullptr) { FAIL("create unique test directory"); goto next_test31; }
         const std::string inflight_file = *fixed_dir + "/round8_inflight.bin";
         const char* kInflightFile = inflight_file.c_str();
@@ -1891,7 +1968,7 @@ int main() {
         void* buf_raw = nullptr;
         void* buf = cuda_malloc_aligned_64k(65536, &buf_raw);
         DataPathMemoryView view{buf, 65536, 0, DataPathMemoryKind::DEVICE};
-        auto mem = dp.register_memory(view, {"local_nvme:0000:08:00.0:ns1"});
+        auto mem = dp.register_memory(view, primary_registration_domain());
 
         cudaStream_t s; cudaStreamCreate(&s);
         IoRequest intent;
@@ -1991,7 +2068,7 @@ int main() {
 
         auto mem_r = dp.register_memory(
             DataPathMemoryView{aligned, 65536, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         CHECK(mem_r.ok(), "register_memory");
         if (!mem_r.ok()) { cudaFree(raw); dp.close(target); dp.shutdown(0); ::unlink(rf.path.c_str()); goto next_t33; }
 
@@ -2098,7 +2175,7 @@ int main() {
 
         auto mem_r = dp.register_memory(
             DataPathMemoryView{aligned, io_size, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         CHECK(mem_r.ok(), "register_memory 1MiB");
         if (!mem_r.ok()) { cudaFree(raw); dp.close(target); dp.shutdown(0); ::unlink(rf.path.c_str()); goto next_t34; }
 
@@ -2210,7 +2287,7 @@ int main() {
             (reinterpret_cast<uintptr_t>(raw) + 65535) & ~65535ULL);
         auto mem = dp.register_memory(
             DataPathMemoryView{aligned, 65536, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         CHECK(mem.ok(), "register_memory");
 
         // Fill different regions of buffer with different patterns.
@@ -2334,7 +2411,7 @@ int main() {
             (reinterpret_cast<uintptr_t>(raw) + 65535) & ~65535ULL);
         auto mem = dp.register_memory(
             DataPathMemoryView{aligned, 65536, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         CHECK(mem.ok(), "register_memory");
 
         // Request 0: valid 4KiB write at offset 0.
@@ -2398,7 +2475,7 @@ int main() {
             if (rbuf) {
                 auto rmem = dp.register_memory(
                     DataPathMemoryView{rbuf, 65536, 0, DataPathMemoryKind::DEVICE},
-                    RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+                    primary_registration_domain());
                 CHECK(rmem.ok(), "partial: register read mem");
                 if (rmem.ok()) {
                     launch_fill_pattern(rbuf, 0xFF, kBlockSize, (void*)ctx_stream());
@@ -2462,10 +2539,10 @@ int main() {
 
         auto mem1 = dp.register_memory(
             DataPathMemoryView{aligned1, 65536, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         auto mem2 = dp.register_memory(
             DataPathMemoryView{aligned2, 65536, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         CHECK(mem1.ok() && mem2.ok(), "register 2 memory regions");
 
         // Create two CUDA streams.
@@ -2622,7 +2699,7 @@ int main() {
         void* buf = cuda_malloc_aligned_64k(65536, &raw);
         auto mem = dp.register_memory(
             DataPathMemoryView{buf, 65536, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         CHECK(mem.ok(), "register_memory");
 
         cudaStream_t s; cudaStreamCreate(&s);
@@ -2730,7 +2807,7 @@ int main() {
         void* buf = cuda_malloc_aligned_64k(65536, &raw);
         auto mem = dp.register_memory(
             DataPathMemoryView{buf, 65536, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         CHECK(mem.ok(), "register");
 
         cudaStream_t s; cudaStreamCreate(&s);
@@ -2802,7 +2879,7 @@ int main() {
         void* buf = cuda_malloc_aligned_64k(65536, &raw);
         auto mem = dp.register_memory(
             DataPathMemoryView{buf, 65536, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         CHECK(mem.ok(), "register");
 
         cudaStream_t s; cudaStreamCreate(&s);
@@ -2903,7 +2980,7 @@ int main() {
         void* buf = cuda_malloc_aligned_64k(65536, &raw);
         auto mem = dp.register_memory(
             DataPathMemoryView{buf, 65536, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         CHECK(mem.ok(), "register");
 
         cudaStream_t s; cudaStreamCreate(&s);
@@ -3061,7 +3138,7 @@ int main() {
         void* buf = cuda_malloc_aligned_64k(io_size + 65536, &raw);
         auto mem = dp.register_memory(
             DataPathMemoryView{buf, io_size, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         CHECK(mem.ok(), "register 1MiB");
 
         // Expected fan-out: ceil(1MiB / effective_mdts).
@@ -3128,7 +3205,7 @@ int main() {
         void* buf = cuda_malloc_aligned_64k(65536, &raw);
         auto mem = dp.register_memory(
             DataPathMemoryView{buf, 65536, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         CHECK(mem.ok(), "register");
 
         cudaStream_t s; cudaStreamCreate(&s);
@@ -3234,7 +3311,7 @@ int main() {
         void* buf = cuda_malloc_aligned_64k(65536, &raw);
         auto mem = dp.register_memory(
             DataPathMemoryView{buf, 65536, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         CHECK(mem.ok(), "register");
 
         cudaStream_t s; cudaStreamCreate(&s);
@@ -3310,7 +3387,7 @@ int main() {
 
         auto mem = dp.register_memory(
             DataPathMemoryView{buf, 65536, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         CHECK(mem.ok(), "register_memory");
         if (!mem.ok()) { cudaFree(raw); dp.close(target); dp.shutdown(0); ::unlink(rf.path.c_str()); goto next_t46; }
 
@@ -3365,7 +3442,7 @@ int main() {
         if (rbuf) {
             auto rmem = dp.register_memory(
                 DataPathMemoryView{rbuf, 65536, 0, DataPathMemoryKind::DEVICE},
-                RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+                primary_registration_domain());
             CHECK(rmem.ok(), "register read mem");
             if (rmem.ok()) {
                 launch_fill_pattern(rbuf, 0xFF, io_size, (void*)ctx_stream());
@@ -3422,7 +3499,7 @@ int main() {
 
         auto mem = dp.register_memory(
             DataPathMemoryView{buf, io_size, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         CHECK(mem.ok(), "register 1MiB");
         if (!mem.ok()) { cudaFree(raw); dp.close(target); dp.shutdown(0); ::unlink(rf.path.c_str()); goto next_t47; }
 
@@ -3523,7 +3600,7 @@ int main() {
         LocalNvmeDataPath dp = make_qg_dp();
         CHECK(init_dp(dp).ok(), "initialize");
 
-        const std::string* fixed_dir = test_dir_under("/mnt/nvme0/GPU0");
+        const std::string* fixed_dir = test_dir_under(primary_test_parent());
         if (fixed_dir == nullptr) { FAIL("create unique test directory"); goto next_t48; }
         const std::string& dir = *fixed_dir;
         const std::string pathA = dir + "/round8_t48A.bin";
@@ -3600,7 +3677,7 @@ int main() {
 
         auto mem = dp.register_memory(
             DataPathMemoryView{buf, 65536, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         CHECK(mem.ok(), "register_memory");
         if (!mem.ok()) { cudaFree(raw); dp.close(target); dp.shutdown(0); ::unlink(pathA.c_str()); ::unlink(pathB.c_str()); goto next_t48; }
 
@@ -3716,7 +3793,7 @@ int main() {
             if (!b) return false;
             auto m = dp.register_memory(
                 DataPathMemoryView{b, tensor, 0, DataPathMemoryKind::DEVICE},
-                RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+                primary_registration_domain());
             if (!m.ok()) { cudaFree(r); return false; }
             *raw_out = r; *buf_out = b; *mem_out = m.value();
             (void)tag;
@@ -3877,10 +3954,10 @@ int main() {
         void* raw2 = nullptr; void* buf2 = cuda_malloc_aligned_64k(65536, &raw2);
         auto m1 = dp.register_memory(
             DataPathMemoryView{buf1, 65536, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         auto m2 = dp.register_memory(
             DataPathMemoryView{buf2, 65536, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         CHECK(buf1 && buf2 && m1.ok() && m2.ok(), "alloc+register 2 memories");
         if (!buf1 || !buf2 || !m1.ok() || !m2.ok()) {
             if (buf1) { if (m1.ok()) dp.unregister_memory(m1.value()); cudaFree(raw1); }
@@ -4018,7 +4095,7 @@ int main() {
         void* buf = cuda_malloc_aligned_64k(65536, &raw);
         auto memory = dp.register_memory(
             DataPathMemoryView{buf, 65536, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         CHECK(buf != nullptr && memory.ok(), "allocate and register memory");
         if (!buf || !memory.ok()) {
             if (memory.ok()) dp.unregister_memory(memory.value());
@@ -4088,7 +4165,7 @@ int main() {
         void* buf = cuda_malloc_aligned_64k(kListBytes + 65536, &raw);
         auto memory = dp.register_memory(
             DataPathMemoryView{buf, kListBytes, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         CHECK(buf != nullptr && memory.ok(), "allocate and register LIST memory");
         if (!buf || !memory.ok()) {
             if (memory.ok()) dp.unregister_memory(memory.value());
@@ -4285,7 +4362,7 @@ int main() {
         void* buf = cuda_malloc_aligned_64k(65536, &raw);
         auto mem = dp.register_memory(
             DataPathMemoryView{buf, 65536, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         CHECK(mem.ok(), "register");
 
         cudaStream_t s; cudaStreamCreate(&s);
@@ -4361,7 +4438,7 @@ int main() {
         void* buf = cuda_malloc_aligned_64k(65536, &raw);
         auto mem = dp.register_memory(
             DataPathMemoryView{buf, 65536, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         CHECK(mem.ok(), "register");
 
         cudaStream_t s; cudaStreamCreate(&s);
@@ -4456,7 +4533,7 @@ int main() {
         LocalNvmeDataPath dp_custom(
             kSnvmeDevPath, kBar0Size,
             kCudaDevice, kNumQueues,
-            kNamespaceId, kBlockSize,
+            kNamespaceId, kDeviceBlockSize,
             0, 0,  // mdts=0, max_batch_entries=0
             42);   // cq_poll_budget=42
         CHECK(init_dp(dp_custom).ok(), "initialize custom budget");
@@ -4480,7 +4557,7 @@ int main() {
         void* buf = cuda_malloc_aligned_64k(65536, &raw);
         auto mem = dp.register_memory(
             DataPathMemoryView{buf, 65536, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         CHECK(mem.ok(), "register");
 
         cudaStream_t s; cudaStreamCreate(&s);
@@ -4535,7 +4612,7 @@ int main() {
             void* buf = cuda_malloc_aligned_64k(65536, &raw);
             auto mem = dp.register_memory(
                 DataPathMemoryView{buf, 65536, 0, DataPathMemoryKind::DEVICE},
-                RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+                primary_registration_domain());
 
             cudaStream_t s; cudaStreamCreate(&s);
             HostSubmitContext ctx{ExecutionDomain::DEVICE_EXECUTION, 0, s};
@@ -4588,7 +4665,7 @@ int main() {
             void* buf = cuda_malloc_aligned_64k(io_size + 65536, &raw);
             auto mem = dp.register_memory(
                 DataPathMemoryView{buf, io_size, 0, DataPathMemoryKind::DEVICE},
-                RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+                primary_registration_domain());
 
             cudaStream_t s; cudaStreamCreate(&s);
             HostSubmitContext ctx{ExecutionDomain::DEVICE_EXECUTION, 0, s};
@@ -4668,10 +4745,10 @@ int main() {
         void* buf2 = cuda_malloc_aligned_64k(65536, &raw2);
         auto mem1 = dp.register_memory(
             DataPathMemoryView{buf1, 65536, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         auto mem2 = dp.register_memory(
             DataPathMemoryView{buf2, 65536, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         CHECK(mem1.ok() && mem2.ok(), "register 2 memory regions");
 
         cudaStream_t s1, s2;
@@ -4807,7 +4884,7 @@ int main() {
         void* buf = cuda_malloc_aligned_64k(65536, &raw);
         auto mem = dp.register_memory(
             DataPathMemoryView{buf, 65536, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         CHECK(mem.ok(), "register");
 
         cudaStream_t s; cudaStreamCreate(&s);
@@ -4891,7 +4968,7 @@ int main() {
         void* buf = cuda_malloc_aligned_64k(65536, &raw);
         auto mem = dp.register_memory(
             DataPathMemoryView{buf, 65536, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         CHECK(mem.ok(), "register");
 
         cudaStream_t s; cudaStreamCreate(&s);
@@ -4993,7 +5070,7 @@ int main() {
         void* buf = cuda_malloc_aligned_64k(65536, &raw);
         auto mem = dp.register_memory(
             DataPathMemoryView{buf, 65536, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         CHECK(mem.ok(), "register");
 
         cudaStream_t s; cudaStreamCreate(&s);
@@ -5071,7 +5148,7 @@ int main() {
         LocalNvmeDataPath dp(
             kSnvmeDevPath, kBar0Size,
             kCudaDevice, kNumQueues,
-            kNamespaceId, kBlockSize,
+            kNamespaceId, kDeviceBlockSize,
             0, 0,   // mdts=0, max_batch_entries=0
             1);     // cq_poll_budget=1 → forces timeout
         CHECK(init_dp(dp).ok(), "initialize budget=1");
@@ -5090,7 +5167,7 @@ int main() {
             void* buf = cuda_malloc_aligned_64k(kListBytes + 65536, &raw);
             auto memory = dp.register_memory(
                 DataPathMemoryView{buf, kListBytes, 0, DataPathMemoryKind::DEVICE},
-                RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+                primary_registration_domain());
             CHECK(buf != nullptr && memory.ok(), "allocate and register LIST memory");
             if (!buf || !memory.ok()) {
                 if (memory.ok()) dp.unregister_memory(memory.value());
@@ -5183,7 +5260,7 @@ int main() {
             void* buf2 = cuda_malloc_aligned_64k(kListBytes + 65536, &raw2);
             auto mem2 = dp2.register_memory(
                 DataPathMemoryView{buf2, kListBytes, 0, DataPathMemoryKind::DEVICE},
-                RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+                primary_registration_domain());
             CHECK(buf2 && mem2.ok(), "regression alloc+register");
             if (!buf2 || !mem2.ok()) {
                 if (mem2.ok()) dp2.unregister_memory(mem2.value());
@@ -5257,7 +5334,7 @@ int main() {
         void* buf = cuda_malloc_aligned_64k(65536, &raw);
         auto mem = dp.register_memory(
             DataPathMemoryView{buf, 65536, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         CHECK(mem.ok(), "register");
 
         cudaStream_t s; cudaStreamCreate(&s);
@@ -5380,7 +5457,7 @@ int main() {
         void* buf = cuda_malloc_aligned_64k(65536, &raw);
         auto mem = dp.register_memory(
             DataPathMemoryView{buf, 65536, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         CHECK(mem.ok(), "register");
 
         cudaStream_t s; cudaStreamCreate(&s);
@@ -5450,7 +5527,7 @@ int main() {
         void* buf = cuda_malloc_aligned_64k(kListBytes + 65536, &raw);
         auto mem = dp.register_memory(
             DataPathMemoryView{buf, kListBytes, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         CHECK(buf && mem.ok(), "alloc+register LIST");
         if (!buf || !mem.ok()) {
             if (mem.ok()) dp.unregister_memory(mem.value());
@@ -5547,7 +5624,7 @@ int main() {
         void* buf = cuda_malloc_aligned_64k(kListBytes + 65536, &raw);
         auto mem = dp.register_memory(
             DataPathMemoryView{buf, kListBytes, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         CHECK(buf && mem.ok(), "alloc+register LIST");
         if (!buf || !mem.ok()) {
             if (mem.ok()) dp.unregister_memory(mem.value());
@@ -5633,7 +5710,7 @@ int main() {
     {
         LocalNvmeDataPath dp(kSnvmeDevPath, kBar0Size,
                              kCudaDevice, kNumQueues,
-                             kNamespaceId, kBlockSize,
+                             kNamespaceId, kDeviceBlockSize,
                              0, 0, 0, /*handle_cache_cap=*/8, /*prp_cache_cap=*/0);
         CHECK(init_dp(dp).ok(), "initialize");
         if (!dp.test_handle_cache_enabled()) {
@@ -5680,7 +5757,7 @@ int main() {
         // (evicts LRU), verify 1st's handle is NOT evicted (pinned).
         LocalNvmeDataPath dp(kSnvmeDevPath, kBar0Size,
                              kCudaDevice, kNumQueues,
-                             kNamespaceId, kBlockSize,
+                             kNamespaceId, kDeviceBlockSize,
                              0, 0, 0, /*handle_cache_cap=*/2, /*prp_cache_cap=*/0);
         CHECK(init_dp(dp).ok(), "initialize");
         if (!dp.test_handle_cache_enabled()) {
@@ -5710,7 +5787,7 @@ int main() {
         if (!buf) { dp.close(o1.value()); dp.shutdown(0); goto next_t64; }
         auto mem = dp.register_memory(
             DataPathMemoryView{buf, kBlockSize, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         CHECK(mem.ok(), "register mem");
 
         cudaStream_t s; cudaStreamCreate(&s);
@@ -5759,7 +5836,7 @@ int main() {
     {
         LocalNvmeDataPath dp(kSnvmeDevPath, kBar0Size,
                              kCudaDevice, kNumQueues,
-                             kNamespaceId, kBlockSize,
+                             kNamespaceId, kDeviceBlockSize,
                              0, 0, 0, /*handle_cache_cap=*/1, /*prp_cache_cap=*/0);
         CHECK(init_dp(dp).ok(), "initialize");
         if (!dp.test_handle_cache_enabled()) {
@@ -5806,7 +5883,7 @@ int main() {
     {
         LocalNvmeDataPath dp(kSnvmeDevPath, kBar0Size,
                              kCudaDevice, kNumQueues,
-                             kNamespaceId, kBlockSize,
+                             kNamespaceId, kDeviceBlockSize,
                              0, 0, 0, /*handle_cache_cap=*/0, /*prp_cache_cap=*/32);
         CHECK(init_dp(dp).ok(), "initialize");
         if (!dp.test_prp_cache_enabled()) {
@@ -5829,7 +5906,7 @@ int main() {
         if (!buf) { dp.close(opened.value()); dp.shutdown(0); goto next_t66; }
         auto mem = dp.register_memory(
             DataPathMemoryView{buf, io_size, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         CHECK(mem.ok(), "register mem");
 
         cudaStream_t s; cudaStreamCreate(&s);
@@ -5932,7 +6009,7 @@ int main() {
 
         auto mem = dp.register_memory(
             DataPathMemoryView{buf, 65536, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         CHECK(mem.ok(), "register memory");
         if (!mem.ok()) { cudaFree(raw); dp.close(opened.value()); dp.shutdown(0); ::unlink(rf.path.c_str()); goto next_t67; }
 
@@ -6043,10 +6120,10 @@ int main() {
 
         auto wmem = dp.register_memory(
             DataPathMemoryView{wbuf, 65536, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         auto rmem = dp.register_memory(
             DataPathMemoryView{rbuf, 65536, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         CHECK(wmem.ok() && rmem.ok(), "register 2 memories");
         if (!wmem.ok() || !rmem.ok()) {
             if (wmem.ok()) dp.unregister_memory(wmem.value());
@@ -6173,7 +6250,7 @@ int main() {
 
         auto mem = dp.register_memory(
             DataPathMemoryView{buf, 65536, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         CHECK(mem.ok(), "register memory");
         if (!mem.ok()) { cudaFree(raw); dp.close(opened.value()); dp.shutdown(0); ::unlink(rf.path.c_str()); goto next_t69; }
 
@@ -6298,12 +6375,12 @@ int main() {
 
         auto mem_w = dp.register_memory(
             DataPathMemoryView{buf_w, io_size, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         CHECK(mem_w.ok(), "register write buffer");
 
         auto mem_r = dp.register_memory(
             DataPathMemoryView{buf_r, io_size, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         CHECK(mem_r.ok(), "register read buffer");
 
         // Fill write buffer with position-dependent pattern.
@@ -6437,7 +6514,7 @@ int main() {
         void* buf = cuda_malloc_aligned_64k(io_size + 65536, &raw);
         auto mem = dp.register_memory(
             DataPathMemoryView{buf, io_size, 0, DataPathMemoryKind::DEVICE},
-            RegistrationDomainKey{"local_nvme:0000:08:00.0:ns1"});
+            primary_registration_domain());
         CHECK(mem.ok(), "register memory");
 
         // Record the device handle pointer BEFORE any submit.
@@ -6502,7 +6579,7 @@ int main() {
         LocalNvmeDataPath dp_big(
             kSnvmeDevPath, kBar0Size,
             kCudaDevice, kNumQueues,
-            kNamespaceId, kBlockSize,
+            kNamespaceId, kDeviceBlockSize,
             /*mdts_bytes=*/0, /*max_batch_entries=*/512,
             /*cq_poll_budget=*/0, /*handle_cache_capacity=*/0,
             /*prp_cache_capacity=*/0,
@@ -6531,7 +6608,7 @@ int main() {
         // entries*effective_mdts).
         LocalNvmeDataPath dp_def(kSnvmeDevPath, kBar0Size,
                                  kCudaDevice, kNumQueues,
-                                 kNamespaceId, kBlockSize);
+                                 kNamespaceId, kDeviceBlockSize);
         CHECK(init_dp(dp_def).ok(), "initialize dp_def (all-default capacity)");
         CHECK(dp_def.test_arena_capacity() == 32,
               "default arena capacity == 2*16 == 32 (unchanged)");
@@ -6626,25 +6703,30 @@ int main() {
         // and accepts the implicit non-narrowing int32->uint32 conversion).
         const std::int32_t kCudaDev = (std::int32_t)test_gpu;
         const std::uint32_t kNumQueues = 16;
-        const std::uint32_t kNsId = 1;
         const std::uint32_t kBlockSize = 4096;
 
         // Up-to-4 DataPath instances, one per available device.
         // Devices 2/3 are conditionally created (unique_ptr) so the
         // resolver/components lists only include what's mounted.
-        LocalNvmeDataPath dp0("/dev/ssnvme0", 16384, kCudaDev, kNumQueues,
-                              kNsId, kBlockSize);
-        LocalNvmeDataPath dp1("/dev/ssnvme1", 16384, kCudaDev, kNumQueues,
-                              kNsId, kBlockSize);
+        const auto& dev0 = g_devices.at(0);
+        const auto& dev1 = g_devices.at(1);
+        LocalNvmeDataPath dp0(dev0.ssnvme_path, dev0.bar0_size, kCudaDev,
+                              kNumQueues, dev0.namespace_id, dev0.block_size);
+        LocalNvmeDataPath dp1(dev1.ssnvme_path, dev1.bar0_size, kCudaDev,
+                              kNumQueues, dev1.namespace_id, dev1.block_size);
         std::unique_ptr<LocalNvmeDataPath> dp2, dp3;
-        if (num_avail >= 3)
+        if (num_avail >= 3) {
+            const auto& dev2 = g_devices.at(2);
             dp2 = std::make_unique<LocalNvmeDataPath>(
-                "/dev/ssnvme2", 16384, kCudaDev, kNumQueues,
-                kNsId, kBlockSize);
-        if (num_avail >= 4)
+                dev2.ssnvme_path, dev2.bar0_size, kCudaDev, kNumQueues,
+                dev2.namespace_id, dev2.block_size);
+        }
+        if (num_avail >= 4) {
+            const auto& dev3 = g_devices.at(3);
             dp3 = std::make_unique<LocalNvmeDataPath>(
-                "/dev/ssnvme3", 16384, kCudaDev, kNumQueues,
-                kNsId, kBlockSize);
+                dev3.ssnvme_path, dev3.bar0_size, kCudaDev, kNumQueues,
+                dev3.namespace_id, dev3.block_size);
+        }
 
         ResourceProvider rp;
         // Note: do NOT call dp*.initialize() manually —
@@ -6653,22 +6735,30 @@ int main() {
 
         // Resolver wrappers with device-specific schemes + keys.
         MultiDeviceResolverWrapper resolver0(
-            "0000:08:00.0", kNsId, kBlockSize,
-            tutti::resolvers::local_file::BackingDeviceConfig{"/dev/snvme0n1", 0},
+            dev0.pci_bdf, dev0.namespace_id, dev0.block_size,
+            tutti::resolvers::local_file::BackingDeviceConfig{dev0.backing_device, 0},
             "file0", "local-nvme-ext4-dev0");
         MultiDeviceResolverWrapper resolver1(
-            "0000:4b:00.0", kNsId, kBlockSize,
-            tutti::resolvers::local_file::BackingDeviceConfig{"/dev/snvme1n1", 0},
+            dev1.pci_bdf, dev1.namespace_id, dev1.block_size,
+            tutti::resolvers::local_file::BackingDeviceConfig{dev1.backing_device, 0},
             "file1", "local-nvme-ext4-dev1");
         std::unique_ptr<MultiDeviceResolverWrapper> resolver2, resolver3;
-        if (dp2) resolver2 = std::make_unique<MultiDeviceResolverWrapper>(
-            "0000:57:00.0", kNsId, kBlockSize,
-            tutti::resolvers::local_file::BackingDeviceConfig{"/dev/snvme2n1", 0},
-            "file2", "local-nvme-ext4-dev2");
-        if (dp3) resolver3 = std::make_unique<MultiDeviceResolverWrapper>(
-            "0000:63:00.0", kNsId, kBlockSize,
-            tutti::resolvers::local_file::BackingDeviceConfig{"/dev/snvme3n1", 0},
-            "file3", "local-nvme-ext4-dev3");
+        if (dp2) {
+            const auto& dev2 = g_devices.at(2);
+            resolver2 = std::make_unique<MultiDeviceResolverWrapper>(
+                dev2.pci_bdf, dev2.namespace_id, dev2.block_size,
+                tutti::resolvers::local_file::BackingDeviceConfig{
+                    dev2.backing_device, 0},
+                "file2", "local-nvme-ext4-dev2");
+        }
+        if (dp3) {
+            const auto& dev3 = g_devices.at(3);
+            resolver3 = std::make_unique<MultiDeviceResolverWrapper>(
+                dev3.pci_bdf, dev3.namespace_id, dev3.block_size,
+                tutti::resolvers::local_file::BackingDeviceConfig{
+                    dev3.backing_device, 0},
+                "file3", "local-nvme-ext4-dev3");
+        }
 
         // Assemble into one Runtime.
         RuntimeComponents components;
@@ -7256,15 +7346,15 @@ int main() {
     // 86-87. Handle cache P0-1 regression (Round 16 S1)
     // =====================================================================
     {
-        const std::uint32_t kCudaDev = 0;
+        const std::uint32_t kCudaDev = static_cast<std::uint32_t>(test_gpu);
         const std::uint32_t kNumQueues = 2;
-        const std::uint32_t kNsId = 1;
         const std::uint32_t kBlockSize = 4096;
         const std::uint64_t io_size = kBlockSize * 4;
 
         // Enable handle cache with capacity=1 to force eviction path.
         LocalNvmeDataPath dp_hc(kSnvmeDevPath, kBar0Size, kCudaDev, kNumQueues,
-                                kNsId, kBlockSize,
+                                primary_device().namespace_id,
+                                primary_device().block_size,
                                 /*mdts*/0, /*max_batch_entries*/256,
                                 /*cq_poll_budget*/0,
                                 /*handle_cache_capacity*/1,
@@ -7272,8 +7362,10 @@ int main() {
 
         // Assemble through StorageRuntime so we get public API (IoRequest with MemoryHandle).
         MultiDeviceResolverWrapper resolver_hc(
-            "0000:08:00.0", kNsId, kBlockSize,
-            tutti::resolvers::local_file::BackingDeviceConfig{"/dev/snvme0n1", 0},
+            primary_device().pci_bdf, primary_device().namespace_id,
+            primary_device().block_size,
+            tutti::resolvers::local_file::BackingDeviceConfig{
+                primary_device().backing_device, 0},
             "file", "local-nvme-ext4");
         RuntimeComponents components_hc;
         components_hc.resolvers.push_back({"file", &resolver_hc});

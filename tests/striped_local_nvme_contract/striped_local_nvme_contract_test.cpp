@@ -29,7 +29,8 @@
 // Returns 0 on pass, 1 on fail, 77 on SKIP (hardware unavailable).
 //
 // Usage:
-//   tutti_striped_local_nvme_contract_test [--devices 2|4]
+//   tutti_striped_local_nvme_contract_test [--devices 2|4] [--gpu ID]
+//       [--nvme ssnvme,bdf,backing,mount[,block_size[,bar0_size[,nsid]]]] ...
 // With no argument, the test selects the largest supported power-of-two
 // device count that is available: 4 when all four devices are ready,
 // otherwise 2 when at least the first two devices are ready.
@@ -43,6 +44,7 @@
 #include "tutti/bindings/striped_local_nvme/binding.h"
 
 #include "../hardware_test_directory.h"
+#include "../nvme_test_cli.h"
 
 #include <tutti/cuda_like.h>
 
@@ -50,6 +52,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -62,6 +65,7 @@ using namespace tutti;
 using namespace tutti::data_paths::striped_local_nvme;
 using namespace tutti::resolvers::striped_file;
 using namespace tutti::resolvers::local_file;
+using namespace tutti::test_support;
 
 extern "C" void launch_fill_pattern_gpu(void* buf, unsigned char val,
                                         std::uint64_t n, void* stream);
@@ -73,6 +77,8 @@ static int g_pass = 0;
 static int g_fail = 0;
 static std::vector<tutti::test_support::UniqueTestDirectory> g_run_dirs;
 static std::vector<std::string> g_test_mounts;
+static std::vector<NvmeTestDevice> g_devices = default_nvme_test_devices();
+static std::int32_t g_gpu_id = 0;
 
 #define TEST_CASE(name) std::printf("--- %s ---\n", name)
 #define CHECK(cond, msg) do { \
@@ -84,7 +90,7 @@ static bool create_test_mounts(std::uint32_t num_devices) {
     g_run_dirs.reserve(num_devices);
     g_test_mounts.reserve(num_devices);
     for (std::uint32_t i = 0; i < num_devices; ++i) {
-        std::string parent = "/mnt/nvme" + std::to_string(i);
+        const std::string& parent = g_devices.at(i).mount_path;
         tutti::test_support::UniqueTestDirectory dir;
         std::string error;
         if (!tutti::test_support::UniqueTestDirectory::create(
@@ -138,19 +144,24 @@ static void print_preserved_test_mounts() {
 // -------------------------------------------------------------------------
 
 static bool device_available(std::uint32_t device) {
-    char dev[32];
-    std::snprintf(dev, sizeof(dev), "/dev/ssnvme%u", device);
+    if (device >= g_devices.size()) return false;
     struct stat st{};
-    if (::stat(dev, &st) != 0) return false;
-
-    char mnt[32];
-    std::snprintf(mnt, sizeof(mnt), "/mnt/nvme%u", device);
-    return ::stat(mnt, &st) == 0 && S_ISDIR(st.st_mode);
+    if (::stat(g_devices[device].ssnvme_path.c_str(), &st) != 0) return false;
+    if (::stat(g_devices[device].mount_path.c_str(), &st) != 0 ||
+        !S_ISDIR(st.st_mode)) return false;
+    const std::size_t slash = g_devices[device].mount_path.find_last_of('/');
+    const std::string parent = slash == 0
+        ? "/"
+        : g_devices[device].mount_path.substr(
+              0, slash == std::string::npos ? 0 : slash);
+    struct stat parent_st{};
+    return !parent.empty() && ::stat(parent.c_str(), &parent_st) == 0 &&
+           st.st_dev != parent_st.st_dev;
 }
 
 static std::uint32_t consecutive_device_count() {
     std::uint32_t count = 0;
-    while (count < 4 && device_available(count)) ++count;
+    while (count < g_devices.size() && count < 4 && device_available(count)) ++count;
     return count;
 }
 
@@ -160,11 +171,13 @@ static bool hw_available(std::uint32_t num_devices) {
     }
     int dc = 0;
     if (cudaGetDeviceCount(&dc) != cudaSuccess || dc == 0) return false;
-    return true;
+    return g_gpu_id >= 0 && g_gpu_id < dc;
 }
 
 static void print_usage(const char* program) {
-    std::fprintf(stderr, "Usage: %s [--devices 2|4]\n", program);
+    std::fprintf(stderr,
+                 "Usage: %s [--devices 2|4] [--gpu ID] [--nvme %s]...\n",
+                 program, nvme_test_device_format().c_str());
 }
 
 static bool parse_device_count(const char* value, std::uint32_t& out) {
@@ -179,21 +192,50 @@ static bool parse_device_count(const char* value, std::uint32_t& out) {
     return false;
 }
 
-static bool requested_device_count(int argc, char** argv,
-                                   std::uint32_t available,
-                                   std::uint32_t& out) {
-    if (argc == 1) {
-        out = available >= 4 ? 4 : (available >= 2 ? 2 : 0);
-        return true;
+static bool parse_args(int argc, char** argv, std::uint32_t& requested) {
+    bool nvme_overridden = false;
+    requested = 0;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--devices") == 0 && i + 1 < argc) {
+            if (!parse_device_count(argv[++i], requested)) return false;
+            continue;
+        }
+        constexpr const char* prefix = "--devices=";
+        if (std::strncmp(argv[i], prefix, std::strlen(prefix)) == 0) {
+            if (!parse_device_count(argv[i] + std::strlen(prefix), requested)) return false;
+            continue;
+        }
+        if (std::strcmp(argv[i], "--gpu") == 0 && i + 1 < argc) {
+            std::uint32_t gpu = 0;
+            if (!parse_u32(argv[++i], &gpu) ||
+                gpu > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
+                return false;
+            }
+            g_gpu_id = static_cast<std::int32_t>(gpu);
+            continue;
+        }
+        if (std::strcmp(argv[i], "--nvme") == 0 && i + 1 < argc) {
+            NvmeTestDevice device;
+            std::string error;
+            if (!parse_nvme_test_device(argv[++i], &device, &error)) {
+                std::fprintf(stderr, "invalid --nvme: %s; expected %s\n",
+                             error.c_str(), nvme_test_device_format().c_str());
+                return false;
+            }
+            if (!nvme_overridden) {
+                g_devices.clear();
+                nvme_overridden = true;
+            }
+            g_devices.push_back(std::move(device));
+            continue;
+        }
+        return false;
     }
-    if (argc == 3 && std::strcmp(argv[1], "--devices") == 0) {
-        return parse_device_count(argv[2], out);
+    if (g_devices.size() > 4) {
+        std::fprintf(stderr, "striped contract supports at most 4 --nvme devices\n");
+        return false;
     }
-    constexpr const char* prefix = "--devices=";
-    if (argc == 2 && std::strncmp(argv[1], prefix, std::strlen(prefix)) == 0) {
-        return parse_device_count(argv[1] + std::strlen(prefix), out);
-    }
-    return false;
+    return true;
 }
 
 static bool create_backing_file(const std::string& path, std::uint64_t size) {
@@ -324,17 +366,14 @@ struct StripedEnv {
 
     explicit StripedEnv(std::uint32_t num_devices)
         : dp(build_devs(num_devices),
-             /*cuda_device=*/(std::uint32_t)test_gpu_id(),
+             /*cuda_device=*/(std::uint32_t)g_gpu_id,
              /*mdts_override=*/0, /*cq_poll_budget=*/2000000,
              /*max_batch_entries=*/4096, /*max_in_flight_operations=*/4) {
-        // Round 16 S3: per-device resolvers for up to 4 devices.
-        static const char* kPciAddrs[] = {"0000:08:00.0", "0000:4b:00.0",
-                                           "0000:57:00.0", "0000:63:00.0"};
-        static const char* kBackingDevs[] = {"/dev/snvme0n1", "/dev/snvme1n1",
-                                             "/dev/snvme2n1", "/dev/snvme3n1"};
         for (std::uint32_t i = 0; i < num_devices; ++i) {
+            const auto& device = g_devices.at(i);
             sub_resolvers.push_back(std::make_unique<LocalFileResolver>(
-                kPciAddrs[i], 1, 4096, BackingDeviceConfig{kBackingDevs[i], 0}));
+                device.pci_bdf, device.namespace_id, device.block_size,
+                BackingDeviceConfig{device.backing_device, 0}));
         }
         striped_resolver = std::make_unique<StripedResolver>(
             std::move(sub_resolvers), kStripeUnit);
@@ -344,13 +383,12 @@ struct StripedEnv {
     // num_user_queues=16 (Round 16 S3 upgrade from 1→16); ring depth is
     // kernel-authoritative (NVM_GET_DEV_INFO), not a parameter.
     static std::vector<DeviceDescriptor> build_devs(std::uint32_t n) {
-        static const char* kSnvmePaths[] = {
-            "/dev/ssnvme0", "/dev/ssnvme1", "/dev/ssnvme2", "/dev/ssnvme3"};
         std::vector<DeviceDescriptor> v;
         for (std::uint32_t i = 0; i < n; ++i) {
-            v.push_back({kSnvmePaths[i], 16384, 1,
-                         (std::uint32_t)test_gpu_id(),
-                         /*num_user_queues=*/16, 4096});
+            const auto& device = g_devices.at(i);
+            v.push_back({device.ssnvme_path, device.bar0_size,
+                         device.namespace_id, (std::uint32_t)g_gpu_id,
+                         /*num_user_queues=*/16, device.block_size});
         }
         return v;
     }
@@ -1827,22 +1865,28 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    const std::uint32_t available = consecutive_device_count();
-    std::uint32_t num_devices = 0;
-    if (!requested_device_count(argc, argv, available, num_devices)) {
+    g_gpu_id = test_gpu_id();
+    std::uint32_t requested = 0;
+    if (!parse_args(argc, argv, requested)) {
         print_usage(argv[0]);
         return 2;
     }
 
-    if (num_devices == 0 || !hw_available(num_devices)) {
-        std::printf("SKIP: hardware not available (found %u consecutive devices; "
-                    "need 2 or 4 matching /dev/ssnvmeN + /mnt/nvmeN pairs "
-                    "and a CUDA device)\n", available);
+    const std::uint32_t available = consecutive_device_count();
+    const std::uint32_t num_devices = requested != 0
+        ? requested
+        : (available >= 4 ? 4 : (available >= 2 ? 2 : 0));
+
+    if (num_devices > g_devices.size() || num_devices == 0 ||
+        !hw_available(num_devices)) {
+        std::printf("SKIP: hardware not available (found %u configured devices; "
+                    "need 2 or 4 matching ssnvme + mount pairs and CUDA device %d)\n",
+                    available, g_gpu_id);
         return 77;
     }
-    std::printf("Using %u striped devices (found %u consecutive devices)\n",
+    std::printf("Using %u striped devices (found %u configured devices)\n",
                 num_devices, available);
-    cudaSetDevice(test_gpu_id());
+    cudaSetDevice(g_gpu_id);
 
     auto env2 = make_env(2);
     if (!env2) {
