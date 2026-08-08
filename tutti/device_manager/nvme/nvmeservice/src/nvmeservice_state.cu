@@ -181,6 +181,15 @@ void ServiceState::init_device(const NvmeEntry& nvme, int32_t device_id) {
     dev.bar0_size            = ctrl->bar0_size;
     dev.dstrd                = ctrl->dstrd;
     dev.max_user_qid         = ctrl->max_user_qid;
+    // QID 0 is the admin queue.  Kernel I/O QPs occupy
+    // [1, start_cq_idx), while the user pool occupies the inclusive
+    // range [start_cq_idx, max_user_qid].
+    const uint32_t first_user_qid = ctrl->start_cq_idx;
+    dev.kernel_io_qps        = first_user_qid > 0 ? first_user_qid - 1 : 0;
+    dev.user_io_qps          = first_user_qid > 0 &&
+                                ctrl->max_user_qid >= first_user_qid
+                                    ? ctrl->max_user_qid - first_user_qid + 1
+                                    : 0;
     dev.max_queues_per_group = ctrl->max_queues_per_group;
     dev.page_size            = ctrl->page_size;
     dev.queue_depth          = ctrl->q_depth;
@@ -220,9 +229,11 @@ void ServiceState::init_device(const NvmeEntry& nvme, int32_t device_id) {
     // Bring-up banner — info level, gated by TUTTI_VERBOSE.
     TUTTI_INFO(
         "nvmeservice: device=%d pci=%s snvme=%s ns=%u qdepth=%u "
+        "io_qp_limit=%u kernel_io_qps=%u user_io_qps=%u "
         "max_user_qid=%u max_q_per_grp=%u allowed_gpus={",
         device_id, nvme.pci_addr.c_str(), dev.snvme_dev_path.c_str(),
         dev.namespace_id, dev.queue_depth,
+        dev.max_user_qid, dev.kernel_io_qps, dev.user_io_qps,
         dev.max_user_qid, dev.max_queues_per_group);
     if (tutti_verbose()) {
         bool first = true;
@@ -378,6 +389,8 @@ std::vector<DeviceSnapshot> ServiceState::list_devices() const {
         s.dstrd                = d.dstrd;
         s.bar0_size            = d.bar0_size;
         s.max_user_qid         = d.max_user_qid;
+        s.kernel_io_qps        = d.kernel_io_qps;
+        s.user_io_qps          = d.user_io_qps;
         s.max_queues_per_group = d.max_queues_per_group;
 
         // Stable order for human readability: sort by gpu id.

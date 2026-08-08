@@ -273,7 +273,11 @@ int main(int argc, char** argv) {
                       << " snvme=" << d.snvme_dev_path
                       << " ns="   << d.namespace_id
                       << " block_size=" << d.blk_size
+                      << " io_qp_limit=" << d.max_user_qid
+                      << " kernel_io_qps=" << d.kernel_io_qps
+                      << " user_io_qps=" << d.user_io_qps
                       << " max_user_qid=" << d.max_user_qid
+                      << " max_q_per_grp=" << d.max_queues_per_group
                       << "\n";
         }
         std::cout.flush();

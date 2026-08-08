@@ -75,6 +75,8 @@ struct DeviceSnapshot {
     uint32_t    dstrd                = 0;
     uint64_t    bar0_size            = 0;
     uint32_t    max_user_qid         = 0;
+    uint32_t    kernel_io_qps        = 0;   // Actual kernel I/O QPs; excludes admin QP.
+    uint32_t    user_io_qps          = 0;   // User QID-pool capacity, not runtime free QPs.
     uint32_t    max_queues_per_group = 0;
 
     // ACL: which cuda_device values may Connect to this NVMe.
@@ -136,6 +138,8 @@ struct DeviceState {
     uint32_t                 blk_size_log         = 0;
     uint32_t                 queue_depth          = 0;
     uint32_t                 max_user_qid         = 0;
+    uint32_t                 kernel_io_qps        = 0;   // Excludes QID 0 admin QP.
+    uint32_t                 user_io_qps          = 0;   // Pool capacity at bring-up.
     uint32_t                 max_queues_per_group = 0;
     size_t                   max_data_size        = 0;   // CTRL.MDTS in bytes
 
