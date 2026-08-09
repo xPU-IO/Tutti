@@ -546,6 +546,7 @@ generate_cmake_presets() {
   ]
 }
 EOF
+    chmod 0644 -- "${presets_tmp}" || return 1
     mv -f -- "${presets_tmp}" "${presets_file}"
     echo "已生成 CMake presets：${presets_file}（依赖提供方：${CPP_DEPS_PROVIDER}）"
 }
@@ -663,6 +664,7 @@ generate_dependency_manifest() {
         write_pkg_config_dependency "${manifest_tmp}" "yaml-cpp" "yaml-cpp"
     fi
 
+    chmod 0644 -- "${manifest_tmp}" || return 1
     mv -f -- "${manifest_tmp}" "${manifest_file}"
     echo "已生成依赖清单：${manifest_file}"
 }
