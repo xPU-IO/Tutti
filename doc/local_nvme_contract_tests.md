@@ -72,9 +72,6 @@ build/cuda/bin/tutti_local_nvme_datapath_contract_test \
 测试中的生产 `LocalNvmeDataPath` 固定请求 `kNumQueues=16`，因此每个使用的
 controller 需要 `user_io_qps >= 16` 且 `max_q_per_grp >= 16`。
 
-当前 device 0 在 `kernel_ioq_cap: 8` 下有 23 个 user QP，可以通过；`cap: 15`
-会留下刚好 16 个。多盘场景中的每个 selected controller 都要满足该要求。
-
 ### 2.2 StorageRuntime local-NVMe contract
 
 该测试只接受一个 `--nvme`，通过 public `StorageRuntime` API 验证 open、内存、
@@ -89,13 +86,6 @@ build/cuda/bin/tutti_storage_runtime_local_nvme_contract_test \
 每个 runtime 申请 `16` 个 QP；`assembly/open` 会同时创建第二个 `dp2` 验证
 mismatched key。因此同一 controller 需要 `max_q_per_grp >= 16` 且至少有
 `32` 个 user QP。
-
-device 0 当前只有 23 个 user QP，所以会在 `create mismatched-key runtime` 处
-失败；这属于 fixture 资源冲突，后续 I/O 仍可能通过。device 1 有 73 个，使用
-上面的 `$NVME1` 命令可满足要求。
-
-若必须验证 device 0 的 key-routing，需要把 `dp2` 改为 skeleton/no-queue fixture
-或调整两个 runtime 的生命周期；仅修改命令参数无法得到 32 个 user QP。
 
 请求 payload 固定为 4 KiB；`block_size` 只负责 LBA 换算。
 
