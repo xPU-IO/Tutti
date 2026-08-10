@@ -136,7 +136,7 @@ enum class DataPathMemoryKind {
 struct DataPathMemoryView {
     void* base = nullptr;
     std::uint64_t size_bytes = 0;
-    std::int32_t device_id = -1;  // -1 for host-only memory
+    std::int32_t expected_accel_id = -1;  // -1 for unspecified/host memory
     DataPathMemoryKind kind = DataPathMemoryKind::HOST;
     // Round 16 S5 (V3): io_granularity > 0 enables registration-time PRP
     // pre-build (legacy build_io_slice_table 9-stage path).  0 = dynamic.
@@ -224,6 +224,9 @@ struct DataPathCapabilities {
     std::uint64_t max_concurrent_operations = 0;
 
     // multi-device
+    // -1: host-only/unbound; >= 0: fixed accelerator device.
+    // A device-executing DataPath must match its owning Runtime exactly.
+    std::int32_t bound_accel_id = -1;
     bool supports_multi_gpu = false;
     bool supports_cross_device = false;
 

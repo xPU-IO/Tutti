@@ -98,7 +98,9 @@ enum class ExecutionDomain {
 // performs no CUDA API calls and no runtime validation.
 struct HostSubmitContext {
     ExecutionDomain execution_domain;
-    std::int32_t    device_id;
+    // -1 means "use the owning Runtime's accelerator".  This is an
+    // accelerator identity, not a daemon NVMe device_id.
+    std::int32_t    accel_id;
     cudaStream_t    stream;
 };
 

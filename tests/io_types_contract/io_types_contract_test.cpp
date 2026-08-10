@@ -100,7 +100,7 @@ static_assert(tutti::ExecutionDomain::HOST_EXECUTION !=
 // 12. HostSubmitContext field types; cudaStream_t comes via <tutti/cuda_like.h>.
 static_assert(std::is_same_v<decltype(tutti::HostSubmitContext::execution_domain),
                              tutti::ExecutionDomain>);
-static_assert(std::is_same_v<decltype(tutti::HostSubmitContext::device_id),
+static_assert(std::is_same_v<decltype(tutti::HostSubmitContext::accel_id),
                              std::int32_t>);
 static_assert(std::is_same_v<decltype(tutti::HostSubmitContext::stream),
                              cudaStream_t>);
@@ -185,13 +185,13 @@ int main() {
             0,
             nullptr};
         CHECK(ctx.execution_domain == tutti::ExecutionDomain::HOST_EXECUTION);
-        CHECK(ctx.device_id == 0);
+        CHECK(ctx.accel_id == 0);
         CHECK(ctx.stream == nullptr);
 
         ctx.execution_domain = tutti::ExecutionDomain::DEVICE_EXECUTION;
-        ctx.device_id = 1;
+        ctx.accel_id = 1;
         CHECK(ctx.execution_domain == tutti::ExecutionDomain::DEVICE_EXECUTION);
-        CHECK(ctx.device_id == 1);
+        CHECK(ctx.accel_id == 1);
     }
 
     if (g_failures == 0) {

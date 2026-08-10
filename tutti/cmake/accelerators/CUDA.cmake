@@ -22,7 +22,11 @@ find_package(CUDAToolkit 12.6 REQUIRED)
 #   - CUDA::cudart and CUDA::cuda_driver links
 # ---------------------------------------------------------------------------
 function(tutti_configure_cuda_like target_name)
-    target_compile_definitions(${target_name} INTERFACE TUTTI_USE_CUDA=1)
+    target_compile_definitions(${target_name} INTERFACE
+        TUTTI_USE_CUDA=1
+        TUTTI_COMPILED_ACCELERATOR_PROFILE=\"CUDA\"
+        TUTTI_DEFAULT_ACCEL_ID=0
+    )
 
     target_include_directories(${target_name} INTERFACE
         "${TUTTI_SOURCE_DIR}/include"

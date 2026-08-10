@@ -23,7 +23,11 @@ set(TUTTI_BUILD_HARDWARE_STACK OFF CACHE BOOL
 #   - No CUDA links
 # ---------------------------------------------------------------------------
 function(tutti_configure_cuda_like target_name)
-    target_compile_definitions(${target_name} INTERFACE TUTTI_USE_HOST=1)
+    target_compile_definitions(${target_name} INTERFACE
+        TUTTI_USE_HOST=1
+        TUTTI_COMPILED_ACCELERATOR_PROFILE=\"HOST\"
+        TUTTI_DEFAULT_ACCEL_ID=-1
+    )
 
     target_include_directories(${target_name} INTERFACE
         "${TUTTI_SOURCE_DIR}/include"

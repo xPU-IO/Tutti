@@ -525,7 +525,7 @@ static int test_memory_info_no_private_fields() {
     static_assert(std::is_same_v<decltype(tutti::MemoryInfo::ownership), tutti::MemoryOwnership>);
     static_assert(std::is_same_v<decltype(tutti::MemoryInfo::size), std::uint64_t>);
     static_assert(std::is_same_v<decltype(tutti::MemoryInfo::address), void*>);
-    static_assert(std::is_same_v<decltype(tutti::MemoryInfo::device_id), std::int32_t>);
+    static_assert(std::is_same_v<decltype(tutti::MemoryInfo::accel_id), std::int32_t>);
     static_assert(std::is_same_v<decltype(tutti::MemoryInfo::inflight_count), int>);
 
     // Aggregate initialization with exactly 6 fields.
@@ -550,7 +550,7 @@ static int test_memory_info_no_private_fields() {
     (void)mi2.ownership;
     (void)mi2.size;
     (void)mi2.address;
-    (void)mi2.device_id;
+    (void)mi2.accel_id;
     (void)mi2.inflight_count;
     return 0;
 }
@@ -1283,7 +1283,8 @@ static int test_shutdown_drain_retry() {
 // 33. Terminal result backpressure: hitting the limit rejects new submit.
 static int test_terminal_backpressure() {
     auto rt = std::move(tutti::StorageRuntime::create(
-        tutti::RuntimeConfig{2, "host"})).value();  // max_terminal_results=2
+        tutti::RuntimeConfig{TUTTI_DEFAULT_ACCEL_ID, 2,
+                             TUTTI_COMPILED_ACCELERATOR_PROFILE})).value();  // max_terminal_results=2
 
     char buf[64];
     auto mem = rt->register_memory(make_host_view(buf, sizeof(buf))).value();
@@ -1446,6 +1447,102 @@ static int test_cross_datapath_batch_not_merged() {
 }
 
 // =====================================================================
+// Phase 1: accelerator identity and binding contract
+// =====================================================================
+
+static tutti::RuntimeConfig phase1_config(std::int32_t accel_id) {
+    return tutti::RuntimeConfig{
+        accel_id, 64, TUTTI_COMPILED_ACCELERATOR_PROFILE};
+}
+
+static int test_phase1_profile_and_accel_range() {
+    auto runtime = tutti::StorageRuntime::create();
+    if (!runtime.ok()) return 1;
+    if (runtime.value()->accel_id() != TUTTI_DEFAULT_ACCEL_ID) return 1;
+    const auto profile = runtime.value()->query_cuda_like_profile();
+    if (profile.profile_name != TUTTI_COMPILED_ACCELERATOR_PROFILE) return 1;
+    if (profile.device_count < 0) return 1;
+
+    auto devices = runtime.value()->list_devices();
+    if (!devices.ok() ||
+        devices.value().size() != static_cast<std::size_t>(profile.device_count)) return 1;
+    for (std::int32_t id = 0; id < profile.device_count; ++id) {
+        if (devices.value()[static_cast<std::size_t>(id)].accel_id != id) return 1;
+        auto explicit_runtime = tutti::StorageRuntime::create(phase1_config(id));
+        if (!explicit_runtime.ok() || explicit_runtime.value()->accel_id() != id) return 1;
+    }
+
+    auto negative = tutti::StorageRuntime::create(phase1_config(-2));
+    if (negative.ok() ||
+        negative.status().code() != tutti::StatusCode::INVALID_ARGUMENT) return 1;
+
+    const std::int32_t out_of_range = profile.device_count;
+    auto out = tutti::StorageRuntime::create(phase1_config(out_of_range));
+    if (out.ok() ||
+        (out.status().code() != tutti::StatusCode::NOT_FOUND &&
+         out.status().code() != tutti::StatusCode::UNSUPPORTED)) return 1;
+
+    const char* mismatch =
+        (std::string(TUTTI_COMPILED_ACCELERATOR_PROFILE) == "HOST")
+        ? "CUDA" : "HOST";
+    auto wrong_profile = tutti::StorageRuntime::create(
+        tutti::RuntimeConfig{TUTTI_DEFAULT_ACCEL_ID, 64, mismatch});
+    if (wrong_profile.ok() ||
+        wrong_profile.status().code() != tutti::StatusCode::INVALID_ARGUMENT) return 1;
+    return 0;
+}
+
+static int test_phase1_datapath_binding_preflight() {
+    RuntimeFakeResolver resolver;
+    RuntimeFakeDataPath data_path;
+    const std::int32_t runtime_accel = TUTTI_DEFAULT_ACCEL_ID;
+    data_path.caps.bound_accel_id = runtime_accel < 0 ? 0 : runtime_accel + 1;
+
+    tutti::RuntimeComponents components;
+    components.resolvers.push_back({"fake", &resolver});
+    components.data_paths.push_back(
+        {"runtime-fake-datapath", &data_path, tutti::DataPathConfig{"fake"}});
+    auto created = tutti::StorageRuntime::create(
+        phase1_config(runtime_accel), std::move(components));
+    if (created.ok() ||
+        created.status().code() != tutti::StatusCode::INVALID_ARGUMENT) return 1;
+    return data_path.initialize_calls == 0 ? 0 : 1;
+}
+
+static int test_phase1_same_accel_multiple_datapaths() {
+    TwoWayFakeResolver resolver;
+    RuntimeFakeDataPath data_path_a;
+    RuntimeFakeDataPath data_path_b;
+    data_path_a.caps.bound_accel_id = TUTTI_DEFAULT_ACCEL_ID;
+    data_path_b.caps.bound_accel_id = TUTTI_DEFAULT_ACCEL_ID;
+    tutti::RuntimeComponents components;
+    components.resolvers.push_back({"fakea", &resolver});
+    components.resolvers.push_back({"fakeb", &resolver});
+    components.data_paths.push_back(
+        {"runtime-fake-datapath-a", &data_path_a, tutti::DataPathConfig{"fakea"}});
+    components.data_paths.push_back(
+        {"runtime-fake-datapath-b", &data_path_b, tutti::DataPathConfig{"fakeb"}});
+    auto created = tutti::StorageRuntime::create(
+        phase1_config(TUTTI_DEFAULT_ACCEL_ID), std::move(components));
+    if (!created.ok()) return 1;
+    auto runtime = std::move(created).value();
+    if (data_path_a.initialize_calls != 1 || data_path_b.initialize_calls != 1) return 1;
+    return runtime->shutdown(1).ok() ? 0 : 1;
+}
+
+static int test_phase1_device_memory_is_not_faked() {
+    auto host_runtime = tutti::StorageRuntime::create(phase1_config(-1));
+    if (!host_runtime.ok()) return 1;
+    auto device = host_runtime.value()->allocate_memory(
+        tutti::MemorySpec{4096, tutti::MemoryKind::DEVICE, -1});
+    if (device.ok() || device.status().code() != tutti::StatusCode::UNSUPPORTED) return 1;
+    auto managed = host_runtime.value()->allocate_memory(
+        tutti::MemorySpec{4096, tutti::MemoryKind::MANAGED, -1});
+    if (managed.ok() || managed.status().code() != tutti::StatusCode::UNSUPPORTED) return 1;
+    return host_runtime.value()->shutdown(1).ok() ? 0 : 1;
+}
+
+// =====================================================================
 // Main
 // =====================================================================
 
@@ -1488,6 +1585,10 @@ int main() {
         test_destructor_inflight_safe,          // 34
         test_cross_target_batch_merges_single_submit, // 82
         test_cross_datapath_batch_not_merged,   // 83
+        test_phase1_profile_and_accel_range,     // 84
+        test_phase1_datapath_binding_preflight,  // 85
+        test_phase1_same_accel_multiple_datapaths,// 86
+        test_phase1_device_memory_is_not_faked,  // 87
     };
 
     const int n = static_cast<int>(sizeof(tests) / sizeof(tests[0]));

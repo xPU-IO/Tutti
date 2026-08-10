@@ -90,7 +90,7 @@ int main(int argc, char** argv) {
         view.size = BUF_SIZE;
         view.expected_kind = MemoryKind::DEVICE;
         view.ownership = MemoryOwnership::CALLER_OWNED;
-        view.expected_device_id = gpu;
+        view.expected_accel_id = gpu;
         view.io_granularity = BUF_SIZE;  // 1 slice per registration
         auto result = rt->register_memory(view);
         if (result.ok()) {

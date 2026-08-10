@@ -41,7 +41,11 @@ function(tutti_configure_cuda_like target_name)
         set(MACA_LIB_DIR "${MACA_ROOT}/lib" CACHE PATH "MACA SDK lib dir" FORCE)
     endif()
 
-    target_compile_definitions(${target_name} INTERFACE TUTTI_USE_MACA=1)
+    target_compile_definitions(${target_name} INTERFACE
+        TUTTI_USE_MACA=1
+        TUTTI_COMPILED_ACCELERATOR_PROFILE=\"MACA\"
+        TUTTI_DEFAULT_ACCEL_ID=0
+    )
 
     target_include_directories(${target_name} INTERFACE
         ${MACA_INCLUDE_DIR}

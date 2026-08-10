@@ -9,8 +9,8 @@
   loader 的目标装配边界为一个 Runtime、一个 accelerator、一组顶层组件。
 - `allowed` 选择一个 slice，`explicit` 必须选择一个 slice，`striped` 必须选择
   两个或更多 slice 且原子成功或失败。
-- canonical daemon schema 采用 `accelerators`、`accel_id`、`stable_id`、
-  `view_root`、`allowed_accel_ids`、`backing_mount_path` 和显式 `device_id`；阶段 3
+- canonical daemon schema 采用 `accelerators`、`accel_id`、`view_root`、
+  `allowed_accel_ids`、`backing_mount_path` 和显式 `device_id`；阶段 3
   迁移前，现有 `gpus`/`allowed_gpus` 仅作为 legacy baseline。
 - 修正 local-NVMe 测试文档中的双盘配置文件名和已漂移的 BDF、mount、BAR0；测试
   参数优先取 daemon RPC metadata。
@@ -19,10 +19,8 @@
 
 ## 环境
 
-- GPU 0：NVIDIA H100 PCIe，UUID
-  `GPU-b3d1dbe2-2f10-7470-9f9f-55e7390e00f1`，BDF `0000:4b:00.0`。
-- GPU 1：NVIDIA H100 PCIe，UUID
-  `GPU-32dcd8ec-8992-770b-1e58-6641dbc5c083`，BDF `0000:4c:00.0`。
+- GPU 0：NVIDIA H100 PCIe，backend ordinal `accel_id=0`，BDF `0000:4b:00.0`。
+- GPU 1：NVIDIA H100 PCIe，backend ordinal `accel_id=1`，BDF `0000:4c:00.0`。
 - daemon 配置：`config/local/daemon_2disk.yaml`。
 - daemon NVMe 0：BDF `0000:41:00.0`，`/dev/ssnvme0`，
   `/dev/snvme0n1`，backing mount `/mnt/snvme/nvme1`。

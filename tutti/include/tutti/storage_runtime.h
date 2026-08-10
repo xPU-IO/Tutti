@@ -38,6 +38,16 @@
 
 namespace tutti {
 
+// Public headers can also be consumed outside the repository CMake targets.
+// Keep a deterministic HOST fallback for that source-only use; normal builds
+// always provide these through the accelerator profile interface target.
+#ifndef TUTTI_COMPILED_ACCELERATOR_PROFILE
+#define TUTTI_COMPILED_ACCELERATOR_PROFILE "HOST"
+#endif
+#ifndef TUTTI_DEFAULT_ACCEL_ID
+#define TUTTI_DEFAULT_ACCEL_ID -1
+#endif
+
 // Forward declaration for the test-access friend (gap 4).
 namespace testing { struct StorageRuntimeTestAccess; }
 
@@ -52,8 +62,9 @@ enum class RuntimeState {
 };
 
 struct RuntimeConfig {
+    std::int32_t accel_id = TUTTI_DEFAULT_ACCEL_ID;
     std::uint64_t max_terminal_results = 64;
-    std::string profile_name = "host";
+    std::string profile_name = TUTTI_COMPILED_ACCELERATOR_PROFILE;
 };
 
 // Static in-process assembly inputs. The runtime never owns these component
@@ -84,22 +95,24 @@ struct CudaLikeProfileInfo {
 };
 
 struct DeviceInfo {
-    std::int32_t device_id = 0;
+    std::int32_t accel_id = -1;
     std::string name;
     std::uint64_t total_memory = 0;
+    std::string pci_bdf;
 };
 
 struct DeviceCapabilities {
-    std::int32_t device_id = 0;
+    std::int32_t accel_id = -1;
     bool supports_host_execution = true;
     bool supports_device_execution = false;
     std::uint64_t max_io_size = 0;
+    std::string pci_bdf;
 };
 
 struct MemorySpec {
     std::uint64_t size = 0;
     MemoryKind kind = MemoryKind::HOST;
-    std::int32_t device_id = -1;
+    std::int32_t accel_id = -1;
 };
 
 struct MemoryAllocation {
@@ -116,7 +129,7 @@ struct MemoryInfo {
     MemoryOwnership ownership = MemoryOwnership::CALLER_OWNED;
     std::uint64_t size = 0;
     void* address = nullptr;
-    std::int32_t device_id = -1;
+    std::int32_t accel_id = -1;
     int inflight_count = 0;
 };
 
@@ -196,8 +209,14 @@ public:
         RuntimeConfig config = {}) {
         std::uint32_t rid = next_runtime_id_.fetch_add(
             1, std::memory_order_relaxed);
-        return std::unique_ptr<StorageRuntime>(
+        auto runtime = std::unique_ptr<StorageRuntime>(
             new StorageRuntime(rid, std::move(config)));
+        Status status = runtime->validate_runtime_config_();
+        if (!status.ok()) {
+            return Result<std::unique_ptr<StorageRuntime>>::Failure(
+                std::move(status));
+        }
+        return runtime;
     }
 
     // Creates a runtime wired to statically injected in-process components.
@@ -209,7 +228,12 @@ public:
             1, std::memory_order_relaxed);
         auto runtime = std::unique_ptr<StorageRuntime>(
             new StorageRuntime(rid, std::move(config)));
-        Status status = runtime->initialize_components_(std::move(components));
+        Status status = runtime->validate_runtime_config_();
+        if (!status.ok()) {
+            return Result<std::unique_ptr<StorageRuntime>>::Failure(
+                std::move(status));
+        }
+        status = runtime->initialize_components_(std::move(components));
         if (!status.ok()) {
             return Result<std::unique_ptr<StorageRuntime>>::Failure(
                 std::move(status));
@@ -286,29 +310,48 @@ public:
         return state_.load();
     }
 
+    std::int32_t accel_id() const noexcept { return config_.accel_id; }
+
     // ---- discovery ----
 
     CudaLikeProfileInfo query_cuda_like_profile() const {
-        return CudaLikeProfileInfo{config_.profile_name, 1};
+        auto count = backend_device_count_();
+        return CudaLikeProfileInfo{config_.profile_name,
+                                   count.ok() ? count.value() : 0};
     }
 
     Result<std::vector<DeviceInfo>> list_devices() const {
+        if (config_.accel_id == -1 && compiled_profile_is_host_()) {
+            return std::vector<DeviceInfo>{};
+        }
+        auto count = backend_device_count_();
+        if (!count.ok()) {
+            return Result<std::vector<DeviceInfo>>::Failure(count.status());
+        }
         std::vector<DeviceInfo> devices;
-        DeviceInfo info;
-        info.device_id = 0;
-        info.name = "stub-device";
-        info.total_memory = 1ULL << 30;
-        devices.push_back(std::move(info));
+        for (int id = 0; id < count.value(); ++id) {
+            auto device = discover_device_(id);
+            if (!device.ok()) {
+                return Result<std::vector<DeviceInfo>>::Failure(device.status());
+            }
+            devices.push_back(std::move(device).value());
+        }
         return devices;
     }
 
     Result<DeviceCapabilities> query_device_capabilities(
-        std::int32_t device_id) const {
-        if (device_id != 0) {
+        std::int32_t accel_id) const {
+        auto devices = list_devices();
+        if (!devices.ok()) {
+            return Result<DeviceCapabilities>::Failure(devices.status());
+        }
+        if (accel_id < 0 || accel_id >= static_cast<std::int32_t>(devices.value().size())) {
             return Result<DeviceCapabilities>::Failure(
                 Status(StatusCode::NOT_FOUND, "device not found"));
         }
-        return DeviceCapabilities{0, true, false, 1ULL << 30};
+        const auto& info = devices.value()[static_cast<std::size_t>(accel_id)];
+        return DeviceCapabilities{accel_id, true, true, 1ULL << 30,
+                                  info.pci_bdf};
     }
 
     // ---- memory ----
@@ -325,6 +368,23 @@ public:
                 Status(StatusCode::INVALID_ARGUMENT,
                        "size must be > 0"));
         }
+        if (spec.kind == MemoryKind::DEVICE ||
+            spec.kind == MemoryKind::MANAGED) {
+            return Result<MemoryAllocation>::Failure(
+                Status(StatusCode::UNSUPPORTED,
+                       "backend allocation for DEVICE/MANAGED memory is not implemented"));
+        }
+        if (spec.accel_id >= 0 && config_.accel_id >= 0 &&
+            spec.accel_id != config_.accel_id) {
+            return Result<MemoryAllocation>::Failure(
+                Status(StatusCode::INVALID_ARGUMENT,
+                       "memory accelerator does not match Runtime"));
+        }
+        if (spec.accel_id >= 0 && config_.accel_id < 0) {
+            return Result<MemoryAllocation>::Failure(
+                Status(StatusCode::INVALID_ARGUMENT,
+                       "host-only Runtime cannot allocate accelerator memory"));
+        }
         void* ptr = std::malloc(static_cast<std::size_t>(spec.size));
         if (!ptr) {
             return Result<MemoryAllocation>::Failure(
@@ -340,7 +400,7 @@ public:
         entry.size = spec.size;
         entry.ownership = MemoryOwnership::RUNTIME_OWNED;
         entry.kind = spec.kind;
-        entry.device_id = spec.device_id;
+        entry.accel_id = spec.accel_id;
         entry.inflight_count = 0;
         entry.data_path_registrations.clear();
         return MemoryAllocation{
@@ -382,6 +442,32 @@ public:
                 Status(StatusCode::INVALID_ARGUMENT,
                        "address and size must be non-null/non-zero"));
         }
+        if (!view.expected_profile.empty() &&
+            !profile_matches_(view.expected_profile)) {
+            return Result<MemoryHandle>::Failure(
+                Status(StatusCode::INVALID_ARGUMENT,
+                       "memory profile does not match compiled accelerator profile"));
+        }
+        if ((view.expected_kind == MemoryKind::DEVICE ||
+             view.expected_kind == MemoryKind::MANAGED) &&
+            config_.accel_id < 0) {
+            return Result<MemoryHandle>::Failure(
+                Status(StatusCode::UNSUPPORTED,
+                       "host-only Runtime cannot register accelerator memory"));
+        }
+        if (view.expected_accel_id >= 0 && config_.accel_id >= 0 &&
+            view.expected_accel_id != config_.accel_id) {
+            return Result<MemoryHandle>::Failure(
+                Status(StatusCode::INVALID_ARGUMENT,
+                       "memory accelerator does not match Runtime"));
+        }
+        if (view.expected_accel_id >= 0 && config_.accel_id < 0 &&
+            (view.expected_kind == MemoryKind::DEVICE ||
+             view.expected_kind == MemoryKind::MANAGED)) {
+            return Result<MemoryHandle>::Failure(
+                Status(StatusCode::INVALID_ARGUMENT,
+                       "host-only Runtime cannot register accelerator memory"));
+        }
         std::uint32_t slot = find_free_memory_slot_();
         std::uint64_t gen = ++memory_gen_counter_;
         MemoryEntry& entry = memory_entries_[slot];
@@ -391,7 +477,11 @@ public:
         entry.size = view.size;
         entry.ownership = MemoryOwnership::CALLER_OWNED;
         entry.kind = view.expected_kind;
-        entry.device_id = view.expected_device_id;
+        entry.accel_id = view.expected_accel_id >= 0
+            ? view.expected_accel_id
+            : ((view.expected_kind == MemoryKind::DEVICE ||
+                view.expected_kind == MemoryKind::MANAGED)
+               ? config_.accel_id : -1);
         entry.inflight_count = 0;
         entry.data_path_registrations.clear();
         return MemoryHandle(runtime_id_, slot, gen);
@@ -428,7 +518,7 @@ public:
         const MemoryEntry& e = memory_entries_[handle.slot_];
         return MemoryInfo{
             e.kind, e.ownership, e.size, e.address,
-            e.device_id, e.inflight_count};
+            e.accel_id, e.inflight_count};
     }
 
     // ---- target ----
@@ -959,7 +1049,7 @@ private:
         std::uint64_t size = 0;
         MemoryOwnership ownership = MemoryOwnership::CALLER_OWNED;
         MemoryKind kind = MemoryKind::HOST;
-        std::int32_t device_id = -1;
+        std::int32_t accel_id = -1;
         int inflight_count = 0;
         std::vector<DataPathMemoryRegistration> data_path_registrations;
     };
@@ -1059,6 +1149,13 @@ private:
                           "component runtime requires resolver and DataPath bindings");
         }
 
+        // Complete all validation before touching a DataPath.  In particular,
+        // a binding conflict must not leave an initialized component behind.
+        Status preflight = preflight_components_(components);
+        if (!preflight.ok()) {
+            return preflight;
+        }
+
         resources_ = components.resources ? components.resources : &default_resources_;
         for (const auto& binding : components.resolvers) {
             if (binding.scheme.empty() || binding.resolver == nullptr) {
@@ -1104,6 +1201,133 @@ private:
         return Status::Ok();
     }
 
+    static bool profile_matches_(std::string_view requested) {
+        const std::string_view compiled = TUTTI_COMPILED_ACCELERATOR_PROFILE;
+        if (requested.size() != compiled.size()) {
+            return false;
+        }
+        for (std::size_t i = 0; i < requested.size(); ++i) {
+            const char a = requested[i] >= 'a' && requested[i] <= 'z'
+                ? static_cast<char>(requested[i] - 'a' + 'A') : requested[i];
+            const char b = compiled[i] >= 'a' && compiled[i] <= 'z'
+                ? static_cast<char>(compiled[i] - 'a' + 'A') : compiled[i];
+            if (a != b) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool compiled_profile_is_host_() {
+        return profile_matches_("HOST");
+    }
+
+    static Result<int> backend_device_count_() {
+#if defined(TUTTI_USE_HOST)
+        return 0;
+#elif defined(TUTTI_USE_CUDA) || defined(TUTTI_USE_MUSA) || defined(TUTTI_USE_MACA)
+        int count = 0;
+        const auto error = cudaGetDeviceCount(&count);
+        if (error != cudaSuccess) {
+            return Result<int>::Failure(
+                Status(StatusCode::NOT_FOUND,
+                       "compiled accelerator backend has no available devices"));
+        }
+        return count;
+#else
+        return Result<int>::Failure(
+            Status(StatusCode::UNSUPPORTED,
+                   "no compiled accelerator backend is available"));
+#endif
+    }
+
+    Result<DeviceInfo> discover_device_(int accel_id) const {
+#if defined(TUTTI_USE_CUDA) || defined(TUTTI_USE_MUSA) || defined(TUTTI_USE_MACA)
+        cudaDeviceProp prop{};
+        if (cudaGetDeviceProperties(&prop, accel_id) != cudaSuccess) {
+            return Result<DeviceInfo>::Failure(
+                Status(StatusCode::DEVICE_ERROR, "failed to query accelerator properties"));
+        }
+        char pci[32]{};
+        (void)cudaDeviceGetPCIBusId(
+            pci, static_cast<int>(sizeof(pci)), accel_id);
+        return DeviceInfo{accel_id, prop.name, prop.totalGlobalMem, pci};
+#elif defined(TUTTI_USE_HOST)
+        (void)accel_id;
+        return Result<DeviceInfo>::Failure(
+            Status(StatusCode::UNSUPPORTED,
+                   "HOST profile has no accelerator device identity"));
+#else
+        (void)accel_id;
+        return Result<DeviceInfo>::Failure(
+            Status(StatusCode::UNSUPPORTED,
+                   "accelerator backend device discovery is unavailable"));
+#endif
+    }
+
+    Status validate_runtime_config_() const {
+        if (!profile_matches_(config_.profile_name)) {
+            return Status(StatusCode::INVALID_ARGUMENT,
+                          "Runtime profile does not match compiled accelerator profile");
+        }
+        if (config_.accel_id < -1) {
+            return Status(StatusCode::INVALID_ARGUMENT,
+                          "accel_id must be -1 or non-negative");
+        }
+        if (config_.accel_id == -1) {
+            return Status::Ok();
+        }
+        auto count = backend_device_count_();
+        if (!count.ok()) {
+            return count.status();
+        }
+        if (config_.accel_id >= count.value()) {
+            return Status(StatusCode::NOT_FOUND,
+                          "accel_id is outside the compiled backend device count");
+        }
+        return Status::Ok();
+    }
+
+    Status preflight_components_(const RuntimeComponents& components) const {
+        std::unordered_map<std::string, bool> resolver_keys;
+        for (const auto& binding : components.resolvers) {
+            if (binding.scheme.empty() || binding.resolver == nullptr) {
+                return Status(StatusCode::INVALID_ARGUMENT,
+                              "resolver binding requires scheme and resolver");
+            }
+            if (!resolver_keys.emplace(binding.scheme, true).second) {
+                return Status(StatusCode::INVALID_ARGUMENT,
+                              "duplicate resolver scheme: " + binding.scheme);
+            }
+        }
+        std::unordered_map<std::string, bool> path_keys;
+        for (const auto& binding : components.data_paths) {
+            if (binding.key.empty() || binding.data_path == nullptr) {
+                return Status(StatusCode::INVALID_ARGUMENT,
+                              "DataPath binding requires key and DataPath");
+            }
+            if (!path_keys.emplace(binding.key, true).second) {
+                return Status(StatusCode::INVALID_ARGUMENT,
+                              "duplicate DataPath key: " + binding.key);
+            }
+            const DataPathCapabilities& caps = binding.data_path->capabilities();
+            if (caps.bound_accel_id < -1) {
+                return Status(StatusCode::INVALID_ARGUMENT,
+                              "DataPath bound_accel_id must be -1 or non-negative");
+            }
+            if (caps.bound_accel_id >= 0 &&
+                caps.bound_accel_id != config_.accel_id) {
+                return Status(StatusCode::INVALID_ARGUMENT,
+                              "DataPath accelerator binding conflicts with Runtime");
+            }
+            if (config_.accel_id == -1 && caps.bound_accel_id >= 0) {
+                return Status(StatusCode::INVALID_ARGUMENT,
+                              "accelerator-bound DataPath cannot attach to host-only Runtime");
+            }
+        }
+        return Status::Ok();
+    }
+
     static std::string scheme_for_(std::string_view uri,
                                    const OpenOptions& options) {
         const std::size_t separator = uri.find("://");
@@ -1139,7 +1363,7 @@ private:
              memory.kind == MemoryKind::MANAGED)
             ? DataPathMemoryKind::DEVICE
             : DataPathMemoryKind::HOST;
-        DataPathMemoryView view{memory.address, memory.size, memory.device_id, kind};
+        DataPathMemoryView view{memory.address, memory.size, memory.accel_id, kind};
         auto registration = target.data_path->register_memory(
             view, target.registration_domain);
         if (!registration.ok()) {
@@ -1163,6 +1387,19 @@ private:
                           "DataPath does not support HOST_EXECUTION");
         }
         if (context.execution_domain == ExecutionDomain::DEVICE_EXECUTION) {
+            const std::int32_t effective_accel_id = context.accel_id >= 0
+                ? context.accel_id : config_.accel_id;
+            if (config_.accel_id < 0 || effective_accel_id != config_.accel_id) {
+                return Status(StatusCode::INVALID_ARGUMENT,
+                              "submit accelerator does not match Runtime");
+            }
+            if (memory.kind == MemoryKind::DEVICE ||
+                memory.kind == MemoryKind::MANAGED) {
+                if (memory.accel_id >= 0 && memory.accel_id != config_.accel_id) {
+                    return Status(StatusCode::INVALID_ARGUMENT,
+                                  "device memory accelerator does not match Runtime");
+                }
+            }
             if (!caps.supports_device_execution) {
                 return Status(StatusCode::UNSUPPORTED,
                               "DataPath does not support DEVICE_EXECUTION");

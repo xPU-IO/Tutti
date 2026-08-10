@@ -81,10 +81,10 @@ StorageRuntime 核心      -> 多个不同 scheme 的 Resolver + 多个不同 ke
 内部，不能进入新通用契约。`device_id` 在新 daemon RPC 中只表示 NVMe resource。
 
 `allowed_accel_ids` 只有在 daemon 和所有 client 对 `accel_id` 使用同一部署映射时
-才有意义。部署不得让不同 client 通过 `CUDA_VISIBLE_DEVICES` 或同类机制把同一
-数字映射到不同物理 accelerator；loader 应在 backend 可查询 UUID/BDF 时校验并
-fail-closed。backend 无法提供稳定身份时，accelerator Runtime bundle 创建返回
-`UNSUPPORTED`；不能退回仅信任 ordinal 的模式。
+才有意义。`accel_id` 直接使用编译 backend 提供的 accelerator ordinal；本设计不
+引入 UUID/stable identity，也不提供 `CUDA_VISIBLE_DEVICES` 或同类重映射兼容层。
+部署侧必须保证 daemon、client 和 Runtime 使用相同的 ordinal 顺序。`pci_bdf` 可以
+作为诊断元数据返回，但不参与 Runtime 创建或归属判定。
 
 `/dev/ssnvmeN`、`/dev/snvmeNn1`、NVMe 的 `backing_mount_path` 和按 accelerator
 生成的 `view_path` 都是 daemon 或 kernel
@@ -261,8 +261,8 @@ daemon 配置描述全机事实和 ACL，不为每个 GPU 启动独立 daemon：
 
 ```yaml
 accelerators:
-  - { accel_id: 0, stable_id: "uuid:<accelerator-0-uuid>", view_root: "/mnt/gpu0" }
-  - { accel_id: 1, stable_id: "uuid:<accelerator-1-uuid>", view_root: "/mnt/gpu1" }
+  - { accel_id: 0, view_root: "/mnt/gpu0" }
+  - { accel_id: 1, view_root: "/mnt/gpu1" }
 
 nvmes:
   - device_id: 0
@@ -282,9 +282,8 @@ nvmes:
 中明确展开后的集合。其数值必须引用 `accelerators[].accel_id`，并满足第 3 节的
 deployment mapping 前置条件。
 
-示例 `stable_id` 仅说明格式，不是当前机器事实；实际值必须由部署侧从 backend/driver
-查询。目标 schema 中，`accelerators`、`accelerators[].accel_id`、
-`accelerators[].stable_id`、`accelerators[].view_root`、
+目标 schema 中，`accelerators`、`accelerators[].accel_id`、
+`accelerators[].view_root`、
 `nvmes[].allowed_accel_ids`、`nvmes[].backing_mount_path` 和显式
 `nvmes[].device_id` 都是 canonical 字段。`device_id` 必须配置且唯一，反转
 `nvmes` 数组顺序不能改变资源身份。YAML 保留 `pci_addr` 名称，它必须保存规范化
@@ -297,7 +296,7 @@ PCI BDF，并映射到新 RPC 的 `pci_bdf`。
 | 当前 legacy 名称/行为 | 目标名称/行为 | 迁移规则 |
 | --- | --- | --- |
 | `gpus[].id` | `accelerators[].accel_id` | checked-in YAML、parser model、错误信息和测试一起修改 |
-| 无 accelerator 稳定身份 | 必填 `accelerators[].stable_id` | backend 与 daemon 必须校验 UUID/BDF；缺失时配置失败 |
+| accelerator 身份映射 | 直接使用 `accelerators[].accel_id` ordinal | daemon、client、Runtime 必须使用相同 backend ordinal；不做 UUID 或重映射校验 |
 | `gpus[].mount_path` | `accelerators[].view_root` | 明确它是 per-accelerator view 的根目录 |
 | `nvmes[].allowed_gpus` | `nvmes[].allowed_accel_ids` | 目标配置和新 RPC 只暴露新名称 |
 | `nvmes[].mount_path` | `nvmes[].backing_mount_path` | 明确它是真实 namespace 文件系统的 backing mount |
@@ -322,12 +321,12 @@ legacy `gpus`/`allowed_gpus` schema；它是迁移输入，不是本文目标 sc
 
 ```text
 ListAccelerators()
-  -> daemon 配置的 accel_id、stable_id 和 view_root
+  -> daemon 配置的 accel_id 和 view_root
 
 ListNvmeResources()
   -> 所有 daemon device_id 及其真实 path、BDF、namespace、队列能力、ACL
 
-AcquireNvmeSlices(accel_id, accel_stable_id, selection, queue_budget)
+AcquireNvmeSlices(accel_id, selection, queue_budget)
   -> 一个 allocation_id + 一个或多个 NvmeSlice
 
 NvmeSlice
@@ -337,9 +336,8 @@ NvmeSlice
 Release(allocation_id)
 ```
 
-daemon 不调用 accelerator API；`ListAccelerators` 只返回配置事实。loader 用编译
-backend 查询 Runtime `accel_id` 对应的稳定身份，与 daemon 的 `stable_id` 比较后
-才允许 Acquire。若 request 携带的 `accel_stable_id` 与配置不符，daemon 同样拒绝。
+daemon 不调用 accelerator API；`ListAccelerators` 只返回配置事实。loader 和 daemon
+直接按 `accel_id` ordinal 做归属检查，`pci_bdf` 仅用于诊断。
 
 `selection` 可以是显式 daemon `device_id` 列表、按 ACL 自动选择，或一个
 striped group。MVP 对三种模式定义确定语义：
@@ -393,8 +391,8 @@ nvme:
 loader/factory 的职责是：
 
 1. 读取 `runtime.accel_id`，创建一个 `RuntimeConfig`，并从编译 backend 查询
-   `accel_stable_id`。
-2. 用 `ListAccelerators` 校验 `accel_id -> stable_id` 的部署映射，再向 daemon 请求
+   `accel_id`。
+2. 用 `ListAccelerators` 校验请求的 `accel_id` 在部署映射中存在，再向 daemon 请求
    该 `accel_id` 允许的 NVMe slice，并持有返回的一个逻辑 allocation。
 3. 按 selection 创建唯一的一组组件：单 slice 创建 local 组件，多 slice 创建
    striped 组件。
@@ -488,7 +486,7 @@ daemon 启动：枚举全部 NVMe，建立 controller/path，开始 RPC
 loader/factory 解析 config(accel_id)
         │  profile/accel_id 基本校验
         ▼
-AcquireNvmeSlices(accel_id, accel_stable_id, policy)
+AcquireNvmeSlices(accel_id, policy)
         │  返回一个 allocation_id + 有序 slice metadata
         ▼
 构造同 accel_id 的 Local/Striped 组件并 StorageRuntime::create()
@@ -518,7 +516,7 @@ controller。
 | Runtime 身份 | `RuntimeConfig` 没有 `accel_id`，profile/device discovery 仍是 stub | 不可变 `accel_id`、编译 profile、一创建一设备 |
 | 通用身份命名 | accelerator 在 public API 中仍使用 `device_id`/`expected_device_id`，daemon/RPC 使用 `cuda_device` | 通用 API、新 RPC 和 target YAML 统一为 `accel_id` |
 | DataPath SPI | 只有 `supports_multi_gpu`/`supports_cross_device`，没有强制 accelerator 绑定 | 新增唯一 `bound_accel_id`；不重新解释现有 capability |
-| daemon schema | `gpus[].id/mount_path`、`allowed_gpus`、无 accelerator 稳定身份、含混的 NVMe `mount_path`、数组下标作为 `device_id` | `accelerators[].accel_id/stable_id/view_root`、`allowed_accel_ids`、`backing_mount_path`、显式 `nvmes[].device_id` |
+| daemon schema | `gpus[].id/mount_path`、`allowed_gpus`、含混的 NVMe `mount_path`、数组下标作为 `device_id` | `accelerators[].accel_id/view_root`、`allowed_accel_ids`、`backing_mount_path`、显式 `nvmes[].device_id` |
 | loader | 从 daemon YAML 展开 `allowed_gpus`、按数组序号合成 chrdev；多项 spec 会重复注册固定 scheme/key 并在 Runtime 创建时失败 | 从 Acquire metadata 构造唯一顶层 Local 或 Striped 组件，不改变核心路由能力 |
 | daemon RPC | `Connect` 一次只分配一个 device；返回单 session，尚无 striped 原子 allocation | 三种 selection、一个逻辑 allocation、N 个 slice |
 | queue policy | 只 clamp 单 client 请求，没有 reservation ledger | daemon admission ledger + kernel 最终权威 |
@@ -538,7 +536,7 @@ DataPath，并有跨 DataPath batch contract test。本任务不新增核心路�
    产品 loader 采用“一 Runtime、一 accelerator、一组顶层 resolver/DataPath”。
 2. 固定 `allowed`、`explicit`、`striped` 的 slice 数量和原子性语义。
 3. 冻结 canonical schema 和迁移规则：目标字段是 `accelerators[].accel_id`、
-   `accelerators[].stable_id/view_root`、`nvmes[].allowed_accel_ids`、
+   `accelerators[].view_root`、`nvmes[].allowed_accel_ids`、
    `nvmes[].backing_mount_path` 和显式 `nvmes[].device_id`；当前
    `gpus`/`allowed_gpus` 只作为待迁移的 legacy baseline，不能出现在新增配置或
    新接口中。
@@ -570,8 +568,8 @@ Exit gate：不改业务行为，现有无硬件 contract test 全绿；双盘 d
    `bound_accel_id` 都与 Runtime 匹配、host-only 规则满足，然后才 initialize；
    不在核心层增加 binding 数量限制，无组件的 contract-test stub 模式不受影响。
 6. `query_cuda_like_profile()`、设备发现和诊断信息返回编译 profile、真实 device
-   count 和 UUID/BDF；不再固定返回一个 stub device。accelerator backend 无法提供
-   稳定身份时，本功能返回 `UNSUPPORTED`。
+   count 和可选 BDF 诊断信息；不再固定返回一个 stub device。Runtime 归属只依赖
+   backend ordinal，不因 backend 无法提供 UUID/stable identity 而失败。
 7. `allocate_memory(DEVICE/MANAGED)` 若尚未实现真正的 backend allocation，明确
    返回 `UNSUPPORTED`；不得继续用 `malloc()` 产生伪 device memory。
 
@@ -586,8 +584,8 @@ Exit gate：不改业务行为，现有无硬件 contract test 全绿；双盘 d
   时，整个 create 在 initialize 前失败。
 - generic public headers 和新增测试中不再出现 accelerator 含义的 `device_id`；
   daemon NVMe `device_id` 与 Runtime `accel_id` 的类型/字段不会互换。
-- 可查询 UUID/BDF 的 backend 对同一物理 accelerator 返回稳定身份；daemon
-  deployment mapping 的交叉校验在阶段 4 完成。
+- backend 返回的 `accel_id` 与编译 backend ordinal 一致；daemon deployment mapping
+  的 ordinal 校验在阶段 4 完成，BDF 只用于诊断。
 - 跨 Runtime 的 target、memory、I/O handle 保持 `NOT_FOUND`/`INVALID_ARGUMENT`，
   即使两个 Runtime 的 `accel_id` 相同也不能互用。
 
@@ -629,7 +627,7 @@ Exit gate：不依赖调用方预先 `cudaSetDevice()`；每条 accelerator 路�
 
 1. 迁移 daemon YAML/parser/internal model：`gpus[].id` 改为
    `accelerators[].accel_id`，`nvmes[].allowed_gpus` 改为
-   `nvmes[].allowed_accel_ids`，新增 `accelerators[].stable_id`，将 GPU
+   `nvmes[].allowed_accel_ids`，新增 `accelerators[].accel_id`，将 GPU
    `mount_path` 改为 `view_root`、NVMe `mount_path` 改为 `backing_mount_path`，并
    要求显式、唯一的 `nvmes[].device_id`。
 2. 过渡 parser 对 legacy alias 只保留一个版本：读取时告警，新旧字段同时出现时
@@ -659,8 +657,8 @@ Exit gate：不依赖调用方预先 `cudaSetDevice()`；每条 accelerator 路�
 - schema contract 覆盖 canonical 配置成功、legacy-only 配置告警且规范化、混用新旧
   字段失败、缺失/重复 `device_id` 失败，以及 `allowed_accel_ids` 引用不存在的
   `accel_id` 失败。
-- stable identity contract 覆盖匹配成功、UUID/BDF 不匹配拒绝、两个 client ordinal
-  映射不同不得共享同一 `accel_id`，以及配置缺少 `stable_id` 时启动失败。
+- accelerator ordinal contract 覆盖有效/无效 `accel_id`、越界拒绝，以及 daemon/client
+  使用同一 ordinal 映射的要求；不测试 UUID/BDF 不匹配或 `CUDA_VISIBLE_DEVICES` 重映射。
 - gRPC client/server contract 覆盖 metadata 字段完整性和旧 RPC 兼容。
 - 反转 YAML NVMe 顺序后 `device_id` 和 allocation 选择不变；制造 stale minor 后，
   返回 path 仍来自实际 bring-up 结果；BDF/chrdev/block 三方不一致时资源不进入
@@ -671,7 +669,7 @@ Exit gate：不依赖调用方预先 `cudaSetDevice()`；每条 accelerator 路�
 
 Exit gate：Runtime 构造所需设备事实全部来自 allocation metadata；任何代码都不再
 用 `accel_id`、`device_id` 或数组下标推导数据路径；仓库内 daemon 配置和目标文档
-均使用 `accelerators`/`stable_id`/`view_root`/`allowed_accel_ids`/
+均使用 `accelerators`/`accel_id`/`view_root`/`allowed_accel_ids`/
 `backing_mount_path`/显式 `device_id`。
 
 ### 12.5 阶段 4：allocation 驱动的单组装配 loader
@@ -679,8 +677,8 @@ Exit gate：Runtime 构造所需设备事实全部来自 allocation metadata；�
 实现范围：
 
 1. 应用 loader 解析 `accelerator.profile`、`runtime.accel_id`、daemon endpoint、
-   `nvme.selection/device_ids/queues_per_controller`；查询 backend `stable_id` 并与
-   `ListAccelerators` 比较。loader 不再读取 daemon YAML，只消费新 RPC 的
+   `nvme.selection/device_ids/queues_per_controller`；查询 backend device count 并
+   确认请求的 ordinal 存在。loader 不再读取 daemon YAML，只消费新 RPC 的
    `allowed_accel_ids` 和 allocation metadata，也不合成 `/dev/ssnvmeN`。
 2. `allowed/explicit` 构造唯一的 `LocalFileResolver + LocalNvmeDataPath`；
    `striped` 构造唯一的 `StripedResolver + StripedDataPath`。striped 的多个 shard
@@ -707,7 +705,7 @@ Exit gate：Runtime 构造所需设备事实全部来自 allocation metadata；�
   “loader 选择使用一组”和“核心只能接受一组”。
 - `explicit` 零个/多个 device ID、`striped` 少于两个、返回 slice 顺序或 accel_id
   不一致均 fail-closed。
-- `ListAccelerators` 返回的 `stable_id` 与 backend 查询结果不一致时，不执行 Acquire
+- `ListAccelerators` 返回的 accelerator ordinal 不存在或不在 ACL 中时，不执行 Acquire
   或 DataPath initialize。
 - 对 Acquire、第二个 slice、DataPath initialize、Runtime create 和 shutdown
   逐点注入失败，断言 Release 次数、顺序和 allocation_id 正确。
@@ -783,12 +781,12 @@ Exit gate：同进程双 Runtime 可持续并发真实 I/O，资源与故障隔�
 
 本机硬件验收使用迁移后的 `config/local/daemon_2disk.yaml`。当前仓库版本仍使用
 legacy `gpus`/`allowed_gpus` 且没有显式 `device_id`；阶段 3 必须先将其转换为
-`accelerators`/`stable_id`/`view_root`/`allowed_accel_ids`/
+`accelerators`/`accel_id`/`view_root`/`allowed_accel_ids`/
 `backing_mount_path`/显式 `device_id`，以下验收不得把 legacy schema 视为目标行为：
 
 - accelerator：GPU 0、GPU 1；当前机器均为 NVIDIA H100 PCIe。
-- 两个 accelerator 的 `stable_id` 必须来自实际 driver 查询，并与 Runtime 看到的
-  UUID/BDF 一致，不能使用第 7.1 节示例值。
+- 两个 accelerator 直接使用 backend ordinal `accel_id=0/1`；BDF 可记录为诊断信息，
+  不参与身份匹配。
 - NVMe `device_id=0`：BDF `0000:41:00.0`，`backing_mount_path`
   `/mnt/snvme/nvme1`。
 - NVMe `device_id=1`：BDF `0000:44:00.0`，`backing_mount_path`
@@ -841,7 +839,7 @@ sudo -S env TUTTI_VERBOSE=1 \
   --config config/local/daemon_2disk.yaml < ~/.passwd/1
 ```
 
-首先只做资源发现，确认 accelerator `stable_id`/`view_root` 映射，以及两个 NVMe
+首先只做资源发现，确认 accelerator `accel_id`/`view_root` 映射，以及两个 NVMe
 BDF、真实 chrdev/block/backing/view path、ACL、block size、queue 能力和
 `available`：
 

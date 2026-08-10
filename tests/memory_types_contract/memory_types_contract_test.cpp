@@ -87,8 +87,8 @@ static void test_memory_view_fields() {
         "expected_kind must be MemoryKind");
     static_assert(std::is_same_v<decltype(MV::ownership), tutti::MemoryOwnership>,
         "ownership must be MemoryOwnership");
-    static_assert(std::is_same_v<decltype(MV::expected_device_id), std::int32_t>,
-        "expected_device_id must be int32_t");
+    static_assert(std::is_same_v<decltype(MV::expected_accel_id), std::int32_t>,
+        "expected_accel_id must be int32_t");
     static_assert(std::is_same_v<decltype(MV::expected_profile), std::string>,
         "expected_profile must be std::string");
 
@@ -103,12 +103,12 @@ static void test_memory_view_fields() {
         0,                              // size
         tutti::MemoryKind::HOST,        // expected_kind
         tutti::MemoryOwnership::CALLER_OWNED, // ownership
-        -1,                             // expected_device_id (unset)
+        -1,                             // expected_accel_id (unset)
         ""                              // expected_profile (unset)
     };
 
     // 5. Sentinel semantics
-    CHECK(mv.expected_device_id < 0, "unset device_id should be negative");
+    CHECK(mv.expected_accel_id < 0, "unset accel_id should be negative");
     CHECK(mv.expected_profile.empty(), "unset profile should be empty");
 }
 
@@ -131,7 +131,7 @@ static void test_copy_move() {
     CHECK(copied.size == original.size, "copy: size");
     CHECK(copied.expected_kind == original.expected_kind, "copy: kind");
     CHECK(copied.ownership == original.ownership, "copy: ownership");
-    CHECK(copied.expected_device_id == original.expected_device_id, "copy: device");
+    CHECK(copied.expected_accel_id == original.expected_accel_id, "copy: device");
     CHECK(copied.expected_profile == original.expected_profile, "copy: profile");
 
     // Move construct
@@ -140,7 +140,7 @@ static void test_copy_move() {
     CHECK(moved.size == original.size, "move: size");
     CHECK(moved.expected_kind == original.expected_kind, "move: kind");
     CHECK(moved.ownership == original.ownership, "move: ownership");
-    CHECK(moved.expected_device_id == original.expected_device_id, "move: device");
+    CHECK(moved.expected_accel_id == original.expected_accel_id, "move: device");
     CHECK(moved.expected_profile == original.expected_profile, "move: profile");
 
     // Copy assign

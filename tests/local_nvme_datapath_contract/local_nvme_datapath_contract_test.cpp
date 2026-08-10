@@ -3186,7 +3186,7 @@ int main(int argc, char** argv) {
     next_t42:;
 
     // =====================================================================
-    // 43. Device mismatch: wrong ctx.device_id → REJECTED before zero issued
+    // 43. Accelerator mismatch: wrong ctx.accel_id -> REJECTED before zero issued
     // =====================================================================
     TEST_CASE("43. device mismatch");
     {
@@ -3210,7 +3210,7 @@ int main(int argc, char** argv) {
 
         cudaStream_t s; cudaStreamCreate(&s);
 
-        // Wrong device_id (1 instead of 0).
+        // Wrong accel_id (1 instead of 0).
         HostSubmitContext ctx{ExecutionDomain::DEVICE_EXECUTION, 1, s};
         DataPathRequest wr;
         wr.intent.direction = IoDirection::WRITE;
@@ -3220,7 +3220,7 @@ int main(int argc, char** argv) {
         wr.intent.target_offset = 0;
         wr.intent.length = kBlockSize;
         auto out = dp.submit(&wr, 1, ctx);
-        CHECK(!out.status.ok(), "wrong device_id rejected");
+        CHECK(!out.status.ok(), "wrong accel_id rejected");
         CHECK(!out.op.has_value(), "no op (zero issued)");
         CHECK(out.initial_states[0].state == RequestState::REJECTED,
               "REJECTED");

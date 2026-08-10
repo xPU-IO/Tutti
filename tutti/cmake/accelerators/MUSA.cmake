@@ -26,7 +26,11 @@ function(tutti_configure_cuda_like target_name)
     set(MUSA_INCLUDE_DIR "/usr/local/musa/include" CACHE PATH "MUSA SDK include dir")
     set(MUSA_LIB_DIR     "/usr/local/musa/lib"      CACHE PATH "MUSA SDK lib dir")
 
-    target_compile_definitions(${target_name} INTERFACE TUTTI_USE_MUSA=1)
+    target_compile_definitions(${target_name} INTERFACE
+        TUTTI_USE_MUSA=1
+        TUTTI_COMPILED_ACCELERATOR_PROFILE=\"MUSA\"
+        TUTTI_DEFAULT_ACCEL_ID=0
+    )
 
     target_include_directories(${target_name} INTERFACE
         ${MUSA_INCLUDE_DIR}

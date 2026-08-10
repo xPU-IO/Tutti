@@ -69,6 +69,7 @@ public:
         caps_.supports_multi_stream = false;
         caps_.max_concurrent_streams = 1;
         caps_.max_concurrent_operations = 256;
+        caps_.bound_accel_id = -1;
     }
 
     ~MemfsDataPath() override = default;

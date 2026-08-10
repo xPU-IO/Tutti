@@ -346,7 +346,7 @@ private:
         void* base = nullptr;
         std::uint64_t size_bytes = 0;
         DataPathMemoryKind kind = DataPathMemoryKind::HOST;
-        std::int32_t device_id = -1;
+        std::int32_t accel_id = -1;
         std::uint64_t generation = 0;
         bool unregistered = false;
 

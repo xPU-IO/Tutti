@@ -20,7 +20,7 @@
 // Actual pointer validation is the future StorageRuntime's job.
 //
 // "Optional" expected_* fields use explicit sentinels (not std::optional):
-//   - expected_device_id < 0       : device not specified
+//   - expected_accel_id < 0        : accelerator not specified
 //   - expected_profile.empty()     : profile not specified
 //   - expected_kind                : always set (no sentinel; caller picks)
 //
@@ -61,7 +61,7 @@ enum class MemoryOwnership {
 //   size               : size in bytes
 //   expected_kind      : caller-expected memory position (always set)
 //   allocation owner   : who allocated this memory
-//   expected_device_id : expected device id (< 0 = unspecified)
+//   expected_accel_id  : accelerator id (< 0 = unspecified)
 //   expected_profile   : expected profile name ("" = unspecified)
 //
 // This value type performs no pointer query or validation.
@@ -71,7 +71,7 @@ struct MemoryView {
     std::uint64_t   size;
     MemoryKind      expected_kind;
     MemoryOwnership ownership;
-    std::int32_t    expected_device_id;  // < 0 = unspecified
+    std::int32_t    expected_accel_id;   // < 0 = unspecified
     std::string     expected_profile;    // empty = unspecified
     // Round 16 S5 (V3): io_granularity > 0 enables registration-time PRP
     // pre-build (legacy build_io_slice_table 9-stage path).  0 = dynamic

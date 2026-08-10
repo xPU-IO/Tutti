@@ -90,6 +90,7 @@ StripedDataPath::StripedDataPath(std::vector<DeviceDescriptor> devices,
     caps_.max_concurrent_operations = max_in_flight_operations_;
     caps_.supports_multi_gpu = false;
     caps_.supports_cross_device = false;
+    caps_.bound_accel_id = static_cast<std::int32_t>(cuda_device_);
     caps_.optional_target_features = {};
 }
 
@@ -790,9 +791,9 @@ SubmitOutcome StripedDataPath::submit(const DataPathRequest* requests,
         reject_all(StatusCode::INVALID_ARGUMENT, "null stream");
         return outcome;
     }
-    if (ctx.device_id != static_cast<std::int32_t>(cuda_device_)) {
+    if (ctx.accel_id != static_cast<std::int32_t>(cuda_device_)) {
         reject_all(StatusCode::INVALID_ARGUMENT,
-                   "ctx.device_id does not match this DataPath's CUDA device");
+                   "ctx.accel_id does not match this DataPath's CUDA device");
         return outcome;
     }
 

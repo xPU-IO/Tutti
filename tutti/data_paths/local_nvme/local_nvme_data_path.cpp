@@ -59,6 +59,7 @@ LocalNvmeDataPath::LocalNvmeDataPath(
     caps_.max_concurrent_operations = 1;
     caps_.supports_multi_gpu = false;
     caps_.supports_cross_device = false;
+    caps_.bound_accel_id = static_cast<std::int32_t>(cuda_device_);
     caps_.optional_target_features = {};
 }
 
@@ -129,6 +130,7 @@ LocalNvmeDataPath::LocalNvmeDataPath(
     caps_.max_concurrent_operations = max_in_flight_operations_;
     caps_.supports_multi_gpu = false;
     caps_.supports_cross_device = false;
+    caps_.bound_accel_id = static_cast<std::int32_t>(cuda_device_);
     caps_.optional_target_features = {};
 }
 
@@ -827,7 +829,7 @@ Result<DataPathMemory> LocalNvmeDataPath::register_memory(
     reg.base = view.base;
     reg.size_bytes = view.size_bytes;
     reg.kind = view.kind;
-    reg.device_id = view.device_id;
+    reg.accel_id = view.expected_accel_id;
     reg.generation = generation;
     reg.unregistered = false;
 
@@ -1087,10 +1089,10 @@ SubmitOutcome LocalNvmeDataPath::submit(
         return outcome;
     }
 
-    // Device ID check (restored from S2).
-    if (ctx.device_id != static_cast<std::int32_t>(queue_group_->cuda_device())) {
+    // Accelerator identity check (the daemon's NVMe device_id is unrelated).
+    if (ctx.accel_id != static_cast<std::int32_t>(queue_group_->cuda_device())) {
         reject_all(StatusCode::INVALID_ARGUMENT,
-                   "ctx.device_id does not match queue group's CUDA device");
+                   "ctx.accel_id does not match queue group's CUDA device");
         return outcome;
     }
 
