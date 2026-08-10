@@ -493,6 +493,15 @@ if(BUILD_TESTING)
                 "${TUTTI_REPOSITORY_ROOT}/tests/config_loader"
                 "${CMAKE_CURRENT_BINARY_DIR}/tests_config_loader"
             )
+
+            # Phase 5: allocation-driven loader -> public Runtime -> real I/O.
+            # Labelled "hardware;loader_e2e;runtime_e2e" and run manually
+            # against a live two-disk nvmeservice daemon.
+            add_subdirectory(
+                "${TUTTI_REPOSITORY_ROOT}/tests/runtime_bundle_loader_contract"
+                "${CMAKE_CURRENT_BINARY_DIR}/tests_runtime_bundle_loader_contract"
+            )
+            message(STATUS "Tutti: added tests/runtime_bundle_loader_contract (hardware;loader_e2e;runtime_e2e)")
         else()
             message(STATUS "Tutti: TUTTI_FEATURE_LOCAL_NVME=OFF -- skipping local_nvme hardware tests")
         endif()
