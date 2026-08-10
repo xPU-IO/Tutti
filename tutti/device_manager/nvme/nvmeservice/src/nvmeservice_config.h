@@ -2,54 +2,47 @@
 #define __NVMESERVICE_CONFIG_H__
 
 /**
- * nvmeservice_config.h -- sys_config.yaml parser for NVMeService daemon.
+ * nvmeservice_config.h -- canonical daemon configuration and diagnostics.
  *
- * Post-L1-Commit-4b schema (no per-GPU queue accounting in YAML)
- * -------------------------------------------------------------
+ * Accelerator and NVMe identities are explicit: accel_id is the compiled
+ * backend ordinal and device_id identifies an NVMe resource. Array order is
+ * not identity and cannot be used to construct device paths.
  *
- * The kernel's user QID pool [start_cq_idx, max_user_qid] is the
- * single source of truth for how many user queues exist on a given
- * NVMe.  The daemon learns those values via NVM_GET_DEV_INFO at
- * bring-up and does NOT track any shadow accounting in YAML.
- *
- * What's left for YAML to express:
- *
- *   * GPU enumeration + per-GPU mount paths (symlink targets).
- *   * NVMe enumeration + which GPUs are allowed to attach to each
- *     NVMe (NUMA / PCIe-switch affinity ACL).
- *   * kernel_ioq_cap pre-bind hint (NVM_SET_KERNEL_IOQ_CAP).
- *   * Per-client allocation policy (default_per_client / max_per_client).
- *   * Lease cadence.
- *
- * YAML schema:
+ * Canonical schema:
  *
  *   grpc:
  *     endpoint: "127.0.0.1:50051"
  *
- *   gpus:
- *     - id: 0
- *       mount_path: "/mnt/gpu0"
+ *   accelerators:
+ *     - accel_id: 0
+ *       view_root: "/mnt/snvme/gpu0"
  *
  *   nvmes:
- *     - pci_addr: "0000:50:00.0"
- *       mount_path: "/mnt/nvme0"
- *       namespace_id: 1                # libnvm doesn't get this from the
- *                                      # kernel today; YAML must supply it.
- *       kernel_ioq_cap: 32             # OPTIONAL: NVM_SET_KERNEL_IOQ_CAP
- *                                      # value passed pre-bind.  0 = let the
- *                                      # kernel pick num_possible_cpus().
- *       allowed_gpus: [0, 1]           # OPTIONAL: NUMA / PCIe-switch
- *                                      # affinity ACL.  When omitted,
- *                                      # every GPU in `gpus` may attach.
+ *     - device_id: 0
+ *       pci_addr: "0000:41:00.0"
+ *       backing_mount_path: "/mnt/snvme/nvme1"
+ *       namespace_id: 1
+ *       kernel_ioq_cap: 32
+ *       allowed_accel_ids: [0, 1]
+ *       auto_mount: true
  *
  *   queue_pool:
- *     default_per_client: 4            # ConnectRequest.num_queues=0 -> use this
- *     max_per_client: 16               # hard cap; further clamped by
- *                                      # kernel max_queues_per_group at runtime
+ *     default_per_client: 4
+ *     max_per_client: 16
  *
  *   lease:
  *     heartbeat_interval_sec: 10
  *     timeout_sec: 30
+ *
+ * The parser accepts one completely legacy-only schema during the transition:
+ * gpus[].id/mount_path and nvmes[].mount_path/allowed_gpus are normalized at
+ * the parser boundary. Canonical and legacy fields cannot be mixed. Legacy
+ * deprecation messages are returned through ConfigDiagnostics so tests and
+ * embedders do not depend on stderr.
+ *
+ * The kernel-reported user QID range supplies controller capacity. queue_pool
+ * is only the per-client admission policy; ServiceState keeps the runtime
+ * reservation ledger after owner bring-up.
  */
 
 #include <cstdint>
@@ -61,99 +54,89 @@ namespace nvmeservice {
 
 // The striped data path currently assumes 4 KiB namespace logical blocks.
 // The controller reports the value for each namespace during bring-up; this
-// constant is only the value used for the daemon's operator-facing warning.
-// It is not a controller-wide format setting, a filesystem block size, or a
-// physical block size.  Values are bytes (1 << Identify Namespace LBA shift).
+// constant is only used for the daemon's operator-facing warning.  It is not
+// a controller-wide format setting, filesystem block size, or physical block
+// size.  Values are bytes (1 << Identify Namespace LBA shift).
 constexpr uint32_t kExpectedNvmeBlockSize = 4096;
 
 struct GrpcConfig {
     std::string endpoint = "127.0.0.1:50051";
 };
 
-struct GpuEntry {
-    int         id = -1;
-    std::string mount_path;
+struct AcceleratorEntry {
+    // Compiled backend ordinal; never an array index inferred by the daemon.
+    int32_t     accel_id = -1;
+    // Root under which this accelerator's published view paths live.
+    std::string view_root;
 };
 
 struct NvmeEntry {
-    std::string         pci_addr;
-    std::string         mount_path;          // real NVMe mount, e.g. "/mnt/nvme0"
-    uint32_t            namespace_id   = 1;
-
-    // NVM_SET_KERNEL_IOQ_CAP hint (QueuePair units).  0 == "no cap,
-    // kernel uses num_possible_cpus()".  Set explicitly when the
-    // controller's MSI-X budget is smaller than the host vCPU count
-    // (otherwise s_nvme_setup_io_queues falls back to
-    // dma_alloc_coherent and the user share path silently misses GPU
-    // memory).
-    uint32_t            kernel_ioq_cap = 0;
-
-    // Optional ACL: which gpus[].id values may Connect to this NVMe.
-    // Empty == "any GPU in gpus[]".  Used both for ACL enforcement
-    // in ConnectRequest and to decide which GPU view paths get a
-    // symlink installed.  Validator cross-checks each id against
-    // gpus[].
-    std::vector<int>    allowed_gpus;
-
-    // Round 17 S1: auto-mount this NVMe block device at mount_path on
-    // daemon startup (ext4, using mount(2)).  When true the daemon
-    // records that it owns the mount and will umount on shutdown.
-    // When false the daemon assumes the operator pre-mounted the
-    // device and never tries to umount.  Default true.
-    bool                auto_mount = true;
+    // Explicit resource identity; array order is not identity.
+    int32_t              device_id = -1;
+    // Canonical PCI BDF after parser normalization.
+    std::string          pci_addr;
+    // Real filesystem mount target for the owner-returned block device.
+    std::string          backing_mount_path;
+    uint32_t             namespace_id = 1;
+    // NVM_SET_KERNEL_IOQ_CAP pre-bind hint in queue-pair units. Zero leaves the
+    // cap to the kernel. Set it when controller MSI-X capacity is smaller than
+    // the host CPU count so the user-share pool remains usable.
+    uint32_t             kernel_ioq_cap = 0;
+    // Accelerator ACL used both for acquisition checks and view publication.
+    // Empty input is expanded to all configured accelerator IDs before the
+    // internal model or RPC snapshot is exposed.
+    std::vector<int32_t> allowed_accel_ids;
+    // When true the daemon mounts block_path at backing_mount_path, records
+    // ownership, and unmounts during graceful shutdown. When false it only
+    // consumes an operator-prepared mount.
+    bool                 auto_mount = true;
 };
 
 struct QueuePoolConfig {
-    int default_per_client = 4;
-    int max_per_client     = 16;
+    // Requested zero means default_per_client. The effective grant is further
+    // clamped by max_per_client, max_queues_per_group, and available capacity.
+    int32_t default_per_client = 4;
+    int32_t max_per_client = 16;
 };
 
 struct LeaseConfig {
     uint32_t heartbeat_interval_sec = 10;
-    uint32_t timeout_sec            = 30;
+    uint32_t timeout_sec = 30;
 };
 
-// Round 17 S1: auto-unmount retry policy on daemon shutdown.
-// When umount(2) returns EBUSY (a process is still holding files
-// open on the mount), the daemon scans /proc to report the holders,
-// then retries after interval_ms up to max times.  Receiving a
-// second SIGTERM/SIGINT during the retry loop forces an immediate
-// exit (mounts left in place, reported to the operator).
 struct UnmountRetryConfig {
+    // EBUSY retry policy during graceful daemon shutdown. A second signal can
+    // stop the retry loop and leave the mount for explicit operator cleanup.
     uint32_t interval_ms = 1000;
-    uint32_t max          = 30;
+    uint32_t max = 30;
 };
 
 struct ServiceConfig {
-    GrpcConfig             grpc;
-    std::vector<GpuEntry>  gpus;
-    std::vector<NvmeEntry> nvmes;
-    QueuePoolConfig        queue_pool;
-    LeaseConfig            lease;
-    UnmountRetryConfig     unmount_retry;   // Round 17 S1
+    GrpcConfig                   grpc;
+    std::vector<AcceleratorEntry> accelerators;
+    std::vector<NvmeEntry>       nvmes;
+    QueuePoolConfig              queue_pool;
+    LeaseConfig                  lease;
+    UnmountRetryConfig           unmount_retry;
 };
 
-/**
- * Parse a YAML file into ServiceConfig.  Returns std::nullopt on
- * parse / validation error; the error message is written to *error
- * when non-null.
- */
-std::optional<ServiceConfig> parse_config_file(const std::string& path,
-                                                std::string* error = nullptr);
+struct ConfigDiagnostics {
+    // Injectable warnings, primarily for legacy-schema deprecation assertions.
+    std::vector<std::string> warnings;
+};
 
-/**
- * Cross-reference validator: every nvmes[].allowed_gpus id must be
- * present in gpus[]; no duplicate pci_addr / mount_path; pool sizes
- * sane; lease cadence sane.  No "queue accounting" check -- that
- * lives in the kernel now.
- */
+std::optional<ServiceConfig> parse_config_file(
+    const std::string& path,
+    std::string* error = nullptr,
+    ConfigDiagnostics* diagnostics = nullptr);
+
+// Cross-reference validator for IDs, paths, PCI BDFs, ACLs, policy, and lease
+// cadence.  It does not probe hardware; bring-up validates device facts later.
 bool validate_config(const ServiceConfig& cfg, std::string* error = nullptr);
 
 // Validate the invariant required by striped operation: every namespace
 // brought up by one daemon must report the same logical block size in bytes.
-// A non-4 KiB value is intentionally not rejected here; callers warn about it
-// separately so a uniform non-default namespace remains usable for
-// non-striped workloads.
+// A uniform non-4 KiB value is allowed and is warned about by the daemon.
 bool validate_uniform_block_size(const std::vector<uint32_t>& block_sizes,
                                  std::string* error = nullptr);
 

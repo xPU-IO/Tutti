@@ -106,3 +106,22 @@ build/cuda/bin/tutti_striped_local_nvme_contract_test \
 `--devices` 只接受 `2` 或 `4`；缺少设备、mount 或 CUDA runtime 时返回 skip（77）。
 所有选中的 namespace 必须有相同 `block_size`，且 `allowed_gpus` 包含 `--gpu 0`；
 每个 selected controller 也要有至少 16 个 user QP。
+
+## 3. 阶段 3 daemon allocation 补充
+
+阶段 3 的 daemon canonical 配置使用 `accelerators[].accel_id/view_root`、
+`nvmes[].device_id/pci_addr/backing_mount_path/allowed_accel_ids`。本节新增
+接口与上面的历史 contract-test 参数同时存在；legacy-only 配置和 `--gpu`/`--cuda`
+入口仍作为兼容路径保留，但 canonical 配置不得与 legacy 字段混用。
+
+硬件测试或 client 应先通过 `ListNvmeResources` 读取本次 owner bring-up 返回的
+`device_id`、`pci_bdf`、实际 `chrdev_path`/minor、`block_path`、namespace、page/
+logical-block、BAR0 和 queue metadata，再生成 `--nvme` 参数。不得按 YAML 数组顺序、
+accelerator ordinal 或设备 ID 拼接 `/dev` 路径；allocation 返回的 `view_path` 才是
+accelerator 可见路径。
+
+阶段 3 hardware gate 还覆盖 accelerator 0/1 的 allowed/explicit acquisition、一个
+有序 striped allocation、共享 controller queue reservation、预算耗尽、统一 Release、
+heartbeat/PID reaper 回收，以及 daemon list/acquire 前后无 accelerator compute context。
+`--skip-io` 仅用于 attach 诊断，不能作为 `validated_available` 证据；最终验证必须对
+每个 slice 执行 scratch 区域 write/read/verify 后再 Release 同一个 allocation。

@@ -37,6 +37,22 @@ public:
     grpc::Status Heartbeat(grpc::ServerContext* ctx,
                             grpc::ServerReaderWriter<HeartbeatMsg, HeartbeatMsg>* stream) override;
 
+    grpc::Status ListAccelerators(grpc::ServerContext* ctx,
+                                  const Empty* request,
+                                  AcceleratorListResponse* response) override;
+
+    grpc::Status ListNvmeResources(grpc::ServerContext* ctx,
+                                   const Empty* request,
+                                   NvmeResourceListResponse* response) override;
+
+    grpc::Status AcquireNvmeSlices(grpc::ServerContext* ctx,
+                                   const AcquireNvmeSlicesRequest* request,
+                                   AcquireNvmeSlicesResponse* response) override;
+
+    grpc::Status Release(grpc::ServerContext* ctx,
+                         const ReleaseRequest* request,
+                         ReleaseResponse* response) override;
+
 private:
     std::shared_ptr<ServiceState> state_;
 };

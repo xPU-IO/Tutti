@@ -410,3 +410,51 @@ ls -l /dev/ssnvme0 /dev/snvme0n1
 当卸载因 holder 返回 `EBUSY` 时，daemon 会报告相关 PID、fd、maps 或 cwd，并按
 `unmount_retry` 重试。第二次发送信号会强制结束重试并留下挂载；除非处于明确的
 应急恢复流程，否则不要发送第二次信号，更不要使用 `kill -9`。
+
+## 10. 阶段 3 canonical 配置与资源分配补充
+
+本节是在保留前述部署指南和历史示例基础上的阶段 3 增量说明。前文的
+`gpus[].id`/`mount_path`、`nvmes[].mount_path`/`allowed_gpus` 示例描述的是
+legacy-only YAML；过渡版本仍可读取该格式并发出 deprecation diagnostic，但
+canonical 文件不能与 legacy 字段混用。新配置使用：
+
+```yaml
+accelerators:
+  - accel_id: 0
+    view_root: "/mnt/snvme/gpu0"
+  - accel_id: 1
+    view_root: "/mnt/snvme/gpu1"
+
+nvmes:
+  - device_id: 0
+    pci_addr: "0000:41:00.0"
+    backing_mount_path: "/mnt/snvme/nvme1"
+    namespace_id: 1
+    kernel_ioq_cap: 32
+    allowed_accel_ids: [0, 1]
+    auto_mount: true
+  - device_id: 1
+    pci_addr: "0000:44:00.0"
+    backing_mount_path: "/mnt/snvme/nvme2"
+    namespace_id: 1
+    kernel_ioq_cap: 32
+    allowed_accel_ids: [0, 1]
+    auto_mount: true
+```
+
+`device_id` 和 `accel_id` 是显式、唯一的身份，数组顺序不参与身份或 `/dev` 路径
+推导。daemon 通过 libnvm owner bring-up 返回实际 `chrdev_path`/minor 和 ioctl
+`disk_name` 对应的 `block_path`，并在 BDF、设备节点、mount/view 校验失败时将资源
+保持为不可用；不会按数组下标拼接 `/dev/ssnvmeN` 或 `/dev/snvmeNn1`。
+
+控制面客户端应先调用 `ListAccelerators` 和 `ListNvmeResources`，再使用
+`AcquireNvmeSlices`。请求支持 allowed、explicit 和按请求顺序的 striped selection；
+一个 striped 请求返回一个 `allocation_id` 和全部 slices。所有 slices 的 queue
+预算在一个临界区内原子预留，`Release`、旧 `Disconnect`、heartbeat timeout 以及
+PID/starttime reaper 都经过同一回收路径。
+
+新 client 入口使用 `--accel`；`--cuda` 仅保留给旧 `Connect` 兼容路径，不能绕过 ACL
+或 queue ledger。daemon 的 list/acquire 路径不调用 accelerator runtime，也不创建
+compute context。最终 hardware gate 必须使用 owner/RPC 返回的实际路径完成 scratch
+区域 write/read/verify；`--skip-io` 只能用于 attach 诊断，不能证明
+`validated_available`。

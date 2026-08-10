@@ -42,6 +42,7 @@
 
 #include <grpcpp/grpcpp.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -94,13 +95,6 @@ static void print_usage(const char* prog) {
         "holders (PID/comm/type) and retries up to unmount_retry.max\n"
         "times.  A second SIGTERM forces immediate exit.\n",
         prog);
-}
-
-// Round 17 S1: construct the block device path from device_id and namespace_id.
-// The snvme kernel module exposes block devices as /dev/snvme<id>n<ns>.
-static std::string make_block_device_path(int32_t device_id, uint32_t namespace_id) {
-    return "/dev/snvme" + std::to_string(device_id) +
-           "n" + std::to_string(namespace_id);
 }
 
 int main(int argc, char** argv) {
@@ -180,57 +174,60 @@ int main(int argc, char** argv) {
     // source of truth.  Uniformity is enforced by ServiceState before any
     // mount or gRPC setup; warn when the uniform value differs from the
     // current 4 KiB striped assumption.
-    const auto startup_devices = state->list_devices();
-    const uint32_t startup_block_size = startup_devices.front().blk_size;
+    const auto startup_devices = state->list_nvme_resources();
+    const uint32_t startup_block_size = startup_devices.empty()
+        ? 0 : startup_devices.front().logical_block_size;
     for (const auto& d : startup_devices) {
-        if (d.blk_size != nvmeservice::kExpectedNvmeBlockSize) {
+        if (d.logical_block_size != nvmeservice::kExpectedNvmeBlockSize) {
             std::fprintf(stderr,
                          "WARNING: NVMe device_id=%d pci=%s reports "
                          "block_size=%u bytes; expected %u bytes for "
                          "striped operation\n",
-                         d.device_id, d.pci_addr.c_str(), d.blk_size,
+                         d.device_id, d.pci_bdf.c_str(), d.logical_block_size,
                          nvmeservice::kExpectedNvmeBlockSize);
         }
     }
 
-    // Round 17 S1: post-bring-up mount.  The snvme kernel module only
-    // creates /dev/snvme<id>n<ns> block devices AFTER ServiceState has
-    // bound + probed the controller, so mount must come after bring-up.
+    // Post-bring-up mount: the namespace block device only exists after the
+    // owner has bound and probed the controller. Consume the owner-returned
+    // block_path; device_id and YAML array order do not determine /dev names.
     nvmeservice::MountManager mount_mgr(cfg.unmount_retry);
     g_mount_mgr = &mount_mgr;
-    for (size_t i = 0; i < cfg.nvmes.size(); ++i) {
-        const auto& nvme = cfg.nvmes[i];
+    for (const auto& nvme : cfg.nvmes) {
         if (!nvme.auto_mount) continue;
-        std::string blkdev = make_block_device_path(
-            static_cast<int32_t>(i), nvme.namespace_id);
-        auto mr = mount_mgr.mount_one(blkdev, nvme.mount_path);
+        const auto found = std::find_if(startup_devices.begin(), startup_devices.end(),
+            [&](const auto& resource) { return resource.device_id == nvme.device_id; });
+        if (found == startup_devices.end() || found->block_path.empty()) {
+            std::fprintf(stderr, "warning: no bring-up block path for device_id=%d\n",
+                         nvme.device_id);
+            continue;
+        }
+        auto mr = mount_mgr.mount_one(found->block_path, nvme.backing_mount_path);
         if (!mr.error.empty()) {
             std::fprintf(stderr,
                          "warning: auto-mount %s at %s failed: %s "
                          "(continuing; device will not be auto-unmounted)\n",
-                         blkdev.c_str(), nvme.mount_path.c_str(),
+                         found->block_path.c_str(), nvme.backing_mount_path.c_str(),
                          mr.error.c_str());
         }
     }
 
-    // Publish filesystem views only after the backing mount is visible.
-    // ServiceState bring-up creates the block device, but deliberately does
-    // not mkdir <mount>/GPU<n>: doing so before mount(2) would create the
-    // directory on the host filesystem and the mount would hide it.
-    for (size_t i = 0; i < cfg.nvmes.size(); ++i) {
-        const auto& nvme = cfg.nvmes[i];
-        if (!nvmeservice::MountManager::is_mounted(nvme.mount_path)) {
+    // Publish accelerator views only after the backing mount is visible.
+    // Creating ACCEL<n> before mount(2) would place it on the host filesystem
+    // and the later mount would hide it.
+    for (const auto& nvme : cfg.nvmes) {
+        if (!nvmeservice::MountManager::is_mounted(nvme.backing_mount_path)) {
             std::fprintf(stderr,
-                         "warning: %s is not mounted; GPU views for "
-                         "device_id=%zu will not be published\n",
-                         nvme.mount_path.c_str(), i);
+                         "warning: %s is not mounted; accelerator views for "
+                         "device_id=%d will not be published\n",
+                         nvme.backing_mount_path.c_str(), nvme.device_id);
             continue;
         }
-        if (!state->publish_gpu_views(static_cast<int32_t>(i))) {
+        if (!state->publish_accelerator_views(nvme.device_id)) {
             std::fprintf(stderr,
-                         "warning: one or more GPU views for device_id=%zu "
+                         "warning: one or more accelerator views for device_id=%d "
                          "could not be published\n",
-                         i);
+                         nvme.device_id);
         }
     }
 
@@ -267,15 +264,16 @@ int main(int argc, char** argv) {
               << " block_size=" << startup_block_size << "\n";
     if (tutti_verbose()) {
         std::cout << "Owned devices:\n";
-        for (const auto& d : state->list_devices()) {
+        for (const auto& d : state->list_nvme_resources()) {
             std::cout << "  device_id=" << d.device_id
-                      << " pci="  << d.pci_addr
-                      << " snvme=" << d.snvme_dev_path
+                      << " pci="  << d.pci_bdf
+                      << " chrdev=" << d.chrdev_path
+                      << " block=" << d.block_path
                       << " ns="   << d.namespace_id
-                      << " block_size=" << d.blk_size
+                      << " block_size=" << d.logical_block_size
                       << " io_qp_limit=" << d.max_user_qid
                       << " kernel_io_qps=" << d.kernel_io_qps
-                      << " user_io_qps=" << d.user_io_qps
+                      << " user_io_qps=" << d.controller_queue_capacity
                       << " max_user_qid=" << d.max_user_qid
                       << " max_q_per_grp=" << d.max_queues_per_group
                       << "\n";
@@ -296,7 +294,7 @@ int main(int argc, char** argv) {
     server->Wait();
     state->stop_reaper();
 
-    // Symlinks and empty GPU<n> directories belong to the mounted
+    // Symlinks and empty ACCEL<n> directories belong to the mounted
     // filesystem, so remove them before mount_manager hides that filesystem
     // again.  The destructor repeats this defensively; the operation is
     // idempotent.

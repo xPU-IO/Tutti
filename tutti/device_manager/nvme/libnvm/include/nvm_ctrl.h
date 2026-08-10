@@ -117,6 +117,26 @@ struct controller* ctrl_to_controller(nvm_ctrl_t* ctrl);
  * for CPU metadata access, and keeps the owner fds alive.  It deliberately
  * does not call any accelerator runtime API and is the interface daemons
  * should use. */
+struct nvm_owner_bringup_result {
+    /* Actual minor returned by SNVM_CHRDEV_CREATE. */
+    int32_t chrdev_minor;
+    /* Character-device path opened by the owner bring-up. */
+    char chrdev_path[256];
+    /* Kernel ioctl disk name for the selected namespace. */
+    char disk_name[32];
+    /* /dev/<disk_name>; returned as a fact rather than reconstructed above. */
+    char block_path[256];
+};
+
+/* Extended owner entry point that reports all created device paths. */
+int nvm_controller_init_b3_owner_with_result(
+    nvm_ctrl_t** ctrl,
+    const char* snvme_control_path,
+    const char* pci_addr,
+    uint32_t kernel_ioq_cap,
+    struct disk* out_disk,
+    struct nvm_owner_bringup_result* out_result);
+
 int nvm_controller_init_b3_owner(nvm_ctrl_t** ctrl,
                                  const char* snvme_control_path,
                                  const char* pci_addr,

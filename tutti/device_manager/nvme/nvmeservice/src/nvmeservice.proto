@@ -49,6 +49,10 @@ service NvmeService {
     rpc Connect        (ConnectRequest)      returns (ConnectResponse);
     rpc Disconnect     (DisconnectRequest)   returns (DisconnectResponse);
     rpc Heartbeat      (stream HeartbeatMsg) returns (stream HeartbeatMsg);
+    rpc ListAccelerators (Empty) returns (AcceleratorListResponse);
+    rpc ListNvmeResources (Empty) returns (NvmeResourceListResponse);
+    rpc AcquireNvmeSlices (AcquireNvmeSlicesRequest) returns (AcquireNvmeSlicesResponse);
+    rpc Release (ReleaseRequest) returns (ReleaseResponse);
 }
 
 // -----------------------------------------------------------------
@@ -176,4 +180,104 @@ message AdminNotice {
     Kind   kind              = 1;
     uint32 seconds_remaining = 2;
     string message           = 3;
+}
+
+// -----------------------------------------------------------------
+// Canonical multi-accelerator resource and allocation API
+// -----------------------------------------------------------------
+
+message AcceleratorListResponse {
+    repeated AcceleratorInfo accelerators = 1;
+}
+
+message AcceleratorInfo {
+    int32 accel_id = 1;
+    string view_root = 2;
+}
+
+message NvmeResourceListResponse {
+    repeated NvmeResource resources = 1;
+}
+
+message NvmeResource {
+    int32 device_id = 1;
+    string pci_bdf = 2;
+    int32 chrdev_minor = 3;
+    string chrdev_path = 4;
+    string block_path = 5;
+    string backing_mount_path = 6;
+    uint32 namespace_id = 7;
+    uint32 page_size = 8;
+    uint32 logical_block_size = 9;
+    uint32 logical_block_size_log = 10;
+    uint32 queue_depth = 11;
+    uint32 dstrd = 12;
+    uint64 bar0_size = 13;
+    uint64 max_data_size = 14;
+    uint32 max_user_qid = 15;
+    uint32 kernel_io_qps = 16;
+    uint32 controller_queue_capacity = 17;
+    uint32 max_queues_per_group = 18;
+    uint32 reserved_queues = 19;
+    uint32 available_queues = 20;
+    repeated int32 allowed_accel_ids = 21;
+    bool available = 22;
+    string diagnostic = 23;
+    uint32 heartbeat_interval_sec = 24;
+    uint32 lease_timeout_sec = 25;
+}
+
+enum NvmeSelectionMode {
+    NVME_SELECTION_ALLOWED = 0;
+    NVME_SELECTION_EXPLICIT = 1;
+    NVME_SELECTION_STRIPED = 2;
+}
+
+message AcquireNvmeSlicesRequest {
+    int32 accel_id = 1;
+    NvmeSelectionMode selection = 2;
+    repeated int32 device_ids = 3;
+    int32 queues_per_controller = 4;
+    uint32 client_pid = 5;
+}
+
+message NvmeSlice {
+    int32 device_id = 1;
+    int32 accel_id = 2;
+    string pci_bdf = 3;
+    int32 chrdev_minor = 4;
+    string chrdev_path = 5;
+    string block_path = 6;
+    string backing_mount_path = 7;
+    string view_path = 8;
+    uint32 namespace_id = 9;
+    uint32 page_size = 10;
+    uint32 logical_block_size = 11;
+    uint32 logical_block_size_log = 12;
+    uint32 queue_depth = 13;
+    uint32 dstrd = 14;
+    uint64 bar0_size = 15;
+    uint64 max_data_size = 16;
+    uint32 controller_queue_capacity = 17;
+    uint32 granted_queues = 18;
+    uint32 max_queues_per_group = 19;
+    repeated int32 allowed_accel_ids = 20;
+    uint32 heartbeat_interval_sec = 21;
+    uint32 lease_timeout_sec = 22;
+}
+
+message AcquireNvmeSlicesResponse {
+    string allocation_id = 1;
+    repeated NvmeSlice slices = 2;
+    string error_message = 99;
+}
+
+message ReleaseRequest {
+    string allocation_id = 1;
+}
+
+message ReleaseResponse {
+    bool success = 1;
+    bool already_released = 2;
+    string error_message = 3;
 }

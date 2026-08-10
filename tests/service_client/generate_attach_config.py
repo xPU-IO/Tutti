@@ -3,11 +3,9 @@
 
 This generator fixes two errors from the T-003 harness:
 
-1. ``mount_path`` is NOT the filesystem mount target of the raw NVMe block
-   device.  It is a work directory under which the daemon creates ``GPU<n>``
-   sub-directories and GPU-view symlinks.  The generator therefore creates
-   ordinary work directories and refuses to run if any ``/dev/nvmeXn1`` is
-   already mounted or has open holders.
+1. ``backing_mount_path`` is the daemon-owned filesystem mount and
+   ``view_root`` is the accelerator-visible symlink root. The generated YAML
+   uses the canonical explicit resource schema.
 
 2. The real client binary is ``nvmeservice_client`` (OUTPUT_NAME), not the
    CMake target name ``nvmeservice_client_example``.  The generator itself
@@ -142,24 +140,26 @@ def main() -> int:
         "grpc:",
         f"  endpoint: {quote_yaml(ENDPOINT)}",
         "",
-        "gpus:",
+        "accelerators:",
     ]
     for gpu_id in range(4):
         gpu_mount = str(gpus_work / f"gpu{gpu_id}")
         lines.extend([
-            f"  - id: {gpu_id}",
-            f"    mount_path: {quote_yaml(gpu_mount)}",
+            f"  - accel_id: {gpu_id}",
+            f"    view_root: {quote_yaml(gpu_mount)}",
         ])
 
     lines.extend(["", "nvmes:"])
     for device_id, bdf, gpu_id in DEVICES:
         nvme_mount = str(nvmes_work / f"nvme{device_id}")
         lines.extend([
-            f"  - pci_addr: {quote_yaml(bdf)}",
-            f"    mount_path: {quote_yaml(nvme_mount)}",
+            f"  - device_id: {device_id}",
+            f"    pci_addr: {quote_yaml(bdf)}",
+            f"    backing_mount_path: {quote_yaml(nvme_mount)}",
             "    namespace_id: 1",
             "    kernel_ioq_cap: 32",
-            f"    allowed_gpus: [{gpu_id}]",
+            f"    allowed_accel_ids: [{gpu_id}]",
+            "    auto_mount: true",
         ])
 
     lines.extend([

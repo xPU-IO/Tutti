@@ -190,3 +190,26 @@ tests/service_client/.work/logs/<YYYYmmdd-HHMMSS>/
     ├── gpus/gpu0..3/
     └── nvmes/nvme0..3/
 ```
+
+## Phase 3 canonical allocation update
+
+The sections above are retained as the history and operating contract of the
+original attach smoke. Phase 3 changes the generated daemon YAML to the
+canonical names `accelerators[].accel_id/view_root` and
+`nvmes[].device_id/backing_mount_path/allowed_accel_ids`. The generated
+`device_id` values are explicit identities, not array positions.
+
+The smoke keeps a legacy `--cuda` run for the compatibility adapter. New
+allocation coverage uses `ListAccelerators`, `ListNvmeResources`, and:
+
+```bash
+nvmeservice_client --accel 0 --selection allowed --skip-io
+nvmeservice_client --accel 0 --selection explicit --device 0 --skip-io
+nvmeservice_client --accel 0 --selection striped --device 0 --device 1 --skip-io
+```
+
+Clients must consume the owner-returned `chrdev_path`, `block_path`, and
+allocation `view_path`; they must not infer device names from YAML order or an
+accelerator ordinal. `--skip-io` still proves only the attach/group lifecycle.
+The phase 3 hardware gate separately performs scratch-region write/read/verify
+on every acquired slice before releasing the single logical allocation.

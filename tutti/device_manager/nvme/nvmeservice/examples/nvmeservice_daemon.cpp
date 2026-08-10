@@ -87,10 +87,10 @@ int main(int argc, char** argv) {
 
     for (const auto& n : cfg.nvmes) {
         std::cout << "Parsed NVMe config: pci=" << n.pci_addr
-                  << " mount=" << n.mount_path
+                  << " backing_mount=" << n.backing_mount_path
                   << " ns=" << n.namespace_id
                   << " kernel_ioq_cap=" << n.kernel_ioq_cap
-                  << " allowed_gpus=" << n.allowed_gpus.size()
+                  << " allowed_accel_ids=" << n.allowed_accel_ids.size()
                   << "\n";
     }
 
@@ -103,19 +103,18 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        // This example does not own the mount lifecycle.  Publish only views
-        // backed by a mount the operator prepared; never create GPU<n> on the
+        // This example does not own the mount lifecycle. Publish only views
+        // backed by an operator-prepared mount; never create ACCEL<n> on the
         // host filesystem as a substitute for a missing mount.
-        for (size_t i = 0; i < cfg.nvmes.size(); ++i) {
-            const auto& nvme = cfg.nvmes[i];
-            if (!nvmeservice::MountManager::is_mounted(nvme.mount_path)) {
+        for (const auto& nvme : cfg.nvmes) {
+            if (!nvmeservice::MountManager::is_mounted(nvme.backing_mount_path)) {
                 std::fprintf(stderr,
-                    "warning: %s is not mounted; GPU views for device_id=%zu "
+                    "warning: %s is not mounted; accelerator views for device_id=%d "
                     "will not be published\n",
-                    nvme.mount_path.c_str(), i);
+                    nvme.backing_mount_path.c_str(), nvme.device_id);
                 continue;
             }
-            state->publish_gpu_views(static_cast<int32_t>(i));
+            state->publish_accelerator_views(nvme.device_id);
         }
 
         state->start_reaper();
@@ -144,23 +143,25 @@ int main(int argc, char** argv) {
         std::cout << "NVMeService daemon listening on "
                 << cfg.grpc.endpoint << " (port " << bound_port << ")\n";
         std::cout << "Registered devices:\n";
-        for (const auto& d : state->list_devices()) {
+        for (const auto& d : state->list_nvme_resources()) {
             std::cout << "  device_id=" << d.device_id
-                    << " pci=" << d.pci_addr
-                    << " snvme=" << d.snvme_dev_path
+                    << " pci=" << d.pci_bdf
+                    << " chrdev=" << d.chrdev_path
+                    << " block=" << d.block_path
                     << " ns=" << d.namespace_id
                     << " page=" << d.page_size
-                    << " blk=" << d.blk_size
+                    << " blk=" << d.logical_block_size
                     << " qdepth=" << d.queue_depth
                     << " dstrd=" << d.dstrd
                     << " bar0=" << d.bar0_size
                     << " max_user_qid=" << d.max_user_qid
                     << " max_q/grp=" << d.max_queues_per_group
                     << "\n";
-            for (const auto& a : d.allowed_gpus) {
-                std::cout << "      allowed: cuda_device=" << a.cuda_device
-                        << " mount=" << (a.mount_path.empty() ? "(none)" : a.mount_path)
-                        << "\n";
+            for (const auto accel_id : d.allowed_accel_ids) {
+                const auto view = d.view_paths.find(accel_id);
+                std::cout << "      allowed: accel_id=" << accel_id
+                          << " view=" << (view == d.view_paths.end()
+                              ? "(none)" : view->second) << "\n";
             }
         }
         std::cout << "lease: heartbeat=" << cfg.lease.heartbeat_interval_sec

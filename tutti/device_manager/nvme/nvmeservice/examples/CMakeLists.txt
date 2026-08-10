@@ -17,14 +17,12 @@ target_link_libraries(nvmeservice_daemon_example PRIVATE
     gRPC::grpc++
     protobuf::libprotobuf
     Threads::Threads
-    ${TUTTI_ACCEL_RUNTIME_LIBS}
 )
 
 set_target_properties(nvmeservice_daemon_example PROPERTIES
     OUTPUT_NAME   "nvmeservice_daemon"
     BUILD_RPATH   "$ORIGIN:$ORIGIN/../lib"
     INSTALL_RPATH "$ORIGIN:$ORIGIN/../lib"
-    CUDA_SEPARABLE_COMPILATION ON
 )
 
 # client: gRPC half in .cpp, CUDA / libnvm IO smoke in .cu (kept
@@ -44,7 +42,6 @@ target_link_libraries(nvmeservice_client_example PRIVATE
     gRPC::grpc++
     protobuf::libprotobuf
     Threads::Threads
-    ${TUTTI_ACCEL_RUNTIME_LIBS}
 )
 
 set_target_properties(nvmeservice_client_example PROPERTIES

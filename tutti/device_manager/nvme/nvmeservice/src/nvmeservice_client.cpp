@@ -26,6 +26,10 @@ NvmeServiceClient::Session::~Session() {
     }
 }
 
+NvmeServiceClient::Allocation::~Allocation() {
+    if (owner != nullptr) owner->release_allocation(this);
+}
+
 // ---------------------------------------------------------------------------
 // NvmeServiceClient
 // ---------------------------------------------------------------------------
@@ -79,6 +83,146 @@ std::vector<ClientDeviceInfo> NvmeServiceClient::list_devices() {
         out.push_back(std::move(info));
     }
     return out;
+}
+
+std::vector<ClientAcceleratorInfo> NvmeServiceClient::list_accelerators() {
+    std::vector<ClientAcceleratorInfo> result;
+    grpc::ClientContext context;
+    Empty request;
+    AcceleratorListResponse response;
+    const auto status = stub_->ListAccelerators(&context, request, &response);
+    if (!status.ok()) {
+        std::fprintf(stderr, "ListAccelerators RPC failed: %s\n",
+                     status.error_message().c_str());
+        return result;
+    }
+    result.reserve(response.accelerators_size());
+    for (const auto& accelerator : response.accelerators()) {
+        result.push_back({accelerator.accel_id(), accelerator.view_root()});
+    }
+    return result;
+}
+
+std::vector<ClientNvmeResource> NvmeServiceClient::list_nvme_resources() {
+    std::vector<ClientNvmeResource> result;
+    grpc::ClientContext context;
+    Empty request;
+    NvmeResourceListResponse response;
+    const auto status = stub_->ListNvmeResources(&context, request, &response);
+    if (!status.ok()) {
+        std::fprintf(stderr, "ListNvmeResources RPC failed: %s\n",
+                     status.error_message().c_str());
+        return result;
+    }
+    result.reserve(response.resources_size());
+    for (const auto& source : response.resources()) {
+        ClientNvmeResource resource;
+        resource.device_id = source.device_id();
+        resource.pci_bdf = source.pci_bdf();
+        resource.chrdev_minor = source.chrdev_minor();
+        resource.chrdev_path = source.chrdev_path();
+        resource.block_path = source.block_path();
+        resource.backing_mount_path = source.backing_mount_path();
+        resource.namespace_id = source.namespace_id();
+        resource.page_size = source.page_size();
+        resource.logical_block_size = source.logical_block_size();
+        resource.logical_block_size_log = source.logical_block_size_log();
+        resource.queue_depth = source.queue_depth();
+        resource.dstrd = source.dstrd();
+        resource.bar0_size = source.bar0_size();
+        resource.max_data_size = source.max_data_size();
+        resource.max_user_qid = source.max_user_qid();
+        resource.kernel_io_qps = source.kernel_io_qps();
+        resource.controller_queue_capacity = source.controller_queue_capacity();
+        resource.max_queues_per_group = source.max_queues_per_group();
+        resource.reserved_queues = source.reserved_queues();
+        resource.available_queues = source.available_queues();
+        resource.allowed_accel_ids.assign(source.allowed_accel_ids().begin(),
+                                          source.allowed_accel_ids().end());
+        resource.available = source.available();
+        resource.diagnostic = source.diagnostic();
+        resource.heartbeat_interval_sec = source.heartbeat_interval_sec();
+        resource.lease_timeout_sec = source.lease_timeout_sec();
+        result.push_back(std::move(resource));
+    }
+    return result;
+}
+
+std::unique_ptr<NvmeServiceClient::Allocation>
+NvmeServiceClient::acquire_nvme_slices(
+    int32_t accel_id, ClientSelectionMode selection,
+    const std::vector<int32_t>& device_ids, int32_t queues_per_controller) {
+    grpc::ClientContext context;
+    AcquireNvmeSlicesRequest request;
+    AcquireNvmeSlicesResponse response;
+    request.set_accel_id(accel_id);
+    switch (selection) {
+        case ClientSelectionMode::Allowed:
+            request.set_selection(NVME_SELECTION_ALLOWED);
+            break;
+        case ClientSelectionMode::Explicit:
+            request.set_selection(NVME_SELECTION_EXPLICIT);
+            break;
+        case ClientSelectionMode::Striped:
+            request.set_selection(NVME_SELECTION_STRIPED);
+            break;
+    }
+    for (int32_t device_id : device_ids) request.add_device_ids(device_id);
+    request.set_queues_per_controller(queues_per_controller);
+    request.set_client_pid(static_cast<uint32_t>(::getpid()));
+    const auto status = stub_->AcquireNvmeSlices(&context, request, &response);
+    if (!status.ok()) {
+        std::fprintf(stderr, "AcquireNvmeSlices RPC failed: %s\n",
+                     status.error_message().c_str());
+        return nullptr;
+    }
+    if (!response.error_message().empty()) {
+        std::fprintf(stderr, "AcquireNvmeSlices rejected: %s\n",
+                     response.error_message().c_str());
+        return nullptr;
+    }
+
+    auto allocation = std::make_unique<Allocation>();
+    allocation->allocation_id = response.allocation_id();
+    allocation->slices.reserve(response.slices_size());
+    uint32_t heartbeat_interval = 10;
+    for (const auto& source : response.slices()) {
+        ClientNvmeSlice slice;
+        slice.device_id = source.device_id();
+        slice.accel_id = source.accel_id();
+        slice.pci_bdf = source.pci_bdf();
+        slice.chrdev_minor = source.chrdev_minor();
+        slice.chrdev_path = source.chrdev_path();
+        slice.block_path = source.block_path();
+        slice.backing_mount_path = source.backing_mount_path();
+        slice.view_path = source.view_path();
+        slice.namespace_id = source.namespace_id();
+        slice.page_size = source.page_size();
+        slice.logical_block_size = source.logical_block_size();
+        slice.logical_block_size_log = source.logical_block_size_log();
+        slice.queue_depth = source.queue_depth();
+        slice.dstrd = source.dstrd();
+        slice.bar0_size = source.bar0_size();
+        slice.max_data_size = source.max_data_size();
+        slice.controller_queue_capacity = source.controller_queue_capacity();
+        slice.granted_queues = source.granted_queues();
+        slice.max_queues_per_group = source.max_queues_per_group();
+        slice.allowed_accel_ids.assign(source.allowed_accel_ids().begin(),
+                                       source.allowed_accel_ids().end());
+        slice.heartbeat_interval_sec = source.heartbeat_interval_sec();
+        slice.lease_timeout_sec = source.lease_timeout_sec();
+        heartbeat_interval = std::min(heartbeat_interval,
+                                      slice.heartbeat_interval_sec);
+        allocation->slices.push_back(std::move(slice));
+    }
+    allocation->owner = this;
+    {
+        std::lock_guard<std::mutex> lock(live_mtx_);
+        live_sessions_.emplace(allocation->allocation_id,
+            LiveSession{allocation->allocation_id, heartbeat_interval});
+    }
+    ensure_heartbeat_started();
+    return allocation;
 }
 
 std::unique_ptr<NvmeServiceClient::Session>
@@ -160,6 +304,26 @@ void NvmeServiceClient::release_session(Session* sess) {
     } else if (!resp.success()) {
         std::fprintf(stderr, "Disconnect rejected: %s\n",
                      resp.error_message().c_str());
+    }
+}
+
+void NvmeServiceClient::release_allocation(Allocation* allocation) {
+    if (!allocation || allocation->allocation_id.empty()) return;
+    {
+        std::lock_guard<std::mutex> lock(live_mtx_);
+        live_sessions_.erase(allocation->allocation_id);
+    }
+    grpc::ClientContext context;
+    ReleaseRequest request;
+    ReleaseResponse response;
+    request.set_allocation_id(allocation->allocation_id);
+    const auto status = stub_->Release(&context, request, &response);
+    if (!status.ok()) {
+        std::fprintf(stderr, "Release RPC failed: %s\n",
+                     status.error_message().c_str());
+    } else if (!response.success()) {
+        std::fprintf(stderr, "Release rejected: %s\n",
+                     response.error_message().c_str());
     }
 }
 

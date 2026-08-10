@@ -102,8 +102,8 @@ MountResult MountManager::mount_one(const std::string& block_device,
     res.block_device = block_device;
 
     // 1. Create the mount point, including configured parent directories.
-    // ServiceState no longer creates <mount_path>/GPU<n> before mount(2), so
-    // mount-point preparation belongs entirely to MountManager.
+    // ServiceState publishes ACCEL<n> view targets only after mount(2), so
+    // backing mount-point preparation belongs entirely to MountManager.
     std::error_code ec;
     std::filesystem::create_directories(mount_path, ec);
     if (ec) {

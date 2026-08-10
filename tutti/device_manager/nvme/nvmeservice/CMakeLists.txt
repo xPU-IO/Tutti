@@ -81,10 +81,6 @@ set_target_properties(nvmeservice PROPERTIES
     OUTPUT_NAME "nvmeservice"
     CXX_STANDARD 20
     CXX_STANDARD_REQUIRED ON
-    CUDA_STANDARD 20
-    CUDA_STANDARD_REQUIRED ON
-    CUDA_SEPARABLE_COMPILATION ON
-    CUDA_RESOLVE_DEVICE_SYMBOLS ON
     POSITION_INDEPENDENT_CODE ON
     BUILD_RPATH "$ORIGIN"
     INSTALL_RPATH "$ORIGIN"
@@ -113,7 +109,6 @@ target_link_libraries(nvmeservice
         protobuf::libprotobuf
     PRIVATE
         libnvm
-        ${TUTTI_ACCEL_RUNTIME_LIBS}
         Threads::Threads
         ${TUTTI_YAML_CPP_TARGET}
 )
@@ -143,3 +138,26 @@ install(FILES
 # =============================================================================
 
 add_subdirectory(examples)
+
+if(BUILD_TESTING)
+    add_executable(nvmeservice_phase3_contract_test
+        "${TUTTI_REPOSITORY_ROOT}/tests/nvmeservice_phase3_contract/nvmeservice_phase3_contract_test.cpp"
+    )
+    target_link_libraries(nvmeservice_phase3_contract_test PRIVATE
+        nvmeservice
+        libnvm
+        gRPC::grpc++
+        protobuf::libprotobuf
+        Threads::Threads
+    )
+    set_target_properties(nvmeservice_phase3_contract_test PROPERTIES
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED ON
+        BUILD_RPATH "$ORIGIN"
+    )
+    add_test(NAME nvmeservice_phase3_contract
+             COMMAND nvmeservice_phase3_contract_test)
+    set_tests_properties(nvmeservice_phase3_contract PROPERTIES
+        LABELS "contract;nvmeservice;phase3"
+        TIMEOUT 60)
+endif()

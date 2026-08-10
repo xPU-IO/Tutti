@@ -1,11 +1,10 @@
 /**
  * nvmeservice_client.cpp -- gRPC half of the NVMeService client smoke.
  *
- * Calls Connect, prints the grant, then dispatches into
- * run_nvmeservice_client_io() (compiled in nvmeservice_client_io.cu)
- * to drive the actual libnvm + GPU IO path.  After IO it holds the
- * session for `--hold` seconds (heartbeat thread runs in background)
- * before letting the Session dtor send Disconnect.
+ * Canonical mode lists accelerators/resources, acquires one logical
+ * allocation (possibly striped), and dispatches each returned slice into the
+ * libnvm + accelerator I/O bridge. The legacy --cuda option remains a thin
+ * compatibility path through Connect/Disconnect.
  */
 
 #include "nvmeservice_client.h"
@@ -14,170 +13,179 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
-#include <filesystem>
 #include <iostream>
 #include <string>
-#include <system_error>
 #include <thread>
+#include <vector>
 
-static void print_usage(const char* prog) {
+namespace {
+
+void print_usage(const char* program) {
     std::fprintf(stderr,
-        "Usage: %s [options]\n"
-        "\n"
-        "Options:\n"
-        "  --endpoint <host:port>   gRPC endpoint (default 127.0.0.1:50051)\n"
-        "  --device   <id>          device_id to allocate on (default 0)\n"
-        "  --cuda     <id>          target cuda_device (default: first allowed)\n"
-        "  --count    <n>           queues to request (0 = daemon default)\n"
-        "  --hold     <sec>         hold session AFTER IO smoke (default 0)\n"
-        "  --list-only              list devices and exit (no Connect)\n"
-        "  --skip-io                Connect + attach + create + destroy, no IO\n"
-        "  -h, --help               show this message\n",
-        prog);
+        "Usage: %s [options]\n\n"
+        "  --endpoint <host:port>\n"
+        "  --accel <id>             canonical accelerator ordinal\n"
+        "  --selection <mode>       allowed|explicit|striped\n"
+        "  --device <id>            repeat for striped selection\n"
+        "  --count <n>              queues per controller (0=default)\n"
+        "  --cuda <id>              legacy Connect compatibility path\n"
+        "  --hold <sec>             keep allocation alive after I/O\n"
+        "  --list-only              list canonical resources and exit\n"
+        "  --skip-io                attach/create/destroy only\n",
+        program);
 }
+
+int run_io(int32_t accel_id, const nvmeservice::ClientNvmeSlice& slice,
+           bool skip_io) {
+    nvmeservice_client_io_args arguments {};
+    arguments.cuda_dev = accel_id;
+    arguments.snvme_dev_path = slice.chrdev_path.c_str();
+    arguments.bar0_size = slice.bar0_size;
+    arguments.namespace_id = slice.namespace_id;
+    arguments.blk_size = slice.logical_block_size;
+    arguments.queue_depth = slice.queue_depth;
+    arguments.granted_queues = static_cast<int>(slice.granted_queues);
+    arguments.skip_io = skip_io;
+    return run_nvmeservice_client_io(&arguments);
+}
+
+} // namespace
 
 int main(int argc, char** argv) {
     std::string endpoint = "127.0.0.1:50051";
-    int32_t device_id   = 0;
-    int32_t cuda_device = -1;
-    int32_t num_queues  = 0;
-    int     hold_seconds = 0;
-    bool    list_only   = false;
-    bool    skip_io     = false;
+    int32_t accel_id = -1;
+    int32_t legacy_cuda_id = -1;
+    int32_t queues = 0;
+    int hold_seconds = 0;
+    bool accel_specified = false;
+    bool cuda_specified = false;
+    bool list_only = false;
+    bool skip_io = false;
+    std::string selection_name = "allowed";
+    std::vector<int32_t> device_ids;
 
-    for (int i = 1; i < argc; ++i) {
-        std::string a = argv[i];
-        auto next = [&](const char* name) -> const char* {
-            if (i + 1 >= argc) {
-                std::fprintf(stderr, "%s requires an argument\n", name);
+    for (int index = 1; index < argc; ++index) {
+        const std::string argument = argv[index];
+        auto next = [&](const char* option) {
+            if (index + 1 >= argc) {
+                std::fprintf(stderr, "%s requires an argument\n", option);
                 std::exit(1);
             }
-            return argv[++i];
+            return argv[++index];
         };
-        if (a == "--endpoint")       endpoint    = next("--endpoint");
-        else if (a == "--device")    device_id   = std::atoi(next("--device"));
-        else if (a == "--cuda")      cuda_device = std::atoi(next("--cuda"));
-        else if (a == "--count")     num_queues  = std::atoi(next("--count"));
-        else if (a == "--hold")      hold_seconds = std::atoi(next("--hold"));
-        else if (a == "--list-only") list_only   = true;
-        else if (a == "--skip-io")   skip_io     = true;
-        else if (a == "-h" || a == "--help") { print_usage(argv[0]); return 0; }
-        else {
-            std::fprintf(stderr, "Unknown argument: %s\n", a.c_str());
+        if (argument == "--endpoint") endpoint = next("--endpoint");
+        else if (argument == "--accel") {
+            accel_id = std::atoi(next("--accel"));
+            accel_specified = true;
+        } else if (argument == "--cuda") {
+            legacy_cuda_id = std::atoi(next("--cuda"));
+            cuda_specified = true;
+        } else if (argument == "--selection") {
+            selection_name = next("--selection");
+        } else if (argument == "--device") {
+            device_ids.push_back(std::atoi(next("--device")));
+        } else if (argument == "--count") {
+            queues = std::atoi(next("--count"));
+        } else if (argument == "--hold") {
+            hold_seconds = std::atoi(next("--hold"));
+        } else if (argument == "--list-only") list_only = true;
+        else if (argument == "--skip-io") skip_io = true;
+        else if (argument == "--help" || argument == "-h") {
             print_usage(argv[0]);
+            return 0;
+        } else {
+            std::fprintf(stderr, "unknown argument: %s\n", argument.c_str());
             return 1;
         }
     }
 
-    std::cout << "Connecting to " << endpoint << " ...\n";
-    nvmeservice::NvmeServiceClient client(endpoint);
-
-    std::cout << "\n=== ListDevices ===\n";
-    auto devs = client.list_devices();
-    if (devs.empty()) {
-        std::fprintf(stderr, "No devices returned. Is the daemon running?\n");
+    if (accel_specified && cuda_specified) {
+        std::fprintf(stderr, "--accel and legacy --cuda cannot be combined\n");
         return 1;
     }
-    for (const auto& d : devs) {
-        std::cout << "  device_id=" << d.device_id
-                  << " pci=" << d.pci_addr
-                  << " snvme=" << d.snvme_dev_path
-                  << " ns=" << d.namespace_id
-                  << " page=" << d.page_size
-                  << " blk=" << d.blk_size
-                  << " qdepth=" << d.queue_depth
-                  << " bar0=" << d.bar0_size
-                  << " max_user_qid=" << d.max_user_qid
-                  << " max_q/grp=" << d.max_queues_per_group
-                  << "\n";
-        for (const auto& a : d.allowed_gpus) {
-            std::cout << "      allowed: cuda_device=" << a.cuda_device
-                      << " mount=" << (a.mount_path.empty() ? "(none)" : a.mount_path)
-                      << "\n";
-        }
+
+    nvmeservice::NvmeServiceClient client(endpoint);
+    const auto accelerators = client.list_accelerators();
+    const auto resources = client.list_nvme_resources();
+    if (accelerators.empty() || resources.empty()) {
+        std::fprintf(stderr, "daemon returned no accelerators or NVMe resources\n");
+        return 1;
     }
 
+    std::cout << "=== ListAccelerators ===\n";
+    for (const auto& accelerator : accelerators) {
+        std::cout << "accel_id=" << accelerator.accel_id
+                  << " view_root=" << accelerator.view_root << '\n';
+    }
+    std::cout << "=== ListNvmeResources ===\n";
+    for (const auto& resource : resources) {
+        std::cout << "device_id=" << resource.device_id
+                  << " pci_bdf=" << resource.pci_bdf
+                  << " chrdev=" << resource.chrdev_path
+                  << " block=" << resource.block_path
+                  << " backing=" << resource.backing_mount_path
+                  << " block_size=" << resource.logical_block_size
+                  << " page_size=" << resource.page_size
+                  << " queue_depth=" << resource.queue_depth
+                  << " bar0=" << resource.bar0_size
+                  << " capacity=" << resource.controller_queue_capacity
+                  << " reserved=" << resource.reserved_queues
+                  << " available_queues=" << resource.available_queues
+                  << " available=" << (resource.available ? "true" : "false")
+                  << " diagnostic=" << resource.diagnostic << '\n';
+    }
     if (list_only) return 0;
 
-    if (cuda_device < 0) {
-        for (const auto& d : devs) {
-            if (d.device_id != device_id) continue;
-            if (!d.allowed_gpus.empty()) cuda_device = d.allowed_gpus.front().cuda_device;
-            break;
+    if (cuda_specified) {
+        const int32_t device_id = device_ids.empty() ? 0 : device_ids.front();
+        auto session = client.connect(device_id, legacy_cuda_id, queues);
+        if (!session) return 1;
+        nvmeservice::ClientNvmeSlice slice;
+        slice.chrdev_path = session->snvme_dev_path;
+        slice.bar0_size = session->bar0_size;
+        slice.namespace_id = session->namespace_id;
+        slice.logical_block_size = session->blk_size;
+        slice.queue_depth = session->queue_depth;
+        slice.granted_queues = static_cast<uint32_t>(session->granted_queues);
+        const int status = run_io(legacy_cuda_id, slice, skip_io);
+        if (status != 0) return status;
+        if (hold_seconds > 0) {
+            std::this_thread::sleep_for(std::chrono::seconds(hold_seconds));
         }
-        if (cuda_device < 0) {
-            std::fprintf(stderr, "Could not auto-pick cuda_device on device %d\n",
-                         device_id);
-            return 1;
-        }
+        return 0;
     }
 
-    std::cout << "\n=== Connect device=" << device_id
-              << " cuda_device=" << cuda_device
-              << " count=" << (num_queues == 0 ? "(default)"
-                                                : std::to_string(num_queues))
-              << " ===\n";
-    auto sess = client.connect(device_id, cuda_device, num_queues);
-    if (!sess) {
-        std::fprintf(stderr, "connect() failed\n");
+    if (!accel_specified) accel_id = accelerators.front().accel_id;
+    nvmeservice::ClientSelectionMode selection;
+    if (selection_name == "allowed") {
+        selection = nvmeservice::ClientSelectionMode::Allowed;
+    } else if (selection_name == "explicit") {
+        selection = nvmeservice::ClientSelectionMode::Explicit;
+    } else if (selection_name == "striped") {
+        selection = nvmeservice::ClientSelectionMode::Striped;
+    } else {
+        std::fprintf(stderr, "unknown selection: %s\n", selection_name.c_str());
         return 1;
     }
 
-    std::cout << "  allocation_id : " << sess->allocation_id << "\n";
-    std::cout << "  device_id     : " << sess->device_id << "\n";
-    std::cout << "  cuda_device   : " << sess->cuda_device << "\n";
-    std::cout << "  granted_queues: " << sess->granted_queues << "\n";
-    std::cout << "  snvme_dev     : " << sess->snvme_dev_path << "\n";
-    std::cout << "  bar0_size     : 0x" << std::hex << sess->bar0_size << std::dec << "\n";
-    std::cout << "  ns_id         : " << sess->namespace_id << "\n";
-    std::cout << "  blk_size      : " << sess->blk_size << "\n";
-    std::cout << "  queue_depth   : " << sess->queue_depth << "\n";
-    std::cout << "  mount_path    : "
-              << (sess->mount_path.empty() ? "(empty)" : sess->mount_path)
-              << "\n";
-    std::cout << "  heartbeat     : " << sess->heartbeat_interval_sec << "s\n";
-    std::cout << "  lease timeout : " << sess->lease_timeout_sec << "s\n";
-
-    if (!sess->mount_path.empty()) {
-        std::error_code ec;
-        const auto resolved = std::filesystem::read_symlink(sess->mount_path, ec);
-        if (!ec) {
-            std::cout << "  mount->        : " << resolved.string() << "\n";
-        }
+    auto allocation = client.acquire_nvme_slices(
+        accel_id, selection, device_ids, queues);
+    if (!allocation) return 1;
+    std::cout << "allocation_id=" << allocation->allocation_id
+              << " slices=" << allocation->slices.size() << '\n';
+    for (const auto& slice : allocation->slices) {
+        std::cout << "slice device_id=" << slice.device_id
+                  << " accel_id=" << slice.accel_id
+                  << " chrdev=" << slice.chrdev_path
+                  << " block=" << slice.block_path
+                  << " view=" << slice.view_path
+                  << " granted_queues=" << slice.granted_queues << '\n';
+        const int status = run_io(accel_id, slice, skip_io);
+        if (status != 0) return status;
     }
-
-    std::cout << "\n=== libnvm bring-up + GPU IO smoke ===\n";
-    nvmeservice_client_io_args io_args;
-    io_args.cuda_dev       = cuda_device;
-    io_args.snvme_dev_path = sess->snvme_dev_path.c_str();
-    io_args.bar0_size      = sess->bar0_size;
-    io_args.namespace_id   = sess->namespace_id;
-    io_args.blk_size       = sess->blk_size;
-    io_args.queue_depth    = sess->queue_depth;
-    io_args.granted_queues = sess->granted_queues;
-    io_args.skip_io        = skip_io;
-
-    int rc = run_nvmeservice_client_io(&io_args);
-    if (rc != 0) {
-        std::fprintf(stderr, "IO smoke failed rc=%d\n", rc);
-        return rc;
-    }
-
     if (hold_seconds > 0) {
-        std::cout << "\n=== Holding session for " << hold_seconds
-                  << "s (heartbeat thread running) ===\n";
-        for (int i = 0; i < hold_seconds; ++i) {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-            if ((i + 1) % 5 == 0 || i + 1 == hold_seconds) {
-                std::cout << "  " << (i + 1) << "s elapsed\n";
-                std::cout.flush();
-            }
-        }
+        std::this_thread::sleep_for(std::chrono::seconds(hold_seconds));
     }
-
-    std::cout << "\n=== Disconnect (Session dtor) ===\n";
-    sess.reset();
-
-    std::cout << "\nDone.\n";
+    allocation.reset();
     return 0;
 }
