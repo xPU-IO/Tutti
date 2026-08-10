@@ -1,37 +1,145 @@
 # ============================================================================
-# Canonical NVMeService daemon example.
+# sys_config.yaml -- deprecated fallback filename for NVMeService config.
 #
-# Accelerator IDs are compiled-backend ordinals. NVMe device IDs are explicit
-# resource identities. Neither identity nor /dev paths come from YAML array
-# order; actual chrdev/block paths are returned by libnvm owner bring-up.
+# The canonical example now lives in config/local_nvme_config.yaml, and the
+# daemon prefers that path when no --config is passed. This file is still kept
+# as a repository-root fallback for existing workflows; using it through the
+# fallback path prints a deprecation warning.
+#
+# The schema below is canonical, not legacy:
+#
+#   accelerators[].accel_id/view_root
+#   nvmes[].device_id/backing_mount_path/allowed_accel_ids
+#
+# The parser also accepts one complete legacy schema during the migration
+# window, but canonical and legacy fields cannot be mixed in the same file or
+# resource entry. Once callers and local deployments stop depending on legacy
+# names, that compatibility path can be removed.
+#
+# Queue capacity is not configured here. The kernel-reported user QID range is
+# the source of controller capacity, and the daemon maintains a runtime
+# reservation ledger for successful allocations.
 # ============================================================================
+
 grpc:
   endpoint: "127.0.0.1:50051"
 
-# The daemon publishes resource views below view_root without calling CUDA or
-# another accelerator runtime.
+# ---------------------------------------------------------------------------
+# Accelerators known to the daemon.
+#
+# accel_id   Compiled backend ordinal, for example the CUDA device index used
+#            by cudaSetDevice when the binary is built with the CUDA backend.
+#            The daemon validates IDs and uses them for ACL checks; it does
+#            not initialize CUDA/MUSA/MACA or create accelerator contexts.
+#
+# view_root  Per-accelerator filesystem view root. For every NVMe whose ACL
+#            includes accel_id, the daemon publishes a symlink under this root.
+#            Clients must consume view_path returned by RPC rather than
+#            constructing paths from accel_id or device_id.
+# ---------------------------------------------------------------------------
 accelerators:
   - accel_id: 0
     view_root: "/mnt/gpu0"
 
-# Per-resource fields:
-#   device_id             explicit unique daemon resource ID
-#   pci_addr              canonical PCI BDF used for owner bind/probe
-#   backing_mount_path    real filesystem mount target
-#   namespace_id          namespace ID supplied to clients
-#   kernel_ioq_cap        optional pre-bind kernel I/O-QP hint
-#   allowed_accel_ids     ACL; empty means all configured accelerators
-#   auto_mount            daemon owns mount/unmount when true
+# ---------------------------------------------------------------------------
+# NVMe resources the daemon takes exclusive ownership of.
+#
+# Per-entry schema:
+#
+#   device_id            Explicit daemon-local NVMe resource identity. It must
+#                        be unique and non-negative. Array order is not used as
+#                        identity.
+#
+#   pci_addr             Canonical "DDDD:BB:DD.F". Used by libnvm owner
+#                        bring-up to bind/probe the matching pci_dev.
+#
+#   backing_mount_path   Filesystem mount point for the owner-returned block
+#                        device. When auto_mount=true, the daemon mounts the
+#                        actual block_path reported by bring-up here. It also
+#                        creates ACCEL<id> subdirectories under this mounted
+#                        filesystem and exposes them through view_root
+#                        symlinks.
+#
+#   namespace_id         NVMe namespace ID exposed to clients, usually 1.
+#
+#   kernel_ioq_cap       Optional NVM_SET_KERNEL_IOQ_CAP pre-bind hint, in
+#                        queue-pair units. Zero leaves the cap to the kernel.
+#
+#   allowed_accel_ids    ACL and view-publication set. Empty or omitted means
+#                        every configured accelerator may acquire this resource.
+#
+#   auto_mount           When true the daemon mounts block_path at
+#                        backing_mount_path during startup and unmounts it
+#                        during graceful shutdown.
+# ---------------------------------------------------------------------------
 nvmes:
-  - {device_id: 0, pci_addr: "0000:08:00.0", backing_mount_path: "/mnt/nvme0", namespace_id: 1, kernel_ioq_cap: 32, allowed_accel_ids: [0], auto_mount: true}
-  - {device_id: 1, pci_addr: "0000:4b:00.0", backing_mount_path: "/mnt/nvme1", namespace_id: 1, kernel_ioq_cap: 32, allowed_accel_ids: [0], auto_mount: true}
-  - {device_id: 2, pci_addr: "0000:57:00.0", backing_mount_path: "/mnt/nvme2", namespace_id: 1, kernel_ioq_cap: 32, allowed_accel_ids: [0], auto_mount: true}
-  - {device_id: 3, pci_addr: "0000:63:00.0", backing_mount_path: "/mnt/nvme3", namespace_id: 1, kernel_ioq_cap: 32, allowed_accel_ids: [0], auto_mount: true}
+  - device_id: 0
+    pci_addr: "0000:08:00.0"
+    backing_mount_path: "/mnt/nvme0"
+    namespace_id: 1
+    kernel_ioq_cap: 32
+    allowed_accel_ids: [0]
+    auto_mount: true
+  - device_id: 1
+    pci_addr: "0000:4b:00.0"
+    backing_mount_path: "/mnt/nvme1"
+    namespace_id: 1
+    kernel_ioq_cap: 32
+    allowed_accel_ids: [0]
+    auto_mount: true
+  - device_id: 2
+    pci_addr: "0000:57:00.0"
+    backing_mount_path: "/mnt/nvme2"
+    namespace_id: 1
+    kernel_ioq_cap: 32
+    allowed_accel_ids: [0]
+    auto_mount: true
+  - device_id: 3
+    pci_addr: "0000:63:00.0"
+    backing_mount_path: "/mnt/nvme3"
+    namespace_id: 1
+    kernel_ioq_cap: 32
+    allowed_accel_ids: [0]
+    auto_mount: true
 
-# Admission policy only. The runtime capacity comes from the kernel-reported
-# user QID pool and is tracked by the daemon's atomic reservation ledger.
-queue_pool: {default_per_client: 16, max_per_client: 16}
+# ---------------------------------------------------------------------------
+# Per-client allocation policy.
+#
+#   default_per_client      queues_per_controller == 0, or legacy
+#                           ConnectRequest.num_queues == 0, uses this value.
+#
+#   max_per_client          Hard cap for a single client allocation. The
+#                           effective grant is also clamped by the
+#                           kernel-reported max_queues_per_group and current
+#                           available queue capacity.
+# ---------------------------------------------------------------------------
+queue_pool:
+  default_per_client: 16
+  max_per_client: 16
 
-# Lease/reaper and graceful-unmount policy.
-lease: {heartbeat_interval_sec: 10, timeout_sec: 30}
-unmount_retry: {interval_ms: 1000, max: 30}
+# ---------------------------------------------------------------------------
+# Lease lifetime parameters.
+#
+#   heartbeat_interval_sec  Client heartbeat cadence. The reaper scans at half
+#                           this interval, with a minimum one-second tick.
+#
+#   timeout_sec             Silent allocations older than this are candidates
+#                           for reaping, subject to PID/starttime checks.
+#
+# Rule of thumb: timeout_sec >= 2 * heartbeat_interval_sec.
+# ---------------------------------------------------------------------------
+lease:
+  heartbeat_interval_sec: 10
+  timeout_sec: 30
+
+# ---------------------------------------------------------------------------
+# Auto-unmount retry policy.
+#
+# When the daemon receives SIGTERM/SIGINT and a daemon-owned mount returns
+# EBUSY, it scans /proc to report holders and retries after interval_ms up to
+# max times. A second signal during the retry loop requests immediate exit and
+# may leave busy mounts in place for operator cleanup.
+# ---------------------------------------------------------------------------
+unmount_retry:
+  interval_ms: 1000
+  max: 30

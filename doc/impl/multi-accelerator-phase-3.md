@@ -7,6 +7,8 @@
   `61af360`。
 - 本记录只覆盖阶段 3 的 daemon resource、bring-up metadata、RPC compatibility、
   原子 slice allocation 和回收；没有进入阶段 4 loader/Runtime bundle。
+- 当前实现同时保留 canonical 与 legacy 两套输入/旧 RPC 兼容入口；canonical 是推荐
+  路径，legacy 只用于迁移窗口，后续在调用方完成切换后可以考虑清理。
 
 ## 实施内容
 
@@ -32,6 +34,54 @@
   resource state seam），覆盖 parser、metadata validation、selection、ACL、预算、
   striped 原子性、Release/reaper、并发 ledger、数组反转不变性、view root fail-closed、
   新旧 RPC metadata/字段编号和 daemon no-context 控制面路径。
+
+## 接口与行为变化摘要
+
+### 接口变化
+
+| 项目 | 修改前 | 修改后 |
+| --- | --- | --- |
+| daemon YAML accelerator 配置 | `gpus[].id`、`gpus[].mount_path` | canonical schema 改为 `accelerators[].accel_id`、`accelerators[].view_root`；完整 legacy-only schema 仍可解析并给出 deprecation diagnostics |
+| daemon YAML NVMe 配置 | `nvmes[]` 数组顺序隐式决定 `device_id`，字段使用 `mount_path`、`allowed_gpus` | `nvmes[].device_id` 显式必填，`mount_path` 改为 `backing_mount_path`，`allowed_gpus` 改为 `allowed_accel_ids` |
+| schema 兼容性 | 只有旧 GPU/NVMe 字段 | canonical 与 legacy 均支持，但顶层、accelerator entry、NVMe entry 都禁止新旧字段混用 |
+| gRPC service | `ListDevices`、`Connect`、`Disconnect`、`Heartbeat` | 旧 RPC 和字段编号保留；新增 `ListAccelerators`、`ListNvmeResources`、`AcquireNvmeSlices`、`Release` |
+| 资源查询 | `ListDevices` 返回 legacy `DeviceInfo` | `ListNvmeResources` 返回 canonical resource metadata，包括 `chrdev_path`、`block_path`、`backing_mount_path`、queue capacity/reservation、availability 和 diagnostic |
+| allocation | `Connect(device_id, cuda_device, num_queues)` 一次只连接一块盘 | `AcquireNvmeSlices(accel_id, selection, device_ids, queues_per_controller)` 支持 `allowed`、`explicit`、`striped`，一次 allocation 可包含多个 slice |
+| release | `Disconnect(allocation_id, client_pid)` | 新增 `Release(allocation_id)`，支持幂等 `already_released`；legacy `Disconnect` 进入同一 release/refund 路径 |
+
+### 行为变化
+
+| 项目 | 修改前 | 修改后 |
+| --- | --- | --- |
+| 设备身份 | NVMe `device_id` 由 `nvmes[]` 数组位置决定 | canonical `device_id` 来自 YAML 显式字段；legacy 文件只在 parser 边界按数组位置补一次 ID |
+| 设备路径 | daemon 可能按 `device_id/ns` 推导 `/dev/snvme...` | daemon 使用 owner bring-up 返回的 `chrdev_path` 和 `block_path`；配置顺序不决定设备路径 |
+| bring-up 校验 | init 成功后直接进入后续流程 | 新增 fail-closed 校验：配置 BDF、observed BDF、chrdev minor/path、block path 与 sysfs BDF 关联必须一致 |
+| view 发布 | legacy 语义围绕 GPU view 与 backing mount | canonical 语义围绕 accelerator view；实际 view_path 必须位于配置的 `view_root` 下，client 消费 RPC 返回路径 |
+| queue accounting | daemon 只给 per-client policy clamp，实际预算主要依赖 kernel | daemon 新增 per-controller reservation ledger；capacity 来自 kernel user QID range，allocation/release/reaper 统一更新 ledger |
+| selection | 只有单设备 `Connect` | `allowed` 选择当前可用的最低 `device_id`，`explicit` 要求一个 ID，`striped` 要求至少两个唯一 ID 并保持请求顺序 |
+| 原子性 | 没有多 slice allocation | striped selection 在一个锁临界区完成全部校验和 reservation，失败不会留下部分 reservation |
+| 回收 | `Disconnect`/timeout 主要清理 lease 记录 | `Release`、legacy `Disconnect`、heartbeat timeout、dead/reused PID reaper 共享退款 helper，释放 allocation 的所有 slice reservation |
+| logical block size | 多盘启动前没有统一检查 | 多个可用 namespace 的 logical block size 必须一致；非 4 KiB 统一值会输出 striped assumption warning |
+| 默认配置查找 | 主要依赖显式 `--config` 或旧 `sys_config.yaml` | `tutti_daemon` 默认优先 `config/local_nvme_config.yaml`，再 fallback 到 deprecated `config/sys_config.yaml` 和 `./sys_config.yaml` |
+
+## 文档同步
+
+除本文外，本分支触及的文档及其作用如下：
+
+| 文档 | 修改描述 |
+| --- | --- |
+| `doc/design/multi-accelerator-runtime.md` | 新增多加速器目标设计，定义 `accel_id`、NVMe `device_id`、allocation/slice、Runtime 单 accelerator 边界和 daemon/client 责任 |
+| `doc/impl/multi-accelerator-phase-0.md` | 记录 phase 0 基线与命名/身份整理，为后续 canonical 术语建立背景 |
+| `doc/impl/multi-accelerator-phase-1.md` | 记录 phase 1 的 accelerator identity contract 与早期实现边界 |
+| `doc/impl/multi-accelerator-phase-2.md` | 记录 phase 2 device guard 与 Runtime 单 accelerator 语义 |
+| `doc/impl/multi-accelerator-phase-2-handoff.md` | 保存 phase 2 交接事项、验证结果和未完成风险 |
+| `doc/impl/multi-accelerator-phase-3-handoff.md` | 保存 phase 3 输入要求、目标、约束和交接上下文 |
+| `doc/local_nvme_contract_tests.md` | 更新 local NVMe contract 测试说明，覆盖 multi-accelerator/striped 相关验证入口 |
+| `doc/tutti_daemon.md` | 更新 daemon 启动流程、canonical YAML 字段、owner-returned block path、view publication、block-size 检查和新 RPC 行为 |
+| `examples/layerwise_kv_overlap/README.md` | 更新示例在多加速器/本地 NVMe 配置下的运行说明 |
+| `tests/service_client/README.md` | 更新 attach smoke 语义，说明 canonical 配置生成、`ListAccelerators/ListNvmeResources/AcquireNvmeSlices` 和 legacy `--cuda` 兼容路径 |
+| `tutti/device_manager/README.md` | 同步 device manager 对 NVMeService/daemon 角色的说明 |
+| `tutti/device_manager/nvme/nvmeservice/NVMeService.md` | 更新 NVMeService API、metadata、allocation 和 legacy compatibility 描述 |
 
 ## 无硬件验证
 
