@@ -18,6 +18,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -26,42 +27,122 @@
 
 namespace tutti {
 
-// Forward declarations (avoid heavy includes in this header).
+class DataPath;
 class StorageRuntime;
+class StorageTargetResolver;
 struct RuntimeComponents;
+struct RuntimeConfig;
 
-namespace data_paths::local_nvme { class LocalNvmeDataPath; }
-namespace resolvers::local_file { class LocalFileResolver; }
+#ifndef TUTTI_COMPILED_ACCELERATOR_PROFILE
+#define TUTTI_COMPILED_ACCELERATOR_PROFILE "HOST"
+#endif
+#ifndef TUTTI_DEFAULT_ACCEL_ID
+#define TUTTI_DEFAULT_ACCEL_ID -1
+#endif
 
 namespace config {
 
-// Owned runtime bundle — the caller must keep this alive while using
-// the StorageRuntime.  Destroying it shuts down the runtime and frees
-// all owned DataPaths/Resolvers.
-struct TuttiRuntime {
-    std::unique_ptr<StorageRuntime> runtime;
-    std::vector<std::unique_ptr<data_paths::local_nvme::LocalNvmeDataPath>> datapaths;
-    std::vector<std::unique_ptr<resolvers::local_file::LocalFileResolver>> resolvers;
+struct RuntimeAcceleratorInfo {
+    std::int32_t accel_id = -1;
+    std::string view_root;
 };
 
-// Load config from a YAML file and wire up a StorageRuntime.
-//
-//   path     — path to tutti_config.yaml
-//   programmatic (optional) — overrides for cache capacities that take
-//              precedence over the config file.  Pass 0 to defer to
-//              the config file (then env, then default).
+struct RuntimeNvmeResource {
+    std::int32_t device_id = -1;
+    std::vector<std::int32_t> allowed_accel_ids;
+    bool available = false;
+};
+
+struct RuntimeNvmeSlice {
+    std::int32_t device_id = -1;
+    std::int32_t accel_id = -1;
+    std::string pci_bdf;
+    std::string chrdev_path;
+    std::string block_path;
+    std::string backing_mount_path;
+    std::string view_path;
+    std::uint32_t namespace_id = 0;
+    std::uint32_t logical_block_size = 0;
+    std::uint64_t bar0_size = 0;
+    std::uint64_t max_data_size = 0;
+    std::uint32_t granted_queues = 0;
+    std::vector<std::int32_t> allowed_accel_ids;
+};
+
+struct RuntimeNvmeAllocation {
+    std::string allocation_id;
+    std::vector<RuntimeNvmeSlice> slices;
+};
+
+enum class NvmeSelection {
+    Allowed,
+    Explicit,
+    Striped,
+};
+
+class RuntimeResourceClient {
+public:
+    virtual ~RuntimeResourceClient() = default;
+
+    virtual Result<std::vector<RuntimeAcceleratorInfo>>
+    list_accelerators() = 0;
+
+    virtual Result<std::vector<RuntimeNvmeResource>>
+    list_nvme_resources() = 0;
+
+    virtual Result<RuntimeNvmeAllocation> acquire_nvme_slices(
+        std::int32_t accel_id,
+        NvmeSelection selection,
+        const std::vector<std::int32_t>& device_ids,
+        std::int32_t queues_per_controller) = 0;
+
+    virtual Status release(const std::string& allocation_id) = 0;
+};
+
+//   programmatic overrides for cache capacities that take precedence over the
+//   config file. Pass 0 to defer to the config file (then env, then default).
 struct ProgrammaticOverrides {
     std::uint32_t handle_cache_capacity = 0;  // 0 = defer to config/env
     std::uint32_t prp_cache_capacity = 0;
     std::uint32_t handle_cache_l2_capacity = 0;
 };
 
-// Device map entry — one CUDA device ↔ one NVMe controller.
-// The map is DERIVED from local_nvme_config.yaml (the deployment fact
-// file shared with the daemon; nvmes[] array order = device_id = ssnvme
-// minor, allowed_gpus picks the CUDA device).  tutti_config.yaml links
-// to that file via its `local_nvme_config` key — device topology has a
-// single source of truth.
+struct LoadTuttiConfigOptions {
+    ProgrammaticOverrides overrides;
+
+    // Test seam: production builds leave these empty and use the compiled
+    // backend + gRPC resource client + StorageRuntime::create.
+    std::function<Result<int>()> backend_device_count;
+    std::function<Result<std::unique_ptr<StorageRuntime>>(
+        RuntimeConfig, RuntimeComponents)> runtime_factory;
+    std::function<std::unique_ptr<RuntimeResourceClient>(
+        const std::string& endpoint)> resource_client_factory;
+};
+
+// Owned runtime bundle — the caller must keep this alive while using
+// the StorageRuntime.  Destroying it shuts down the runtime and frees
+// all owned DataPaths/Resolvers.
+struct TuttiRuntime {
+    std::unique_ptr<StorageRuntime> runtime;
+    std::vector<std::unique_ptr<DataPath>> datapaths;
+    std::vector<std::unique_ptr<StorageTargetResolver>> resolvers;
+    std::unique_ptr<RuntimeResourceClient> resource_client;
+    std::string allocation_id;
+    std::vector<RuntimeNvmeSlice> allocation_slices;
+    std::vector<std::string> resolver_schemes;
+    std::vector<std::string> data_path_keys;
+
+    ~TuttiRuntime();
+    Status shutdown();
+
+private:
+    bool shutdown_complete_ = false;
+    bool allocation_released_ = false;
+};
+
+// Legacy parse-only device map entry. The phase-4 product loader no longer
+// derives /dev paths from local_nvme_config, accelerator ordinal, or array
+// order; it consumes daemon allocation metadata through RuntimeResourceClient.
 struct DeviceSpec {
     std::uint32_t cuda_device = 0;
     std::string snvme_dev;
@@ -74,12 +155,26 @@ Result<std::unique_ptr<TuttiRuntime>> load_tutti_config(
     const std::string& path,
     const ProgrammaticOverrides& overrides = {});
 
+Result<std::unique_ptr<TuttiRuntime>> load_tutti_config(
+    const std::string& path,
+    LoadTuttiConfigOptions options);
+
 // Parse-only: returns the parsed config values without constructing
 // any objects.  Useful for testing and validation.
 struct ParsedConfig {
     std::string gpu_vendor = "nvidia";
+    std::string accelerator_profile = TUTTI_COMPILED_ACCELERATOR_PROFILE;
     std::string storage_backend = "local-nvme";
     std::uint64_t default_stripe_unit = 0;
+
+    std::int32_t runtime_accel_id = TUTTI_DEFAULT_ACCEL_ID;
+
+    std::string nvme_service_endpoint = "127.0.0.1:50051";
+    NvmeSelection nvme_selection = NvmeSelection::Allowed;
+    std::string nvme_selection_text = "allowed";
+    std::vector<std::int32_t> nvme_device_ids;
+    std::int32_t queues_per_controller = 0;
+    std::uint64_t stripe_unit = 65536;
 
     // local_nvme tuning
     std::uint32_t handle_cache_capacity = 0;
@@ -97,11 +192,8 @@ struct ParsedConfig {
 
 Result<ParsedConfig> parse_tutti_config(const std::string& path);
 
-// Derive the device map from a local_nvme_config.yaml: nvmes[] array
-// order gives the ssnvme minor; each allowed_gpus entry yields one
-// DeviceSpec (bar0_size/block_size use built-in defaults).
-// Entries without an explicit allowed_gpus list are SKIPPED (no unique
-// mapping — fail-closed, do not guess).  Fail-closed on missing/bad yaml.
+// Legacy helper for compatibility tests only. New loader code must not call
+// this path because it derives /dev names from legacy YAML array order.
 Result<std::vector<DeviceSpec>> derive_local_nvme_devices(
     const std::string& path);
 

@@ -12,10 +12,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 #include <unistd.h>
 
 #include <tutti/config/tutti_config.h>
+#include <tutti/storage_runtime.h>
 
 using namespace tutti::config;
 
@@ -32,6 +36,126 @@ static std::string write_tmp(const std::string& content) {
     write(fd, content.data(), content.size());
     close(fd);
     return std::string(tmpl);
+}
+
+struct FakeClientState {
+    std::vector<RuntimeAcceleratorInfo> accelerators;
+    std::vector<RuntimeNvmeResource> resources;
+    RuntimeNvmeAllocation allocation;
+    tutti::Status acquire_status;
+    int list_accelerators_calls = 0;
+    int list_resources_calls = 0;
+    int acquire_calls = 0;
+    int release_calls = 0;
+    std::string released_allocation;
+    std::string endpoint;
+};
+
+class FakeClient final : public RuntimeResourceClient {
+public:
+    explicit FakeClient(std::shared_ptr<FakeClientState> state)
+        : state_(std::move(state)) {}
+
+    tutti::Result<std::vector<RuntimeAcceleratorInfo>>
+    list_accelerators() override {
+        ++state_->list_accelerators_calls;
+        return tutti::Result<std::vector<RuntimeAcceleratorInfo>>::Success(
+            state_->accelerators);
+    }
+
+    tutti::Result<std::vector<RuntimeNvmeResource>>
+    list_nvme_resources() override {
+        ++state_->list_resources_calls;
+        return tutti::Result<std::vector<RuntimeNvmeResource>>::Success(
+            state_->resources);
+    }
+
+    tutti::Result<RuntimeNvmeAllocation> acquire_nvme_slices(
+        std::int32_t,
+        NvmeSelection,
+        const std::vector<std::int32_t>&,
+        std::int32_t) override {
+        ++state_->acquire_calls;
+        if (!state_->acquire_status.ok()) {
+            return tutti::Result<RuntimeNvmeAllocation>::Failure(
+                state_->acquire_status);
+        }
+        return tutti::Result<RuntimeNvmeAllocation>::Success(
+            state_->allocation);
+    }
+
+    tutti::Status release(const std::string& allocation_id) override {
+        ++state_->release_calls;
+        state_->released_allocation = allocation_id;
+        return tutti::Status::Ok();
+    }
+
+private:
+    std::shared_ptr<FakeClientState> state_;
+};
+
+static RuntimeNvmeSlice make_slice(std::int32_t device_id,
+                                   std::int32_t accel_id = 0) {
+    RuntimeNvmeSlice slice;
+    slice.device_id = device_id;
+    slice.accel_id = accel_id;
+    slice.pci_bdf = "0000:4" + std::to_string(device_id) + ":00.0";
+    slice.chrdev_path = "/dev/from-daemon/ssnvme" + std::to_string(device_id);
+    slice.block_path = "/dev/from-daemon/snvme" + std::to_string(device_id) + "n1";
+    slice.backing_mount_path = "/mnt/backing/nvme" + std::to_string(device_id);
+    slice.view_path = "/mnt/view/gpu0/nvme" + std::to_string(device_id);
+    slice.namespace_id = 1;
+    slice.logical_block_size = 4096;
+    slice.bar0_size = 16384;
+    slice.max_data_size = 131072;
+    slice.granted_queues = 4;
+    slice.allowed_accel_ids = {0, 1};
+    return slice;
+}
+
+static std::shared_ptr<FakeClientState> make_state(
+    std::vector<RuntimeNvmeSlice> slices) {
+    auto state = std::make_shared<FakeClientState>();
+    state->accelerators = {{0, "/views/zero"}, {1, "/views/one"}};
+    state->resources = {
+        {0, {0, 1}, true},
+        {1, {0, 1}, true},
+    };
+    state->allocation.allocation_id = "alloc-test";
+    state->allocation.slices = std::move(slices);
+    return state;
+}
+
+static LoadTuttiConfigOptions fake_options(
+    const std::shared_ptr<FakeClientState>& state,
+    bool fail_runtime_create = false) {
+    LoadTuttiConfigOptions options;
+    options.backend_device_count = [] {
+        return tutti::Result<int>::Success(2);
+    };
+    options.resource_client_factory = [state](const std::string& endpoint) {
+        state->endpoint = endpoint;
+        return std::unique_ptr<RuntimeResourceClient>(
+            new FakeClient(state));
+    };
+    options.runtime_factory =
+        [fail_runtime_create](tutti::RuntimeConfig,
+                              tutti::RuntimeComponents components) {
+            if (fail_runtime_create) {
+                return tutti::Result<std::unique_ptr<tutti::StorageRuntime>>::Failure(
+                    tutti::Status(tutti::StatusCode::INTERNAL,
+                                  "injected runtime create failure"));
+            }
+            CHECK(components.resolvers.size() == 1,
+                  "loader: one top-level resolver binding");
+            CHECK(components.data_paths.size() == 1,
+                  "loader: one top-level DataPath binding");
+            tutti::RuntimeConfig host_cfg;
+            host_cfg.accel_id = -1;
+            host_cfg.profile_name = TUTTI_COMPILED_ACCELERATOR_PROFILE;
+            return tutti::StorageRuntime::create(host_cfg);
+        };
+    return options;
 }
 
 int main() {
@@ -52,6 +176,17 @@ local_nvme:
   num_user_queues: 8
   io_granularity: 524288
 local_nvme_config: local_nvme_config.yaml
+accelerator:
+  profile: CUDA
+runtime:
+  accel_id: 0
+nvme_service:
+  endpoint: "127.0.0.1:50051"
+nvme:
+  selection: "striped"
+  device_ids: [0, 1]
+  queues_per_controller: 4
+  stripe_unit: 65536
 )";
         auto path = write_tmp(yaml);
         auto r = parse_tutti_config(path);
@@ -70,6 +205,14 @@ local_nvme_config: local_nvme_config.yaml
             CHECK(c.io_granularity == 524288, "io_granularity");
             CHECK(c.local_nvme_config == "local_nvme_config.yaml",
                   "local_nvme_config link");
+            CHECK(c.accelerator_profile == "CUDA", "accelerator profile");
+            CHECK(c.runtime_accel_id == 0, "runtime accel_id");
+            CHECK(c.nvme_selection == NvmeSelection::Striped,
+                  "nvme selection");
+            CHECK(c.nvme_device_ids.size() == 2 &&
+                  c.nvme_device_ids[1] == 1, "nvme device ids");
+            CHECK(c.queues_per_controller == 4, "queues per controller");
+            CHECK(c.stripe_unit == 65536, "stripe unit");
         }
         ::unlink(path.c_str());
     }
@@ -157,7 +300,40 @@ local_nvme_config: local_nvme_config.yaml
         CHECK(!r.ok(), "non-existent file: fail-closed");
     }
 
-    // 7. derive_local_nvme_devices — topology from nvmes[]+allowed_gpus.
+    // 7. New nvme selection validation.
+    {
+        auto bad_selection = write_tmp(
+            "nvme:\n  selection: mystery\n");
+        CHECK(!parse_tutti_config(bad_selection).ok(),
+              "unknown selection fail-closed");
+        ::unlink(bad_selection.c_str());
+
+        auto explicit_zero = write_tmp(
+            "nvme:\n  selection: explicit\n  device_ids: []\n");
+        CHECK(!parse_tutti_config(explicit_zero).ok(),
+              "explicit zero ids fail-closed");
+        ::unlink(explicit_zero.c_str());
+
+        auto explicit_many = write_tmp(
+            "nvme:\n  selection: explicit\n  device_ids: [0, 1]\n");
+        CHECK(!parse_tutti_config(explicit_many).ok(),
+              "explicit many ids fail-closed");
+        ::unlink(explicit_many.c_str());
+
+        auto striped_one = write_tmp(
+            "nvme:\n  selection: striped\n  device_ids: [0]\n");
+        CHECK(!parse_tutti_config(striped_one).ok(),
+              "striped one id fail-closed");
+        ::unlink(striped_one.c_str());
+
+        auto duplicate = write_tmp(
+            "nvme:\n  selection: striped\n  device_ids: [0, 0]\n");
+        CHECK(!parse_tutti_config(duplicate).ok(),
+              "duplicate ids fail-closed");
+        ::unlink(duplicate.c_str());
+    }
+
+    // 8. derive_local_nvme_devices — legacy parse-only topology helper.
     {
         std::string yaml = R"(
 nvmes:
@@ -188,6 +364,164 @@ nvmes:
 
         auto r2 = derive_local_nvme_devices("/tmp/tutti_nonexistent_lnvc.yaml");
         CHECK(!r2.ok(), "derive: missing file fail-closed");
+    }
+
+    // 9. Fake-client loader: single-slice allocation produces one top-level
+    // file resolver and one local DataPath binding, then releases once.
+    {
+        std::string yaml = R"(
+accelerator: {profile: CUDA}
+runtime: {accel_id: 0}
+nvme_service: {endpoint: "fake-endpoint"}
+nvme:
+  selection: explicit
+  device_ids: [0]
+  queues_per_controller: 4
+)";
+        auto path = write_tmp(yaml);
+        auto state = make_state({make_slice(0)});
+        auto r = load_tutti_config(path, fake_options(state));
+        CHECK(r.ok(), "loader single-slice: ok");
+        if (r.ok()) {
+            auto bundle = std::move(r).value();
+            CHECK(bundle->resolver_schemes.size() == 1 &&
+                  bundle->resolver_schemes[0] == "file",
+                  "loader single-slice: file resolver");
+            CHECK(bundle->data_path_keys.size() == 1 &&
+                  bundle->data_path_keys[0] == "local-nvme-ext4",
+                  "loader single-slice: local DataPath key");
+            CHECK(state->acquire_calls == 1, "loader single-slice: acquire once");
+            CHECK(bundle->shutdown().ok(), "loader single-slice: shutdown ok");
+            CHECK(state->release_calls == 1 &&
+                  state->released_allocation == "alloc-test",
+                  "loader single-slice: release once");
+            bundle.reset();
+            CHECK(state->release_calls == 1,
+                  "loader single-slice: destructor no double release");
+        }
+        ::unlink(path.c_str());
+    }
+
+    // 10. Fake-client loader: two slices produce one striped top-level pair.
+    {
+        std::string yaml = R"(
+accelerator: {profile: CUDA}
+runtime: {accel_id: 0}
+nvme_service: {endpoint: "fake-endpoint"}
+nvme:
+  selection: striped
+  device_ids: [0, 1]
+  queues_per_controller: 4
+  stripe_unit: 65536
+)";
+        auto path = write_tmp(yaml);
+        auto state = make_state({make_slice(0), make_slice(1)});
+        auto r = load_tutti_config(path, fake_options(state));
+        CHECK(r.ok(), "loader striped: ok");
+        if (r.ok()) {
+            auto bundle = std::move(r).value();
+            CHECK(bundle->resolver_schemes.size() == 1 &&
+                  bundle->resolver_schemes[0] == "striped",
+                  "loader striped: striped resolver");
+            CHECK(bundle->data_path_keys.size() == 1 &&
+                  bundle->data_path_keys[0] == "striped-local-nvme",
+                  "loader striped: striped DataPath key");
+            (void)bundle->shutdown();
+            CHECK(state->release_calls == 1, "loader striped: release once");
+        }
+        ::unlink(path.c_str());
+    }
+
+    // 11. Failures after Acquire release the allocation; preflight failures
+    // do not acquire.
+    {
+        std::string yaml = R"(
+accelerator: {profile: CUDA}
+runtime: {accel_id: 0}
+nvme:
+  selection: striped
+  device_ids: [0, 1]
+)";
+        auto path = write_tmp(yaml);
+        auto state = make_state({make_slice(1), make_slice(0)});
+        auto r = load_tutti_config(path, fake_options(state));
+        CHECK(!r.ok(), "loader striped wrong order: fail");
+        CHECK(state->acquire_calls == 1, "loader wrong order: acquired");
+        CHECK(state->release_calls == 1, "loader wrong order: released");
+        ::unlink(path.c_str());
+    }
+
+    {
+        std::string yaml = R"(
+accelerator: {profile: CUDA}
+runtime: {accel_id: 0}
+nvme:
+  selection: explicit
+  device_ids: [0]
+)";
+        auto path = write_tmp(yaml);
+        auto state = make_state({make_slice(0, 1)});
+        auto r = load_tutti_config(path, fake_options(state));
+        CHECK(!r.ok(), "loader accel mismatch slice: fail");
+        CHECK(state->acquire_calls == 1,
+              "loader accel mismatch slice: acquired");
+        CHECK(state->release_calls == 1,
+              "loader accel mismatch slice: released");
+        ::unlink(path.c_str());
+    }
+
+    {
+        std::string yaml = R"(
+accelerator: {profile: CUDA}
+runtime: {accel_id: 1}
+nvme:
+  selection: explicit
+  device_ids: [0]
+)";
+        auto path = write_tmp(yaml);
+        auto state = make_state({make_slice(0, 1)});
+        state->accelerators = {{0, "/views/zero"}};
+        auto r = load_tutti_config(path, fake_options(state));
+        CHECK(!r.ok(), "loader missing accelerator: fail");
+        CHECK(state->acquire_calls == 0, "loader missing accelerator: no acquire");
+        CHECK(state->release_calls == 0, "loader missing accelerator: no release");
+        ::unlink(path.c_str());
+    }
+
+    {
+        std::string yaml = R"(
+accelerator: {profile: CUDA}
+runtime: {accel_id: 0}
+nvme:
+  selection: explicit
+  device_ids: [0]
+)";
+        auto path = write_tmp(yaml);
+        auto state = make_state({make_slice(0)});
+        state->acquire_status = tutti::Status(
+            tutti::StatusCode::NOT_READY, "injected acquire failure");
+        auto r = load_tutti_config(path, fake_options(state));
+        CHECK(!r.ok(), "loader acquire failure: fail");
+        CHECK(state->acquire_calls == 1, "loader acquire failure: acquire once");
+        CHECK(state->release_calls == 0, "loader acquire failure: no release");
+        ::unlink(path.c_str());
+    }
+
+    {
+        std::string yaml = R"(
+accelerator: {profile: CUDA}
+runtime: {accel_id: 0}
+nvme:
+  selection: explicit
+  device_ids: [0]
+)";
+        auto path = write_tmp(yaml);
+        auto state = make_state({make_slice(0)});
+        auto r = load_tutti_config(path, fake_options(state, true));
+        CHECK(!r.ok(), "loader runtime create failure: fail");
+        CHECK(state->release_calls == 1,
+              "loader runtime create failure: release once");
+        ::unlink(path.c_str());
     }
 
     std::printf("\n=== Summary ===\n  passed: %d\n  failed: %d\n", g_pass, g_fail);

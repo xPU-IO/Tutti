@@ -23,12 +23,20 @@
 # ============================================================================
 
 # ---------------------------------------------------------------------------
-# GPU vendor (determines which accelerator profile to activate).
-#   nvidia  — CUDA profile (default)
-#   amd     — ROCm/HIP profile (placeholder, not yet implemented)
+# Accelerator profile and Runtime identity.
+#   profile must match the compiled profile (CUDA/HOST/MUSA/MACA).
+#   accel_id >= 0 creates an accelerator Runtime and acquires NVMe slices
+#   from the daemon. HOST profile uses accel_id: -1 and does not contact
+#   the daemon.
 # ---------------------------------------------------------------------------
-gpu:
-  vendor: nvidia
+accelerator:
+  profile: CUDA
+
+runtime:
+  accel_id: 0
+
+nvme_service:
+  endpoint: "127.0.0.1:50051"
 
 # ---------------------------------------------------------------------------
 # Storage backend selection.
@@ -87,11 +95,15 @@ local_nvme:
   io_granularity: 0
 
 # ---------------------------------------------------------------------------
-# Link to the local-NVMe deployment fact file (topology single source of
-# truth, shared with the daemon).  The loader derives the CUDA device ↔
-# ssnvme device map from its nvmes[] entries (array order = device_id =
-# ssnvme minor; allowed_gpus picks the CUDA device).  Resolved relative to
-# THIS file's directory.  When the key is absent or the file missing, the
-# loader falls back to a single-device default (/dev/ssnvme0, CUDA device 0).
+# NVMe allocation policy. All device paths and queue grants come from daemon
+# allocation metadata; the loader does not read daemon YAML or derive /dev
+# names from device_ids.
 # ---------------------------------------------------------------------------
+nvme:
+  selection: explicit          # allowed | explicit | striped
+  device_ids: [0]              # allowed: []; explicit: 1 id; striped: >=2 ids
+  queues_per_controller: 4     # 0 = daemon default
+  stripe_unit: 65536           # striped only
+
+# Legacy parse-only compatibility key. New load_tutti_config() does not use it.
 local_nvme_config: local_nvme_config.yaml

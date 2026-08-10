@@ -5,12 +5,33 @@
 
 #include "tutti/config/tutti_config.h"
 
+#include <algorithm>
 #include <cstdlib>
+#include <set>
 #include <string>
 
 #include <yaml-cpp/yaml.h>
 
 namespace tutti::config {
+
+namespace {
+
+Result<NvmeSelection> parse_selection(const std::string& value) {
+    if (value == "allowed") {
+        return Result<NvmeSelection>::Success(NvmeSelection::Allowed);
+    }
+    if (value == "explicit") {
+        return Result<NvmeSelection>::Success(NvmeSelection::Explicit);
+    }
+    if (value == "striped") {
+        return Result<NvmeSelection>::Success(NvmeSelection::Striped);
+    }
+    return Result<NvmeSelection>::Failure(
+        Status(StatusCode::INVALID_ARGUMENT,
+               "nvme.selection must be allowed, explicit, or striped"));
+}
+
+} // namespace
 
 Result<ParsedConfig> parse_tutti_config(const std::string& path) {
     YAML::Node root;
@@ -28,11 +49,103 @@ Result<ParsedConfig> parse_tutti_config(const std::string& path) {
         if (auto v = gpu["vendor"]) cfg.gpu_vendor = v.as<std::string>();
     }
 
+    if (auto accelerator = root["accelerator"]) {
+        if (auto v = accelerator["profile"])
+            cfg.accelerator_profile = v.as<std::string>();
+    }
+
+    if (auto runtime = root["runtime"]) {
+        if (auto v = runtime["accel_id"])
+            cfg.runtime_accel_id = v.as<std::int32_t>();
+    }
+
+    if (cfg.runtime_accel_id < -1) {
+        return Result<ParsedConfig>::Failure(
+            Status(StatusCode::INVALID_ARGUMENT,
+                   "runtime.accel_id must be -1 or non-negative"));
+    }
+
     if (auto storage = root["storage"]) {
         if (auto b = storage["backend"])
             cfg.storage_backend = b.as<std::string>();
         if (auto s = storage["default_stripe_unit"])
             cfg.default_stripe_unit = s.as<std::uint64_t>();
+    }
+
+    if (auto service = root["nvme_service"]) {
+        if (auto endpoint = service["endpoint"])
+            cfg.nvme_service_endpoint = endpoint.as<std::string>();
+    }
+
+    bool stripe_unit_explicit = false;
+    if (auto nvme = root["nvme"]) {
+        if (auto selection = nvme["selection"]) {
+            cfg.nvme_selection_text = selection.as<std::string>();
+            auto parsed_selection = parse_selection(cfg.nvme_selection_text);
+            if (!parsed_selection.ok()) {
+                return Result<ParsedConfig>::Failure(parsed_selection.status());
+            }
+            cfg.nvme_selection = parsed_selection.value();
+        }
+        if (auto ids = nvme["device_ids"]) {
+            if (!ids.IsSequence()) {
+                return Result<ParsedConfig>::Failure(
+                    Status(StatusCode::INVALID_ARGUMENT,
+                           "nvme.device_ids must be a sequence"));
+            }
+            for (const auto& id : ids) {
+                const auto parsed = id.as<std::int32_t>();
+                if (parsed < 0) {
+                    return Result<ParsedConfig>::Failure(
+                        Status(StatusCode::INVALID_ARGUMENT,
+                               "nvme.device_ids entries must be non-negative"));
+                }
+                cfg.nvme_device_ids.push_back(parsed);
+            }
+        }
+        if (auto queues = nvme["queues_per_controller"]) {
+            const auto parsed = queues.as<std::int32_t>();
+            if (parsed < 0) {
+                return Result<ParsedConfig>::Failure(
+                    Status(StatusCode::INVALID_ARGUMENT,
+                           "nvme.queues_per_controller must be >= 0"));
+            }
+            cfg.queues_per_controller = parsed;
+        }
+        if (auto stripe = nvme["stripe_unit"]) {
+            cfg.stripe_unit = stripe.as<std::uint64_t>();
+            stripe_unit_explicit = true;
+        }
+    }
+
+    if (!stripe_unit_explicit && cfg.default_stripe_unit != 0) {
+        cfg.stripe_unit = cfg.default_stripe_unit;
+    }
+
+    std::set<std::int32_t> unique_ids(
+        cfg.nvme_device_ids.begin(), cfg.nvme_device_ids.end());
+    if (unique_ids.size() != cfg.nvme_device_ids.size()) {
+        return Result<ParsedConfig>::Failure(
+            Status(StatusCode::INVALID_ARGUMENT,
+                   "nvme.device_ids must not contain duplicates"));
+    }
+    if (cfg.nvme_selection == NvmeSelection::Allowed &&
+        !cfg.nvme_device_ids.empty()) {
+        return Result<ParsedConfig>::Failure(
+            Status(StatusCode::INVALID_ARGUMENT,
+                   "nvme.selection=allowed requires empty device_ids"));
+    }
+    if (cfg.nvme_selection == NvmeSelection::Explicit &&
+        cfg.nvme_device_ids.size() != 1) {
+        return Result<ParsedConfig>::Failure(
+            Status(StatusCode::INVALID_ARGUMENT,
+                   "nvme.selection=explicit requires exactly one device_id"));
+    }
+    if (cfg.nvme_selection == NvmeSelection::Striped &&
+        cfg.nvme_device_ids.size() < 2) {
+        return Result<ParsedConfig>::Failure(
+            Status(StatusCode::INVALID_ARGUMENT,
+                   "nvme.selection=striped requires at least two device_ids"));
     }
 
     if (auto ln = root["local_nvme"]) {

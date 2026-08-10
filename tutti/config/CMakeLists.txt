@@ -41,9 +41,18 @@ target_include_directories(tutti_config PUBLIC
 target_link_libraries(tutti_config PUBLIC
     tutti_config_parse
     tutti_local_nvme_datapath
+    tutti_striped_local_nvme_datapath
     tutti_local_file_resolver
+    tutti_striped_file_resolver
     tutti_api
 )
+
+if(TARGET nvmeservice)
+    target_link_libraries(tutti_config PUBLIC nvmeservice)
+    target_compile_definitions(tutti_config PRIVATE
+        TUTTI_CONFIG_HAS_NVMESERVICE=1
+    )
+endif()
 
 set_target_properties(tutti_config PROPERTIES
     CXX_STANDARD 17
