@@ -917,6 +917,34 @@ int main(int argc, char** argv) {
     const std::uint32_t kBar0Size = primary_device().bar0_size;
     const std::size_t kBufSize = 1 * 1024 * 1024;  // 1 MiB
 
+    // Phase 2 direct-DataPath probe: initialize/shutdown must select the
+    // bound accelerator even when the caller entered on the other GPU.
+    if (cuda_dev_count >= 2) {
+        const int caller_gpu = test_gpu == 0 ? 1 : 0;
+        CHECK(cudaSetDevice(caller_gpu) == cudaSuccess,
+              "direct DataPath probe selects non-target caller device");
+        LocalNvmeDataPath direct_dp(kSnvmeDevPath, kBar0Size);
+        DataPathConfig direct_config{"local_nvme"};
+        ResourceProvider* direct_resources = nullptr;
+        const Status direct_init = direct_dp.initialize(
+            direct_config, *direct_resources);
+        CHECK(direct_init.ok(),
+              "direct LocalNvmeDataPath initialize works from wrong caller device");
+        int after_init = -1;
+        CHECK(cudaGetDevice(&after_init) == cudaSuccess &&
+              after_init == caller_gpu,
+              "direct LocalNvmeDataPath initialize restores caller device");
+        const Status direct_shutdown = direct_dp.shutdown(0);
+        CHECK(direct_shutdown.ok(),
+              "direct LocalNvmeDataPath shutdown works from wrong caller device");
+        int after_shutdown = -1;
+        CHECK(cudaGetDevice(&after_shutdown) == cudaSuccess &&
+              after_shutdown == caller_gpu,
+              "direct LocalNvmeDataPath shutdown restores caller device");
+        CHECK(cudaSetDevice(test_gpu) == cudaSuccess,
+              "direct DataPath probe restores test accelerator");
+    }
+
     // Helper lambda for DP with real device.
     auto make_real_dp = [&]() {
         return LocalNvmeDataPath(kSnvmeDevPath, kBar0Size);

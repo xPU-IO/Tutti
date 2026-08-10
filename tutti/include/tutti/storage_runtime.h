@@ -15,6 +15,7 @@
 // SPI; concrete transports and vendor SDK headers never enter this header.
 
 #include <tutti/status.h>
+#include <tutti/accelerator_device_guard.h>
 #include <tutti/io_types.h>
 #include <tutti/memory_types.h>
 #include <tutti/spi/data_path.h>
@@ -455,6 +456,12 @@ public:
                 Status(StatusCode::UNSUPPORTED,
                        "host-only Runtime cannot register accelerator memory"));
         }
+        Status pointer_status = validate_pointer_accel_(view.address,
+                                                        view.expected_kind,
+                                                        view.expected_accel_id);
+        if (!pointer_status.ok()) {
+            return Result<MemoryHandle>::Failure(std::move(pointer_status));
+        }
         if (view.expected_accel_id >= 0 && config_.accel_id >= 0 &&
             view.expected_accel_id != config_.accel_id) {
             return Result<MemoryHandle>::Failure(
@@ -583,17 +590,22 @@ public:
         DataPath* data_path = path_it->second;
         auto private_target = [&]() -> Result<DataPathTarget> {
             std::lock_guard<std::mutex> dp_lock(datapath_open_mutex_);
-            return data_path->open(resolved.value());
+            return call_data_path_result_<DataPathTarget>(
+                *data_path, [&] { return data_path->open(resolved.value()); });
         }();
         if (!private_target.ok()) {
             return Result<TargetHandle>::Failure(private_target.status());
         }
         auto domain = [&]() -> Result<RegistrationDomainKey> {
             std::lock_guard<std::mutex> dp_lock(datapath_open_mutex_);
-            return data_path->registration_domain(private_target.value());
+            return call_data_path_result_<RegistrationDomainKey>(
+                *data_path,
+                [&] { return data_path->registration_domain(private_target.value()); });
         }();
         if (!domain.ok()) {
-            (void)data_path->close(private_target.value());
+            (void)call_data_path_status_(
+                *data_path,
+                [&] { return data_path->close(private_target.value()); });
             return Result<TargetHandle>::Failure(domain.status());
         }
 
@@ -769,15 +781,20 @@ public:
             RegistrationDomainKey domain;
             {
                 std::lock_guard<std::mutex> dp_lock(datapath_open_mutex_);
-                auto pt = data_path->open(rt);
+                auto pt = call_data_path_result_<DataPathTarget>(
+                    *data_path, [&] { return data_path->open(rt); });
                 if (!pt.ok()) {
                     results[i] = Result<TargetHandle>::Failure(pt.status());
                     continue;
                 }
                 private_target = pt.value();
-                auto dom = data_path->registration_domain(private_target);
+                auto dom = call_data_path_result_<RegistrationDomainKey>(
+                    *data_path,
+                    [&] { return data_path->registration_domain(private_target); });
                 if (!dom.ok()) {
-                    (void)data_path->close(private_target);
+                    (void)call_data_path_status_(
+                        *data_path,
+                        [&] { return data_path->close(private_target); });
                     results[i] = Result<TargetHandle>::Failure(dom.status());
                     continue;
                 }
@@ -814,7 +831,9 @@ public:
                           "target has inflight operations");
         }
         if (entry.data_path != nullptr) {
-            Status status = entry.data_path->close(entry.data_path_target);
+            Status status = call_data_path_status_(
+                *entry.data_path,
+                [&] { return entry.data_path->close(entry.data_path_target); });
             if (!status.ok()) {
                 return status;
             }
@@ -1027,6 +1046,18 @@ public:
         if (!entry.terminal) {
             return Status(StatusCode::BUSY, "IO is still in flight");
         }
+        for (const auto& sub_op : entry.data_path_operations) {
+            auto gate_it = progress_gates_.find(sub_op.data_path);
+            std::unique_lock<std::mutex> gate_lock;
+            if (gate_it != progress_gates_.end()) {
+                gate_lock = std::unique_lock<std::mutex>(*gate_it->second);
+            }
+            Status status = call_data_path_status_(
+                *sub_op.data_path,
+                [&] { return sub_op.data_path->release(sub_op.op); });
+            if (!status.ok()) return status;
+        }
+        entry.data_path_operations.clear();
         entry.released = true;
         entry.active = false;
         if (terminal_result_count_ > 0) {
@@ -1089,6 +1120,39 @@ private:
     StorageRuntime(std::uint32_t runtime_id, RuntimeConfig config)
         : runtime_id_(runtime_id), config_(std::move(config)) {}
 
+    std::int32_t data_path_accel_id_(const DataPath& data_path) const noexcept {
+        const auto bound = data_path.capabilities().bound_accel_id;
+        return bound >= 0 ? bound : config_.accel_id;
+    }
+
+    template <typename T, typename Fn>
+    Result<T> call_data_path_result_(DataPath& data_path, Fn&& fn) const {
+        DeviceGuard guard(data_path_accel_id_(data_path));
+        if (!guard.ok()) {
+            return Result<T>::Failure(guard.status());
+        }
+        Result<T> result = fn();
+        Status restored = guard.restore();
+        if (!restored.ok()) {
+            return Result<T>::Failure(std::move(restored));
+        }
+        return result;
+    }
+
+    template <typename Fn>
+    Status call_data_path_status_(DataPath& data_path, Fn&& fn) const {
+        DeviceGuard guard(data_path_accel_id_(data_path));
+        if (!guard.ok()) {
+            return guard.status();
+        }
+        Status result = fn();
+        Status restored = guard.restore();
+        if (!restored.ok()) {
+            return restored;
+        }
+        return result;
+    }
+
     Status finalize_shutdown_locked_(std::unique_lock<std::mutex>& lock) {
         // Caller holds registry_mutex_. No in-flight IO remains.
         // Release data-path targets before resolver leases, then per-memory
@@ -1100,7 +1164,9 @@ private:
             if (target.data_path != nullptr) {
                 // DataPath::close does not call back into the Runtime, so
                 // holding the lock here is safe (no deadlock).
-                Status status = target.data_path->close(target.data_path_target);
+                Status status = call_data_path_status_(
+                    *target.data_path,
+                    [&] { return target.data_path->close(target.data_path_target); });
                 if (!status.ok()) {
                     return status;
                 }
@@ -1128,7 +1194,8 @@ private:
         for (auto it = initialized_data_paths_.rbegin();
              it != initialized_data_paths_.rend(); ++it) {
             // DataPath::shutdown does not call back into the Runtime.
-            Status status = (*it)->shutdown(0);
+            Status status = call_data_path_status_(
+                **it, [&] { return (*it)->shutdown(0); });
             if (!status.ok()) {
                 return status;
             }
@@ -1185,10 +1252,19 @@ private:
             if (config.name.empty()) {
                 config.name = binding.key;
             }
-            Status status = binding.data_path->initialize(config, *resources_);
+            Status status = [&]() {
+                DeviceGuard guard(data_path_accel_id_(*binding.data_path));
+                if (!guard.ok()) return guard.status();
+                Status initialize_status = binding.data_path->initialize(
+                    config, *resources_);
+                Status restore_status = guard.restore();
+                if (!restore_status.ok()) return restore_status;
+                return initialize_status;
+            }();
             if (!status.ok()) {
                 for (DataPath* initialized : initialized_data_paths_) {
-                    (void)initialized->shutdown(0);
+                    (void)call_data_path_status_(*initialized,
+                                                 [&] { return initialized->shutdown(0); });
                 }
                 initialized_data_paths_.clear();
                 return status;
@@ -1340,7 +1416,9 @@ private:
     Status unregister_data_path_memory_(MemoryEntry& entry) {
         for (auto it = entry.data_path_registrations.rbegin();
              it != entry.data_path_registrations.rend(); ++it) {
-            Status status = it->data_path->unregister_memory(it->memory);
+            Status status = call_data_path_status_(
+                *it->data_path,
+                [&] { return it->data_path->unregister_memory(it->memory); });
             if (!status.ok()) {
                 return status;
             }
@@ -1364,8 +1442,12 @@ private:
             ? DataPathMemoryKind::DEVICE
             : DataPathMemoryKind::HOST;
         DataPathMemoryView view{memory.address, memory.size, memory.accel_id, kind};
-        auto registration = target.data_path->register_memory(
-            view, target.registration_domain);
+        auto registration = call_data_path_result_<DataPathMemory>(
+            *target.data_path,
+            [&] {
+                return target.data_path->register_memory(
+                    view, target.registration_domain);
+            });
         if (!registration.ok()) {
             return Result<DataPathMemory>::Failure(registration.status());
         }
@@ -1376,11 +1458,86 @@ private:
         return registration.value();
     }
 
+    Status validate_pointer_accel_(void* address, MemoryKind kind,
+                                   std::int32_t expected_accel_id) const {
+        const bool device_memory = kind == MemoryKind::DEVICE ||
+                                   kind == MemoryKind::MANAGED;
+        if (!device_memory) return Status::Ok();
+        if (config_.accel_id < 0) {
+            return Status(StatusCode::INVALID_ARGUMENT,
+                          "accelerator memory cannot belong to a host-only Runtime");
+        }
+        const std::int32_t effective_accel_id = expected_accel_id >= 0
+            ? expected_accel_id : config_.accel_id;
+        if (effective_accel_id != config_.accel_id) {
+            return Status(StatusCode::INVALID_ARGUMENT,
+                          "device pointer accelerator does not match Runtime");
+        }
+#if defined(TUTTI_USE_HOST)
+        // HOST's shim has no device pointers.  DEVICE/MANAGED registration is
+        // rejected by the host-only Runtime above.
+        (void)address;
+        return Status(StatusCode::UNSUPPORTED,
+                      "HOST profile cannot query accelerator pointer ownership");
+#elif defined(TUTTI_USE_CUDA) || defined(TUTTI_USE_MUSA) || defined(TUTTI_USE_MACA)
+        if (address == nullptr) {
+            return Status(StatusCode::INVALID_ARGUMENT,
+                          "accelerator pointer must be non-null");
+        }
+        cudaPointerAttributes attributes{};
+        const cudaError_t error = cudaPointerGetAttributes(&attributes, address);
+        if (error != cudaSuccess) {
+            return Status(StatusCode::DEVICE_ERROR,
+                          "accelerator pointer ownership query failed: " +
+                          std::string(cudaGetErrorString(error)));
+        }
+#if defined(TUTTI_USE_CUDA)
+        if (attributes.type != cudaMemoryTypeDevice &&
+            attributes.type != cudaMemoryTypeManaged) {
+            return Status(StatusCode::INVALID_ARGUMENT,
+                          "pointer is not device/managed accelerator memory");
+        }
+#elif defined(TUTTI_USE_MUSA) || defined(TUTTI_USE_MACA)
+        // The vendor shims expose device ordinal but do not provide a
+        // stable managed-memory type contract yet.  Do not accept a managed
+        // pointer on an unverifiable backend.
+        if (kind == MemoryKind::MANAGED ||
+            attributes.type != cudaMemoryTypeDevice) {
+            return Status(StatusCode::UNSUPPORTED,
+                          "backend cannot verify managed/device pointer kind");
+        }
+#endif
+        if (attributes.device != config_.accel_id) {
+            return Status(StatusCode::INVALID_ARGUMENT,
+                          "accelerator pointer belongs to a different Runtime");
+        }
+        return Status::Ok();
+#else
+        (void)address;
+        return Status(StatusCode::UNSUPPORTED,
+                      "accelerator pointer ownership query is unavailable");
+#endif
+    }
+
     Status validate_component_request_(const IoRequest& request,
                                        const TargetEntry& target,
                                        const MemoryEntry& memory,
                                        const HostSubmitContext& context) const {
         const DataPathCapabilities& caps = target.data_path->capabilities();
+        // HOST_EXECUTION has no accelerator ownership.  Preserve the
+        // historical host contract where callers may leave a legacy ordinal
+        // in this field; it is ignored when this Runtime itself is host-only.
+        // Accelerator Runtimes still reject an explicit mismatching ordinal.
+        if (context.accel_id >= 0 && config_.accel_id >= 0 &&
+            context.accel_id != config_.accel_id) {
+            return Status(StatusCode::INVALID_ARGUMENT,
+                          "submit accelerator does not match Runtime");
+        }
+        if (context.execution_domain == ExecutionDomain::DEVICE_EXECUTION &&
+            context.accel_id >= 0 && config_.accel_id < 0) {
+            return Status(StatusCode::INVALID_ARGUMENT,
+                          "submit accelerator does not match Runtime");
+        }
         if (context.execution_domain == ExecutionDomain::HOST_EXECUTION &&
             !caps.supports_host_execution) {
             return Status(StatusCode::UNSUPPORTED,
@@ -1408,7 +1565,28 @@ private:
                 return Status(StatusCode::INVALID_ARGUMENT,
                               "DEVICE_EXECUTION requires a non-null stream");
             }
+#if defined(TUTTI_USE_CUDA)
+            int stream_accel_id = -1;
+            const cudaError_t stream_error =
+                cudaStreamGetDevice(context.stream, &stream_accel_id);
+            if (stream_error != cudaSuccess) {
+                return Status(StatusCode::DEVICE_ERROR,
+                              "stream accelerator ownership query failed: " +
+                              std::string(cudaGetErrorString(stream_error)));
+            }
+            if (stream_accel_id != config_.accel_id) {
+                return Status(StatusCode::INVALID_ARGUMENT,
+                              "stream belongs to a different Runtime accelerator");
+            }
+#else
+            // MUSA/MACA shims currently have no portable stream-owner query;
+            // callers must create/pass the stream on the Runtime accelerator.
+            // Pointer ownership remains fail-closed where the shim exposes it.
+#endif
         }
+        Status pointer_status = validate_pointer_accel_(
+            memory.address, memory.kind, memory.accel_id);
+        if (!pointer_status.ok()) return pointer_status;
         const bool device_memory = memory.kind == MemoryKind::DEVICE ||
                                    memory.kind == MemoryKind::MANAGED;
         if (device_memory ? !caps.supports_device_memory
@@ -1594,18 +1772,55 @@ private:
                 (gate_it != progress_gates_.end()) ? &gate_it->second : nullptr;
 
             SubmitOutcome submitted;
-            if (gate_ptr) {
-                std::lock_guard<std::mutex> pg(**gate_ptr);
-                submitted = group.data_path->submit(
-                    group.requests.data(), group.requests.size(), context);
-            } else {
-                submitted = group.data_path->submit(
-                    group.requests.data(), group.requests.size(), context);
+            Status guard_status = Status::Ok();
+            {
+                DeviceGuard guard(data_path_accel_id_(*group.data_path));
+                if (!guard.ok()) {
+                    guard_status = guard.status();
+                } else if (gate_ptr) {
+                    std::lock_guard<std::mutex> pg(**gate_ptr);
+                    submitted = group.data_path->submit(
+                        group.requests.data(), group.requests.size(), context);
+                    guard_status = guard.restore();
+                } else {
+                    submitted = group.data_path->submit(
+                        group.requests.data(), group.requests.size(), context);
+                    guard_status = guard.restore();
+                }
+            }
+            if (!guard_status.ok()) {
+                // A DataPath may have accepted the group before the outer
+                // Runtime guard failed while restoring the caller device.
+                // Reclaim that opaque operation while the DataPath target
+                // remains selected; otherwise rolling back only Runtime
+                // credits would leak device-side state.
+                if (submitted.op.has_value()) {
+                    (void)call_data_path_status_(
+                        *group.data_path,
+                        [&] { return group.data_path->release(submitted.op.value()); });
+                }
+                for (std::size_t index : group.indices) {
+                    reject_one(index, guard_status);
+                    auto& mem_e = memory_entries_[requests[index].memory.slot_];
+                    auto& tgt_e = target_entries_[requests[index].target.slot_];
+                    if (mem_e.inflight_count > 0) --mem_e.inflight_count;
+                    if (tgt_e.inflight_count > 0) --tgt_e.inflight_count;
+                }
+                continue;
             }
             if (submitted.initial_states.size() != group.requests.size()) {
+                if (submitted.op.has_value()) {
+                    (void)call_data_path_status_(
+                        *group.data_path,
+                        [&] { return group.data_path->release(submitted.op.value()); });
+                }
                 for (std::size_t index : group.indices) {
                     reject_one(index, Status(StatusCode::INTERNAL,
                                              "DataPath returned invalid state count"));
+                    auto& mem_e = memory_entries_[requests[index].memory.slot_];
+                    auto& tgt_e = target_entries_[requests[index].target.slot_];
+                    if (mem_e.inflight_count > 0) --mem_e.inflight_count;
+                    if (tgt_e.inflight_count > 0) --tgt_e.inflight_count;
                 }
                 continue;
             }
@@ -1638,7 +1853,9 @@ private:
             } else if (has_op) {
                 // DataPath returned an op but no request in this group
                 // was accepted — release the orphan op.
-                (void)group.data_path->release(submitted.op.value());
+                (void)call_data_path_status_(
+                    *group.data_path,
+                    [&] { return group.data_path->release(submitted.op.value()); });
             }
             if (!submitted.status.ok() && !group_has_accepted) {
                 have_rejection = true;
@@ -1774,7 +1991,9 @@ private:
             auto* gate = progress_gate_for_(sub_op.data_path);
             std::unique_lock<std::mutex> gate_lock;
             if (gate) gate_lock = std::unique_lock<std::mutex>(*gate);
-            auto snapshot = sub_op.data_path->query(sub_op.op);
+            auto snapshot = call_data_path_result_<DataPathSnapshot>(
+                *sub_op.data_path,
+                [&] { return sub_op.data_path->query(sub_op.op); });
             gate_lock.unlock();
 
             if (!snapshot.ok()) {
@@ -1807,8 +2026,11 @@ private:
             auto* gate = progress_gate_for_(sub_op.data_path);
             std::unique_lock<std::mutex> gate_lock;
             if (gate) gate_lock = std::unique_lock<std::mutex>(*gate);
-            (void)sub_op.data_path->release(sub_op.op);
+            (void)call_data_path_status_(
+                *sub_op.data_path,
+                [&] { return sub_op.data_path->release(sub_op.op); });
         }
+        entry.data_path_operations.clear();
         finish_io_(entry, failed ? IoState::FAILED : IoState::COMPLETED,
                    failed ? std::move(first_failure) : Status::Ok());
     }
@@ -1848,14 +2070,39 @@ private:
         }
 
         lock.unlock();
+        std::vector<std::pair<DataPath*, Status>> progress_errors;
         for (auto& [path, gate] : gates) {
             // Per-DataPath serialization: at most one progress() call per
             // DataPath at a time.  Different DataPaths progress concurrently.
             std::lock_guard<std::mutex> pg(*gate);
-            (void)path->progress(ProgressBudget{16, 1000000});
+            DeviceGuard device_guard(data_path_accel_id_(*path));
+            if (!device_guard.ok()) {
+                progress_errors.emplace_back(path, device_guard.status());
+                continue;
+            }
+            auto progress_result = path->progress(ProgressBudget{16, 1000000});
+            if (!progress_result.ok()) {
+                progress_errors.emplace_back(path, progress_result.status());
+            }
+            Status restore_status = device_guard.restore();
+            if (!restore_status.ok()) {
+                progress_errors.emplace_back(path, std::move(restore_status));
+            }
         }
         lock.lock();
 
+        for (const auto& error : progress_errors) {
+            for (auto& entry : io_entries_) {
+                if (entry.active && !entry.terminal) {
+                    for (const auto& sub_op : entry.data_path_operations) {
+                        if (sub_op.data_path == error.first) {
+                            finish_io_(entry, IoState::FAILED, error.second);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
         for (auto& entry : io_entries_) {
             refresh_component_io_(entry);
         }

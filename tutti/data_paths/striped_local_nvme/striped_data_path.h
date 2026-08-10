@@ -172,6 +172,26 @@ public:
                                  std::vector<std::uint32_t>& out) const;
 
 private:
+    // Public SPI entry points are thin device-guarded wrappers; impl methods
+    // keep resource/error paths free of duplicated current-device plumbing.
+    Status initialize_impl_(const DataPathConfig& config,
+                            ResourceProvider& resources);
+    Status shutdown_impl_(std::uint64_t timeout_ns);
+    Result<DataPathTarget> open_impl_(const ResolvedTarget& target);
+    Status close_impl_(DataPathTarget target);
+    Result<RegistrationDomainKey> registration_domain_impl_(
+        DataPathTarget target) const;
+    Result<DataPathMemory> register_memory_impl_(
+        const DataPathMemoryView& view,
+        const RegistrationDomainKey& domain);
+    Status unregister_memory_impl_(DataPathMemory memory);
+    SubmitOutcome submit_impl_(const DataPathRequest* requests,
+                               std::size_t count,
+                               const HostSubmitContext& ctx);
+    Result<ProgressResult> progress_impl_(ProgressBudget budget);
+    Result<DataPathSnapshot> query_impl_(DataPathOp op) const;
+    Status release_impl_(DataPathOp op);
+
     struct DeviceSlot {
         DeviceDescriptor desc;
         nvm_ctrl_t* ctrl = nullptr;

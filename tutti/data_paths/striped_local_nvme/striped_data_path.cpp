@@ -17,6 +17,7 @@
 #include <nvm_dma.h>
 
 #include <tutti/cuda_like.h>
+#include <tutti/accelerator_device_guard.h>
 
 #include <algorithm>
 #include <chrono>
@@ -113,7 +114,121 @@ const DataPathCapabilities& StripedDataPath::capabilities() const {
 // =========================================================================
 
 Status StripedDataPath::initialize(const DataPathConfig& config,
-                                   ResourceProvider& /*resources*/) {
+                                   ResourceProvider& resources) {
+    DeviceGuard guard(static_cast<std::int32_t>(cuda_device_));
+    if (!guard.ok()) return guard.status();
+    Status result = initialize_impl_(config, resources);
+    Status restored = guard.restore();
+    return restored.ok() ? result : restored;
+}
+
+Status StripedDataPath::shutdown(std::uint64_t timeout_ns) {
+    DeviceGuard guard(static_cast<std::int32_t>(cuda_device_));
+    if (!guard.ok()) return guard.status();
+    Status result = shutdown_impl_(timeout_ns);
+    Status restored = guard.restore();
+    return restored.ok() ? result : restored;
+}
+
+Result<DataPathTarget> StripedDataPath::open(const ResolvedTarget& target) {
+    DeviceGuard guard(static_cast<std::int32_t>(cuda_device_));
+    if (!guard.ok()) return Result<DataPathTarget>::Failure(guard.status());
+    auto result = open_impl_(target);
+    Status restored = guard.restore();
+    return restored.ok() ? result
+                         : Result<DataPathTarget>::Failure(std::move(restored));
+}
+
+Status StripedDataPath::close(DataPathTarget target) {
+    DeviceGuard guard(static_cast<std::int32_t>(cuda_device_));
+    if (!guard.ok()) return guard.status();
+    Status result = close_impl_(target);
+    Status restored = guard.restore();
+    return restored.ok() ? result : restored;
+}
+
+Result<RegistrationDomainKey> StripedDataPath::registration_domain(
+    DataPathTarget target) const {
+    DeviceGuard guard(static_cast<std::int32_t>(cuda_device_));
+    if (!guard.ok()) {
+        return Result<RegistrationDomainKey>::Failure(guard.status());
+    }
+    auto result = registration_domain_impl_(target);
+    Status restored = guard.restore();
+    return restored.ok() ? result
+                         : Result<RegistrationDomainKey>::Failure(std::move(restored));
+}
+
+Result<DataPathMemory> StripedDataPath::register_memory(
+    const DataPathMemoryView& view,
+    const RegistrationDomainKey& domain) {
+    DeviceGuard guard(static_cast<std::int32_t>(cuda_device_));
+    if (!guard.ok()) return Result<DataPathMemory>::Failure(guard.status());
+    auto result = register_memory_impl_(view, domain);
+    Status restored = guard.restore();
+    return restored.ok() ? result
+                         : Result<DataPathMemory>::Failure(std::move(restored));
+}
+
+Status StripedDataPath::unregister_memory(DataPathMemory memory) {
+    DeviceGuard guard(static_cast<std::int32_t>(cuda_device_));
+    if (!guard.ok()) return guard.status();
+    Status result = unregister_memory_impl_(memory);
+    Status restored = guard.restore();
+    return restored.ok() ? result : restored;
+}
+
+SubmitOutcome StripedDataPath::submit(const DataPathRequest* requests,
+                                      std::size_t count,
+                                      const HostSubmitContext& ctx) {
+    DeviceGuard guard(static_cast<std::int32_t>(cuda_device_));
+    if (!guard.ok()) {
+        SubmitOutcome result;
+        result.status = guard.status();
+        result.initial_states.resize(count);
+        for (auto& state : result.initial_states) {
+            state.state = RequestState::REJECTED;
+            state.status = result.status;
+        }
+        return result;
+    }
+    SubmitOutcome result = submit_impl_(requests, count, ctx);
+    Status restored = guard.restore();
+    if (!restored.ok()) {
+        result.status = restored;
+        return result;
+    }
+    return result;
+}
+
+Result<ProgressResult> StripedDataPath::progress(ProgressBudget budget) {
+    DeviceGuard guard(static_cast<std::int32_t>(cuda_device_));
+    if (!guard.ok()) return Result<ProgressResult>::Failure(guard.status());
+    auto result = progress_impl_(budget);
+    Status restored = guard.restore();
+    return restored.ok() ? result
+                         : Result<ProgressResult>::Failure(std::move(restored));
+}
+
+Result<DataPathSnapshot> StripedDataPath::query(DataPathOp op) const {
+    DeviceGuard guard(static_cast<std::int32_t>(cuda_device_));
+    if (!guard.ok()) return Result<DataPathSnapshot>::Failure(guard.status());
+    auto result = query_impl_(op);
+    Status restored = guard.restore();
+    return restored.ok() ? result
+                         : Result<DataPathSnapshot>::Failure(std::move(restored));
+}
+
+Status StripedDataPath::release(DataPathOp op) {
+    DeviceGuard guard(static_cast<std::int32_t>(cuda_device_));
+    if (!guard.ok()) return guard.status();
+    Status result = release_impl_(op);
+    Status restored = guard.restore();
+    return restored.ok() ? result : restored;
+}
+
+Status StripedDataPath::initialize_impl_(const DataPathConfig& config,
+                                         ResourceProvider& /*resources*/) {
     if (initialized_) {
         return Status(StatusCode::BUSY, "already initialized");
     }
@@ -307,7 +422,7 @@ Status StripedDataPath::initialize(const DataPathConfig& config,
 // shutdown — release arena, all N devices
 // =========================================================================
 
-Status StripedDataPath::shutdown(std::uint64_t timeout_ns) {
+Status StripedDataPath::shutdown_impl_(std::uint64_t timeout_ns) {
     if (!initialized_) return Status::Ok();
 
     auto has_inflight = [&]() -> bool {
@@ -383,7 +498,7 @@ Status StripedDataPath::shutdown(std::uint64_t timeout_ns) {
 // open — extract StripedLocalNvmePayload, build N DeviceTargetHandles
 // =========================================================================
 
-Result<DataPathTarget> StripedDataPath::open(const ResolvedTarget& target) {
+Result<DataPathTarget> StripedDataPath::open_impl_(const ResolvedTarget& target) {
     if (!initialized_) {
         return Result<DataPathTarget>::Failure(
             Status(StatusCode::NOT_READY, "not initialized"));
@@ -519,7 +634,7 @@ bool StripedDataPath::build_shard_handle_(
 // close / registration_domain
 // =========================================================================
 
-Status StripedDataPath::close(DataPathTarget target) {
+Status StripedDataPath::close_impl_(DataPathTarget target) {
     if (!target.valid()) {
         return Status(StatusCode::INVALID_ARGUMENT,
                       "close: target identity is invalid");
@@ -545,7 +660,7 @@ Status StripedDataPath::close(DataPathTarget target) {
     return Status::Ok();
 }
 
-Result<RegistrationDomainKey> StripedDataPath::registration_domain(
+Result<RegistrationDomainKey> StripedDataPath::registration_domain_impl_(
     DataPathTarget target) const {
     const auto* tgt = find_target_(target);
     if (!tgt) {
@@ -560,7 +675,7 @@ Result<RegistrationDomainKey> StripedDataPath::registration_domain(
 // register_memory / unregister_memory — nvm_dma_map_data_device x N
 // =========================================================================
 
-Result<DataPathMemory> StripedDataPath::register_memory(
+Result<DataPathMemory> StripedDataPath::register_memory_impl_(
     const DataPathMemoryView& view,
     const RegistrationDomainKey& /*domain*/) {
 
@@ -576,6 +691,46 @@ Result<DataPathMemory> StripedDataPath::register_memory(
         return Result<DataPathMemory>::Failure(
             Status(StatusCode::UNSUPPORTED, "only DEVICE memory supported"));
     }
+    if (view.expected_accel_id >= 0 &&
+        view.expected_accel_id != static_cast<std::int32_t>(cuda_device_)) {
+        return Result<DataPathMemory>::Failure(
+            Status(StatusCode::INVALID_ARGUMENT,
+                   "memory accelerator does not match DataPath"));
+    }
+#if defined(TUTTI_USE_HOST)
+    return Result<DataPathMemory>::Failure(
+        Status(StatusCode::UNSUPPORTED,
+               "HOST profile has no device memory"));
+#elif defined(TUTTI_USE_CUDA) || defined(TUTTI_USE_MUSA) || defined(TUTTI_USE_MACA)
+    cudaPointerAttributes attributes{};
+    const cudaError_t pointer_error =
+        cudaPointerGetAttributes(&attributes, view.base);
+    if (pointer_error != cudaSuccess) {
+        return Result<DataPathMemory>::Failure(
+            Status(StatusCode::DEVICE_ERROR,
+                   "pointer ownership query failed: " +
+                   std::string(cudaGetErrorString(pointer_error))));
+    }
+#if defined(TUTTI_USE_CUDA)
+    if (attributes.type != cudaMemoryTypeDevice &&
+        attributes.type != cudaMemoryTypeManaged) {
+        return Result<DataPathMemory>::Failure(
+            Status(StatusCode::INVALID_ARGUMENT,
+                   "pointer is not device memory"));
+    }
+#else
+    if (attributes.type != cudaMemoryTypeDevice) {
+        return Result<DataPathMemory>::Failure(
+            Status(StatusCode::UNSUPPORTED,
+                   "backend cannot verify pointer kind"));
+    }
+#endif
+    if (attributes.device != static_cast<int>(cuda_device_)) {
+        return Result<DataPathMemory>::Failure(
+            Status(StatusCode::INVALID_ARGUMENT,
+                   "pointer belongs to another accelerator"));
+    }
+#endif
     if ((reinterpret_cast<std::uintptr_t>(view.base) % 65536) != 0) {
         return Result<DataPathMemory>::Failure(
             Status(StatusCode::INVALID_ARGUMENT,
@@ -624,7 +779,7 @@ Result<DataPathMemory> StripedDataPath::register_memory(
         detail::SpiIdentityMint::mint<detail::DataPathMemoryTag>(tok, 1));
 }
 
-Status StripedDataPath::unregister_memory(DataPathMemory memory) {
+Status StripedDataPath::unregister_memory_impl_(DataPathMemory memory) {
     if (!memory.valid()) {
         return Status(StatusCode::INVALID_ARGUMENT,
                       "unregister_memory: memory identity is invalid");
@@ -743,9 +898,9 @@ void StripedDataPath::destroy_striped_prebuilt_(StripedMemory& mem) {
 // submit — stripe split -> 1 H2D (entries + dev_table) -> 1 launch -> 1 event
 // =========================================================================
 
-SubmitOutcome StripedDataPath::submit(const DataPathRequest* requests,
-                                      std::size_t count,
-                                      const HostSubmitContext& ctx) {
+SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
+                                            std::size_t count,
+                                            const HostSubmitContext& ctx) {
     ++test_submit_call_count_;
 
     SubmitOutcome outcome;
@@ -791,11 +946,28 @@ SubmitOutcome StripedDataPath::submit(const DataPathRequest* requests,
         reject_all(StatusCode::INVALID_ARGUMENT, "null stream");
         return outcome;
     }
-    if (ctx.accel_id != static_cast<std::int32_t>(cuda_device_)) {
+    if (ctx.accel_id >= 0 &&
+        ctx.accel_id != static_cast<std::int32_t>(cuda_device_)) {
         reject_all(StatusCode::INVALID_ARGUMENT,
                    "ctx.accel_id does not match this DataPath's CUDA device");
         return outcome;
     }
+#if defined(TUTTI_USE_CUDA)
+    int stream_accel_id = -1;
+    const cudaError_t stream_error =
+        cudaStreamGetDevice(ctx.stream, &stream_accel_id);
+    if (stream_error != cudaSuccess) {
+        reject_all(StatusCode::DEVICE_ERROR,
+                   std::string("stream ownership query failed: ") +
+                   cudaGetErrorString(stream_error));
+        return outcome;
+    }
+    if (stream_accel_id != static_cast<int>(cuda_device_)) {
+        reject_all(StatusCode::INVALID_ARGUMENT,
+                   "stream belongs to another accelerator");
+        return outcome;
+    }
+#endif
 
     std::uint64_t in_flight_count = 0;
     for (const auto& [tok, op] : ops_) {
@@ -1282,7 +1454,7 @@ SubmitOutcome StripedDataPath::submit(const DataPathRequest* requests,
 // progress — poll events
 // =========================================================================
 
-Result<ProgressResult> StripedDataPath::progress(ProgressBudget budget) {
+Result<ProgressResult> StripedDataPath::progress_impl_(ProgressBudget budget) {
     ProgressResult result{};
     if (budget.max_work_units == 0 || budget.timeout_ns == 0) {
         for (const auto& [tok, op] : ops_) {
@@ -1406,7 +1578,7 @@ void StripedDataPath::aggregate_completion_status_(OpEntry& op) {
 // query / release
 // =========================================================================
 
-Result<DataPathSnapshot> StripedDataPath::query(DataPathOp op) const {
+Result<DataPathSnapshot> StripedDataPath::query_impl_(DataPathOp op) const {
     const auto* entry = find_op_(op);
     if (!entry) {
         return Result<DataPathSnapshot>::Failure(
@@ -1419,7 +1591,7 @@ Result<DataPathSnapshot> StripedDataPath::query(DataPathOp op) const {
     return Result<DataPathSnapshot>::Success(std::move(snap));
 }
 
-Status StripedDataPath::release(DataPathOp op) {
+Status StripedDataPath::release_impl_(DataPathOp op) {
     auto* entry = find_op_(op);
     if (!entry) {
         return Status(StatusCode::NOT_FOUND, "release: op not found");

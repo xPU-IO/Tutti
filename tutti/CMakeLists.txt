@@ -327,6 +327,12 @@ if(BUILD_TESTING)
     )
     message(STATUS "Tutti: added tests/cuda_like (contract test)")
 
+    add_subdirectory(
+        "${TUTTI_REPOSITORY_ROOT}/tests/accelerator_device_guard"
+        "${CMAKE_CURRENT_BINARY_DIR}/tests_accelerator_device_guard"
+    )
+    message(STATUS "Tutti: added accelerator device guard contract test")
+
     # Public API usage test (runs in all profiles: CUDA and HOST)
     add_subdirectory(
         "${TUTTI_REPOSITORY_ROOT}/tests/public_api"

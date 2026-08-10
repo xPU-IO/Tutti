@@ -325,6 +325,27 @@ public:
     PrpPageCache::Stats test_prp_cache_stats() const;
 
 private:
+    // Public SPI entry points are thin device-guarded wrappers.  The impl
+    // methods deliberately contain the existing resource/error paths without
+    // duplicating current-device plumbing at every early return.
+    Status initialize_impl_(const DataPathConfig& config,
+                            ResourceProvider& resources);
+    Status shutdown_impl_(std::uint64_t timeout_ns);
+    Result<DataPathTarget> open_impl_(const ResolvedTarget& target);
+    Status close_impl_(DataPathTarget target);
+    Result<RegistrationDomainKey> registration_domain_impl_(
+        DataPathTarget target) const;
+    Result<DataPathMemory> register_memory_impl_(
+        const DataPathMemoryView& view,
+        const RegistrationDomainKey& domain);
+    Status unregister_memory_impl_(DataPathMemory memory);
+    SubmitOutcome submit_impl_(const DataPathRequest* requests,
+                               std::size_t count,
+                               const HostSubmitContext& ctx);
+    Result<ProgressResult> progress_impl_(ProgressBudget budget);
+    Result<DataPathSnapshot> query_impl_(DataPathOp op) const;
+    Status release_impl_(DataPathOp op);
+
     DataPathCapabilities caps_{};
     bool initialized_ = false;
     std::uint64_t next_token_ = 1;
