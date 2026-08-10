@@ -24,7 +24,7 @@ cmake --build --preset cuda --target \
 ```bash
 sudo env TUTTI_VERBOSE=1 \
   build/cuda-module/tutti/device_manager/nvme/nvmeservice/examples/tutti_daemon \
-  --config config/local/daemon_2_disk.yaml
+  --config config/local/daemon_2disk.yaml
 ```
 
 ### 1.3 将 daemon 配置转换为 `--nvme`
@@ -35,16 +35,18 @@ sudo env TUTTI_VERBOSE=1 \
 ssnvme_path,pci_bdf,backing_device,mount_path[,block_size[,bar0_size[,namespace_id]]]
 ```
 
-字段依次为 daemon 报告的 `snvme`、`pci_addr`、namespace 块设备、真实
-`mount_path`、`blk`、`bar0` 和 YAML 的 `namespace_id`。GPU view（例如
-`/mnt/gpu0/ssnvme0`）不是 `mount_path`。配置数组顺序决定 `device_id`，
-`allowed_gpus` 必须包含测试命令的 `--gpu`。
+字段依次为 daemon RPC 报告的 `snvme`、`pci_addr`、对应 namespace 块设备、真实
+`mount_path`、`blk`、`bar0` 和 `namespace_id`。先运行 client 的 `--list-only`，
+以 RPC metadata 为准生成参数；不要根据 YAML 数组顺序或设备名模板推导路径。
+GPU view（例如 `/mnt/snvme/gpu0/ssnvme0`）不是 backing `mount_path`。
+legacy `allowed_gpus` 必须包含测试命令的 `--gpu`。
 
-当前 `config/local/daemon_2_disk.yaml`（两个 namespace 均为 4 KiB）对应：
+当前 `config/local/daemon_2disk.yaml` 的一次实机 RPC 结果如下（两个 namespace 均为
+4 KiB）；daemon 每次 bring-up 后仍须重新核对这些 metadata：
 
 ```bash
-NVME0='/dev/ssnvme0,0000:b1:00.0,/dev/snvme0n1,/mnt/nvme0,4096,16384,1'
-NVME1='/dev/ssnvme1,0000:e3:00.0,/dev/snvme1n1,/mnt/nvme1,4096,16384,1'
+NVME0='/dev/ssnvme0,0000:41:00.0,/dev/snvme0n1,/mnt/snvme/nvme1,4096,32768,1'
+NVME1='/dev/ssnvme1,0000:44:00.0,/dev/snvme1n1,/mnt/snvme/nvme2,4096,32768,1'
 ```
 
 如果 daemon 使用其他 YAML，必须同步修改这些字段。`block_size` 是 namespace
