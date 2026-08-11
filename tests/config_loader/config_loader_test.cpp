@@ -21,8 +21,16 @@
 
 #include <tutti/config/tutti_config.h>
 #include <tutti/storage_runtime.h>
+#include "tutti/resource/nvme/nvme_resource_internal.h"
 
 using namespace tutti::config;
+using tutti::resources::nvme::NvmeAcceleratorInfo;
+using tutti::resources::nvme::NvmeProviderResource;
+using tutti::resources::nvme::NvmeResourceClient;
+using tutti::resources::nvme::NvmeResourceSpec;
+using tutti::resources::nvme::NvmeResourceTestingAccess;
+using tutti::resources::nvme::RuntimeNvmeAllocation;
+using tutti::resources::nvme::RuntimeNvmeSlice;
 
 static int g_pass = 0, g_fail = 0;
 #define CHECK(cond, msg) do { \
@@ -40,8 +48,8 @@ static std::string write_tmp(const std::string& content) {
 }
 
 struct FakeClientState {
-    std::vector<RuntimeAcceleratorInfo> accelerators;
-    std::vector<RuntimeNvmeResource> resources;
+    std::vector<NvmeAcceleratorInfo> accelerators;
+    std::vector<NvmeProviderResource> resources;
     RuntimeNvmeAllocation allocation;
     tutti::Status acquire_status;
     int list_accelerators_calls = 0;
@@ -55,22 +63,22 @@ struct FakeClientState {
     std::string endpoint;
 };
 
-class FakeClient final : public RuntimeResourceClient {
+class FakeClient final : public NvmeResourceClient {
 public:
     explicit FakeClient(std::shared_ptr<FakeClientState> state)
         : state_(std::move(state)) {}
 
-    tutti::Result<std::vector<RuntimeAcceleratorInfo>>
+    tutti::Result<std::vector<NvmeAcceleratorInfo>>
     list_accelerators() override {
         ++state_->list_accelerators_calls;
-        return tutti::Result<std::vector<RuntimeAcceleratorInfo>>::Success(
+        return tutti::Result<std::vector<NvmeAcceleratorInfo>>::Success(
             state_->accelerators);
     }
 
-    tutti::Result<std::vector<RuntimeNvmeResource>>
+    tutti::Result<std::vector<NvmeProviderResource>>
     list_nvme_resources() override {
         ++state_->list_resources_calls;
-        return tutti::Result<std::vector<RuntimeNvmeResource>>::Success(
+        return tutti::Result<std::vector<NvmeProviderResource>>::Success(
             state_->resources);
     }
 
@@ -206,10 +214,21 @@ static LoadTuttiConfigOptions fake_options(
     options.backend_device_count = [] {
         return tutti::Result<int>::Success(2);
     };
-    options.resource_client_factory = [state](const std::string& endpoint) {
-        state->endpoint = endpoint;
-        return std::unique_ptr<RuntimeResourceClient>(
-            new FakeClient(state));
+    options.resource_factory = [state](const ResourceSpec& resource_spec,
+                                       std::int32_t accel_id) {
+        state->endpoint = resource_spec.provider.endpoint;
+        auto nvme_resource = NvmeResourceTestingAccess::make(
+            NvmeResourceSpec{
+                resource_spec.id,
+                accel_id,
+                resource_spec.provider,
+                resource_spec.allocation,
+            },
+            std::make_unique<FakeClient>(state));
+        std::unique_ptr<tutti::Resource> resource =
+            std::move(nvme_resource);
+        return tutti::Result<std::unique_ptr<tutti::Resource>>::Success(
+            std::move(resource));
     };
     options.runtime_factory =
         [fail_runtime_create](tutti::RuntimeConfig,
@@ -466,22 +485,28 @@ nvme:
             CHECK(state->acquire_calls == 1, "loader single-slice: acquire once");
             CHECK(bundle->state() == TuttiRuntimeState::RUNNING,
                   "loader single-slice: runtime starts RUNNING");
-            const auto before_shutdown = bundle->inspection();
-            CHECK(before_shutdown.allocation_id == "alloc-test" &&
-                  before_shutdown.allocation_slices.size() == 1,
-                  "loader single-slice: inspection snapshot");
-            auto detached_snapshot = before_shutdown;
-            detached_snapshot.allocation_slices.front().block_path = "mutated";
-            CHECK(bundle->inspection().allocation_slices.front().block_path !=
-                      "mutated",
-                  "loader single-slice: inspection is a copy");
+            auto resource_info = bundle->resource_info();
+            CHECK(resource_info.ok() &&
+                      resource_info.value().id == "legacy-nvme-resource" &&
+                      resource_info.value().type == "nvme" &&
+                      resource_info.value().state ==
+                          tutti::ResourceState::INITIALIZED,
+                  "loader single-slice: Resource identity and state");
+            if (resource_info.ok()) {
+                resource_info.value().id = "mutated";
+                CHECK(bundle->resource_info().value().id ==
+                          "legacy-nvme-resource",
+                      "loader single-slice: ResourceInfo is a copy");
+            }
             CHECK(bundle->shutdown().ok(), "loader single-slice: shutdown ok");
             CHECK(bundle->state() == TuttiRuntimeState::STOPPED,
                   "loader single-slice: runtime stops");
+            CHECK(bundle->resource_info().ok() &&
+                      bundle->resource_info().value().state ==
+                          tutti::ResourceState::STOPPED,
+                  "loader single-slice: Resource stops after components");
             CHECK(bundle->shutdown().ok(),
                   "loader single-slice: second shutdown is idempotent");
-            CHECK(bundle->inspection().allocation_released,
-                  "loader single-slice: inspection records release");
             CHECK(state->release_calls == 1 &&
                   state->released_allocation == "alloc-test",
                   "loader single-slice: release once");
@@ -518,7 +543,7 @@ nvme:
                 TuttiRuntimeShutdownStage::STORAGE_RUNTIME_DESTROYED,
                 TuttiRuntimeShutdownStage::RESOLVERS_DESTROYED,
                 TuttiRuntimeShutdownStage::DATAPATHS_DESTROYED,
-                TuttiRuntimeShutdownStage::ALLOCATION_RELEASED,
+                TuttiRuntimeShutdownStage::RESOURCE_SHUTDOWN,
                 TuttiRuntimeShutdownStage::COMPLETE,
             };
             CHECK(state->shutdown_stages == expected,

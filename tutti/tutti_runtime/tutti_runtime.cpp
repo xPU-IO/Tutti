@@ -27,6 +27,19 @@ TuttiRuntime::~TuttiRuntime() {
     (void)shutdown();
 }
 
+Status TuttiRuntime::adopt_resource(std::unique_ptr<Resource> resource) {
+    if (!resource) {
+        return lifecycle_error(StatusCode::INVALID_ARGUMENT,
+                               "cannot adopt a null Resource");
+    }
+    if (state_ != TuttiRuntimeState::RUNNING || resource_) {
+        return lifecycle_error(StatusCode::BUSY,
+                               "TuttiRuntime cannot adopt Resource");
+    }
+    resource_ = std::move(resource);
+    return Status::Ok();
+}
+
 DataPath* TuttiRuntime::register_datapath(
     std::unique_ptr<DataPath> data_path, std::string key) {
     if (!data_path || state_ != TuttiRuntimeState::RUNNING) return nullptr;
@@ -103,42 +116,29 @@ Status TuttiRuntime::shutdown() {
     // Keep route strings as immutable diagnostics for the temporary P2
     // inspection seam; the owning component vectors above are empty.
 
-    if (!allocation_id.empty() && !allocation_released_) {
-        if (resource_client) {
-            try {
-                keep_first_error(first_error,
-                                 resource_client->release(allocation_id));
-            } catch (...) {
-                keep_first_error(first_error,
-                                 lifecycle_error(StatusCode::INTERNAL,
-                                                 "resource release threw"));
-            }
-        } else {
+    if (resource_) {
+        try {
+            keep_first_error(first_error, resource_->shutdown());
+        } catch (...) {
             keep_first_error(first_error,
-                             lifecycle_error(
-                                 StatusCode::INTERNAL,
-                                 "allocation exists without resource client"));
+                             lifecycle_error(StatusCode::INTERNAL,
+                                             "Resource shutdown threw"));
         }
-        // A release attempt owns the one release slot even when it fails.
-        allocation_released_ = true;
     }
-    observe_(TuttiRuntimeShutdownStage::ALLOCATION_RELEASED);
-    resource_client.reset();
+    observe_(TuttiRuntimeShutdownStage::RESOURCE_SHUTDOWN);
 
     state_ = TuttiRuntimeState::STOPPED;
     observe_(TuttiRuntimeShutdownStage::COMPLETE);
     return first_error;
 }
 
-TuttiRuntimeInspection TuttiRuntime::inspection() const {
-    TuttiRuntimeInspection snapshot;
-    snapshot.state = state_;
-    snapshot.allocation_released = allocation_released_;
-    snapshot.allocation_id = allocation_id;
-    snapshot.allocation_slices = allocation_slices;
-    snapshot.resolver_schemes = resolver_schemes;
-    snapshot.data_path_keys = data_path_keys;
-    return snapshot;
+Result<ResourceInfo> TuttiRuntime::resource_info() const {
+    if (!resource_) {
+        return Result<ResourceInfo>::Failure(
+            lifecycle_error(StatusCode::NOT_FOUND,
+                            "TuttiRuntime has no Resource"));
+    }
+    return Result<ResourceInfo>::Success(resource_->info());
 }
 
 } // namespace tutti::config

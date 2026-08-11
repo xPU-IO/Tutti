@@ -41,6 +41,8 @@ set_target_properties(tutti_config_parse PROPERTIES
 )
 
 function(tutti_add_config_loader)
+    tutti_enable_nvme_resource_grpc()
+
     add_library(tutti_config STATIC
         "${TUTTI_SOURCE_DIR}/config/tutti_config.cpp"
         "${TUTTI_SOURCE_DIR}/tutti_runtime/tutti_runtime.cpp"
@@ -57,15 +59,9 @@ function(tutti_add_config_loader)
         tutti_striped_local_nvme_datapath
         tutti_local_file_resolver
         tutti_striped_file_resolver
+        tutti_nvme_resource
         tutti_api
     )
-
-    if(TARGET nvmeservice)
-        target_link_libraries(tutti_config PUBLIC nvmeservice)
-        target_compile_definitions(tutti_config PRIVATE
-            TUTTI_CONFIG_HAS_NVMESERVICE=1
-        )
-    endif()
 
     set_target_properties(tutti_config PROPERTIES
         CXX_STANDARD 17

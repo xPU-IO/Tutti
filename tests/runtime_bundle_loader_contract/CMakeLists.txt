@@ -7,6 +7,7 @@ add_executable(tutti_runtime_bundle_loader_contract_test
 
 target_link_libraries(tutti_runtime_bundle_loader_contract_test PRIVATE
     tutti_config
+    nvmeservice
 )
 
 set_target_properties(tutti_runtime_bundle_loader_contract_test PROPERTIES

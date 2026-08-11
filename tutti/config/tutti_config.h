@@ -55,12 +55,12 @@ struct LoadTuttiConfigOptions {
     ProgrammaticOverrides overrides;
 
     // Test seam: production builds leave these empty and use the compiled
-    // backend + gRPC resource client + StorageRuntime::create.
+    // backend + Resource factory + StorageRuntime::create.
     std::function<Result<int>()> backend_device_count;
     std::function<Result<std::unique_ptr<StorageRuntime>>(
         RuntimeConfig, RuntimeComponents)> runtime_factory;
-    std::function<std::unique_ptr<RuntimeResourceClient>(
-        const std::string& endpoint)> resource_client_factory;
+    std::function<Result<std::unique_ptr<Resource>>(
+        const ResourceSpec&, std::int32_t accel_id)> resource_factory;
 
     // Optional lifecycle seams used by contract tests. Production callers
     // leave these empty and TuttiRuntime invokes StorageRuntime::shutdown().
@@ -70,7 +70,7 @@ struct LoadTuttiConfigOptions {
 
 // Legacy parse-only device map entry. The phase-4 product loader no longer
 // derives /dev paths from local_nvme_config, accelerator ordinal, or array
-// order; it consumes daemon allocation metadata through RuntimeResourceClient.
+// order; it consumes daemon allocation metadata through NvmeResource.
 struct DeviceSpec {
     std::uint32_t cuda_device = 0;
     std::string snvme_dev;

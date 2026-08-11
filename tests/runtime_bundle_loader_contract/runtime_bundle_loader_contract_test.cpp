@@ -5,6 +5,8 @@
 #include <tutti/storage_runtime.h>
 
 #include "nvmeservice_client.h"
+#include "tutti/resource/nvme/nvme_resource_internal.h"
+#include "tutti/tutti_runtime/tutti_runtime_internal.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -49,8 +51,12 @@ using tutti::OpenOptions;
 using tutti::Status;
 using tutti::StorageRuntime;
 using tutti::TargetHandle;
-using tutti::config::RuntimeNvmeSlice;
 using tutti::config::TuttiRuntime;
+using tutti::config::TuttiRuntimeTestingAccess;
+using tutti::resources::nvme::NvmeResource;
+using tutti::resources::nvme::NvmeResourceInspection;
+using tutti::resources::nvme::NvmeResourceTestingAccess;
+using tutti::resources::nvme::RuntimeNvmeSlice;
 using nvmeservice::ClientNvmeResource;
 using nvmeservice::NvmeServiceClient;
 
@@ -75,6 +81,7 @@ struct Options {
     std::int32_t device0 = 0;
     std::int32_t device1 = 1;
     std::int32_t queues = 4;
+    bool single_accelerator = false;
 };
 
 bool parse_i32(const char* text, std::int32_t& value) {
@@ -93,7 +100,8 @@ bool parse_i32(const char* text, std::int32_t& value) {
 void usage(const char* program) {
     std::fprintf(stderr,
         "Usage: %s [--endpoint HOST:PORT] [--accel0 ID] [--accel1 ID] "
-        "[--device0 ID] [--device1 ID] [--queues N]\n", program);
+        "[--device0 ID] [--device1 ID] [--queues N] "
+        "[--single-accelerator]\n", program);
 }
 
 bool parse_options(int argc, char** argv, Options& options) {
@@ -102,6 +110,10 @@ bool parse_options(int argc, char** argv, Options& options) {
         if (arg == "--help" || arg == "-h") {
             usage(argv[0]);
             std::exit(0);
+        }
+        if (arg == "--single-accelerator") {
+            options.single_accelerator = true;
+            continue;
         }
         if (i + 1 >= argc) return false;
         const char* value = argv[++i];
@@ -121,8 +133,8 @@ bool parse_options(int argc, char** argv, Options& options) {
             return false;
         }
     }
-    return options.queues > 0 && options.accel0 != options.accel1 &&
-           options.device0 != options.device1;
+    return options.queues > 0 && options.device0 != options.device1 &&
+           (options.single_accelerator || options.accel0 != options.accel1);
 }
 
 template <typename Function>
@@ -154,23 +166,53 @@ public:
                       std::int32_t accel_id, const std::string& selection,
                       const std::vector<std::int32_t>& device_ids) {
         const std::string path = path_ + "/" + name + ".yaml";
+        const bool striped = selection == "striped";
         std::ofstream output(path, std::ios::trunc);
         output << "accelerator:\n"
                << "  profile: \"CUDA\"\n\n"
                << "runtime:\n"
                << "  accel_id: " << accel_id << "\n\n"
-               << "nvme_service:\n"
-               << "  endpoint: \"" << options.endpoint << "\"\n\n"
-               << "nvme:\n"
-               << "  selection: \"" << selection << "\"\n"
-               << "  device_ids: [";
+               << "storage:\n"
+               << "  resources:\n"
+               << "    - id: nvme-resource\n"
+               << "      type: nvme\n"
+               << "      provider:\n"
+               << "        type: nvme-service\n"
+               << "        endpoint: \"" << options.endpoint << "\"\n"
+               << "      allocation:\n"
+               << "        selection: \"" << selection << "\"\n"
+               << "        device_ids: [";
         for (std::size_t i = 0; i < device_ids.size(); ++i) {
             if (i != 0) output << ", ";
             output << device_ids[i];
         }
         output << "]\n"
-               << "  queues_per_controller: " << options.queues << "\n"
-               << "  stripe_unit: " << kStripeUnit << "\n";
+               << "        queues_per_controller: " << options.queues << "\n"
+               << "  resolvers:\n"
+               << "    - id: storage-resolver\n"
+               << "      type: "
+               << (striped ? "striped-file" : "local-file") << "\n"
+               << "      scheme: " << (striped ? "striped" : "file") << "\n"
+               << "      config: {}\n"
+               << "  datapaths:\n"
+               << "    - id: storage-datapath\n"
+               << "      type: "
+               << (striped ? "striped-local-nvme" : "local-nvme") << "\n"
+               << "      config: {}\n"
+               << "  backends:\n"
+               << "    - id: storage-backend\n"
+               << "      contract: "
+               << (striped ? "striped-local-nvme" : "ext4-local-nvme")
+               << "\n"
+               << "      resolver: storage-resolver\n"
+               << "      datapath: storage-datapath\n"
+               << "      resource: nvme-resource\n"
+               << "      config: ";
+        if (striped) {
+            output << "{stripe_unit: " << kStripeUnit << "}\n";
+        } else {
+            output << "{}\n";
+        }
         output.close();
         if (!output) return {};
         files_.push_back(path);
@@ -265,17 +307,25 @@ bool paths_share_filesystem(const std::string& lhs, const std::string& rhs) {
            lhs_stat.st_dev == rhs_stat.st_dev;
 }
 
+NvmeResourceInspection inspect_nvme_resource(const TuttiRuntime& bundle) {
+    const auto* resource = dynamic_cast<const NvmeResource*>(
+        TuttiRuntimeTestingAccess::resource(bundle));
+    if (resource == nullptr) return {};
+    return NvmeResourceTestingAccess::inspection(*resource);
+}
+
 bool validate_metadata(const TuttiRuntime& bundle,
                        const ResourceMap& baseline,
                        std::int32_t accel_id,
                        const std::vector<std::int32_t>& selected,
                        std::uint32_t queues) {
-    bool ok = !bundle.allocation_id.empty() &&
-              bundle.allocation_slices.size() == selected.size();
+    const auto inspection = inspect_nvme_resource(bundle);
+    bool ok = !inspection.allocation.allocation_id.empty() &&
+              inspection.allocation.slices.size() == selected.size();
     ok = ok && bundle.resolver_schemes.size() == 1 &&
          bundle.data_path_keys.size() == 1;
-    for (std::size_t i = 0; i < bundle.allocation_slices.size(); ++i) {
-        const RuntimeNvmeSlice& slice = bundle.allocation_slices[i];
+    for (std::size_t i = 0; i < inspection.allocation.slices.size(); ++i) {
+        const RuntimeNvmeSlice& slice = inspection.allocation.slices[i];
         const auto resource_it = baseline.find(slice.device_id);
         if (resource_it == baseline.end()) {
             ok = false;
@@ -299,7 +349,8 @@ bool validate_metadata(const TuttiRuntime& bundle,
         std::printf(
             "SLICE allocation=%s device=%d accel=%d pci=%s chrdev=%s block=%s "
             "backing=%s view=%s ns=%u lba=%u bar0=%llu mdts=%llu grant=%u\n",
-            bundle.allocation_id.c_str(), slice.device_id, slice.accel_id,
+            inspection.allocation.allocation_id.c_str(), slice.device_id,
+            slice.accel_id,
             slice.pci_bdf.c_str(), slice.chrdev_path.c_str(),
             slice.block_path.c_str(), slice.backing_mount_path.c_str(),
             slice.view_path.c_str(), slice.namespace_id,
@@ -526,7 +577,8 @@ bool run_local_scenario(const Options& options, const std::string& config_path,
     print_snapshot((label + " acquired").c_str(), acquired);
     ok = check_acquired_ledger(baseline, acquired, {device_id}, options.queues) && ok;
 
-    const RuntimeNvmeSlice slice = bundle->allocation_slices.front();
+    const RuntimeNvmeSlice slice =
+        inspect_nvme_resource(*bundle).allocation.slices.front();
     const std::string scratch = slice.view_path + "/tutti_phase5_" +
         std::to_string(::getpid()) + "_" + label + ".bin";
     std::printf("SCRATCH scenario=%s path=%s\n",
@@ -709,8 +761,10 @@ bool run_striped_bundle_phase(
     ok = check_acquired_ledger(baseline, acquired, devices, options.queues) && ok;
 
     if (write_phase) {
+        const auto allocation_slices =
+            inspect_nvme_resource(*bundle).allocation.slices;
         const bool created = ensure_striped_files(
-            name, bundle->allocation_slices, scratch_paths);
+            name, allocation_slices, scratch_paths);
         for (const std::string& path : scratch_paths) {
             std::printf("SCRATCH scenario=%s path=%s\n",
                         label.c_str(), path.c_str());
@@ -718,13 +772,15 @@ bool run_striped_bundle_phase(
         check(created, label + ": striped scratch files created from view_path");
         ok = created && ok;
     } else {
-        const auto expected_paths = striped_paths(name, bundle->allocation_slices);
+        const auto expected_paths = striped_paths(
+            name, inspect_nvme_resource(*bundle).allocation.slices);
         check(expected_paths == scratch_paths,
               label + ": restart resolves the same allocation view paths");
         ok = expected_paths == scratch_paths && ok;
     }
 
-    const std::string uri = striped_uri(name, bundle->allocation_slices);
+    const std::string uri = striped_uri(
+        name, inspect_nvme_resource(*bundle).allocation.slices);
     auto opened = call_preserving_device(
         label + "/open", caller_device,
         [&] { return bundle->runtime->open(uri, OpenOptions{"striped"}); });
@@ -799,16 +855,20 @@ int main(int argc, char** argv) {
 
     int device_count = 0;
     if (cudaGetDeviceCount(&device_count) != cudaSuccess ||
-        options.accel0 < 0 || options.accel1 < 0 ||
-        options.accel0 >= device_count || options.accel1 >= device_count) {
-        std::printf("SKIP: phase 5 requires both requested accelerators\n");
+        options.accel0 < 0 || options.accel0 >= device_count ||
+        (!options.single_accelerator &&
+         (options.accel1 < 0 || options.accel1 >= device_count))) {
+        std::printf("SKIP: requested accelerator set is unavailable\n");
         return kSkip;
     }
 
     NvmeServiceClient observer(options.endpoint);
     const auto accelerators = observer.list_accelerators();
     const ResourceMap baseline = snapshot_resources(observer);
-    if (accelerators.size() < 2 || baseline.count(options.device0) == 0 ||
+    const std::size_t required_accelerators =
+        options.single_accelerator ? 1 : 2;
+    if (accelerators.size() < required_accelerators ||
+        baseline.count(options.device0) == 0 ||
         baseline.count(options.device1) == 0 ||
         !baseline.at(options.device0).available ||
         !baseline.at(options.device1).available) {
@@ -829,10 +889,13 @@ int main(int argc, char** argv) {
     }
 
     bool ok = true;
-    const std::vector<std::pair<std::int32_t, std::int32_t>> accelerators_to_run = {
-        {options.accel0, options.accel1},
-        {options.accel1, options.accel0},
-    };
+    const std::vector<std::pair<std::int32_t, std::int32_t>> accelerators_to_run =
+        options.single_accelerator
+        ? std::vector<std::pair<std::int32_t, std::int32_t>>{
+              {options.accel0, options.accel0}}
+        : std::vector<std::pair<std::int32_t, std::int32_t>>{
+              {options.accel0, options.accel1},
+              {options.accel1, options.accel0}};
     int scenario = 1;
     for (const auto& accel : accelerators_to_run) {
         for (std::int32_t device_id : {options.device0, options.device1}) {
