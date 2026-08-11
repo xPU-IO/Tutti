@@ -82,6 +82,18 @@ option(TUTTI_FEATURE_MEMFS_SAMPLE "Include memfs sample extension" ON)
 option(TUTTI_BUILD_KERNEL_MODULE
     "Configure snvme kernel-module build/load targets" OFF)
 
+find_package(yaml-cpp REQUIRED)
+if(TARGET yaml-cpp::yaml-cpp)
+    set(TUTTI_YAML_CPP_TARGET yaml-cpp::yaml-cpp)
+elseif(TARGET yaml-cpp)
+    set(TUTTI_YAML_CPP_TARGET yaml-cpp)
+else()
+    set(TUTTI_YAML_CPP_TARGET ${YAML_CPP_LIBRARIES})
+endif()
+message(STATUS "Tutti: yaml-cpp target: ${TUTTI_YAML_CPP_TARGET}")
+
+add_subdirectory(config)
+
 # ---------------------------------------------------------------------------
 # Include directories
 # ---------------------------------------------------------------------------
@@ -210,10 +222,8 @@ if(TUTTI_BUILD_HARDWARE_STACK)
     # SDK through their profile modules.
     find_package(Threads REQUIRED)
 
-    # gRPC: optional; when found, nvmeservice (daemon NVMe multi-process path) is
-    # enabled and TUTTI_NVMESERVICE_ENABLED is defined on all targets that need it.
-    # gRPC and yaml-cpp are local-NVMe-specific dependencies (nvmeservice config).
-    # When TUTTI_FEATURE_LOCAL_NVME=OFF they are not looked up.
+    # gRPC is optional and local-NVMe-specific. yaml-cpp is resolved above for
+    # the profile-independent application config parser.
     if(TUTTI_FEATURE_LOCAL_NVME)
         find_package(gRPC CONFIG QUIET)
         if(gRPC_FOUND)
@@ -221,22 +231,8 @@ if(TUTTI_BUILD_HARDWARE_STACK)
         else()
             message(STATUS "Tutti: gRPC NOT found -- daemon NVMe path disabled")
         endif()
-
-        # yaml-cpp: used by Layer 2 (device_manager/nvme/nvmeservice) config parser.
-        # Normalize the target name across packagings:
-        #   vcpkg / new upstream : yaml-cpp::yaml-cpp
-        #   old system pkg (0.5.x): bare "yaml-cpp" target, or only ${YAML_CPP_LIBRARIES}
-        find_package(yaml-cpp REQUIRED)
-        if(TARGET yaml-cpp::yaml-cpp)
-            set(TUTTI_YAML_CPP_TARGET yaml-cpp::yaml-cpp)
-        elseif(TARGET yaml-cpp)
-            set(TUTTI_YAML_CPP_TARGET yaml-cpp)
-        else()
-            set(TUTTI_YAML_CPP_TARGET ${YAML_CPP_LIBRARIES})
-        endif()
-        message(STATUS "Tutti: yaml-cpp target: ${TUTTI_YAML_CPP_TARGET}")
     else()
-        message(STATUS "Tutti: TUTTI_FEATURE_LOCAL_NVME=OFF -- gRPC/yaml-cpp/libnvm skipped")
+        message(STATUS "Tutti: TUTTI_FEATURE_LOCAL_NVME=OFF -- gRPC/libnvm skipped")
     endif()
 
     if(TUTTI_ACCELERATOR STREQUAL "CUDA")
@@ -286,10 +282,8 @@ if(TUTTI_BUILD_HARDWARE_STACK)
         # above (lines ~170-171).
         add_subdirectory(data_paths/striped_local_nvme)
 
-        # Round 20 S1: application config loader (yaml → RuntimeComponents).
-        # Translates config/tutti_config.yaml into DataPath/Resolver
-        # construction via the public API.
-        add_subdirectory(config)
+        tutti_add_config_loader()
+
     else()
         message(STATUS "Tutti: TUTTI_FEATURE_LOCAL_NVME=OFF -- skipping device_manager, data_paths/local_nvme")
     endif()
@@ -416,6 +410,12 @@ if(BUILD_TESTING)
         "${CMAKE_CURRENT_BINARY_DIR}/tests_mock_data_path_kit_contract"
     )
     message(STATUS "Tutti: added tests/mock_data_path_kit_contract (MockDataPath kit self-contract test)")
+
+    add_subdirectory(
+        "${TUTTI_REPOSITORY_ROOT}/tests/storage_config_contract"
+        "${CMAKE_CURRENT_BINARY_DIR}/tests_storage_config_contract"
+    )
+    message(STATUS "Tutti: added tests/storage_config_contract (hardware-free parser contract)")
 
     # Round 17 S1: MountManager host-side unit tests (hardware-free).
     # Tests config parsing, /proc scanning, mount/unmount lifecycle

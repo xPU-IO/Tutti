@@ -126,6 +126,75 @@ static std::shared_ptr<FakeClientState> make_state(
     return state;
 }
 
+static std::string canonical_local_yaml(
+    const std::string& selection = "explicit",
+    const std::string& device_ids = "[0]",
+    const std::string& queues = "4",
+    const std::string& resource_id = "nvme-local-0",
+    const std::string& resolver_type = "local-file",
+    const std::string& scheme = "file",
+    const std::string& contract = "ext4-local-nvme",
+    const std::string& resource_reference = "nvme-local-0",
+    const std::string& resource_extra = {},
+    const std::string& resolver_extra = {},
+    const std::string& backend_extra = {},
+    const std::string& root_extra = {}) {
+    return "accelerator: {profile: CUDA}\n"
+           "runtime: {accel_id: 0}\n"
+           "storage:\n"
+           "  resources:\n"
+           "    - id: '" + resource_id + "'\n"
+           "      type: nvme\n"
+           "      provider: {type: nvme-service, endpoint: fake-endpoint}\n"
+           "      allocation:\n"
+           "        selection: " + selection + "\n"
+           "        device_ids: " + device_ids + "\n"
+           "        queues_per_controller: " + queues + "\n" +
+           resource_extra +
+           "  resolvers:\n"
+           "    - id: file-resolver-0\n"
+           "      type: " + resolver_type + "\n"
+           "      scheme: '" + scheme + "'\n"
+           "      config: {}\n" +
+           resolver_extra +
+           "  datapaths:\n"
+           "    - id: local-nvme-datapath-0\n"
+           "      type: local-nvme\n"
+           "      config: {}\n"
+           "  backends:\n"
+           "    - id: model-storage\n"
+           "      contract: " + contract + "\n"
+           "      resolver: file-resolver-0\n"
+           "      datapath: local-nvme-datapath-0\n"
+           "      resource: " + resource_reference + "\n"
+           "      config: {}\n" +
+           backend_extra + root_extra;
+}
+
+static std::string canonical_striped_yaml(const std::string& device_ids,
+                                          const std::string& stripe_unit) {
+    return "accelerator: {profile: CUDA}\n"
+           "runtime: {accel_id: 0}\n"
+           "storage:\n"
+           "  resources:\n"
+           "    - id: nvme-striped-0\n"
+           "      type: nvme\n"
+           "      provider: {type: nvme-service, endpoint: fake-endpoint}\n"
+           "      allocation: {selection: striped, device_ids: " + device_ids +
+           ", queues_per_controller: 4}\n"
+           "  resolvers:\n"
+           "    - {id: striped-resolver-0, type: striped-file, scheme: striped, config: {}}\n"
+           "  datapaths:\n"
+           "    - {id: striped-datapath-0, type: striped-local-nvme, config: {}}\n"
+           "  backends:\n"
+           "    - id: striped-storage\n"
+           "      contract: striped-local-nvme\n"
+           "      resolver: striped-resolver-0\n"
+           "      datapath: striped-datapath-0\n"
+           "      resource: nvme-striped-0\n"
+           "      config: {stripe_unit: " + stripe_unit + "}\n";
+}
+
 static LoadTuttiConfigOptions fake_options(
     const std::shared_ptr<FakeClientState>& state,
     bool fail_runtime_create = false) {
@@ -522,6 +591,124 @@ nvme:
         CHECK(state->release_calls == 1,
               "loader runtime create failure: release once");
         ::unlink(path.c_str());
+    }
+
+    // 12. Canonical configs feed the unchanged assembly compatibility layer.
+    {
+        auto path = write_tmp(canonical_local_yaml());
+        auto state = make_state({make_slice(0)});
+        auto r = load_tutti_config(path, fake_options(state));
+        CHECK(r.ok(), "canonical loader local: ok");
+        CHECK(state->endpoint == "fake-endpoint",
+              "canonical loader local: provider endpoint adapted");
+        CHECK(state->list_accelerators_calls == 1 &&
+              state->list_resources_calls == 1 && state->acquire_calls == 1,
+              "canonical loader local: one preflight and acquire");
+        if (r.ok()) {
+            auto bundle = std::move(r).value();
+            CHECK(bundle->resolver_schemes == std::vector<std::string>{"file"},
+                  "canonical loader local: resolver route");
+            CHECK(bundle->data_path_keys ==
+                      std::vector<std::string>{"local-nvme-ext4"},
+                  "canonical loader local: DataPath route");
+            (void)bundle->shutdown();
+            CHECK(state->release_calls == 1,
+                  "canonical loader local: release once");
+        }
+        ::unlink(path.c_str());
+    }
+
+    {
+        auto path = write_tmp(canonical_striped_yaml("[0, 1]", "65536"));
+        auto state = make_state({make_slice(0), make_slice(1)});
+        auto r = load_tutti_config(path, fake_options(state));
+        CHECK(r.ok(), "canonical loader striped: ok");
+        if (r.ok()) {
+            auto bundle = std::move(r).value();
+            CHECK(bundle->resolver_schemes == std::vector<std::string>{"striped"},
+                  "canonical loader striped: resolver route");
+            CHECK(bundle->data_path_keys ==
+                      std::vector<std::string>{"striped-local-nvme"},
+                  "canonical loader striped: DataPath route");
+            (void)bundle->shutdown();
+            CHECK(state->release_calls == 1,
+                  "canonical loader striped: release once");
+        }
+        ::unlink(path.c_str());
+    }
+
+    // 13. Every canonical static failure returns before client creation/list/acquire.
+    {
+        const std::string duplicate_resource =
+            "    - id: nvme-local-0\n"
+            "      type: nvme\n"
+            "      provider: {type: nvme-service, endpoint: duplicate}\n"
+            "      allocation: {selection: explicit, device_ids: [1], queues_per_controller: 4}\n";
+        const std::string duplicate_resolver =
+            "    - {id: file-resolver-1, type: local-file, scheme: file, config: {}}\n";
+        const std::string unused_resolver =
+            "    - {id: unused-resolver, type: local-file, scheme: unused, config: {}}\n";
+        const std::string duplicate_backend =
+            "    - id: model-storage-2\n"
+            "      contract: ext4-local-nvme\n"
+            "      resolver: file-resolver-0\n"
+            "      datapath: local-nvme-datapath-0\n"
+            "      resource: nvme-local-0\n"
+            "      config: {}\n";
+        std::string zero_backend = canonical_local_yaml();
+        const std::size_t backends_position = zero_backend.find("  backends:\n");
+        zero_backend.erase(backends_position);
+        zero_backend += "  backends: []\n";
+        const std::vector<std::pair<std::string, std::string>> invalid_configs = {
+            {"missing id", canonical_local_yaml("explicit", "[0]", "4", "")},
+            {"duplicate id", canonical_local_yaml(
+                "explicit", "[0]", "4", "nvme-local-0", "local-file", "file",
+                "ext4-local-nvme", "nvme-local-0", duplicate_resource)},
+            {"dangling reference", canonical_local_yaml(
+                "explicit", "[0]", "4", "nvme-local-0", "local-file", "file",
+                "ext4-local-nvme", "missing-resource")},
+            {"duplicate scheme", canonical_local_yaml(
+                "explicit", "[0]", "4", "nvme-local-0", "local-file", "file",
+                "ext4-local-nvme", "nvme-local-0", {}, duplicate_resolver)},
+            {"duplicate key", canonical_local_yaml(
+                "explicit", "[0]", "4", "nvme-local-0", "local-file", "file",
+                "ext4-local-nvme", "nvme-local-0", {}, {}, duplicate_backend)},
+            {"zero backend", zero_backend},
+            {"unreferenced", canonical_local_yaml(
+                "explicit", "[0]", "4", "nvme-local-0", "local-file", "file",
+                "ext4-local-nvme", "nvme-local-0", {}, unused_resolver)},
+            {"unknown contract", canonical_local_yaml(
+                "explicit", "[0]", "4", "nvme-local-0", "local-file", "file",
+                "unknown-contract")},
+            {"unknown type", canonical_local_yaml(
+                "explicit", "[0]", "4", "nvme-local-0", "unknown-resolver")},
+            {"invalid scheme", canonical_local_yaml(
+                "explicit", "[0]", "4", "nvme-local-0", "local-file", "Bad Scheme")},
+            {"allowed ids", canonical_local_yaml("allowed", "[0]")},
+            {"explicit zero", canonical_local_yaml("explicit", "[]")},
+            {"explicit many", canonical_local_yaml("explicit", "[0, 1]")},
+            {"striped one", canonical_striped_yaml("[0]", "65536")},
+            {"striped duplicate", canonical_striped_yaml("[0, 0]", "65536")},
+            {"negative queues", canonical_local_yaml("explicit", "[0]", "-1")},
+            {"zero stripe", canonical_striped_yaml("[0, 1]", "0")},
+            {"unaligned stripe", canonical_striped_yaml("[0, 1]", "65537")},
+            {"mixed syntax", canonical_local_yaml(
+                "explicit", "[0]", "4", "nvme-local-0", "local-file", "file",
+                "ext4-local-nvme", "nvme-local-0", {}, {}, {},
+                "nvme_service: {endpoint: legacy}\n")},
+        };
+        for (const auto& entry : invalid_configs) {
+            auto path = write_tmp(entry.second);
+            auto state = make_state({make_slice(0), make_slice(1)});
+            auto r = load_tutti_config(path, fake_options(state));
+            CHECK(!r.ok(), ("canonical static failure rejected: " + entry.first).c_str());
+            CHECK(state->endpoint.empty() &&
+                  state->list_accelerators_calls == 0 &&
+                  state->list_resources_calls == 0 &&
+                  state->acquire_calls == 0 && state->release_calls == 0,
+                  ("canonical static failure has zero RPC: " + entry.first).c_str());
+            ::unlink(path.c_str());
+        }
     }
 
     std::printf("\n=== Summary ===\n  passed: %d\n  failed: %d\n", g_pass, g_fail);

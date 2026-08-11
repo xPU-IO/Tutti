@@ -25,6 +25,8 @@
 
 #include <tutti/status.h>
 
+#include "tutti/config/storage_config.h"
+
 namespace tutti {
 
 class DataPath;
@@ -72,12 +74,6 @@ struct RuntimeNvmeSlice {
 struct RuntimeNvmeAllocation {
     std::string allocation_id;
     std::vector<RuntimeNvmeSlice> slices;
-};
-
-enum class NvmeSelection {
-    Allowed,
-    Explicit,
-    Striped,
 };
 
 class RuntimeResourceClient {
@@ -162,6 +158,9 @@ Result<std::unique_ptr<TuttiRuntime>> load_tutti_config(
 // Parse-only: returns the parsed config values without constructing
 // any objects.  Useful for testing and validation.
 struct ParsedConfig {
+    ConfigSyntax syntax = ConfigSyntax::Legacy;
+    CanonicalStorageConfig canonical_storage;
+
     std::string gpu_vendor = "nvidia";
     std::string accelerator_profile = TUTTI_COMPILED_ACCELERATOR_PROFILE;
     std::string storage_backend = "local-nvme";
