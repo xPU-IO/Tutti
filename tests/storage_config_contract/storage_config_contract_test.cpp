@@ -268,6 +268,45 @@ int main() {
                    "unknown type");
     expect_failure(replace_once(local_yaml(), "scheme: file", "scheme: 'Bad Scheme'"),
                    "invalid scheme");
+    expect_failure(
+        local_yaml("explicit", "[0]", "4",
+                   "      config: {capacity_bytes: 4096}\n"),
+        "nvme resource config must be empty");
+    expect_failure(
+        replace_once(local_yaml(),
+                     "      type: local-file\n"
+                     "      scheme: file\n"
+                     "      config: {}\n",
+                     "      type: local-file\n"
+                     "      scheme: file\n"
+                     "      config: {unknown: true}\n"),
+        "local file resolver config must be empty");
+    expect_failure(
+        replace_once(striped_yaml(),
+                     "      type: striped-file\n"
+                     "      scheme: striped\n"
+                     "      config: {}\n",
+                     "      type: striped-file\n"
+                     "      scheme: striped\n"
+                     "      config: {unknown: true}\n"),
+        "striped file resolver config must be empty");
+    expect_failure(
+        replace_once(local_yaml(), "        handle_cache_capacity: 11\n",
+                     "        unknown_tuning: 11\n"),
+        "local NVMe datapath unknown config");
+    expect_failure(
+        replace_once(
+            striped_yaml(),
+            "      config: {max_in_flight_operations: 32, max_batch_entries: 64}\n",
+            "      config: {max_in_flight_operations: 32, stripe_unit: 65536}\n"),
+        "striped NVMe datapath unknown config");
+    expect_failure(
+        replace_once(local_yaml(),
+                     "      resource: nvme-local-0\n"
+                     "      config: {}\n",
+                     "      resource: nvme-local-0\n"
+                     "      config: {stripe_unit: 4096}\n"),
+        "ext4 backend disallows stripe unit");
     expect_failure(local_yaml("allowed", "[0]"), "allowed with device id");
     expect_failure(local_yaml("explicit", "[]"), "explicit without device id");
     expect_failure(local_yaml("explicit", "[0, 1]"), "explicit with many ids");
@@ -302,6 +341,35 @@ int main() {
         "  backends:\n"
         "    - {id: memfs-backend, contract: memfs, resolver: memfs-resolver, datapath: memfs-datapath, resource: memory-0, config: {}}\n";
     expect_failure(memfs, "memfs factory unsupported", tutti::StatusCode::UNSUPPORTED);
+    expect_failure(
+        replace_once(memfs, "capacity_bytes: 4096", "capacity_bytes: 0"),
+        "memfs zero capacity");
+    expect_failure(
+        replace_once(
+            memfs, "      type: memory\n",
+            "      type: memory\n"
+            "      provider: {type: nvme-service, endpoint: local}\n"),
+        "memfs resource with provider");
+    expect_failure(
+        replace_once(
+            memfs, "      type: memory\n",
+            "      type: memory\n"
+            "      allocation: {selection: allowed, queues_per_controller: 1}\n"),
+        "memfs resource with allocation");
+    expect_failure(
+        replace_once(memfs,
+                     "    - {id: memfs-resolver, type: memfs, scheme: memfs, config: {}}\n",
+                     "    - {id: memfs-resolver, type: memfs, scheme: memfs, config: {unknown: true}}\n"),
+        "memfs resolver config must be empty");
+    expect_failure(
+        replace_once(memfs,
+                     "    - {id: memfs-datapath, type: memfs, config: {}}\n",
+                     "    - {id: memfs-datapath, type: memfs, config: {io_granularity: 4096}}\n"),
+        "memfs datapath config must be empty");
+    expect_failure(
+        replace_once(memfs, "resource: memory-0, config: {}}",
+                     "resource: memory-0, config: {stripe_unit: 4096}}"),
+        "memfs backend config must be empty");
 
     const StorageContract* local_contract = find_storage_contract("ext4-local-nvme");
     const StorageContract* striped_contract =

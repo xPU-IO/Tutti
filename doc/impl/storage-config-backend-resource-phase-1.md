@@ -10,7 +10,9 @@ canonical storage 值模型、严格静态 schema、contract registry 和 legacy
 `ParsedConfig` 兼容装配字段；legacy 合法配置保持行为等价；19 类 canonical 静态错误
 均在 client factory、list RPC、Acquire 或 DataPath 构造之前失败。HOST/CUDA parser
 contract 和完整非硬件回归全绿，daemon schema、RPC、配置和 `StorageRuntime` contract
-均未修改。
+均未修改。P1 后续模块化优化进一步将 canonical storage parser 拆为 `resource`、
+`resolver`、`datapath`、`backend` 四类目录，每个具体 type/contract 由一个独立源文件
+实现；legacy NVMe adapter 单列，未改变配置语义或 runtime assembly。
 
 ## 2. 计划项与本次实现对比
 
@@ -23,6 +25,7 @@ contract 和完整非硬件回归全绿，daemon schema、RPC、配置和 `Stora
 | 逻辑 contract registry | 注册 `ext4-local-nvme`、`striped-local-nvme` 和 schema-only `memfs`，固定 resolver/DataPath/resource type、cardinality 和 Runtime key | 完成 |
 | memfs 未实现时明确失败 | 完成 schema/type/引用校验后返回 `UNSUPPORTED`，不伪装为 NVMe 或隐式选择 factory | 完成 |
 | 保留 `ParsedConfig` 兼容层 | `ParsedConfig` 新增 syntax/canonical model；canonical 和 legacy 都填充旧 loader 所需的只读兼容字段，P1 不改 runtime assembly | 完成 |
+| storage parser 按组件和具体类型拆分 | 建立 `storage/resource`、`storage/resolver`、`storage/datapath`、`storage/backend`；2/3/3/3 个具体实现各自占用一个 `.cpp` | 完成 |
 | HOST/CUDA 纯 parser target | `tutti_config_parse` 提升为所有 profile 构建；新增 `tutti_storage_config_contract_test`，只链接 parse library | 完成 |
 | 静态失败零 RPC | CUDA full loader 使用计数 fake client 验证 19 类错误的 list/acquire/release 全为 0 | 完成 |
 
@@ -58,7 +61,25 @@ DataPath 或 `StorageRuntime::create()` 的装配顺序。
 `UNSUPPORTED`；未知 legacy backend 现在 fail-closed，不再被现有 loader 静默当作
 local NVMe。
 
-### 3.3 Build 行为
+### 3.3 Parser 模块边界
+
+canonical storage 解析按配置对象类别分为四层，每个具体类型的字段白名单、值读取和
+类型专属约束只存在于对应源文件：
+
+| 类别 | 具体解析单元 |
+| --- | --- |
+| resource | `nvme`、`memory` |
+| resolver | `local-file`、`striped-file`、`memfs` |
+| datapath | `local-nvme`、`striped-local-nvme`、`memfs` |
+| backend | `ext4-local-nvme`、`striped-local-nvme`、`memfs` |
+
+`tutti_config_parse.cpp` 只读取公共 `id/type/reference` 字段、遍历四组数组、分派具体
+解析器，并执行 ID、scheme、引用、reachability 和 contract registry graph 校验。
+NVMe selection/device IDs 的复用读取逻辑与两个 NVMe DataPath 共用的 tuning 读取逻辑
+位于各自目录的私有头中，不进入通用 parser。legacy NVMe flat config 由独立兼容源文件
+解析并一次性转换为 canonical graph。
+
+### 3.4 Build 行为
 
 `yaml-cpp` 和 `tutti_config_parse` 从 local-NVMe hardware stack 内移到通用 target graph，
 因此 HOST profile 也编译并运行相同 parser。full `tutti_config` loader 仍只在 hardware
@@ -71,11 +92,17 @@ stack + local-NVMe feature 启用时创建，未把 CUDA、gRPC 或 daemon 依�
 | --- | --- |
 | `tutti/config/storage_config.h` | 新增 canonical 值模型、syntax 标识和 contract descriptor/lookup |
 | `tutti/config/tutti_config.h` | 复用新 `NvmeSelection` 定义，并在 `ParsedConfig` 中保存 syntax 与 canonical model |
-| `tutti/config/tutti_config_parse.cpp` | 重写为 syntax 识别、strict canonical parse、legacy adapter、graph/contract 静态校验和兼容字段投影 |
-| `tutti/config/CMakeLists.txt` | parse library 始终可构建，full loader 由 hardware stack 在依赖就绪后创建 |
+| `tutti/config/tutti_config_parse.cpp` | 收敛为 syntax 识别、四数组公共字段解析/具体实现分派、graph/contract 静态校验 |
+| `tutti/config/tutti_config_legacy_nvme_parse.cpp` | 独立实现 legacy NVMe flat config、canonical adapter、兼容字段投影和旧 NVMe config helper |
+| `tutti/config/storage/parse_internal.h` | 声明共享 YAML helper 与 11 个具体解析单元的内部接口 |
+| `tutti/config/storage/resource/*.cpp` | `nvme_config_parse.cpp`、`memory_config_parse.cpp` 分别实现两种 resource 配置 |
+| `tutti/config/storage/resolver/*.cpp` | `local_file`、`striped_file`、`memfs` 各自实现 resolver config 白名单 |
+| `tutti/config/storage/datapath/*.cpp` | `local_nvme`、`striped_local_nvme`、`memfs` 各自实现 DataPath config；NVMe 共用读取逻辑留在目录私有头 |
+| `tutti/config/storage/backend/*.cpp` | `ext4_local_nvme`、`striped_local_nvme`、`memfs` 各自实现 backend config 与 contract 专属校验 |
+| `tutti/config/CMakeLists.txt` | 显式列出四类 11 个 parser source；parse library 始终可构建，full loader 仍由 hardware stack 创建 |
 | `tutti/CMakeLists.txt` | 通用查找 `yaml-cpp`、注册 parser target 和全 profile parser contract test |
 | `tests/storage_config_contract/CMakeLists.txt` | 新增硬件无关 parser contract target |
-| `tests/storage_config_contract/storage_config_contract_test.cpp` | 新增合法矩阵、非法矩阵、legacy adapter、HOST no-storage 和 registry 测试 |
+| `tests/storage_config_contract/storage_config_contract_test.cpp` | 新增合法矩阵、非法矩阵、legacy adapter、HOST no-storage、registry 及 11 个具体解析单元的字段边界测试 |
 | `tests/config_loader/config_loader_test.cpp` | 新增 canonical local/striped assembly 正向测试及 19 类静态失败零 RPC 测试 |
 | `doc/impl/storage-config-backend-resource-phase-1.md` | 新增本阶段实施和验证记录 |
 
@@ -101,7 +128,10 @@ parser contract 覆盖并拒绝：缺 ID、重复 ID、悬空引用、重复 sch
 DataPath key、0 backend、多 backend、未引用声明、未知 contract/type、非法 scheme、
 `allowed` 带 ID、`explicit` 0/多个 ID、`striped` 少于 2 个/重复 ID、负 queues、
 stripe unit 为 0/未对齐、canonical/legacy 混用、unknown canonical field、contract type
-混搭和 memfs factory 未实现。
+混搭和 memfs factory 未实现。模块化优化另行覆盖 NVMe resource 非空 config、三种
+resolver 非空 config、两种 NVMe DataPath 未知 tuning、memory 零容量或携带
+provider/allocation、memfs DataPath/backend 非空 config，以及 ext4 backend 非零
+stripe unit。
 
 CUDA full loader 对其中 19 类 canonical 静态错误逐例注入计数 client，结果均为：
 
@@ -119,13 +149,13 @@ release_calls           = 0
 
 | 命令/target | 结果 | 原始结果摘要 |
 | --- | --- | --- |
-| HOST `tutti_storage_config_contract_test` | PASS | 88 checks、0 failures |
-| CUDA `tutti_storage_config_contract_test` | PASS | 88 checks、0 failures |
+| HOST `tutti_storage_config_contract_test` | PASS | 124 checks、0 failures |
+| CUDA `tutti_storage_config_contract_test` | PASS | 124 checks、0 failures |
 | CUDA `tutti_config_loader_test` | PASS | 124 passed、0 failed |
 | `cmake --build build/host --parallel 8` | PASS | 包含通用 `tutti_config_parse` 和新 parser test |
 | `ctest --test-dir build/host --output-on-failure -j 8` | PASS | 18/18，通过时间 0.26 秒 |
 | `cmake --build build/cuda --parallel 8` | PASS | full loader、runtime bundle E2E binary 和所有非硬件 target 构建成功 |
-| `ctest --test-dir build/cuda -LE hardware --output-on-failure -j 8` | PASS | 20/20，通过时间 0.49 秒 |
+| `ctest --test-dir build/cuda -LE hardware --output-on-failure -j 8` | PASS | 20/20，通过时间 0.57 秒 |
 | `git diff --check` | PASS | 无 whitespace error |
 
 ## 7. 基于硬件的验证结果
@@ -153,9 +183,26 @@ P1 的 parser/static validation 本身不访问硬件；硬件回归用于证明
 loader 变更未影响已有 daemon allocation/control path。由于双 accelerator 前置条件不
 满足，本阶段没有把完整 loader I/O 场景报告为通过。
 
+### 7.3 模块化优化后的硬件复核
+
+使用最终四类 parser 拆分代码重新构建 CUDA profile，并再次以
+`config/local/daemon_2_disk.yaml` 启动 daemon：
+
+| 检查 | 结果 | 证据 |
+| --- | --- | --- |
+| daemon 启动与双盘枚举 | PASS | device 0/1 分别为 `0000:b1:00.0`、`0000:e3:00.0`，LBA 4096、BAR0 16384 |
+| ledger 前后对比 | PASS | device 0 始终 `reserved=0 available=23`；device 1 始终 `reserved=0 available=72` |
+| 完整 loader hardware E2E | SKIP | 返回 77：请求 accelerator 0/1，但本机只有 accelerator 0（一块 L40S） |
+| daemon 清理 | PASS | 单次 SIGTERM 后 `tutti_daemon exited cleanly`；无 50051 listener、mount、device node 或 daemon 进程残留 |
+
+本次 hardware E2E 在 accelerator 数量检查处跳过，未发生 Acquire，因此不将其报告为
+I/O PASS；parser 和 loader 装配行为由 124 项 parser contract 与 124 项 fake-client
+loader 测试覆盖。
+
 ## 8. Exit Gate 与后续约束
 
 - canonical 合法/非法矩阵通过，静态错误在 client factory/list/Acquire 前失败；
+- 四类 storage 对象按目录分离，每个具体 type/contract 的解析和专属校验只有一个实现源文件；
 - legacy 合法 loader 行为等价，runtime assembly 和 `StorageRuntime` contract 不变；
 - HOST/CUDA parser 使用同一源码和测试矩阵，HOST 不需要 CUDA 或 daemon；
 - 本阶段保留 `ParsedConfig` flat compatibility 字段和 `TuttiRuntime` public allocation

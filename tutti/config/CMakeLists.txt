@@ -11,6 +11,18 @@
 # Pure-host parse library (no CUDA, no DataPath).
 add_library(tutti_config_parse STATIC
     tutti_config_parse.cpp
+    tutti_config_legacy_nvme_parse.cpp
+    storage/resource/memory_config_parse.cpp
+    storage/resource/nvme_config_parse.cpp
+    storage/resolver/local_file_config_parse.cpp
+    storage/resolver/memfs_config_parse.cpp
+    storage/resolver/striped_file_config_parse.cpp
+    storage/datapath/local_nvme_config_parse.cpp
+    storage/datapath/memfs_config_parse.cpp
+    storage/datapath/striped_local_nvme_config_parse.cpp
+    storage/backend/ext4_local_nvme_config_parse.cpp
+    storage/backend/memfs_config_parse.cpp
+    storage/backend/striped_local_nvme_config_parse.cpp
 )
 
 target_include_directories(tutti_config_parse PUBLIC
