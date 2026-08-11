@@ -29,6 +29,10 @@ Status validate_provider_snapshot(
         return error(StatusCode::NOT_FOUND,
                      "daemon does not advertise requested accel_id");
     }
+    if (accelerator->view_root.empty()) {
+        return error(StatusCode::INVALID_ARGUMENT,
+                     "daemon accelerator snapshot has empty view_root");
+    }
 
     if (spec.allocation.selection == config::NvmeSelection::Allowed) {
         const auto usable = std::find_if(
@@ -164,15 +168,43 @@ Status NvmeResource::validate_allocation_metadata_() const {
     const std::uint32_t logical_block_size =
         impl_->allocation.slices.front().logical_block_size;
     for (const RuntimeNvmeSlice& slice : impl_->allocation.slices) {
-        if (slice.device_id < 0 || slice.accel_id != spec_.accel_id ||
-            !contains_accelerator(slice.allowed_accel_ids, spec_.accel_id) ||
-            slice.pci_bdf.empty() || slice.chrdev_path.empty() ||
-            slice.block_path.empty() || slice.backing_mount_path.empty() ||
-            slice.view_path.empty() || slice.namespace_id == 0 ||
-            slice.logical_block_size == 0 || slice.bar0_size == 0 ||
-            slice.max_data_size == 0 || slice.granted_queues == 0) {
+        if (slice.device_id < 0) {
             return error(StatusCode::INVALID_ARGUMENT,
-                         "AcquireNvmeSlices returned incomplete slice metadata");
+                         "NVMe allocation slice has invalid device_id");
+        }
+        if (slice.accel_id != spec_.accel_id) {
+            return error(StatusCode::INVALID_ARGUMENT,
+                         "NVMe allocation slice accel_id does not match Runtime");
+        }
+        if (!contains_accelerator(slice.allowed_accel_ids, spec_.accel_id)) {
+            return error(StatusCode::INVALID_ARGUMENT,
+                         "NVMe allocation slice ACL excludes Runtime accelerator");
+        }
+        if (slice.pci_bdf.empty() || slice.chrdev_path.empty() ||
+            slice.block_path.empty() || slice.backing_mount_path.empty() ||
+            slice.view_path.empty()) {
+            return error(StatusCode::INVALID_ARGUMENT,
+                         "NVMe allocation slice is missing required path metadata");
+        }
+        if (slice.namespace_id == 0) {
+            return error(StatusCode::INVALID_ARGUMENT,
+                         "NVMe allocation slice has invalid namespace_id");
+        }
+        if (slice.logical_block_size == 0) {
+            return error(StatusCode::INVALID_ARGUMENT,
+                         "NVMe allocation slice has invalid logical block size");
+        }
+        if (slice.bar0_size == 0) {
+            return error(StatusCode::INVALID_ARGUMENT,
+                         "NVMe allocation slice has invalid BAR0 size");
+        }
+        if (slice.max_data_size == 0) {
+            return error(StatusCode::INVALID_ARGUMENT,
+                         "NVMe allocation slice has invalid max data size");
+        }
+        if (slice.granted_queues == 0) {
+            return error(StatusCode::INVALID_ARGUMENT,
+                         "NVMe allocation slice has no granted queues");
         }
         if (slice.logical_block_size != logical_block_size) {
             return error(StatusCode::INVALID_ARGUMENT,

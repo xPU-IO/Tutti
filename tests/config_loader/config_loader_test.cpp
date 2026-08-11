@@ -22,6 +22,7 @@
 #include <tutti/config/tutti_config.h>
 #include <tutti/storage_runtime.h>
 #include "tutti/resource/nvme/nvme_resource_internal.h"
+#include "tutti/tutti_runtime/tutti_runtime_internal.h"
 
 using namespace tutti::config;
 using tutti::resources::nvme::NvmeAcceleratorInfo;
@@ -51,11 +52,15 @@ struct FakeClientState {
     std::vector<NvmeAcceleratorInfo> accelerators;
     std::vector<NvmeProviderResource> resources;
     RuntimeNvmeAllocation allocation;
+    tutti::Status list_accelerators_status;
+    tutti::Status list_resources_status;
     tutti::Status acquire_status;
     int list_accelerators_calls = 0;
     int list_resources_calls = 0;
     int acquire_calls = 0;
     int release_calls = 0;
+    int resource_factory_calls = 0;
+    int runtime_factory_calls = 0;
     tutti::Status release_status;
     int runtime_shutdown_calls = 0;
     std::vector<TuttiRuntimeShutdownStage> shutdown_stages;
@@ -71,6 +76,10 @@ public:
     tutti::Result<std::vector<NvmeAcceleratorInfo>>
     list_accelerators() override {
         ++state_->list_accelerators_calls;
+        if (!state_->list_accelerators_status.ok()) {
+            return tutti::Result<std::vector<NvmeAcceleratorInfo>>::Failure(
+                state_->list_accelerators_status);
+        }
         return tutti::Result<std::vector<NvmeAcceleratorInfo>>::Success(
             state_->accelerators);
     }
@@ -78,6 +87,10 @@ public:
     tutti::Result<std::vector<NvmeProviderResource>>
     list_nvme_resources() override {
         ++state_->list_resources_calls;
+        if (!state_->list_resources_status.ok()) {
+            return tutti::Result<std::vector<NvmeProviderResource>>::Failure(
+                state_->list_resources_status);
+        }
         return tutti::Result<std::vector<NvmeProviderResource>>::Success(
             state_->resources);
     }
@@ -216,6 +229,7 @@ static LoadTuttiConfigOptions fake_options(
     };
     options.resource_factory = [state](const ResourceSpec& resource_spec,
                                        std::int32_t accel_id) {
+        ++state->resource_factory_calls;
         state->endpoint = resource_spec.provider.endpoint;
         auto nvme_resource = NvmeResourceTestingAccess::make(
             NvmeResourceSpec{
@@ -231,8 +245,9 @@ static LoadTuttiConfigOptions fake_options(
             std::move(resource));
     };
     options.runtime_factory =
-        [fail_runtime_create](tutti::RuntimeConfig,
-                              tutti::RuntimeComponents components) {
+        [state, fail_runtime_create](tutti::RuntimeConfig,
+                                     tutti::RuntimeComponents components) {
+            ++state->runtime_factory_calls;
             if (fail_runtime_create) {
                 return tutti::Result<std::unique_ptr<tutti::StorageRuntime>>::Failure(
                     tutti::Status(tutti::StatusCode::INTERNAL,
@@ -498,6 +513,37 @@ nvme:
                           "legacy-nvme-resource",
                       "loader single-slice: ResourceInfo is a copy");
             }
+            CHECK(bundle->resource_info("legacy-nvme-resource").ok() &&
+                      bundle->resource_infos().size() == 1,
+                  "loader single-slice: Resource registry is ID-addressed");
+            CHECK(TuttiRuntimeTestingAccess::resource_initialization_order(
+                      *bundle) ==
+                      std::vector<std::string>{"legacy-nvme-resource"},
+                  "loader single-slice: initialization order records ID once");
+            auto backend_manifest =
+                bundle->backend_manifest("legacy-backend");
+            CHECK(backend_manifest.ok() &&
+                      backend_manifest.value().contract ==
+                          "ext4-local-nvme" &&
+                      backend_manifest.value().resolver_id ==
+                          "legacy-resolver" &&
+                      backend_manifest.value().datapath_id ==
+                          "legacy-datapath" &&
+                      backend_manifest.value().resource_id ==
+                          "legacy-nvme-resource",
+                  "loader single-slice: manifest preserves backend IDs");
+            if (backend_manifest.ok()) {
+                backend_manifest.value().resource_id = "mutated";
+                CHECK(bundle->backend_manifest("legacy-backend")
+                              .value().resource_id ==
+                          "legacy-nvme-resource",
+                      "loader single-slice: BackendManifest is a copy");
+            }
+            const auto busy = TuttiRuntimeTestingAccess::shutdown_resource(
+                *bundle, "legacy-nvme-resource");
+            CHECK(!busy.ok() && busy.code() == tutti::StatusCode::BUSY &&
+                      state->release_calls == 0,
+                  "loader single-slice: bound Resource shutdown is BUSY");
             CHECK(bundle->shutdown().ok(), "loader single-slice: shutdown ok");
             CHECK(bundle->state() == TuttiRuntimeState::STOPPED,
                   "loader single-slice: runtime stops");
@@ -658,8 +704,12 @@ nvme:
         auto state = make_state({make_slice(1), make_slice(0)});
         auto r = load_tutti_config(path, fake_options(state));
         CHECK(!r.ok(), "loader striped wrong order: fail");
+        CHECK(r.status().message().find("order") != std::string::npos,
+              "loader wrong order: explicit diagnostic");
         CHECK(state->acquire_calls == 1, "loader wrong order: acquired");
         CHECK(state->release_calls == 1, "loader wrong order: released");
+        CHECK(state->runtime_factory_calls == 0,
+              "loader wrong order: no Runtime/DataPath assembly");
         ::unlink(path.c_str());
     }
 
@@ -675,10 +725,159 @@ nvme:
         auto state = make_state({make_slice(0, 1)});
         auto r = load_tutti_config(path, fake_options(state));
         CHECK(!r.ok(), "loader accel mismatch slice: fail");
+        CHECK(r.status().message().find("accel_id") != std::string::npos,
+              "loader accel mismatch slice: explicit diagnostic");
         CHECK(state->acquire_calls == 1,
               "loader accel mismatch slice: acquired");
         CHECK(state->release_calls == 1,
               "loader accel mismatch slice: released");
+        CHECK(state->runtime_factory_calls == 0,
+              "loader accel mismatch slice: no Runtime/DataPath assembly");
+        ::unlink(path.c_str());
+    }
+
+    {
+        auto path = write_tmp(canonical_local_yaml());
+        auto state = make_state({make_slice(0)});
+        state->allocation.allocation_id.clear();
+        auto r = load_tutti_config(path, fake_options(state));
+        CHECK(!r.ok() &&
+                  r.status().message().find("allocation_id") !=
+                      std::string::npos,
+              "loader empty allocation ID: explicit failure");
+        CHECK(state->acquire_calls == 1 && state->release_calls == 1 &&
+                  state->runtime_factory_calls == 0,
+              "loader empty allocation ID: Release once before assembly");
+        ::unlink(path.c_str());
+    }
+
+    {
+        auto path = write_tmp(canonical_local_yaml());
+        auto state = make_state({make_slice(0)});
+        auto options = fake_options(state);
+        options.resource_factory =
+            [state](const ResourceSpec&, std::int32_t) {
+                ++state->resource_factory_calls;
+                return tutti::Result<std::unique_ptr<tutti::Resource>>::Failure(
+                    tutti::Status(tutti::StatusCode::NOT_READY,
+                                  "injected ResourceFactory failure"));
+            };
+        auto r = load_tutti_config(path, std::move(options));
+        CHECK(!r.ok() && r.status().code() == tutti::StatusCode::NOT_READY,
+              "loader ResourceFactory failure is propagated");
+        CHECK(state->resource_factory_calls == 1 &&
+                  state->list_accelerators_calls == 0 &&
+                  state->list_resources_calls == 0 &&
+                  state->acquire_calls == 0 && state->release_calls == 0 &&
+                  state->runtime_factory_calls == 0,
+              "loader ResourceFactory failure has zero provider ledger");
+        ::unlink(path.c_str());
+    }
+
+    {
+        auto path = write_tmp(canonical_local_yaml());
+        auto state = make_state({make_slice(0), make_slice(1)});
+        auto r = load_tutti_config(path, fake_options(state));
+        CHECK(!r.ok() &&
+                  r.status().message().find("exactly one slice") !=
+                      std::string::npos,
+              "loader local cardinality: explicit failure");
+        CHECK(state->acquire_calls == 1 && state->release_calls == 1 &&
+                  state->runtime_factory_calls == 0,
+              "loader local cardinality: Release once before assembly");
+        ::unlink(path.c_str());
+    }
+
+    {
+        auto path = write_tmp(canonical_striped_yaml("[0, 1]", "65536"));
+        auto state = make_state({make_slice(0)});
+        auto r = load_tutti_config(path, fake_options(state));
+        CHECK(!r.ok() &&
+                  r.status().message().find("slice count") !=
+                      std::string::npos,
+              "loader striped cardinality: explicit failure");
+        CHECK(state->acquire_calls == 1 && state->release_calls == 1 &&
+                  state->runtime_factory_calls == 0,
+              "loader striped cardinality: Release once before assembly");
+        ::unlink(path.c_str());
+    }
+
+    {
+        auto path = write_tmp(canonical_local_yaml());
+        auto slice = make_slice(0);
+        slice.allowed_accel_ids = {1};
+        auto state = make_state({std::move(slice)});
+        auto r = load_tutti_config(path, fake_options(state));
+        CHECK(!r.ok() && r.status().message().find("ACL") != std::string::npos,
+              "loader slice ACL: explicit failure");
+        CHECK(state->acquire_calls == 1 && state->release_calls == 1 &&
+                  state->runtime_factory_calls == 0,
+              "loader slice ACL: Release once before assembly");
+        ::unlink(path.c_str());
+    }
+
+    {
+        auto path = write_tmp(canonical_local_yaml());
+        auto slice = make_slice(0);
+        slice.namespace_id = 0;
+        auto state = make_state({std::move(slice)});
+        auto r = load_tutti_config(path, fake_options(state));
+        CHECK(!r.ok() &&
+                  r.status().message().find("namespace_id") !=
+                      std::string::npos,
+              "loader slice namespace: explicit failure");
+        CHECK(state->acquire_calls == 1 && state->release_calls == 1 &&
+                  state->runtime_factory_calls == 0,
+              "loader slice namespace: Release once before assembly");
+        ::unlink(path.c_str());
+    }
+
+    {
+        auto path = write_tmp(canonical_striped_yaml("[0, 1]", "65536"));
+        auto second = make_slice(1);
+        second.logical_block_size = 512;
+        auto state = make_state({make_slice(0), std::move(second)});
+        auto r = load_tutti_config(path, fake_options(state));
+        CHECK(!r.ok() &&
+                  r.status().message().find("block sizes") !=
+                      std::string::npos,
+              "loader slice block size: explicit failure");
+        CHECK(state->acquire_calls == 1 && state->release_calls == 1 &&
+                  state->runtime_factory_calls == 0,
+              "loader slice block size: Release once before assembly");
+        ::unlink(path.c_str());
+    }
+
+    {
+        auto path = write_tmp(canonical_local_yaml());
+        auto slice = make_slice(0);
+        slice.chrdev_path.clear();
+        auto state = make_state({std::move(slice)});
+        auto r = load_tutti_config(path, fake_options(state));
+        CHECK(!r.ok() &&
+                  r.status().message().find("path metadata") !=
+                      std::string::npos,
+              "loader required slice metadata: explicit failure");
+        CHECK(state->acquire_calls == 1 && state->release_calls == 1 &&
+                  state->runtime_factory_calls == 0,
+              "loader required metadata: Release once before assembly");
+        ::unlink(path.c_str());
+    }
+
+    {
+        auto path = write_tmp(canonical_local_yaml());
+        auto state = make_state({make_slice(0)});
+        state->list_resources_status = tutti::Status(
+            tutti::StatusCode::NOT_FOUND,
+            "second Resource provider snapshot is missing");
+        auto r = load_tutti_config(path, fake_options(state));
+        CHECK(!r.ok() && r.status().code() == tutti::StatusCode::NOT_FOUND,
+              "loader provider snapshot failure is propagated");
+        CHECK(state->list_accelerators_calls == 1 &&
+                  state->list_resources_calls == 1 &&
+                  state->acquire_calls == 0 && state->release_calls == 0 &&
+                  state->runtime_factory_calls == 0,
+              "loader snapshot failure precedes Acquire and assembly");
         ::unlink(path.c_str());
     }
 
@@ -749,6 +948,13 @@ nvme:
               "canonical loader local: one preflight and acquire");
         if (r.ok()) {
             auto bundle = std::move(r).value();
+            auto manifest = bundle->backend_manifest("model-storage");
+            CHECK(manifest.ok() &&
+                      manifest.value().resolver_id == "file-resolver-0" &&
+                      manifest.value().datapath_id ==
+                          "local-nvme-datapath-0" &&
+                      manifest.value().resource_id == "nvme-local-0",
+                  "canonical loader local: manifest preserves canonical IDs");
             CHECK(bundle->resolver_schemes == std::vector<std::string>{"file"},
                   "canonical loader local: resolver route");
             CHECK(bundle->data_path_keys ==
@@ -798,6 +1004,24 @@ nvme:
             "      datapath: local-nvme-datapath-0\n"
             "      resource: nvme-local-0\n"
             "      config: {}\n";
+        const std::string duplicate_resource_consumer =
+            "accelerator: {profile: CUDA}\n"
+            "runtime: {accel_id: 0}\n"
+            "storage:\n"
+            "  resources:\n"
+            "    - id: nvme-local-0\n"
+            "      type: nvme\n"
+            "      provider: {type: nvme-service, endpoint: fake}\n"
+            "      allocation: {selection: explicit, device_ids: [0], queues_per_controller: 4}\n"
+            "  resolvers:\n"
+            "    - {id: resolver-0, type: local-file, scheme: file, config: {}}\n"
+            "    - {id: resolver-1, type: local-file, scheme: file2, config: {}}\n"
+            "  datapaths:\n"
+            "    - {id: datapath-0, type: local-nvme, config: {}}\n"
+            "    - {id: datapath-1, type: local-nvme, config: {}}\n"
+            "  backends:\n"
+            "    - {id: backend-0, contract: ext4-local-nvme, resolver: resolver-0, datapath: datapath-0, resource: nvme-local-0, config: {}}\n"
+            "    - {id: backend-1, contract: ext4-local-nvme, resolver: resolver-1, datapath: datapath-1, resource: nvme-local-0, config: {}}\n";
         std::string zero_backend = canonical_local_yaml();
         const std::size_t backends_position = zero_backend.find("  backends:\n");
         zero_backend.erase(backends_position);
@@ -839,19 +1063,29 @@ nvme:
                 "explicit", "[0]", "4", "nvme-local-0", "local-file", "file",
                 "ext4-local-nvme", "nvme-local-0", {}, {}, {},
                 "nvme_service: {endpoint: legacy}\n")},
+            {"duplicate Resource consumer", duplicate_resource_consumer},
         };
         for (const auto& entry : invalid_configs) {
             auto path = write_tmp(entry.second);
             auto state = make_state({make_slice(0), make_slice(1)});
             auto r = load_tutti_config(path, fake_options(state));
             CHECK(!r.ok(), ("canonical static failure rejected: " + entry.first).c_str());
-            CHECK(state->endpoint.empty() &&
+            CHECK(state->resource_factory_calls == 0 && state->endpoint.empty() &&
                   state->list_accelerators_calls == 0 &&
                   state->list_resources_calls == 0 &&
                   state->acquire_calls == 0 && state->release_calls == 0,
                   ("canonical static failure has zero RPC: " + entry.first).c_str());
             ::unlink(path.c_str());
         }
+
+        auto duplicate_consumer_path = write_tmp(duplicate_resource_consumer);
+        auto parsed_duplicate_consumer =
+            parse_tutti_config(duplicate_consumer_path);
+        CHECK(!parsed_duplicate_consumer.ok() &&
+                  parsed_duplicate_consumer.status().message().find(
+                      "independent datapaths") != std::string::npos,
+              "duplicate Resource consumer has explicit static diagnostic");
+        ::unlink(duplicate_consumer_path.c_str());
     }
 
     std::printf("\n=== Summary ===\n  passed: %d\n  failed: %d\n", g_pass, g_fail);

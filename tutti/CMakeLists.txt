@@ -424,6 +424,12 @@ if(BUILD_TESTING)
     )
     message(STATUS "Tutti: added tests/resource_contract (hardware-free Resource contract)")
 
+    add_subdirectory(
+        "${TUTTI_REPOSITORY_ROOT}/tests/runtime_resource_registry_contract"
+        "${CMAKE_CURRENT_BINARY_DIR}/tests_runtime_resource_registry_contract"
+    )
+    message(STATUS "Tutti: added Runtime Resource registry contract test")
+
     # Round 17 S1: MountManager host-side unit tests (hardware-free).
     # Tests config parsing, /proc scanning, mount/unmount lifecycle
     # with tmpfs, and force-exit flag.  No real NVMe devices needed.

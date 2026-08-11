@@ -236,6 +236,35 @@ void test_acquire_failure() {
           "Acquire failure has no allocation to release");
 }
 
+void test_provider_snapshot_failures() {
+    {
+        auto state = valid_state();
+        state->list_resources_status = Status(
+            StatusCode::NOT_FOUND,
+            "second Resource provider snapshot is missing");
+        auto resource = make_resource(state);
+        const Status status = resource->initialize();
+        CHECK(!status.ok() && status.code() == StatusCode::NOT_FOUND,
+              "missing NVMe provider snapshot is propagated");
+        CHECK(state->list_accelerators_calls == 1 &&
+                  state->list_resources_calls == 1 &&
+                  state->acquire_calls == 0 && state->release_calls == 0,
+              "snapshot failure occurs before Acquire");
+    }
+
+    {
+        auto state = valid_state();
+        state->accelerators.front().view_root.clear();
+        auto resource = make_resource(state);
+        const Status status = resource->initialize();
+        CHECK(!status.ok() &&
+                  status.message().find("view_root") != std::string::npos,
+              "accelerator snapshot requires view_root metadata");
+        CHECK(state->acquire_calls == 0 && state->release_calls == 0,
+              "invalid accelerator snapshot does not Acquire");
+    }
+}
+
 void test_invalid_allocation_releases_once() {
     {
         auto state = valid_state();
@@ -327,6 +356,7 @@ void test_destructor_fallback_and_preinit_view() {
 int main() {
     test_success_and_read_only_views();
     test_acquire_failure();
+    test_provider_snapshot_failures();
     test_invalid_allocation_releases_once();
     test_release_failures_are_not_retried();
     test_destructor_fallback_and_preinit_view();

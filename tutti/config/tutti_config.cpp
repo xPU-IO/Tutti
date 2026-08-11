@@ -7,10 +7,14 @@
 
 #include <algorithm>
 #include <cctype>
+#include <exception>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -24,6 +28,7 @@
 #include "tutti/data_paths/local_nvme/local_nvme_data_path.h"
 #include "tutti/data_paths/striped_local_nvme/striped_data_path.h"
 #include "tutti/resource/nvme/nvme_resource.h"
+#include "tutti/tutti_runtime/tutti_runtime_internal.h"
 
 namespace tutti::config {
 namespace {
@@ -34,8 +39,213 @@ using nvme_resource::NvmeDataPathSliceView;
 using nvme_resource::NvmeResolverResourceView;
 using nvme_resource::NvmeResolverSliceView;
 
+struct StorageIdTables {
+    std::unordered_map<std::string, const ResourceSpec*> resources;
+    std::unordered_map<std::string, const ResolverSpec*> resolvers;
+    std::unordered_map<std::string, const DataPathSpec*> datapaths;
+    std::unordered_map<std::string, const BackendSpec*> backends;
+};
+
+struct BackendComponents {
+    StorageTargetResolver* resolver = nullptr;
+    DataPath* datapath = nullptr;
+};
+
 Status error(StatusCode code, std::string message) {
     return Status(code, std::move(message));
+}
+
+template <typename Spec>
+Status index_specs(const std::vector<Spec>& specs, const char* group,
+                   std::unordered_map<std::string, const Spec*>& table) {
+    for (const Spec& spec : specs) {
+        if (spec.id.empty()) {
+            return error(StatusCode::INVALID_ARGUMENT,
+                         std::string("storage.") + group +
+                             " contains an empty ID");
+        }
+        if (!table.emplace(spec.id, &spec).second) {
+            return error(StatusCode::INVALID_ARGUMENT,
+                         std::string("storage.") + group +
+                             " contains duplicate ID " + spec.id);
+        }
+    }
+    return Status::Ok();
+}
+
+Status validate_requested_cardinality(const ResourceSpec& resource,
+                                      const BackendSpec& backend,
+                                      const StorageContract& contract) {
+    std::size_t requested_cardinality = 1;
+    if (resource.type == "nvme" &&
+        resource.allocation.selection == NvmeSelection::Striped) {
+        requested_cardinality = resource.allocation.device_ids.size();
+    }
+    if (requested_cardinality < contract.minimum_cardinality ||
+        requested_cardinality > contract.maximum_cardinality) {
+        return error(StatusCode::INVALID_ARGUMENT,
+                     "backend " + backend.id +
+                         " Resource request cardinality does not match contract " +
+                         backend.contract);
+    }
+    if (contract.maximum_cardinality == 1 &&
+        resource.allocation.selection == NvmeSelection::Striped) {
+        return error(StatusCode::INVALID_ARGUMENT,
+                     "local backend cannot use striped Resource selection");
+    }
+    if (contract.minimum_cardinality >= 2 &&
+        resource.allocation.selection != NvmeSelection::Striped) {
+        return error(StatusCode::INVALID_ARGUMENT,
+                     "striped backend requires striped Resource selection");
+    }
+    return Status::Ok();
+}
+
+Status build_storage_id_tables(const CanonicalStorageConfig& storage,
+                               StorageIdTables& tables) {
+    if (!storage.present && storage.resources.empty() &&
+        storage.resolvers.empty() && storage.datapaths.empty() &&
+        storage.backends.empty()) {
+        return Status::Ok();
+    }
+
+    Status status = index_specs(storage.resources, "resources",
+                                tables.resources);
+    if (!status.ok()) return status;
+    status = index_specs(storage.resolvers, "resolvers", tables.resolvers);
+    if (!status.ok()) return status;
+    status = index_specs(storage.datapaths, "datapaths", tables.datapaths);
+    if (!status.ok()) return status;
+    status = index_specs(storage.backends, "backends", tables.backends);
+    if (!status.ok()) return status;
+
+    std::unordered_set<std::string> reachable_resources;
+    std::unordered_set<std::string> reachable_resolvers;
+    std::unordered_set<std::string> reachable_datapaths;
+    std::unordered_map<std::string, std::string> resource_datapaths;
+    for (const BackendSpec& backend : storage.backends) {
+        const auto resource = tables.resources.find(backend.resource);
+        const auto resolver = tables.resolvers.find(backend.resolver);
+        const auto datapath = tables.datapaths.find(backend.datapath);
+        const StorageContract* contract =
+            find_storage_contract(backend.contract);
+        if (resource == tables.resources.end() ||
+            resolver == tables.resolvers.end() ||
+            datapath == tables.datapaths.end()) {
+            return error(StatusCode::INVALID_ARGUMENT,
+                         "backend contains a dangling storage ID reference");
+        }
+        if (contract == nullptr) {
+            return error(StatusCode::INVALID_ARGUMENT,
+                         "backend references an unknown storage contract");
+        }
+        if (resource->second->type != contract->resource_type ||
+            resolver->second->type != contract->resolver_type ||
+            datapath->second->type != contract->datapath_type) {
+            return error(StatusCode::INVALID_ARGUMENT,
+                         "backend storage types do not match its contract");
+        }
+        status = validate_requested_cardinality(
+            *resource->second, backend, *contract);
+        if (!status.ok()) return status;
+
+        const auto consumer = resource_datapaths.emplace(
+            backend.resource, backend.datapath);
+        if (!consumer.second && consumer.first->second != backend.datapath) {
+            return error(
+                StatusCode::INVALID_ARGUMENT,
+                "Resource cannot be consumed by independent DataPaths");
+        }
+        reachable_resources.emplace(backend.resource);
+        reachable_resolvers.emplace(backend.resolver);
+        reachable_datapaths.emplace(backend.datapath);
+    }
+
+    if (reachable_resources.size() != storage.resources.size() ||
+        reachable_resolvers.size() != storage.resolvers.size() ||
+        reachable_datapaths.size() != storage.datapaths.size()) {
+        return error(StatusCode::INVALID_ARGUMENT,
+                     "all storage declarations must be backend-reachable");
+    }
+    if (storage.backends.size() != 1) {
+        return error(StatusCode::INVALID_ARGUMENT,
+                     "storage must contain exactly one backend");
+    }
+    return Status::Ok();
+}
+
+void discard_resource(std::unique_ptr<Resource>& resource) noexcept {
+    if (!resource) return;
+    try {
+        (void)resource->shutdown();
+    } catch (...) {
+    }
+    resource.reset();
+}
+
+Result<std::unique_ptr<Resource>> resolve_resource_spec(
+    const ResourceSpec& spec, std::int32_t accel_id,
+    const std::function<Result<std::unique_ptr<Resource>>(
+        const ResourceSpec&, std::int32_t)>& factory) {
+    Result<std::unique_ptr<Resource>> created =
+        Result<std::unique_ptr<Resource>>::Failure(
+            error(StatusCode::INTERNAL,
+                  "ResourceFactory did not return a result"));
+    try {
+        created = factory(spec, accel_id);
+    } catch (const std::exception& exception) {
+        return Result<std::unique_ptr<Resource>>::Failure(
+            error(StatusCode::INTERNAL,
+                  std::string("ResourceFactory threw: ") + exception.what()));
+    } catch (...) {
+        return Result<std::unique_ptr<Resource>>::Failure(
+            error(StatusCode::INTERNAL, "ResourceFactory threw"));
+    }
+    if (!created.ok()) return created;
+
+    std::unique_ptr<Resource> resource = std::move(created).value();
+    if (!resource) {
+        return Result<std::unique_ptr<Resource>>::Failure(
+            error(StatusCode::INVALID_ARGUMENT,
+                  "ResourceFactory returned null"));
+    }
+    ResourceInfo info = resource->info();
+    if (info.id != spec.id || info.type != spec.type ||
+        resource->capabilities().resource_type != spec.type ||
+        info.state != ResourceState::CREATED) {
+        discard_resource(resource);
+        return Result<std::unique_ptr<Resource>>::Failure(
+            error(StatusCode::INVALID_ARGUMENT,
+                  "ResourceFactory result does not match ResourceSpec"));
+    }
+
+    Status status;
+    try {
+        status = resource->initialize();
+    } catch (const std::exception& exception) {
+        discard_resource(resource);
+        return Result<std::unique_ptr<Resource>>::Failure(
+            error(StatusCode::INTERNAL,
+                  std::string("Resource initialize threw: ") +
+                      exception.what()));
+    } catch (...) {
+        discard_resource(resource);
+        return Result<std::unique_ptr<Resource>>::Failure(
+            error(StatusCode::INTERNAL, "Resource initialize threw"));
+    }
+    if (!status.ok()) {
+        discard_resource(resource);
+        return Result<std::unique_ptr<Resource>>::Failure(std::move(status));
+    }
+    info = resource->info();
+    if (info.id != spec.id || info.type != spec.type ||
+        info.state != ResourceState::INITIALIZED) {
+        discard_resource(resource);
+        return Result<std::unique_ptr<Resource>>::Failure(
+            error(StatusCode::INVALID_ARGUMENT,
+                  "Resource initialize did not produce the expected instance"));
+    }
+    return Result<std::unique_ptr<Resource>>::Success(std::move(resource));
 }
 
 std::string upper(std::string value) {
@@ -125,12 +335,11 @@ std::uint32_t checked_u32(std::uint64_t value, const char* name) {
     return static_cast<std::uint32_t>(value);
 }
 
-void add_local_components(TuttiRuntime& tr,
-                          RuntimeComponents& components,
-                          const ParsedConfig& parsed,
-                          const EffectiveCacheConfig& eff,
-                          const NvmeResolverSliceView& resolver_slice,
-                          const NvmeDataPathSliceView& datapath_slice) {
+BackendComponents add_local_components(
+    TuttiRuntime& tr, RuntimeComponents& components,
+    const ParsedConfig& parsed, const EffectiveCacheConfig& eff,
+    const NvmeResolverSliceView& resolver_slice,
+    const NvmeDataPathSliceView& datapath_slice) {
     namespace local_dp = data_paths::local_nvme;
     namespace local_resolver = resolvers::local_file;
     namespace local_binding = tutti::binding::ext4_local_nvme;
@@ -170,14 +379,14 @@ void add_local_components(TuttiRuntime& tr,
         throw std::runtime_error("TuttiRuntime rejected resolver registration");
     }
     components.resolvers.push_back({"file", resolver_ptr});
+    return BackendComponents{resolver_ptr, dp_ptr};
 }
 
-void add_striped_components(TuttiRuntime& tr,
-                            RuntimeComponents& components,
-                            const ParsedConfig& parsed,
-                            const EffectiveCacheConfig& eff,
-                            const NvmeResolverResourceView& resolver_view,
-                            const NvmeDataPathResourceView& datapath_view) {
+BackendComponents add_striped_components(
+    TuttiRuntime& tr, RuntimeComponents& components,
+    const ParsedConfig& parsed, const EffectiveCacheConfig& eff,
+    const NvmeResolverResourceView& resolver_view,
+    const NvmeDataPathResourceView& datapath_view) {
     namespace striped_dp = data_paths::striped_local_nvme;
     namespace local_resolver = resolvers::local_file;
     namespace striped_resolver = resolvers::striped_file;
@@ -239,6 +448,7 @@ void add_striped_components(TuttiRuntime& tr,
         throw std::runtime_error("TuttiRuntime rejected resolver registration");
     }
     components.resolvers.push_back({"striped", resolver_ptr});
+    return BackendComponents{resolver_ptr, dp_ptr};
 }
 
 } // namespace
@@ -261,7 +471,14 @@ Result<std::unique_ptr<TuttiRuntime>> load_tutti_config(
     }
     const auto& parsed = parsed_result.value();
 
-    Status status = validate_profile_and_accel(parsed, options);
+    StorageIdTables id_tables;
+    Status status = build_storage_id_tables(parsed.canonical_storage,
+                                             id_tables);
+    if (!status.ok()) {
+        return Result<std::unique_ptr<TuttiRuntime>>::Failure(status);
+    }
+
+    status = validate_profile_and_accel(parsed, options);
     if (!status.ok()) {
         return Result<std::unique_ptr<TuttiRuntime>>::Failure(status);
     }
@@ -288,27 +505,57 @@ Result<std::unique_ptr<TuttiRuntime>> load_tutti_config(
     auto tr = std::make_unique<TuttiRuntime>();
     tr->set_runtime_shutdown_hook(std::move(options.runtime_shutdown_hook));
     tr->set_shutdown_observer(std::move(options.shutdown_observer));
-    const ResourceSpec& resource_spec =
-        parsed.canonical_storage.resources.front();
-    auto created_resource = options.resource_factory
-        ? options.resource_factory(resource_spec, parsed.runtime_accel_id)
-        : default_resource_factory(resource_spec, parsed.runtime_accel_id);
-    if (!created_resource.ok()) {
-        return Result<std::unique_ptr<TuttiRuntime>>::Failure(
-            created_resource.status());
+
+    std::function<Result<std::unique_ptr<Resource>>(
+        const ResourceSpec&, std::int32_t)> resource_factory =
+        options.resource_factory
+            ? std::move(options.resource_factory)
+            : std::function<Result<std::unique_ptr<Resource>>(
+                  const ResourceSpec&, std::int32_t)>(default_resource_factory);
+    for (const BackendSpec& backend : parsed.canonical_storage.backends) {
+        if (TuttiRuntimeAssemblyAccess::resource(*tr, backend.resource) !=
+            nullptr) {
+            continue;
+        }
+        const auto resource_spec = id_tables.resources.find(backend.resource);
+        if (resource_spec == id_tables.resources.end()) {
+            return Result<std::unique_ptr<TuttiRuntime>>::Failure(
+                error(StatusCode::INTERNAL,
+                      "backend Resource is missing from the ID table"));
+        }
+        auto resolved = resolve_resource_spec(
+            *resource_spec->second, parsed.runtime_accel_id, resource_factory);
+        if (!resolved.ok()) {
+            return Result<std::unique_ptr<TuttiRuntime>>::Failure(
+                resolved.status());
+        }
+        try {
+            status = TuttiRuntimeAssemblyAccess::adopt_resource(
+                *tr, backend.resource, std::move(resolved).value());
+        } catch (const std::exception& exception) {
+            return Result<std::unique_ptr<TuttiRuntime>>::Failure(
+                error(StatusCode::INTERNAL,
+                      std::string("Resource registry insertion threw: ") +
+                          exception.what()));
+        } catch (...) {
+            return Result<std::unique_ptr<TuttiRuntime>>::Failure(
+                error(StatusCode::INTERNAL,
+                      "Resource registry insertion threw"));
+        }
+        if (!status.ok()) {
+            return Result<std::unique_ptr<TuttiRuntime>>::Failure(status);
+        }
     }
 
-    std::unique_ptr<Resource> resource =
-        std::move(created_resource).value();
-    auto* nvme = dynamic_cast<nvme_resource::NvmeResource*>(resource.get());
+    const BackendSpec& backend = parsed.canonical_storage.backends.front();
+    const Resource* resource =
+        TuttiRuntimeAssemblyAccess::resource(*tr, backend.resource);
+    const auto* nvme =
+        dynamic_cast<const nvme_resource::NvmeResource*>(resource);
     if (nvme == nullptr) {
         return Result<std::unique_ptr<TuttiRuntime>>::Failure(
             error(StatusCode::INVALID_ARGUMENT,
-                  "Resource factory returned incompatible implementation"));
-    }
-    status = resource->initialize();
-    if (!status.ok()) {
-        return Result<std::unique_ptr<TuttiRuntime>>::Failure(status);
+                  "ResourceFactory returned incompatible implementation"));
     }
 
     auto resolver_view = nvme->resolver_view();
@@ -327,26 +574,51 @@ Result<std::unique_ptr<TuttiRuntime>> load_tutti_config(
             error(StatusCode::INTERNAL,
                   "NVMe resource views have inconsistent cardinality"));
     }
-    status = tr->adopt_resource(std::move(resource));
-    if (!status.ok()) {
-        return Result<std::unique_ptr<TuttiRuntime>>::Failure(status);
-    }
-
     RuntimeComponents components;
     const auto eff = resolve_cache_config(parsed, options.overrides);
+    BackendComponents backend_components;
     try {
-        if (datapath_view.value().slices.size() == 1) {
-            add_local_components(*tr, components, parsed, eff,
-                                 resolver_view.value().slices.front(),
-                                 datapath_view.value().slices.front());
+        if (backend.contract == "ext4-local-nvme") {
+            if (datapath_view.value().slices.size() != 1) {
+                return Result<std::unique_ptr<TuttiRuntime>>::Failure(
+                    error(StatusCode::INVALID_ARGUMENT,
+                          "local backend requires exactly one Resource slice"));
+            }
+            backend_components = add_local_components(
+                *tr, components, parsed, eff,
+                resolver_view.value().slices.front(),
+                datapath_view.value().slices.front());
+        } else if (backend.contract == "striped-local-nvme") {
+            const auto resource_spec = id_tables.resources.find(
+                backend.resource);
+            const std::size_t requested =
+                resource_spec->second->allocation.device_ids.size();
+            if (requested < 2 ||
+                datapath_view.value().slices.size() != requested) {
+                return Result<std::unique_ptr<TuttiRuntime>>::Failure(
+                    error(StatusCode::INVALID_ARGUMENT,
+                          "striped backend Resource slice count does not match request"));
+            }
+            backend_components = add_striped_components(
+                *tr, components, parsed, eff, resolver_view.value(),
+                datapath_view.value());
         } else {
-            add_striped_components(*tr, components, parsed, eff,
-                                   resolver_view.value(),
-                                   datapath_view.value());
+            return Result<std::unique_ptr<TuttiRuntime>>::Failure(
+                error(StatusCode::UNSUPPORTED,
+                      "backend contract factory is not implemented"));
         }
     } catch (const std::exception& e) {
         return Result<std::unique_ptr<TuttiRuntime>>::Failure(
             error(StatusCode::INVALID_ARGUMENT, e.what()));
+    }
+
+    status = TuttiRuntimeAssemblyAccess::register_backend(
+        *tr,
+        BackendManifest{backend.id, backend.contract, backend.resolver,
+                        backend.datapath, backend.resource},
+        resource, backend_components.resolver, backend_components.datapath);
+    if (!status.ok()) {
+        return Result<std::unique_ptr<TuttiRuntime>>::Failure(status);
     }
 
     auto created = options.runtime_factory

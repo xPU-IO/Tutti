@@ -2,9 +2,10 @@
 #
 # Round 20 S1 — application config loader.
 #
-# Split into two libraries:
+# Split into three libraries:
 #   tutti_config_parse — pure host (yaml-cpp only), no CUDA.
 #                         Used by unit tests.
+#   tutti_runtime      — profile-independent ownership/registry lifecycle.
 #   tutti_config       — full loader (constructs DataPaths + Runtime).
 #                         Needs tutti_local_nvme_datapath (CUDA).
 
@@ -40,12 +41,28 @@ set_target_properties(tutti_config_parse PROPERTIES
     CXX_STANDARD_REQUIRED ON
 )
 
+add_library(tutti_runtime STATIC
+    "${TUTTI_SOURCE_DIR}/tutti_runtime/tutti_runtime.cpp"
+)
+
+target_include_directories(tutti_runtime PUBLIC
+    "${TUTTI_REPOSITORY_ROOT}"
+)
+
+target_link_libraries(tutti_runtime PUBLIC
+    tutti_api
+)
+
+set_target_properties(tutti_runtime PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+)
+
 function(tutti_add_config_loader)
     tutti_enable_nvme_resource_grpc()
 
     add_library(tutti_config STATIC
         "${TUTTI_SOURCE_DIR}/config/tutti_config.cpp"
-        "${TUTTI_SOURCE_DIR}/tutti_runtime/tutti_runtime.cpp"
     )
 
     target_include_directories(tutti_config PUBLIC
@@ -55,6 +72,7 @@ function(tutti_add_config_loader)
 
     target_link_libraries(tutti_config PUBLIC
         tutti_config_parse
+        tutti_runtime
         tutti_local_nvme_datapath
         tutti_striped_local_nvme_datapath
         tutti_local_file_resolver

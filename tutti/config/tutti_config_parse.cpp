@@ -305,6 +305,7 @@ Status validate_canonical(const CanonicalStorageConfig& storage) {
     std::unordered_set<std::string> reachable_resolvers;
     std::unordered_set<std::string> reachable_datapaths;
     std::unordered_set<std::string> data_path_keys;
+    std::unordered_map<std::string, std::string> resource_datapaths;
     bool unsupported_contract = false;
 
     for (const auto& backend : storage.backends) {
@@ -333,6 +334,12 @@ Status validate_canonical(const CanonicalStorageConfig& storage) {
             resource_it->second->type != contract->resource_type) {
             return invalid("backend " + backend.id +
                            " types do not match contract " + backend.contract);
+        }
+        const auto consumer = resource_datapaths.emplace(
+            backend.resource, backend.datapath);
+        if (!consumer.second && consumer.first->second != backend.datapath) {
+            return invalid("resource " + backend.resource +
+                           " cannot be consumed by independent datapaths");
         }
         if (!data_path_keys.emplace(contract->data_path_key).second) {
             return invalid("duplicate contract DataPath key " +

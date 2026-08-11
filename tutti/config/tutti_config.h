@@ -23,6 +23,7 @@
 #include <string>
 #include <vector>
 
+#include <tutti/config/storage_config.h>
 #include <tutti/status.h>
 #include <tutti/tutti_runtime.h>
 
