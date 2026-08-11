@@ -1,10 +1,13 @@
 #include <tutti/config/tutti_config.h>
+#include <tutti/bindings/ext4_local_nvme/binding.h>
+#include <tutti/bindings/striped_local_nvme/binding.h>
 #include <tutti/cuda_like.h>
 #include <tutti/io_types.h>
 #include <tutti/memory_types.h>
 #include <tutti/storage_runtime.h>
 
 #include "nvmeservice_client.h"
+#include "tutti/data_paths/striped_local_nvme/striped_data_path.h"
 #include "tutti/resource/nvme/nvme_resource_internal.h"
 #include "tutti/tutti_runtime/tutti_runtime_internal.h"
 
@@ -53,10 +56,13 @@ using tutti::StorageRuntime;
 using tutti::TargetHandle;
 using tutti::config::TuttiRuntime;
 using tutti::config::TuttiRuntimeTestingAccess;
+using tutti::data_paths::striped_local_nvme::DeviceDescriptor;
+using tutti::data_paths::striped_local_nvme::StripedDataPath;
 using tutti::resources::nvme::NvmeResource;
 using tutti::resources::nvme::NvmeResourceInspection;
 using tutti::resources::nvme::NvmeResourceTestingAccess;
 using tutti::resources::nvme::RuntimeNvmeSlice;
+using nvmeservice::ClientAcceleratorInfo;
 using nvmeservice::ClientNvmeResource;
 using nvmeservice::NvmeServiceClient;
 
@@ -155,7 +161,7 @@ auto call_preserving_device(const std::string& api, std::int32_t caller_device,
 class TempConfigDirectory {
 public:
     bool create() {
-        char path[] = "/tmp/tutti_phase5_XXXXXX";
+        char path[] = "/tmp/tutti_phase7_XXXXXX";
         char* created = ::mkdtemp(path);
         if (created == nullptr) return false;
         path_ = created;
@@ -232,6 +238,15 @@ private:
 };
 
 using ResourceMap = std::map<std::int32_t, ClientNvmeResource>;
+using AcceleratorMap = std::map<std::int32_t, ClientAcceleratorInfo>;
+
+AcceleratorMap snapshot_accelerators(NvmeServiceClient& client) {
+    AcceleratorMap result;
+    for (auto& accelerator : client.list_accelerators()) {
+        result.emplace(accelerator.accel_id, std::move(accelerator));
+    }
+    return result;
+}
 
 ResourceMap snapshot_resources(NvmeServiceClient& client) {
     ResourceMap result;
@@ -241,14 +256,41 @@ ResourceMap snapshot_resources(NvmeServiceClient& client) {
     return result;
 }
 
+std::string join_ids(const std::vector<std::int32_t>& ids) {
+    std::ostringstream output;
+    for (std::size_t index = 0; index < ids.size(); ++index) {
+        if (index != 0) output << ',';
+        output << ids[index];
+    }
+    return output.str();
+}
+
 void print_snapshot(const char* label, const ResourceMap& resources) {
-    std::printf("LEDGER %s\n", label);
+    std::printf("NVME_SNAPSHOT %s\n", label);
     for (const auto& row : resources) {
         const auto& resource = row.second;
-        std::printf("  device=%d reserved=%u available=%u available_flag=%s\n",
-                    resource.device_id, resource.reserved_queues,
-                    resource.available_queues,
-                    resource.available ? "true" : "false");
+        std::printf(
+            "  device=%d pci=%s chrdev=%s block=%s backing=%s ns=%u lba=%u "
+            "bar0=%llu mdts=%llu capacity_queues=%u reserved=%u available=%u "
+            "allowed_accels=%s available_flag=%s\n",
+            resource.device_id, resource.pci_bdf.c_str(),
+            resource.chrdev_path.c_str(), resource.block_path.c_str(),
+            resource.backing_mount_path.c_str(), resource.namespace_id,
+            resource.logical_block_size,
+            static_cast<unsigned long long>(resource.bar0_size),
+            static_cast<unsigned long long>(resource.max_data_size),
+            resource.controller_queue_capacity, resource.reserved_queues,
+            resource.available_queues,
+            join_ids(resource.allowed_accel_ids).c_str(),
+            resource.available ? "true" : "false");
+    }
+}
+
+void print_accelerator_snapshot(const AcceleratorMap& accelerators) {
+    std::printf("ACCELERATOR_SNAPSHOT baseline\n");
+    for (const auto& row : accelerators) {
+        std::printf("  accel=%d view_root=%s\n", row.second.accel_id,
+                    row.second.view_root.c_str());
     }
 }
 
@@ -273,6 +315,63 @@ bool wait_for_baseline(NvmeServiceClient& client, const ResourceMap& baseline,
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     return false;
+}
+
+bool check_scenario_baseline(NvmeServiceClient& client,
+                             const ResourceMap& baseline,
+                             const std::string& label) {
+    const ResourceMap observed = snapshot_resources(client);
+    print_snapshot((label + " baseline").c_str(), observed);
+    const bool clean = same_ledger(baseline, observed);
+    check(clean, label + ": daemon ledger starts at exact baseline");
+    return clean;
+}
+
+bool static_config_is_logical(
+    const std::string& path, const Options& options,
+    std::int32_t accel_id, tutti::config::NvmeSelection selection,
+    const std::vector<std::int32_t>& device_ids,
+    const ResourceMap& daemon_snapshot, const std::string& label) {
+    const auto parsed = tutti::config::parse_tutti_config(path);
+    bool ok = parsed.ok();
+    if (parsed.ok()) {
+        const auto& config = parsed.value();
+        const auto& storage = config.canonical_storage;
+        ok = ok && config.runtime_accel_id == accel_id && storage.present &&
+             storage.resources.size() == 1 && storage.resolvers.size() == 1 &&
+             storage.datapaths.size() == 1 && storage.backends.size() == 1;
+        if (!storage.resources.empty()) {
+            const auto& resource = storage.resources.front();
+            ok = ok && resource.provider.endpoint == options.endpoint &&
+                 resource.allocation.selection == selection &&
+                 resource.allocation.device_ids == device_ids &&
+                 resource.allocation.queues_per_controller == options.queues;
+        }
+    }
+
+    std::ifstream input(path);
+    const bool opened = input.is_open();
+    const std::string yaml((std::istreambuf_iterator<char>(input)),
+                           std::istreambuf_iterator<char>());
+    const std::vector<std::string> forbidden_fields = {
+        "pci_bdf:", "pci_addr:", "chrdev_path:", "block_path:",
+        "backing_mount_path:", "view_path:", "mount_path:",
+        "allocation_id:", "lease:", "granted_queues:",
+        "allowed_accel_ids:"};
+    ok = ok && opened && !input.bad();
+    for (const std::string& field : forbidden_fields) {
+        ok = ok && yaml.find(field) == std::string::npos;
+    }
+    for (const auto& row : daemon_snapshot) {
+        const auto& resource = row.second;
+        for (const std::string* fact : {
+                 &resource.pci_bdf, &resource.chrdev_path,
+                 &resource.block_path, &resource.backing_mount_path}) {
+            ok = ok && (fact->empty() || yaml.find(*fact) == std::string::npos);
+        }
+    }
+    check(ok, label + ": canonical static config contains only logical facts");
+    return ok;
 }
 
 bool check_acquired_ledger(const ResourceMap& baseline,
@@ -307,6 +406,12 @@ bool paths_share_filesystem(const std::string& lhs, const std::string& rhs) {
            lhs_stat.st_dev == rhs_stat.st_dev;
 }
 
+bool path_is_within(const std::string& path, const std::string& root) {
+    if (path == root) return true;
+    return !root.empty() && path.size() > root.size() &&
+           path.compare(0, root.size(), root) == 0 && path[root.size()] == '/';
+}
+
 NvmeResourceInspection inspect_nvme_resource(const TuttiRuntime& bundle) {
     const auto* resource = dynamic_cast<const NvmeResource*>(
         TuttiRuntimeTestingAccess::resource(bundle));
@@ -315,20 +420,30 @@ NvmeResourceInspection inspect_nvme_resource(const TuttiRuntime& bundle) {
 }
 
 bool validate_metadata(const TuttiRuntime& bundle,
+                       const AcceleratorMap& accelerators,
                        const ResourceMap& baseline,
                        std::int32_t accel_id,
                        const std::vector<std::int32_t>& selected,
                        std::uint32_t queues) {
     const auto inspection = inspect_nvme_resource(bundle);
-    bool ok = !inspection.allocation.allocation_id.empty() &&
+    bool ok = inspection.lease_state ==
+                  tutti::resources::nvme::NvmeLeaseState::ACQUIRED &&
+              !inspection.allocation.allocation_id.empty() &&
               inspection.allocation.slices.size() == selected.size();
     const auto resource_info = bundle.resource_info("nvme-resource");
     const auto manifests = bundle.backend_manifests();
     ok = ok && resource_info.ok() &&
+         resource_info.value().id == "nvme-resource" &&
+         resource_info.value().type == "nvme" &&
          resource_info.value().state == tutti::ResourceState::INITIALIZED &&
          manifests.size() == 1 &&
+         manifests.front().id == "storage-backend" &&
+         manifests.front().resolver_id == "storage-resolver" &&
+         manifests.front().datapath_id == "storage-datapath" &&
          manifests.front().resource_id == "nvme-resource" &&
          bundle.storage_runtime() != nullptr;
+    const auto accelerator_it = accelerators.find(accel_id);
+    ok = ok && accelerator_it != accelerators.end();
     for (std::size_t i = 0; i < inspection.allocation.slices.size(); ++i) {
         const RuntimeNvmeSlice& slice = inspection.allocation.slices[i];
         const auto resource_it = baseline.find(slice.device_id);
@@ -348,9 +463,14 @@ bool validate_metadata(const TuttiRuntime& bundle,
         ok = ok && slice.bar0_size == resource.bar0_size;
         ok = ok && slice.max_data_size == resource.max_data_size;
         ok = ok && slice.granted_queues == queues;
+        ok = ok && slice.allowed_accel_ids == resource.allowed_accel_ids;
         ok = ok && !slice.view_path.empty() &&
              paths_share_filesystem(slice.view_path,
                                     slice.backing_mount_path);
+        if (accelerator_it != accelerators.end()) {
+            ok = ok && path_is_within(slice.view_path,
+                                      accelerator_it->second.view_root);
+        }
         std::printf(
             "SLICE allocation=%s device=%d accel=%d pci=%s chrdev=%s block=%s "
             "backing=%s view=%s ns=%u lba=%u bar0=%llu mdts=%llu grant=%u\n",
@@ -551,46 +671,67 @@ bool shutdown_and_check_ledger(std::unique_ptr<TuttiRuntime>& bundle,
                                NvmeServiceClient& observer,
                                const ResourceMap& baseline,
                                const std::string& label) {
-    Status status = call_preserving_device(
-        label + "/shutdown", caller_device,
+    Status first = call_preserving_device(
+        label + "/shutdown-1", caller_device,
         [&] { return bundle->shutdown(); });
-    check(status.ok(), label + ": bundle shutdown succeeds");
+    check(first.ok(), label + ": first bundle shutdown succeeds");
+    Status second = call_preserving_device(
+        label + "/shutdown-2", caller_device,
+        [&] { return bundle->shutdown(); });
+    check(second.ok(), label + ": second bundle shutdown is idempotent");
     bundle.reset();
     ResourceMap released;
     const bool restored = wait_for_baseline(observer, baseline, released);
     print_snapshot((label + " released").c_str(), released);
     check(restored, label + ": Release restores exact ledger baseline");
-    return status.ok() && restored;
+    return first.ok() && second.ok() && restored;
 }
 
 bool run_local_scenario(const Options& options, const std::string& config_path,
                         std::int32_t accel_id, std::int32_t caller_device,
                         std::int32_t device_id, NvmeServiceClient& observer,
+                        const AcceleratorMap& accelerators,
                         const ResourceMap& baseline, const std::string& label) {
     std::printf("\n=== %s accel=%d device=%d caller=%d ===\n",
                 label.c_str(), accel_id, device_id, caller_device);
     (void)cudaSetDevice(caller_device);
+    bool ok = check_scenario_baseline(observer, baseline, label);
+    ok = static_config_is_logical(
+             config_path, options, accel_id,
+             tutti::config::NvmeSelection::Explicit, {device_id}, baseline,
+             label) && ok;
     auto bundle = load_bundle(config_path, caller_device, label);
     if (!bundle) return false;
-    bool ok = validate_metadata(*bundle, baseline, accel_id, {device_id},
-                                static_cast<std::uint32_t>(options.queues));
+    ok = validate_metadata(*bundle, accelerators, baseline, accel_id,
+                           {device_id},
+                           static_cast<std::uint32_t>(options.queues)) && ok;
     const auto manifest = bundle->backend_manifest("storage-backend");
-    ok = manifest.ok() &&
-         manifest.value().contract == "ext4-local-nvme" && ok;
-    check(ok, label + ": loader publishes one Local top-level binding");
+    const bool manifest_ok = manifest.ok() &&
+        manifest.value().contract == "ext4-local-nvme";
+    check(manifest_ok,
+          label + ": loader publishes one Local top-level binding");
+    ok = manifest_ok && ok;
     const ResourceMap acquired = snapshot_resources(observer);
     print_snapshot((label + " acquired").c_str(), acquired);
     ok = check_acquired_ledger(baseline, acquired, {device_id}, options.queues) && ok;
 
-    const RuntimeNvmeSlice slice =
-        inspect_nvme_resource(*bundle).allocation.slices.front();
-    const std::string scratch = slice.view_path + "/tutti_phase5_" +
+    const auto slices = inspect_nvme_resource(*bundle).allocation.slices;
+    if (slices.empty()) {
+        (void)shutdown_and_check_ledger(bundle, caller_device, observer,
+                                        baseline, label);
+        return false;
+    }
+    const RuntimeNvmeSlice slice = slices.front();
+    const std::string scratch = slice.view_path + "/tutti_phase7_" +
         std::to_string(::getpid()) + "_" + label + ".bin";
     std::printf("SCRATCH scenario=%s path=%s\n",
                 label.c_str(), scratch.c_str());
     const std::uint64_t io_size = 4 * kStripeUnit;
-    ok = create_direct_file(scratch, io_size, slice.logical_block_size) && ok;
-    check(ok, label + ": scratch file created from allocation view_path");
+    const bool scratch_created = create_direct_file(
+        scratch, io_size, slice.logical_block_size);
+    check(scratch_created,
+          label + ": scratch file created from allocation view_path");
+    ok = scratch_created && ok;
 
     auto opened = call_preserving_device(
         label + "/open", caller_device,
@@ -604,8 +745,10 @@ bool run_local_scenario(const Options& options, const std::string& config_path,
         return false;
     }
 
+    bool io_ok = true;
     GpuBuffer buffer;
-    ok = allocate_gpu_buffer(accel_id, caller_device, io_size, buffer) && ok;
+    io_ok = allocate_gpu_buffer(
+        accel_id, caller_device, io_size, buffer) && io_ok;
     auto registered = call_preserving_device(
         label + "/register", caller_device,
         [&] {
@@ -627,20 +770,24 @@ bool run_local_scenario(const Options& options, const std::string& config_path,
 
     const unsigned char pattern = static_cast<unsigned char>(
         0x30 + accel_id * 4 + (device_id & 3));
-    ok = fill_value(buffer, accel_id, caller_device, 0, io_size, pattern) && ok;
+    io_ok = fill_value(
+        buffer, accel_id, caller_device, 0, io_size, pattern) && io_ok;
     const HostSubmitContext context{
         ExecutionDomain::DEVICE_EXECUTION, accel_id, buffer.stream};
     IoRequest write{IoDirection::WRITE, registered.value(), 0,
                     opened.value(), 0, io_size};
-    ok = submit_and_wait(*bundle->storage_runtime(), &write, 1, context,
-                         caller_device, label + "/write") && ok;
-    ok = fill_value(buffer, accel_id, caller_device, 0, io_size, 0xff) && ok;
+    io_ok = submit_and_wait(*bundle->storage_runtime(), &write, 1, context,
+                            caller_device, label + "/write") && io_ok;
+    io_ok = fill_value(
+        buffer, accel_id, caller_device, 0, io_size, 0xff) && io_ok;
     IoRequest read{IoDirection::READ, registered.value(), 0,
                    opened.value(), 0, io_size};
-    ok = submit_and_wait(*bundle->storage_runtime(), &read, 1, context,
-                         caller_device, label + "/read") && ok;
-    ok = verify_value(buffer, accel_id, caller_device, 0, io_size, pattern) && ok;
-    check(ok, label + ": Local write/read is byte-exact");
+    io_ok = submit_and_wait(*bundle->storage_runtime(), &read, 1, context,
+                            caller_device, label + "/read") && io_ok;
+    io_ok = verify_value(
+        buffer, accel_id, caller_device, 0, io_size, pattern) && io_ok;
+    check(io_ok, label + ": Local write/read is byte-exact");
+    ok = io_ok && ok;
 
     ok = cleanup_runtime_objects(*bundle, opened.value(), registered.value(),
                                  caller_device, label) && ok;
@@ -745,22 +892,88 @@ bool run_striped_io(StorageRuntime& runtime, TargetHandle target,
     return ok;
 }
 
+bool validate_striped_component_order(
+    TuttiRuntime& bundle, const std::string& uri,
+    const std::vector<RuntimeNvmeSlice>& allocation_slices,
+    const std::string& label) {
+    auto* resolver = TuttiRuntimeTestingAccess::backend_resolver(
+        bundle, "storage-backend");
+    const auto* datapath = dynamic_cast<const StripedDataPath*>(
+        TuttiRuntimeTestingAccess::backend_datapath(
+            bundle, "storage-backend"));
+    bool ok = resolver != nullptr && datapath != nullptr;
+    if (!ok) {
+        check(false, label + ": striped backend components are inspectable");
+        return false;
+    }
+
+    tutti::ResolveOptions options;
+    options.scheme = "striped";
+    auto resolved = resolver->resolve(uri, options);
+    ok = resolved.ok();
+    if (!resolved.ok()) {
+        check(false, label + ": resolver shard order is inspectable");
+        return false;
+    }
+    const auto payload =
+        tutti::binding::striped_local_nvme::view_payload(resolved.value());
+    ok = ok && payload.ok();
+    const auto& descriptors = datapath->test_device_descriptors();
+    if (payload.ok()) {
+        const auto* striped = payload.value();
+        ok = ok && striped->shards().size() == descriptors.size() &&
+             descriptors.size() == allocation_slices.size();
+        const std::size_t count = std::min(
+            striped->shards().size(),
+            std::min(descriptors.size(), allocation_slices.size()));
+        for (std::size_t index = 0; index < count; ++index) {
+            const auto shard =
+                tutti::binding::ext4_local_nvme::view_payload(
+                    striped->shards()[index]);
+            ok = ok && shard.ok();
+            if (!shard.ok()) continue;
+            const auto& identity = shard.value()->namespace_identity();
+            const DeviceDescriptor& descriptor = descriptors[index];
+            const RuntimeNvmeSlice& slice = allocation_slices[index];
+            ok = ok && identity.controller_pci_addr ==
+                           descriptor.controller_pci_addr &&
+                 identity.namespace_id == descriptor.namespace_id &&
+                 identity.block_size == descriptor.block_size &&
+                 descriptor.controller_pci_addr == slice.pci_bdf &&
+                 descriptor.snvme_dev_path == slice.chrdev_path &&
+                 descriptor.namespace_id == slice.namespace_id &&
+                 descriptor.block_size == slice.logical_block_size;
+        }
+    }
+    check(ok, label +
+                  ": resolver shard order equals DataPath descriptor order");
+    return ok;
+}
+
 bool run_striped_bundle_phase(
     const Options& options, const std::string& config_path,
     std::int32_t accel_id, std::int32_t caller_device,
     const std::vector<std::int32_t>& devices, NvmeServiceClient& observer,
+    const AcceleratorMap& accelerators,
     const ResourceMap& baseline, const std::string& name,
     const std::string& label, bool write_phase,
     std::vector<std::string>& scratch_paths) {
     (void)cudaSetDevice(caller_device);
+    bool ok = check_scenario_baseline(observer, baseline, label);
+    ok = static_config_is_logical(
+             config_path, options, accel_id,
+             tutti::config::NvmeSelection::Striped, devices, baseline,
+             label) && ok;
     auto bundle = load_bundle(config_path, caller_device, label);
     if (!bundle) return false;
-    bool ok = validate_metadata(*bundle, baseline, accel_id, devices,
-                                static_cast<std::uint32_t>(options.queues));
+    ok = validate_metadata(*bundle, accelerators, baseline, accel_id, devices,
+                           static_cast<std::uint32_t>(options.queues)) && ok;
     const auto manifest = bundle->backend_manifest("storage-backend");
-    ok = manifest.ok() &&
-         manifest.value().contract == "striped-local-nvme" && ok;
-    check(ok, label + ": loader publishes one Striped top-level binding");
+    const bool manifest_ok = manifest.ok() &&
+        manifest.value().contract == "striped-local-nvme";
+    check(manifest_ok,
+          label + ": loader publishes one Striped top-level binding");
+    ok = manifest_ok && ok;
     const ResourceMap acquired = snapshot_resources(observer);
     print_snapshot((label + " acquired").c_str(), acquired);
     ok = check_acquired_ledger(baseline, acquired, devices, options.queues) && ok;
@@ -786,6 +999,9 @@ bool run_striped_bundle_phase(
 
     const std::string uri = striped_uri(
         name, inspect_nvme_resource(*bundle).allocation.slices);
+    ok = validate_striped_component_order(
+             *bundle, uri,
+             inspect_nvme_resource(*bundle).allocation.slices, label) && ok;
     auto opened = call_preserving_device(
         label + "/open", caller_device,
         [&] { return bundle->storage_runtime()->open(
@@ -833,17 +1049,20 @@ bool run_striped_scenario(
     const Options& options, const std::string& config_path,
     std::int32_t accel_id, std::int32_t caller_device,
     const std::vector<std::int32_t>& devices, NvmeServiceClient& observer,
+    const AcceleratorMap& accelerators,
     const ResourceMap& baseline, const std::string& label) {
     std::printf("\n=== %s accel=%d devices=%d,%d caller=%d ===\n",
                 label.c_str(), accel_id, devices[0], devices[1], caller_device);
-    const std::string name = "tutti_phase5_" + std::to_string(::getpid()) +
+    const std::string name = "tutti_phase7_" + std::to_string(::getpid()) +
                              "_" + label;
     std::vector<std::string> scratch_paths;
     bool ok = run_striped_bundle_phase(
         options, config_path, accel_id, caller_device, devices, observer,
+        accelerators,
         baseline, name, label + "-write", true, scratch_paths);
     ok = run_striped_bundle_phase(
         options, config_path, accel_id, caller_device, devices, observer,
+        accelerators,
         baseline, name, label + "-restart-read", false, scratch_paths) && ok;
     for (const std::string& path : scratch_paths) {
         check(::unlink(path.c_str()) == 0, label + ": striped scratch removed");
@@ -870,11 +1089,14 @@ int main(int argc, char** argv) {
     }
 
     NvmeServiceClient observer(options.endpoint);
-    const auto accelerators = observer.list_accelerators();
+    const AcceleratorMap accelerators = snapshot_accelerators(observer);
     const ResourceMap baseline = snapshot_resources(observer);
     const std::size_t required_accelerators =
         options.single_accelerator ? 1 : 2;
     if (accelerators.size() < required_accelerators ||
+        accelerators.count(options.accel0) == 0 ||
+        (!options.single_accelerator &&
+         accelerators.count(options.accel1) == 0) ||
         baseline.count(options.device0) == 0 ||
         baseline.count(options.device1) == 0 ||
         !baseline.at(options.device0).available ||
@@ -882,6 +1104,23 @@ int main(int argc, char** argv) {
         std::printf("SKIP: live daemon with two available NVMe resources required\n");
         return kSkip;
     }
+    const std::vector<std::int32_t> requested_accelerators =
+        options.single_accelerator
+        ? std::vector<std::int32_t>{options.accel0}
+        : std::vector<std::int32_t>{options.accel0, options.accel1};
+    for (std::int32_t device_id : {options.device0, options.device1}) {
+        for (std::int32_t accel_id : requested_accelerators) {
+            const auto& allowed = baseline.at(device_id).allowed_accel_ids;
+            if (std::find(allowed.begin(), allowed.end(), accel_id) ==
+                allowed.end()) {
+                std::printf(
+                    "SKIP: device %d ACL does not allow accelerator %d\n",
+                    device_id, accel_id);
+                return kSkip;
+            }
+        }
+    }
+    print_accelerator_snapshot(accelerators);
     print_snapshot("baseline", baseline);
     if (baseline.at(options.device0).logical_block_size !=
         baseline.at(options.device1).logical_block_size) {
@@ -903,18 +1142,23 @@ int main(int argc, char** argv) {
         : std::vector<std::pair<std::int32_t, std::int32_t>>{
               {options.accel0, options.accel1},
               {options.accel1, options.accel0}};
-    int scenario = 1;
-    for (const auto& accel : accelerators_to_run) {
+    for (std::size_t accel_index = 0;
+         accel_index < accelerators_to_run.size(); ++accel_index) {
+        const auto& accel = accelerators_to_run[accel_index];
+        const char prefix = accel_index == 0 ? 'A' : 'B';
+        int scenario = 0;
         for (std::int32_t device_id : {options.device0, options.device1}) {
-            const std::string label = "A" + std::to_string(scenario++);
+            const std::string label = std::string(1, prefix) +
+                                      std::to_string(scenario++);
             const std::string config = configs.write(
                 label, options, accel.first, "explicit", {device_id});
             check(!config.empty(), label + ": temporary canonical config written");
             ok = !config.empty() && run_local_scenario(
                 options, config, accel.first, accel.second, device_id,
-                observer, baseline, label) && ok;
+                observer, accelerators, baseline, label) && ok;
         }
-        const std::string label = "A" + std::to_string(scenario++);
+        const std::string label = std::string(1, prefix) +
+                                  std::to_string(scenario);
         const std::vector<std::int32_t> devices = {
             options.device0, options.device1};
         const std::string config = configs.write(
@@ -922,7 +1166,7 @@ int main(int argc, char** argv) {
         check(!config.empty(), label + ": temporary canonical config written");
         ok = !config.empty() && run_striped_scenario(
             options, config, accel.first, accel.second, devices,
-            observer, baseline, label) && ok;
+            observer, accelerators, baseline, label) && ok;
     }
 
     ResourceMap final_snapshot;
@@ -930,7 +1174,7 @@ int main(int argc, char** argv) {
     print_snapshot("final", final_snapshot);
     check(final_clean, "final daemon ledger equals test baseline");
 
-    std::printf("\nphase5 checks=%d failures=%d result=%s\n",
+    std::printf("\nphase7 checks=%d failures=%d result=%s\n",
                 g_checks, g_failures, ok && g_failures == 0 ? "PASS" : "FAIL");
     return ok && g_failures == 0 ? 0 : 1;
 }

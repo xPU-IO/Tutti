@@ -155,6 +155,9 @@ public:
     std::uint32_t test_num_devices() const {
         return static_cast<std::uint32_t>(devices_.size());
     }
+    const std::vector<DeviceDescriptor>& test_device_descriptors() const {
+        return device_descs_;
+    }
     std::uint64_t test_effective_mdts() const { return effective_mdts_bytes_; }
     std::uint64_t test_submit_call_count() const { return test_submit_call_count_; }
     std::uint64_t test_kernel_launch_count() const { return test_kernel_launch_count_; }

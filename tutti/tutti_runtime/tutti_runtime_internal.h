@@ -68,6 +68,20 @@ public:
         return runtime.find_resource_(id);
     }
 
+    static StorageTargetResolver* backend_resolver(
+        TuttiRuntime& runtime, std::string_view id) noexcept {
+        const auto found = runtime.backends_.find(std::string(id));
+        return found == runtime.backends_.end()
+            ? nullptr : found->second.resolver;
+    }
+
+    static const DataPath* backend_datapath(
+        const TuttiRuntime& runtime, std::string_view id) noexcept {
+        const auto found = runtime.backends_.find(std::string(id));
+        return found == runtime.backends_.end()
+            ? nullptr : found->second.datapath;
+    }
+
     static const std::vector<std::string>& resource_initialization_order(
         const TuttiRuntime& runtime) noexcept {
         return runtime.resource_initialization_order_;
