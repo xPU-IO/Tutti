@@ -24,8 +24,7 @@
 #include <vector>
 
 #include <tutti/status.h>
-
-#include "tutti/config/storage_config.h"
+#include <tutti/tutti_runtime.h>
 
 namespace tutti {
 
@@ -43,57 +42,6 @@ struct RuntimeConfig;
 #endif
 
 namespace config {
-
-struct RuntimeAcceleratorInfo {
-    std::int32_t accel_id = -1;
-    std::string view_root;
-};
-
-struct RuntimeNvmeResource {
-    std::int32_t device_id = -1;
-    std::vector<std::int32_t> allowed_accel_ids;
-    bool available = false;
-};
-
-struct RuntimeNvmeSlice {
-    std::int32_t device_id = -1;
-    std::int32_t accel_id = -1;
-    std::string pci_bdf;
-    std::string chrdev_path;
-    std::string block_path;
-    std::string backing_mount_path;
-    std::string view_path;
-    std::uint32_t namespace_id = 0;
-    std::uint32_t logical_block_size = 0;
-    std::uint64_t bar0_size = 0;
-    std::uint64_t max_data_size = 0;
-    std::uint32_t granted_queues = 0;
-    std::vector<std::int32_t> allowed_accel_ids;
-};
-
-struct RuntimeNvmeAllocation {
-    std::string allocation_id;
-    std::vector<RuntimeNvmeSlice> slices;
-};
-
-class RuntimeResourceClient {
-public:
-    virtual ~RuntimeResourceClient() = default;
-
-    virtual Result<std::vector<RuntimeAcceleratorInfo>>
-    list_accelerators() = 0;
-
-    virtual Result<std::vector<RuntimeNvmeResource>>
-    list_nvme_resources() = 0;
-
-    virtual Result<RuntimeNvmeAllocation> acquire_nvme_slices(
-        std::int32_t accel_id,
-        NvmeSelection selection,
-        const std::vector<std::int32_t>& device_ids,
-        std::int32_t queues_per_controller) = 0;
-
-    virtual Status release(const std::string& allocation_id) = 0;
-};
 
 //   programmatic overrides for cache capacities that take precedence over the
 //   config file. Pass 0 to defer to the config file (then env, then default).
@@ -113,27 +61,11 @@ struct LoadTuttiConfigOptions {
         RuntimeConfig, RuntimeComponents)> runtime_factory;
     std::function<std::unique_ptr<RuntimeResourceClient>(
         const std::string& endpoint)> resource_client_factory;
-};
 
-// Owned runtime bundle — the caller must keep this alive while using
-// the StorageRuntime.  Destroying it shuts down the runtime and frees
-// all owned DataPaths/Resolvers.
-struct TuttiRuntime {
-    std::unique_ptr<StorageRuntime> runtime;
-    std::vector<std::unique_ptr<DataPath>> datapaths;
-    std::vector<std::unique_ptr<StorageTargetResolver>> resolvers;
-    std::unique_ptr<RuntimeResourceClient> resource_client;
-    std::string allocation_id;
-    std::vector<RuntimeNvmeSlice> allocation_slices;
-    std::vector<std::string> resolver_schemes;
-    std::vector<std::string> data_path_keys;
-
-    ~TuttiRuntime();
-    Status shutdown();
-
-private:
-    bool shutdown_complete_ = false;
-    bool allocation_released_ = false;
+    // Optional lifecycle seams used by contract tests. Production callers
+    // leave these empty and TuttiRuntime invokes StorageRuntime::shutdown().
+    std::function<Status(StorageRuntime&)> runtime_shutdown_hook;
+    std::function<void(TuttiRuntimeShutdownStage)> shutdown_observer;
 };
 
 // Legacy parse-only device map entry. The phase-4 product loader no longer

@@ -43,6 +43,7 @@ set_target_properties(tutti_config_parse PROPERTIES
 function(tutti_add_config_loader)
     add_library(tutti_config STATIC
         "${TUTTI_SOURCE_DIR}/config/tutti_config.cpp"
+        "${TUTTI_SOURCE_DIR}/tutti_runtime/tutti_runtime.cpp"
     )
 
     target_include_directories(tutti_config PUBLIC

@@ -8,6 +8,7 @@
 //   4. valid parse of all keys
 
 #include <cassert>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -47,6 +48,9 @@ struct FakeClientState {
     int list_resources_calls = 0;
     int acquire_calls = 0;
     int release_calls = 0;
+    tutti::Status release_status;
+    int runtime_shutdown_calls = 0;
+    std::vector<TuttiRuntimeShutdownStage> shutdown_stages;
     std::string released_allocation;
     std::string endpoint;
 };
@@ -87,7 +91,7 @@ public:
     tutti::Status release(const std::string& allocation_id) override {
         ++state_->release_calls;
         state_->released_allocation = allocation_id;
-        return tutti::Status::Ok();
+        return state_->release_status;
     }
 
 private:
@@ -460,13 +464,127 @@ nvme:
                   bundle->data_path_keys[0] == "local-nvme-ext4",
                   "loader single-slice: local DataPath key");
             CHECK(state->acquire_calls == 1, "loader single-slice: acquire once");
+            CHECK(bundle->state() == TuttiRuntimeState::RUNNING,
+                  "loader single-slice: runtime starts RUNNING");
+            const auto before_shutdown = bundle->inspection();
+            CHECK(before_shutdown.allocation_id == "alloc-test" &&
+                  before_shutdown.allocation_slices.size() == 1,
+                  "loader single-slice: inspection snapshot");
+            auto detached_snapshot = before_shutdown;
+            detached_snapshot.allocation_slices.front().block_path = "mutated";
+            CHECK(bundle->inspection().allocation_slices.front().block_path !=
+                      "mutated",
+                  "loader single-slice: inspection is a copy");
             CHECK(bundle->shutdown().ok(), "loader single-slice: shutdown ok");
+            CHECK(bundle->state() == TuttiRuntimeState::STOPPED,
+                  "loader single-slice: runtime stops");
+            CHECK(bundle->shutdown().ok(),
+                  "loader single-slice: second shutdown is idempotent");
+            CHECK(bundle->inspection().allocation_released,
+                  "loader single-slice: inspection records release");
             CHECK(state->release_calls == 1 &&
                   state->released_allocation == "alloc-test",
                   "loader single-slice: release once");
             bundle.reset();
             CHECK(state->release_calls == 1,
                   "loader single-slice: destructor no double release");
+        }
+        ::unlink(path.c_str());
+    }
+
+    // 10a. Destructor fallback and reverse lifecycle observation release once.
+    {
+        std::string yaml = R"(
+accelerator: {profile: CUDA}
+runtime: {accel_id: 0}
+nvme:
+  selection: explicit
+  device_ids: [0]
+)";
+        auto path = write_tmp(yaml);
+        auto state = make_state({make_slice(0)});
+        auto options = fake_options(state);
+        options.shutdown_observer = [state](TuttiRuntimeShutdownStage stage) {
+            state->shutdown_stages.push_back(stage);
+        };
+        auto r = load_tutti_config(path, std::move(options));
+        CHECK(r.ok(), "loader destructor fallback: load ok");
+        if (r.ok()) {
+            { auto bundle = std::move(r).value(); }
+            CHECK(state->release_calls == 1,
+                  "loader destructor fallback: release once");
+            const std::vector<TuttiRuntimeShutdownStage> expected = {
+                TuttiRuntimeShutdownStage::STORAGE_RUNTIME_SHUTDOWN,
+                TuttiRuntimeShutdownStage::STORAGE_RUNTIME_DESTROYED,
+                TuttiRuntimeShutdownStage::RESOLVERS_DESTROYED,
+                TuttiRuntimeShutdownStage::DATAPATHS_DESTROYED,
+                TuttiRuntimeShutdownStage::ALLOCATION_RELEASED,
+                TuttiRuntimeShutdownStage::COMPLETE,
+            };
+            CHECK(state->shutdown_stages == expected,
+                  "loader destructor fallback: reverse lifecycle order");
+        }
+        ::unlink(path.c_str());
+    }
+
+    // 10b. A StorageRuntime shutdown error is returned first, while resource
+    // release still runs and remains idempotent.
+    {
+        std::string yaml = R"(
+accelerator: {profile: CUDA}
+runtime: {accel_id: 0}
+nvme:
+  selection: explicit
+  device_ids: [0]
+)";
+        auto path = write_tmp(yaml);
+        auto state = make_state({make_slice(0)});
+        auto options = fake_options(state);
+        options.runtime_shutdown_hook = [state](tutti::StorageRuntime&) {
+            ++state->runtime_shutdown_calls;
+            return tutti::Status(tutti::StatusCode::TIMEOUT,
+                                  "injected runtime shutdown failure");
+        };
+        auto r = load_tutti_config(path, std::move(options));
+        CHECK(r.ok(), "loader shutdown failure: load ok");
+        if (r.ok()) {
+            auto bundle = std::move(r).value();
+            const auto status = bundle->shutdown();
+            CHECK(!status.ok() && status.code() == tutti::StatusCode::TIMEOUT,
+                  "loader shutdown failure: first error propagated");
+            CHECK(state->runtime_shutdown_calls == 1 &&
+                  state->release_calls == 1,
+                  "loader shutdown failure: remaining cleanup attempted");
+            CHECK(bundle->shutdown().ok() && state->release_calls == 1,
+                  "loader shutdown failure: retry is idempotent");
+        }
+        ::unlink(path.c_str());
+    }
+
+    // 10c. A release error is returned, but the client is not called twice.
+    {
+        std::string yaml = R"(
+accelerator: {profile: CUDA}
+runtime: {accel_id: 0}
+nvme:
+  selection: explicit
+  device_ids: [0]
+)";
+        auto path = write_tmp(yaml);
+        auto state = make_state({make_slice(0)});
+        state->release_status = tutti::Status(
+            tutti::StatusCode::DEVICE_ERROR, "injected release failure");
+        auto r = load_tutti_config(path, fake_options(state));
+        CHECK(r.ok(), "loader release failure: load ok");
+        if (r.ok()) {
+            auto bundle = std::move(r).value();
+            const auto status = bundle->shutdown();
+            CHECK(!status.ok() && status.code() == tutti::StatusCode::DEVICE_ERROR,
+                  "loader release failure: status propagated");
+            CHECK(state->release_calls == 1,
+                  "loader release failure: attempted once");
+            CHECK(bundle->shutdown().ok() && state->release_calls == 1,
+                  "loader release failure: retry is idempotent");
         }
         ::unlink(path.c_str());
     }

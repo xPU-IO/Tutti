@@ -345,21 +345,25 @@ void add_local_components(TuttiRuntime& tr,
         parsed.max_batch_entries,
         0,
         eff.handle_cache_l2_capacity);
+    auto* dp_ptr = tr.register_datapath(
+        std::move(dp), std::string(local_binding::kRecommendedDataPathKey));
+    if (dp_ptr == nullptr) {
+        throw std::runtime_error("TuttiRuntime rejected DataPath registration");
+    }
     components.data_paths.push_back(
-        {std::string(local_binding::kRecommendedDataPathKey), dp.get(),
+        {std::string(local_binding::kRecommendedDataPathKey), dp_ptr,
          DataPathConfig{"local_nvme"}});
-    tr.data_path_keys.push_back(
-        std::string(local_binding::kRecommendedDataPathKey));
-    tr.datapaths.push_back(std::move(dp));
 
     auto resolver = std::make_unique<local_resolver::LocalFileResolver>(
         slice.pci_bdf,
         slice.namespace_id,
         slice.logical_block_size,
         local_resolver::BackingDeviceConfig{slice.block_path, 0});
-    components.resolvers.push_back({"file", resolver.get()});
-    tr.resolver_schemes.push_back("file");
-    tr.resolvers.push_back(std::move(resolver));
+    auto* resolver_ptr = tr.register_resolver(std::move(resolver), "file");
+    if (resolver_ptr == nullptr) {
+        throw std::runtime_error("TuttiRuntime rejected resolver registration");
+    }
+    components.resolvers.push_back({"file", resolver_ptr});
 }
 
 void add_striped_components(TuttiRuntime& tr,
@@ -407,53 +411,25 @@ void add_striped_components(TuttiRuntime& tr,
         static_cast<std::uint32_t>(parsed.max_in_flight_operations),
         eff.handle_cache_capacity,
         eff.prp_cache_capacity);
+    auto* dp_ptr = tr.register_datapath(
+        std::move(dp), std::string(striped_binding::kRecommendedDataPathKey));
+    if (dp_ptr == nullptr) {
+        throw std::runtime_error("TuttiRuntime rejected DataPath registration");
+    }
     components.data_paths.push_back(
-        {std::string(striped_binding::kRecommendedDataPathKey), dp.get(),
+        {std::string(striped_binding::kRecommendedDataPathKey), dp_ptr,
          DataPathConfig{"striped-local-nvme"}});
-    tr.data_path_keys.push_back(
-        std::string(striped_binding::kRecommendedDataPathKey));
-    tr.datapaths.push_back(std::move(dp));
 
     auto resolver = std::make_unique<striped_resolver::StripedResolver>(
         std::move(shard_resolvers), parsed.stripe_unit);
-    components.resolvers.push_back({"striped", resolver.get()});
-    tr.resolver_schemes.push_back("striped");
-    tr.resolvers.push_back(std::move(resolver));
+    auto* resolver_ptr = tr.register_resolver(std::move(resolver), "striped");
+    if (resolver_ptr == nullptr) {
+        throw std::runtime_error("TuttiRuntime rejected resolver registration");
+    }
+    components.resolvers.push_back({"striped", resolver_ptr});
 }
 
 } // namespace
-
-TuttiRuntime::~TuttiRuntime() {
-    (void)shutdown();
-}
-
-Status TuttiRuntime::shutdown() {
-    if (shutdown_complete_) return Status::Ok();
-
-    Status first_error;
-    if (runtime) {
-        Status status = runtime->shutdown(0);
-        if (!status.ok() && first_error.ok()) first_error = status;
-        runtime.reset();
-    }
-
-    resolvers.clear();
-    datapaths.clear();
-
-    if (!allocation_id.empty() && !allocation_released_) {
-        if (resource_client) {
-            Status status = resource_client->release(allocation_id);
-            if (!status.ok() && first_error.ok()) first_error = status;
-        } else if (first_error.ok()) {
-            first_error = error(StatusCode::INTERNAL,
-                                "allocation exists without resource client");
-        }
-        allocation_released_ = true;
-    }
-    resource_client.reset();
-    shutdown_complete_ = true;
-    return first_error;
-}
 
 Result<std::unique_ptr<TuttiRuntime>> load_tutti_config(
     const std::string& path,
@@ -492,10 +468,14 @@ Result<std::unique_ptr<TuttiRuntime>> load_tutti_config(
         }
         auto tr = std::make_unique<TuttiRuntime>();
         tr->runtime = std::move(created).value();
+        tr->set_runtime_shutdown_hook(std::move(options.runtime_shutdown_hook));
+        tr->set_shutdown_observer(std::move(options.shutdown_observer));
         return Result<std::unique_ptr<TuttiRuntime>>::Success(std::move(tr));
     }
 
     auto tr = std::make_unique<TuttiRuntime>();
+    tr->set_runtime_shutdown_hook(std::move(options.runtime_shutdown_hook));
+    tr->set_shutdown_observer(std::move(options.shutdown_observer));
     tr->resource_client = options.resource_client_factory
         ? options.resource_client_factory(parsed.nvme_service_endpoint)
         : default_resource_client_factory(parsed.nvme_service_endpoint);
