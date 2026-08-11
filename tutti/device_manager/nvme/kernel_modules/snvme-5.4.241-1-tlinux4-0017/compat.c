@@ -24,8 +24,10 @@ long compat_get_user_pages(unsigned long start, unsigned long nr_pages,
 #elif LINUX_VERSION_CODE <= KERNEL_VERSION(4, 8, 17)
 #warning "Building for older kernel, not properly tested"
 	return get_user_pages(start, nr_pages, write, 0, pages, NULL);
-#else
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0)
 	return get_user_pages(start, nr_pages, write ? FOLL_WRITE : 0,
 			      pages, NULL);
+#else
+	return get_user_pages(start, nr_pages, write ? FOLL_WRITE : 0, pages);
 #endif
 }

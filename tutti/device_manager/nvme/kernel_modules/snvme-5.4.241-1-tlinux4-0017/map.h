@@ -68,7 +68,7 @@ struct map
     uint8_t             kind;           /* enum nvm_map_kind */
     uint8_t             reserved_pad[7];
     unsigned long       n_addrs;        /* Number of mapped pages */
-    uint64_t            addrs[1];       /* Bus addresses */
+    uint64_t            addrs[];        /* Bus addresses */
 };
 
 

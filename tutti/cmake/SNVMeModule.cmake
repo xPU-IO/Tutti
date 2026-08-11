@@ -60,10 +60,16 @@ if(NOT SNVME_KERNEL_VERSION)
     set(_snvme_best_length 0)
     string(LENGTH "${_snvme_uname}" _snvme_uname_length)
     foreach(_tag IN LISTS _snvme_tags)
-        string(LENGTH "${_tag}" _tag_length)
+        # Public baselines use a descriptive suffix (for example
+        # 6.8.0-public), while uname carries the distribution ABI suffix
+        # (for example 6.8.0-90-generic).  Match both on the numeric kernel
+        # prefix and retain longest-prefix selection for more specific trees.
+        string(REGEX REPLACE "-public$" "" _match_prefix "${_tag}")
+        string(LENGTH "${_match_prefix}" _tag_length)
         if(_tag_length LESS_EQUAL _snvme_uname_length)
             string(SUBSTRING "${_snvme_uname}" 0 ${_tag_length} _uname_prefix)
-            if(_uname_prefix STREQUAL _tag AND _tag_length GREATER _snvme_best_length)
+            if(_uname_prefix STREQUAL _match_prefix AND
+               _tag_length GREATER _snvme_best_length)
                 set(_snvme_best_tag "${_tag}")
                 set(_snvme_best_length "${_tag_length}")
             endif()
