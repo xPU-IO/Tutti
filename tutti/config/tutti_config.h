@@ -23,6 +23,7 @@
 #include <string>
 #include <vector>
 
+#include <tutti/config/backend_factory.h>
 #include <tutti/config/storage_config.h>
 #include <tutti/status.h>
 #include <tutti/tutti_runtime.h>
@@ -62,6 +63,7 @@ struct LoadTuttiConfigOptions {
         RuntimeConfig, RuntimeComponents)> runtime_factory;
     std::function<Result<std::unique_ptr<Resource>>(
         const ResourceSpec&, std::int32_t accel_id)> resource_factory;
+    BackendFactory backend_factory;
 
     // Optional lifecycle seams used by contract tests. Production callers
     // leave these empty and TuttiRuntime invokes StorageRuntime::shutdown().

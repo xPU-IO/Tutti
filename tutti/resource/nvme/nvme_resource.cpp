@@ -372,6 +372,7 @@ Result<NvmeDataPathResourceView> NvmeResource::datapath_view() const {
     for (const RuntimeNvmeSlice& slice : impl_->allocation.slices) {
         view.slices.push_back({
             slice.device_id,
+            slice.pci_bdf,
             slice.accel_id,
             slice.chrdev_path,
             slice.namespace_id,

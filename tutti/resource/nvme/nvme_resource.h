@@ -33,6 +33,7 @@ struct NvmeResolverResourceView {
 
 struct NvmeDataPathSliceView {
     std::int32_t device_id = -1;
+    std::string pci_bdf;
     std::int32_t accel_id = -1;
     std::string chrdev_path;
     std::uint32_t namespace_id = 0;

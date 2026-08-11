@@ -75,11 +75,15 @@ struct CanonicalStorageConfig {
 struct StorageContract {
     std::string_view name;
     std::string_view resolver_type;
+    std::string_view resolver_scheme;
     std::string_view datapath_type;
     std::string_view resource_type;
-    std::string_view data_path_key;
     std::size_t minimum_cardinality = 0;
     std::size_t maximum_cardinality = 0;
+    std::string_view resolver_type_id;
+    std::string_view payload_type_id;
+    std::uint32_t payload_api_version = 0;
+    std::string_view data_path_key;
     bool implemented = false;
 };
 

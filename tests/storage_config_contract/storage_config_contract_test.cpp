@@ -1,4 +1,6 @@
 #include <tutti/config/tutti_config.h>
+#include <tutti/bindings/ext4_local_nvme/binding.h>
+#include <tutti/bindings/striped_local_nvme/binding.h>
 
 #include <cstdio>
 #include <fstream>
@@ -375,10 +377,37 @@ int main() {
     const StorageContract* striped_contract =
         find_storage_contract("striped-local-nvme");
     const StorageContract* memfs_contract = find_storage_contract("memfs");
-    check(local_contract != nullptr && local_contract->data_path_key ==
-              "local-nvme-ext4" && local_contract->implemented,
+    check(local_contract != nullptr &&
+              local_contract->resolver_type == "local-file" &&
+              local_contract->resolver_scheme == "file" &&
+              local_contract->datapath_type == "local-nvme" &&
+              local_contract->resource_type == "nvme" &&
+              local_contract->minimum_cardinality == 1 &&
+              local_contract->maximum_cardinality == 1 &&
+              local_contract->resolver_type_id ==
+                  tutti::binding::ext4_local_nvme::kResolverTypeId &&
+              local_contract->payload_type_id ==
+                  tutti::binding::ext4_local_nvme::kPayloadTypeId &&
+              local_contract->payload_api_version ==
+                  tutti::binding::ext4_local_nvme::kPayloadApiVersion &&
+              local_contract->data_path_key ==
+                  tutti::binding::ext4_local_nvme::kRecommendedDataPathKey &&
+              local_contract->implemented,
           "local contract registry entry");
-    check(striped_contract != nullptr && striped_contract->minimum_cardinality == 2,
+    check(striped_contract != nullptr &&
+              striped_contract->resolver_type == "striped-file" &&
+              striped_contract->resolver_scheme == "striped" &&
+              striped_contract->datapath_type == "striped-local-nvme" &&
+              striped_contract->resource_type == "nvme" &&
+              striped_contract->minimum_cardinality == 2 &&
+              striped_contract->resolver_type_id ==
+                  tutti::binding::striped_local_nvme::kResolverTypeId &&
+              striped_contract->payload_type_id ==
+                  tutti::binding::striped_local_nvme::kPayloadTypeId &&
+              striped_contract->payload_api_version ==
+                  tutti::binding::striped_local_nvme::kPayloadApiVersion &&
+              striped_contract->data_path_key ==
+                  tutti::binding::striped_local_nvme::kRecommendedDataPathKey,
           "striped contract registry entry");
     check(memfs_contract != nullptr && !memfs_contract->implemented,
           "memfs schema-only contract registry entry");

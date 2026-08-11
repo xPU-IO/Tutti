@@ -21,7 +21,12 @@
 
 #include <tutti/config/tutti_config.h>
 #include <tutti/storage_runtime.h>
+#include <tutti/resolvers/local_file/resolver.h>
+#include <tutti/resolvers/striped_file/resolver.h>
+#include "tutti/data_paths/local_nvme/local_nvme_data_path.h"
+#include "tutti/data_paths/striped_local_nvme/striped_data_path.h"
 #include "tutti/resource/nvme/nvme_resource_internal.h"
+#include "tutti/testing/mock_data_path.h"
 #include "tutti/tutti_runtime/tutti_runtime_internal.h"
 
 using namespace tutti::config;
@@ -66,6 +71,52 @@ struct FakeClientState {
     std::vector<TuttiRuntimeShutdownStage> shutdown_stages;
     std::string released_allocation;
     std::string endpoint;
+};
+
+struct ComponentLifetimeState {
+    int resolver_destructs = 0;
+    int datapath_initialize_calls = 0;
+    int datapath_destructs = 0;
+};
+
+class TrackingResolver final : public tutti::StorageTargetResolver {
+public:
+    explicit TrackingResolver(std::shared_ptr<ComponentLifetimeState> state)
+        : state_(std::move(state)) {}
+
+    ~TrackingResolver() override { ++state_->resolver_destructs; }
+
+    tutti::Result<tutti::ResolvedTarget> resolve(
+        std::string_view, const tutti::ResolveOptions&) override {
+        return tutti::Result<tutti::ResolvedTarget>::Failure(
+            tutti::Status(tutti::StatusCode::NOT_FOUND,
+                          "tracking resolver is not used"));
+    }
+
+private:
+    std::shared_ptr<ComponentLifetimeState> state_;
+};
+
+class TrackingDataPath final : public tutti::testing::MockDataPath {
+public:
+    TrackingDataPath(std::shared_ptr<ComponentLifetimeState> state,
+                     tutti::Status initialize_status)
+        : state_(std::move(state)),
+          initialize_status_(std::move(initialize_status)) {
+        caps.bound_accel_id = 0;
+    }
+
+    ~TrackingDataPath() override { ++state_->datapath_destructs; }
+
+    tutti::Status initialize(const tutti::DataPathConfig&,
+                             tutti::ResourceProvider&) override {
+        ++state_->datapath_initialize_calls;
+        return initialize_status_;
+    }
+
+private:
+    std::shared_ptr<ComponentLifetimeState> state_;
+    tutti::Status initialize_status_;
 };
 
 class FakeClient final : public NvmeResourceClient {
@@ -928,10 +979,49 @@ nvme:
 )";
         auto path = write_tmp(yaml);
         auto state = make_state({make_slice(0)});
-        auto r = load_tutti_config(path, fake_options(state, true));
+        auto lifetime = std::make_shared<ComponentLifetimeState>();
+        auto options = fake_options(state, true);
+        options.backend_factory =
+            [lifetime](const BackendFactoryContext& context) {
+                auto created = create_backend_from_registry(context);
+                if (!created.ok()) return created;
+                BackendFactoryProduct product = std::move(created).value();
+                product.resolver =
+                    std::make_unique<TrackingResolver>(lifetime);
+                product.datapath = std::make_unique<TrackingDataPath>(
+                    lifetime, tutti::Status::Ok());
+                return tutti::Result<BackendFactoryProduct>::Success(
+                    std::move(product));
+            };
+        auto r = load_tutti_config(path, std::move(options));
         CHECK(!r.ok(), "loader runtime create failure: fail");
         CHECK(state->release_calls == 1,
               "loader runtime create failure: release once");
+        CHECK(lifetime->datapath_initialize_calls == 0 &&
+                  lifetime->resolver_destructs == 1 &&
+                  lifetime->datapath_destructs == 1,
+              "loader runtime create failure leaves no backend components");
+        ::unlink(path.c_str());
+    }
+
+    {
+        auto path = write_tmp(canonical_local_yaml());
+        auto state = make_state({make_slice(0)});
+        auto options = fake_options(state);
+        options.runtime_factory =
+            [state](tutti::RuntimeConfig, tutti::RuntimeComponents) {
+                ++state->runtime_factory_calls;
+                return tutti::Result<std::unique_ptr<tutti::StorageRuntime>>::
+                    Success(nullptr);
+            };
+        auto r = load_tutti_config(path, std::move(options));
+        CHECK(!r.ok() &&
+                  r.status().message().find("returned null") !=
+                      std::string::npos,
+              "loader Runtime factory success/null rejected");
+        CHECK(state->runtime_factory_calls == 1 &&
+                  state->acquire_calls == 1 && state->release_calls == 1,
+              "loader Runtime factory null releases Resource once");
         ::unlink(path.c_str());
     }
 
@@ -939,8 +1029,41 @@ nvme:
     {
         auto path = write_tmp(canonical_local_yaml());
         auto state = make_state({make_slice(0)});
-        auto r = load_tutti_config(path, fake_options(state));
+        auto options = fake_options(state);
+        bool factory_checked = false;
+        options.backend_factory = [&](const BackendFactoryContext& context) {
+            auto created = create_backend_from_registry(context);
+            if (!created.ok()) return created;
+            BackendFactoryProduct& product = created.value();
+            const StorageContract* contract =
+                find_storage_contract("ext4-local-nvme");
+            factory_checked =
+                dynamic_cast<tutti::resolvers::local_file::LocalFileResolver*>(
+                    product.resolver.get()) != nullptr &&
+                dynamic_cast<tutti::data_paths::local_nvme::LocalNvmeDataPath*>(
+                    product.datapath.get()) != nullptr &&
+                product.scheme == "file" &&
+                product.data_path_key == "local-nvme-ext4" &&
+                product.resolver_shards.size() == 1 &&
+                product.datapath_shards.size() == 1 &&
+                product.resolver_shards.front().device_id == 0 &&
+                product.resolver_shards.front().controller_pci_addr ==
+                    product.datapath_shards.front().controller_pci_addr &&
+                product.resolver_shards.front().namespace_id ==
+                    product.datapath_shards.front().namespace_id &&
+                product.resolver_shards.front().logical_block_size ==
+                    product.datapath_shards.front().logical_block_size &&
+                product.effective_max_data_size == 131072 &&
+                contract != nullptr &&
+                product.resolver_type_id == contract->resolver_type_id &&
+                product.payload_type_id == contract->payload_type_id &&
+                product.payload_api_version == contract->payload_api_version;
+            return created;
+        };
+        auto r = load_tutti_config(path, std::move(options));
         CHECK(r.ok(), "canonical loader local: ok");
+        CHECK(factory_checked,
+              "canonical loader local: typed factory contract checked");
         CHECK(state->endpoint == "fake-endpoint",
               "canonical loader local: provider endpoint adapted");
         CHECK(state->list_accelerators_calls == 1 &&
@@ -969,9 +1092,40 @@ nvme:
 
     {
         auto path = write_tmp(canonical_striped_yaml("[0, 1]", "65536"));
-        auto state = make_state({make_slice(0), make_slice(1)});
-        auto r = load_tutti_config(path, fake_options(state));
+        auto first = make_slice(0);
+        first.max_data_size = 262144;
+        auto second = make_slice(1);
+        second.max_data_size = 65536;
+        auto state = make_state({std::move(first), std::move(second)});
+        auto options = fake_options(state);
+        bool factory_checked = false;
+        options.backend_factory = [&](const BackendFactoryContext& context) {
+            auto created = create_backend_from_registry(context);
+            if (!created.ok()) return created;
+            BackendFactoryProduct& product = created.value();
+            factory_checked =
+                dynamic_cast<tutti::resolvers::striped_file::StripedResolver*>(
+                    product.resolver.get()) != nullptr &&
+                dynamic_cast<tutti::data_paths::striped_local_nvme::StripedDataPath*>(
+                    product.datapath.get()) != nullptr &&
+                product.scheme == "striped" &&
+                product.data_path_key == "striped-local-nvme" &&
+                product.resolver_shards.size() == 2 &&
+                product.datapath_shards.size() == 2 &&
+                product.resolver_shards[0].device_id == 0 &&
+                product.resolver_shards[1].device_id == 1 &&
+                product.resolver_shards[0].controller_pci_addr ==
+                    product.datapath_shards[0].controller_pci_addr &&
+                product.resolver_shards[1].controller_pci_addr ==
+                    product.datapath_shards[1].controller_pci_addr &&
+                product.effective_max_data_size == 65536 &&
+                product.stripe_unit == 65536;
+            return created;
+        };
+        auto r = load_tutti_config(path, std::move(options));
         CHECK(r.ok(), "canonical loader striped: ok");
+        CHECK(factory_checked,
+              "canonical loader striped: ordered views and minimum MDTS");
         if (r.ok()) {
             auto bundle = std::move(r).value();
             CHECK(bundle->resolver_schemes == std::vector<std::string>{"striped"},
@@ -983,6 +1137,85 @@ nvme:
             CHECK(state->release_calls == 1,
                   "canonical loader striped: release once");
         }
+        ::unlink(path.c_str());
+    }
+
+    // 12a. A factory that claims the wrong compiled payload version is
+    // rejected before DataPath initialize/Runtime create and rolls back the
+    // acquired Resource and both unregistered components.
+    {
+        auto path = write_tmp(canonical_local_yaml());
+        auto state = make_state({make_slice(0)});
+        auto lifetime = std::make_shared<ComponentLifetimeState>();
+        auto options = fake_options(state);
+        options.backend_factory =
+            [lifetime](const BackendFactoryContext& context) {
+                auto created = create_backend_from_registry(context);
+                if (!created.ok()) return created;
+                BackendFactoryProduct product = std::move(created).value();
+                ++product.payload_api_version;
+                product.resolver =
+                    std::make_unique<TrackingResolver>(lifetime);
+                product.datapath = std::make_unique<TrackingDataPath>(
+                    lifetime, tutti::Status::Ok());
+                return tutti::Result<BackendFactoryProduct>::Success(
+                    std::move(product));
+            };
+        auto r = load_tutti_config(path, std::move(options));
+        CHECK(!r.ok() && r.status().code() == tutti::StatusCode::UNSUPPORTED,
+              "backend payload version mismatch rejected");
+        CHECK(state->acquire_calls == 1 && state->release_calls == 1 &&
+                  state->runtime_factory_calls == 0,
+              "payload mismatch releases before Runtime/DataPath initialize");
+        CHECK(lifetime->datapath_initialize_calls == 0 &&
+                  lifetime->resolver_destructs == 1 &&
+                  lifetime->datapath_destructs == 1,
+              "payload mismatch leaves no resolver or DataPath");
+        ::unlink(path.c_str());
+    }
+
+    // 12b. DataPath initialize failure destroys the entire backend and
+    // releases its Resource exactly once.
+    {
+        auto path = write_tmp(canonical_local_yaml());
+        auto state = make_state({make_slice(0)});
+        auto lifetime = std::make_shared<ComponentLifetimeState>();
+        auto options = fake_options(state);
+        options.backend_factory =
+            [lifetime](const BackendFactoryContext& context) {
+                auto created = create_backend_from_registry(context);
+                if (!created.ok()) return created;
+                BackendFactoryProduct product = std::move(created).value();
+                product.resolver =
+                    std::make_unique<TrackingResolver>(lifetime);
+                product.datapath = std::make_unique<TrackingDataPath>(
+                    lifetime,
+                    tutti::Status(tutti::StatusCode::NOT_READY,
+                                  "injected DataPath initialize failure"));
+                return tutti::Result<BackendFactoryProduct>::Success(
+                    std::move(product));
+            };
+        options.runtime_factory =
+            [state](tutti::RuntimeConfig,
+                    tutti::RuntimeComponents components) {
+                ++state->runtime_factory_calls;
+                tutti::ResourceProvider resources;
+                tutti::Status initialized =
+                    components.data_paths.front().data_path->initialize(
+                        components.data_paths.front().config, resources);
+                return tutti::Result<std::unique_ptr<tutti::StorageRuntime>>::
+                    Failure(std::move(initialized));
+            };
+        auto r = load_tutti_config(path, std::move(options));
+        CHECK(!r.ok() && r.status().code() == tutti::StatusCode::NOT_READY,
+              "DataPath initialize failure propagated");
+        CHECK(state->acquire_calls == 1 && state->release_calls == 1 &&
+                  state->runtime_factory_calls == 1,
+              "DataPath initialize failure releases Resource once");
+        CHECK(lifetime->datapath_initialize_calls == 1 &&
+                  lifetime->resolver_destructs == 1 &&
+                  lifetime->datapath_destructs == 1,
+              "DataPath initialize failure leaves no backend components");
         ::unlink(path.c_str());
     }
 

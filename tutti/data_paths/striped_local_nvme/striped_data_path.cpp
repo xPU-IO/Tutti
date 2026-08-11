@@ -567,6 +567,12 @@ bool StripedDataPath::build_shard_handle_(
     if (ns.block_size == 0) return false;
 
     DeviceSlot& slot = devices_[dev_idx];
+    if ((!slot.desc.controller_pci_addr.empty() &&
+         ns.controller_pci_addr != slot.desc.controller_pci_addr) ||
+        ns.namespace_id != slot.desc.namespace_id ||
+        ns.block_size != slot.desc.block_size) {
+        return false;
+    }
     if (!slot.queue_group || slot.queue_group->d_qps() == nullptr) return false;
 
     std::uint32_t bs = ns.block_size;

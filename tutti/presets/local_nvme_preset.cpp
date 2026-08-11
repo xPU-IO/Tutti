@@ -73,7 +73,8 @@ RuntimeWithTelemetry make_striped_nvme_runtime(const StripedNvmePreset& p) {
     std::vector<snvme::DeviceDescriptor> sdevs;
     for (const auto& d : p.devices) {
         sdevs.push_back({d.ssnvme_path, d.bar0_size, d.namespace_id,
-                         (std::uint32_t)p.gpu_id, p.num_queues, d.block_size});
+                         (std::uint32_t)p.gpu_id, p.num_queues, d.block_size,
+                         d.pci_bdf});
     }
 
     auto* dp = new snvme::StripedDataPath(

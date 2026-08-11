@@ -182,9 +182,16 @@ void test_success_and_read_only_views() {
               resolver_view.value().slices.front().block_path ==
                   "/dev/snvme0n1",
           "resolver view contains resolver-only metadata");
-    CHECK(datapath_view.ok() && datapath_view.value().slices.size() == 1 &&
+    CHECK(resolver_view.ok() && datapath_view.ok() &&
+              datapath_view.value().slices.size() == 1 &&
               datapath_view.value().slices.front().chrdev_path ==
-                  "/dev/ssnvme0",
+                  "/dev/ssnvme0" &&
+              datapath_view.value().slices.front().pci_bdf ==
+                  resolver_view.value().slices.front().pci_bdf &&
+              datapath_view.value().slices.front().namespace_id ==
+                  resolver_view.value().slices.front().namespace_id &&
+              datapath_view.value().slices.front().logical_block_size ==
+                  resolver_view.value().slices.front().logical_block_size,
           "DataPath view contains datapath-only metadata");
     if (resolver_view.ok() && datapath_view.ok()) {
         resolver_view.value().slices.front().block_path = "mutated";

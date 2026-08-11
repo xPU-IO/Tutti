@@ -156,7 +156,8 @@ public:
                       std::uint64_t max_request_bytes_override = 0,
                       // Round 16 S6b: L2 (host-pinned content) tier for the
                       // handle cache.  0 = default 4×L1 when L1 enabled.
-                      std::uint32_t handle_cache_l2_capacity = 0);
+                      std::uint32_t handle_cache_l2_capacity = 0,
+                      std::string controller_pci_addr = {});
 
     ~LocalNvmeDataPath() override;
 
@@ -497,6 +498,7 @@ private:
     std::uint32_t queue_depth_ = 0;
     std::uint32_t namespace_id_ = 0;
     std::uint32_t block_size_ = 0;
+    std::string controller_pci_addr_;
 
     // IO limits.
     std::uint64_t mdts_bytes_ = 0;        // configured override (0 = use hardware)

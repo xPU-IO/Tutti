@@ -21,6 +21,7 @@ add_library(tutti_config_parse STATIC
     storage/datapath/local_nvme_config_parse.cpp
     storage/datapath/memfs_config_parse.cpp
     storage/datapath/striped_local_nvme_config_parse.cpp
+    storage/backend/contract_registry.cpp
     storage/backend/ext4_local_nvme_config_parse.cpp
     storage/backend/memfs_config_parse.cpp
     storage/backend/striped_local_nvme_config_parse.cpp
@@ -62,6 +63,7 @@ function(tutti_add_config_loader)
     tutti_enable_nvme_resource_grpc()
 
     add_library(tutti_config STATIC
+        "${TUTTI_SOURCE_DIR}/config/backend_factory.cpp"
         "${TUTTI_SOURCE_DIR}/config/tutti_config.cpp"
     )
 

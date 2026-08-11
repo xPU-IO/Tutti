@@ -96,6 +96,7 @@ struct DeviceDescriptor {
     // (no queue_depth field: ring depth is fixed by the kernel module's
     //  io_queue_depth and obtained via NVM_GET_DEV_INFO at initialize())
     std::uint32_t block_size = 4096;
+    std::string controller_pci_addr;
 };
 
 // -------------------------------------------------------------------------

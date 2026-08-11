@@ -77,11 +77,13 @@ LocalNvmeDataPath::LocalNvmeDataPath(
     std::uint64_t max_in_flight_operations,
     std::uint64_t max_batch_requests,
     std::uint64_t max_request_bytes_override,
-    std::uint32_t handle_cache_l2_capacity)
+    std::uint32_t handle_cache_l2_capacity,
+    std::string controller_pci_addr)
     : snvme_dev_path_(std::move(snvme_dev_path)), bar0_size_(bar0_size),
       cuda_device_(cuda_device), num_user_queues_(num_user_queues),
       namespace_id_(namespace_id),
       block_size_(block_size),
+      controller_pci_addr_(std::move(controller_pci_addr)),
       mdts_bytes_(mdts_bytes),
       max_batch_entries_(max_batch_entries == 0 ? 256 : max_batch_entries),
       max_batch_requests_(max_batch_requests == 0
@@ -685,6 +687,22 @@ Result<DataPathTarget> LocalNvmeDataPath::open_impl_(const ResolvedTarget& targe
         return Result<DataPathTarget>::Failure(
             Status(StatusCode::INVALID_ARGUMENT,
                    "open: controller_pci_addr is empty"));
+    }
+    if (!controller_pci_addr_.empty() &&
+        ns.controller_pci_addr != controller_pci_addr_) {
+        return Result<DataPathTarget>::Failure(
+            Status(StatusCode::INVALID_ARGUMENT,
+                   "open: controller_pci_addr does not match DataPath resource view"));
+    }
+    if (namespace_id_ != 0 && ns.namespace_id != namespace_id_) {
+        return Result<DataPathTarget>::Failure(
+            Status(StatusCode::INVALID_ARGUMENT,
+                   "open: namespace_id does not match DataPath resource view"));
+    }
+    if (block_size_ != 0 && ns.block_size != block_size_) {
+        return Result<DataPathTarget>::Failure(
+            Status(StatusCode::INVALID_ARGUMENT,
+                   "open: block_size does not match DataPath resource view"));
     }
 
     LocalNvmeTargetState state;

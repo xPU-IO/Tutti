@@ -1,8 +1,6 @@
 #include "tutti/config/storage/parse_internal.h"
 
 #include <algorithm>
-#include <array>
-#include <limits>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -107,14 +105,6 @@ namespace {
 using detail::invalid;
 using detail::read_required_string;
 using detail::validate_keys;
-
-constexpr std::array<StorageContract, 3> kStorageContracts{{
-    {"ext4-local-nvme", "local-file", "local-nvme", "nvme",
-     "local-nvme-ext4", 1, 1, true},
-    {"striped-local-nvme", "striped-file", "striped-local-nvme", "nvme",
-     "striped-local-nvme", 2, std::numeric_limits<std::size_t>::max(), true},
-    {"memfs", "memfs", "memfs", "memory", "memfs", 1, 1, false},
-}};
 
 template <typename T>
 Result<T> failure(Status status) {
@@ -329,17 +319,18 @@ Status validate_canonical(const CanonicalStorageConfig& storage) {
             return invalid("backend " + backend.id + " references unknown resource " +
                            backend.resource);
         }
-        if (resolver_it->second->type != contract->resolver_type ||
-            datapath_it->second->type != contract->datapath_type ||
-            resource_it->second->type != contract->resource_type) {
-            return invalid("backend " + backend.id +
-                           " types do not match contract " + backend.contract);
-        }
         const auto consumer = resource_datapaths.emplace(
             backend.resource, backend.datapath);
         if (!consumer.second && consumer.first->second != backend.datapath) {
             return invalid("resource " + backend.resource +
                            " cannot be consumed by independent datapaths");
+        }
+        if (resolver_it->second->type != contract->resolver_type ||
+            resolver_it->second->scheme != contract->resolver_scheme ||
+            datapath_it->second->type != contract->datapath_type ||
+            resource_it->second->type != contract->resource_type) {
+            return invalid("backend " + backend.id +
+                           " types do not match contract " + backend.contract);
         }
         if (!data_path_keys.emplace(contract->data_path_key).second) {
             return invalid("duplicate contract DataPath key " +
@@ -495,13 +486,6 @@ bool has_key(const YAML::Node& node, const char* key) {
 }
 
 } // namespace
-
-const StorageContract* find_storage_contract(std::string_view name) {
-    const auto found = std::find_if(
-        kStorageContracts.begin(), kStorageContracts.end(),
-        [&](const StorageContract& contract) { return contract.name == name; });
-    return found == kStorageContracts.end() ? nullptr : &*found;
-}
 
 Result<ParsedConfig> parse_tutti_config(const std::string& path) {
     try {

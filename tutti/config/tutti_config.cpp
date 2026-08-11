@@ -5,28 +5,19 @@
 
 #include "tutti/config/tutti_config.h"
 
-#include <algorithm>
 #include <cctype>
 #include <exception>
 #include <functional>
-#include <limits>
 #include <memory>
-#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
-#include <tutti/bindings/ext4_local_nvme/binding.h>
-#include <tutti/bindings/striped_local_nvme/binding.h>
 #include <tutti/cuda_like.h>
 #include <tutti/io_types.h>
-#include <tutti/resolvers/local_file/resolver.h>
-#include <tutti/resolvers/striped_file/resolver.h>
 #include <tutti/storage_runtime.h>
-#include "tutti/data_paths/local_nvme/local_nvme_data_path.h"
-#include "tutti/data_paths/striped_local_nvme/striped_data_path.h"
 #include "tutti/resource/nvme/nvme_resource.h"
 #include "tutti/tutti_runtime/tutti_runtime_internal.h"
 
@@ -34,21 +25,11 @@ namespace tutti::config {
 namespace {
 
 namespace nvme_resource = tutti::resources::nvme;
-using nvme_resource::NvmeDataPathResourceView;
-using nvme_resource::NvmeDataPathSliceView;
-using nvme_resource::NvmeResolverResourceView;
-using nvme_resource::NvmeResolverSliceView;
-
 struct StorageIdTables {
     std::unordered_map<std::string, const ResourceSpec*> resources;
     std::unordered_map<std::string, const ResolverSpec*> resolvers;
     std::unordered_map<std::string, const DataPathSpec*> datapaths;
     std::unordered_map<std::string, const BackendSpec*> backends;
-};
-
-struct BackendComponents {
-    StorageTargetResolver* resolver = nullptr;
-    DataPath* datapath = nullptr;
 };
 
 Status error(StatusCode code, std::string message) {
@@ -139,16 +120,6 @@ Status build_storage_id_tables(const CanonicalStorageConfig& storage,
             return error(StatusCode::INVALID_ARGUMENT,
                          "backend references an unknown storage contract");
         }
-        if (resource->second->type != contract->resource_type ||
-            resolver->second->type != contract->resolver_type ||
-            datapath->second->type != contract->datapath_type) {
-            return error(StatusCode::INVALID_ARGUMENT,
-                         "backend storage types do not match its contract");
-        }
-        status = validate_requested_cardinality(
-            *resource->second, backend, *contract);
-        if (!status.ok()) return status;
-
         const auto consumer = resource_datapaths.emplace(
             backend.resource, backend.datapath);
         if (!consumer.second && consumer.first->second != backend.datapath) {
@@ -156,6 +127,16 @@ Status build_storage_id_tables(const CanonicalStorageConfig& storage,
                 StatusCode::INVALID_ARGUMENT,
                 "Resource cannot be consumed by independent DataPaths");
         }
+        if (resource->second->type != contract->resource_type ||
+            resolver->second->type != contract->resolver_type ||
+            resolver->second->scheme != contract->resolver_scheme ||
+            datapath->second->type != contract->datapath_type) {
+            return error(StatusCode::INVALID_ARGUMENT,
+                         "backend storage types do not match its contract");
+        }
+        status = validate_requested_cardinality(
+            *resource->second, backend, *contract);
+        if (!status.ok()) return status;
         reachable_resources.emplace(backend.resource);
         reachable_resolvers.emplace(backend.resolver);
         reachable_datapaths.emplace(backend.datapath);
@@ -279,6 +260,33 @@ Result<std::unique_ptr<StorageRuntime>> default_runtime_factory(
     return StorageRuntime::create(std::move(config), std::move(components));
 }
 
+Result<std::unique_ptr<StorageRuntime>> invoke_runtime_factory(
+    const LoadTuttiConfigOptions& options,
+    RuntimeConfig config,
+    RuntimeComponents components) {
+    try {
+        auto created = options.runtime_factory
+            ? options.runtime_factory(std::move(config),
+                                      std::move(components))
+            : default_runtime_factory(std::move(config),
+                                      std::move(components));
+        if (created.ok() && !created.value()) {
+            return Result<std::unique_ptr<StorageRuntime>>::Failure(
+                error(StatusCode::INVALID_ARGUMENT,
+                      "Runtime factory returned null"));
+        }
+        return created;
+    } catch (const std::exception& exception) {
+        return Result<std::unique_ptr<StorageRuntime>>::Failure(
+            error(StatusCode::INTERNAL,
+                  std::string("Runtime factory threw: ") +
+                      exception.what()));
+    } catch (...) {
+        return Result<std::unique_ptr<StorageRuntime>>::Failure(
+            error(StatusCode::INTERNAL, "Runtime factory threw"));
+    }
+}
+
 Result<std::unique_ptr<Resource>> default_resource_factory(
     const ResourceSpec& resource_spec,
     std::int32_t accel_id) {
@@ -328,129 +336,6 @@ Status validate_profile_and_accel(const ParsedConfig& parsed,
     return Status::Ok();
 }
 
-std::uint32_t checked_u32(std::uint64_t value, const char* name) {
-    if (value > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::runtime_error(std::string(name) + " exceeds uint32_t");
-    }
-    return static_cast<std::uint32_t>(value);
-}
-
-BackendComponents add_local_components(
-    TuttiRuntime& tr, RuntimeComponents& components,
-    const ParsedConfig& parsed, const EffectiveCacheConfig& eff,
-    const NvmeResolverSliceView& resolver_slice,
-    const NvmeDataPathSliceView& datapath_slice) {
-    namespace local_dp = data_paths::local_nvme;
-    namespace local_resolver = resolvers::local_file;
-    namespace local_binding = tutti::binding::ext4_local_nvme;
-
-    auto dp = std::make_unique<local_dp::LocalNvmeDataPath>(
-        datapath_slice.chrdev_path,
-        checked_u32(datapath_slice.bar0_size, "bar0_size"),
-        static_cast<std::uint32_t>(datapath_slice.accel_id),
-        datapath_slice.granted_queues,
-        datapath_slice.namespace_id,
-        datapath_slice.logical_block_size,
-        datapath_slice.max_data_size,
-        static_cast<std::uint32_t>(parsed.max_batch_entries),
-        0,
-        eff.handle_cache_capacity,
-        eff.prp_cache_capacity,
-        parsed.max_in_flight_operations,
-        parsed.max_batch_entries,
-        0,
-        eff.handle_cache_l2_capacity);
-    auto* dp_ptr = tr.register_datapath(
-        std::move(dp), std::string(local_binding::kRecommendedDataPathKey));
-    if (dp_ptr == nullptr) {
-        throw std::runtime_error("TuttiRuntime rejected DataPath registration");
-    }
-    components.data_paths.push_back(
-        {std::string(local_binding::kRecommendedDataPathKey), dp_ptr,
-         DataPathConfig{"local_nvme"}});
-
-    auto resolver = std::make_unique<local_resolver::LocalFileResolver>(
-        resolver_slice.pci_bdf,
-        resolver_slice.namespace_id,
-        resolver_slice.logical_block_size,
-        local_resolver::BackingDeviceConfig{resolver_slice.block_path, 0});
-    auto* resolver_ptr = tr.register_resolver(std::move(resolver), "file");
-    if (resolver_ptr == nullptr) {
-        throw std::runtime_error("TuttiRuntime rejected resolver registration");
-    }
-    components.resolvers.push_back({"file", resolver_ptr});
-    return BackendComponents{resolver_ptr, dp_ptr};
-}
-
-BackendComponents add_striped_components(
-    TuttiRuntime& tr, RuntimeComponents& components,
-    const ParsedConfig& parsed, const EffectiveCacheConfig& eff,
-    const NvmeResolverResourceView& resolver_view,
-    const NvmeDataPathResourceView& datapath_view) {
-    namespace striped_dp = data_paths::striped_local_nvme;
-    namespace local_resolver = resolvers::local_file;
-    namespace striped_resolver = resolvers::striped_file;
-    namespace striped_binding = tutti::binding::striped_local_nvme;
-
-    std::vector<striped_dp::DeviceDescriptor> descriptors;
-    descriptors.reserve(datapath_view.slices.size());
-    std::vector<std::unique_ptr<StorageTargetResolver>> shard_resolvers;
-    shard_resolvers.reserve(resolver_view.slices.size());
-
-    std::uint64_t mdts = 0;
-    for (std::size_t index = 0; index < datapath_view.slices.size(); ++index) {
-        const NvmeDataPathSliceView& datapath_slice =
-            datapath_view.slices[index];
-        const NvmeResolverSliceView& resolver_slice =
-            resolver_view.slices[index];
-        descriptors.push_back({
-            datapath_slice.chrdev_path,
-            datapath_slice.bar0_size,
-            datapath_slice.namespace_id,
-            static_cast<std::uint32_t>(datapath_slice.accel_id),
-            datapath_slice.granted_queues,
-            datapath_slice.logical_block_size});
-        if (datapath_slice.max_data_size != 0) {
-            mdts = mdts == 0 ? datapath_slice.max_data_size
-                             : std::min(mdts, datapath_slice.max_data_size);
-        }
-        shard_resolvers.push_back(
-            std::make_unique<local_resolver::LocalFileResolver>(
-                resolver_slice.pci_bdf,
-                resolver_slice.namespace_id,
-                resolver_slice.logical_block_size,
-                local_resolver::BackingDeviceConfig{
-                    resolver_slice.block_path, 0}));
-    }
-
-    auto dp = std::make_unique<striped_dp::StripedDataPath>(
-        std::move(descriptors),
-        static_cast<std::uint32_t>(parsed.runtime_accel_id),
-        mdts,
-        0,
-        static_cast<std::uint32_t>(parsed.max_batch_entries),
-        static_cast<std::uint32_t>(parsed.max_in_flight_operations),
-        eff.handle_cache_capacity,
-        eff.prp_cache_capacity);
-    auto* dp_ptr = tr.register_datapath(
-        std::move(dp), std::string(striped_binding::kRecommendedDataPathKey));
-    if (dp_ptr == nullptr) {
-        throw std::runtime_error("TuttiRuntime rejected DataPath registration");
-    }
-    components.data_paths.push_back(
-        {std::string(striped_binding::kRecommendedDataPathKey), dp_ptr,
-         DataPathConfig{"striped-local-nvme"}});
-
-    auto resolver = std::make_unique<striped_resolver::StripedResolver>(
-        std::move(shard_resolvers), parsed.stripe_unit);
-    auto* resolver_ptr = tr.register_resolver(std::move(resolver), "striped");
-    if (resolver_ptr == nullptr) {
-        throw std::runtime_error("TuttiRuntime rejected resolver registration");
-    }
-    components.resolvers.push_back({"striped", resolver_ptr});
-    return BackendComponents{resolver_ptr, dp_ptr};
-}
-
 } // namespace
 
 Result<std::unique_ptr<TuttiRuntime>> load_tutti_config(
@@ -488,9 +373,8 @@ Result<std::unique_ptr<TuttiRuntime>> load_tutti_config(
     runtime_config.profile_name = parsed.accelerator_profile;
 
     if (parsed.runtime_accel_id == -1) {
-        auto created = options.runtime_factory
-            ? options.runtime_factory(runtime_config, RuntimeComponents{})
-            : StorageRuntime::create(runtime_config);
+        auto created = invoke_runtime_factory(
+            options, runtime_config, RuntimeComponents{});
         if (!created.ok()) {
             return Result<std::unique_ptr<TuttiRuntime>>::Failure(
                 created.status());
@@ -505,6 +389,17 @@ Result<std::unique_ptr<TuttiRuntime>> load_tutti_config(
     auto tr = std::make_unique<TuttiRuntime>();
     tr->set_runtime_shutdown_hook(std::move(options.runtime_shutdown_hook));
     tr->set_shutdown_observer(std::move(options.shutdown_observer));
+
+    const BackendSpec& backend = parsed.canonical_storage.backends.front();
+    const StorageContract* contract = find_storage_contract(backend.contract);
+    const BackendFactoryRegistration* registered_factory =
+        find_backend_factory(backend.contract);
+    if (contract == nullptr || registered_factory == nullptr ||
+        registered_factory->contract != contract) {
+        return Result<std::unique_ptr<TuttiRuntime>>::Failure(
+            error(StatusCode::UNSUPPORTED,
+                  "backend contract factory is not implemented"));
+    }
 
     std::function<Result<std::unique_ptr<Resource>>(
         const ResourceSpec&, std::int32_t)> resource_factory =
@@ -547,83 +442,109 @@ Result<std::unique_ptr<TuttiRuntime>> load_tutti_config(
         }
     }
 
-    const BackendSpec& backend = parsed.canonical_storage.backends.front();
     const Resource* resource =
         TuttiRuntimeAssemblyAccess::resource(*tr, backend.resource);
-    const auto* nvme =
-        dynamic_cast<const nvme_resource::NvmeResource*>(resource);
-    if (nvme == nullptr) {
-        return Result<std::unique_ptr<TuttiRuntime>>::Failure(
-            error(StatusCode::INVALID_ARGUMENT,
-                  "ResourceFactory returned incompatible implementation"));
-    }
-
-    auto resolver_view = nvme->resolver_view();
-    if (!resolver_view.ok()) {
-        return Result<std::unique_ptr<TuttiRuntime>>::Failure(
-            resolver_view.status());
-    }
-    auto datapath_view = nvme->datapath_view();
-    if (!datapath_view.ok()) {
-        return Result<std::unique_ptr<TuttiRuntime>>::Failure(
-            datapath_view.status());
-    }
-    if (resolver_view.value().slices.size() !=
-        datapath_view.value().slices.size()) {
+    if (resource == nullptr) {
         return Result<std::unique_ptr<TuttiRuntime>>::Failure(
             error(StatusCode::INTERNAL,
-                  "NVMe resource views have inconsistent cardinality"));
+                  "backend Resource is missing from Runtime registry"));
     }
-    RuntimeComponents components;
+
+    const auto resolver_spec = id_tables.resolvers.find(backend.resolver);
+    const auto datapath_spec = id_tables.datapaths.find(backend.datapath);
+    const auto resource_spec = id_tables.resources.find(backend.resource);
+    if (resolver_spec == id_tables.resolvers.end() ||
+        datapath_spec == id_tables.datapaths.end() ||
+        resource_spec == id_tables.resources.end()) {
+        return Result<std::unique_ptr<TuttiRuntime>>::Failure(
+            error(StatusCode::INTERNAL,
+                  "backend assembly IDs are missing from lookup tables"));
+    }
     const auto eff = resolve_cache_config(parsed, options.overrides);
-    BackendComponents backend_components;
+    const BackendFactoryContext factory_context{
+        backend,
+        *resolver_spec->second,
+        *datapath_spec->second,
+        *resource_spec->second,
+        *resource,
+        parsed.runtime_accel_id,
+        BackendFactoryCacheConfig{
+            eff.handle_cache_capacity,
+            eff.prp_cache_capacity,
+            eff.handle_cache_l2_capacity,
+        },
+    };
+
+    Result<BackendFactoryProduct> factory_result =
+        Result<BackendFactoryProduct>::Failure(
+            error(StatusCode::INTERNAL,
+                  "backend factory did not return a result"));
     try {
-        if (backend.contract == "ext4-local-nvme") {
-            if (datapath_view.value().slices.size() != 1) {
-                return Result<std::unique_ptr<TuttiRuntime>>::Failure(
-                    error(StatusCode::INVALID_ARGUMENT,
-                          "local backend requires exactly one Resource slice"));
-            }
-            backend_components = add_local_components(
-                *tr, components, parsed, eff,
-                resolver_view.value().slices.front(),
-                datapath_view.value().slices.front());
-        } else if (backend.contract == "striped-local-nvme") {
-            const auto resource_spec = id_tables.resources.find(
-                backend.resource);
-            const std::size_t requested =
-                resource_spec->second->allocation.device_ids.size();
-            if (requested < 2 ||
-                datapath_view.value().slices.size() != requested) {
-                return Result<std::unique_ptr<TuttiRuntime>>::Failure(
-                    error(StatusCode::INVALID_ARGUMENT,
-                          "striped backend Resource slice count does not match request"));
-            }
-            backend_components = add_striped_components(
-                *tr, components, parsed, eff, resolver_view.value(),
-                datapath_view.value());
-        } else {
-            return Result<std::unique_ptr<TuttiRuntime>>::Failure(
-                error(StatusCode::UNSUPPORTED,
-                      "backend contract factory is not implemented"));
-        }
+        factory_result = options.backend_factory
+            ? options.backend_factory(factory_context)
+            : create_backend_from_registry(factory_context);
     } catch (const std::exception& e) {
         return Result<std::unique_ptr<TuttiRuntime>>::Failure(
-            error(StatusCode::INVALID_ARGUMENT, e.what()));
+            error(StatusCode::INVALID_ARGUMENT,
+                  std::string("backend factory threw: ") + e.what()));
+    } catch (...) {
+        return Result<std::unique_ptr<TuttiRuntime>>::Failure(
+            error(StatusCode::INTERNAL, "backend factory threw"));
+    }
+    if (!factory_result.ok()) {
+        return Result<std::unique_ptr<TuttiRuntime>>::Failure(
+            factory_result.status());
+    }
+    BackendFactoryProduct product = std::move(factory_result).value();
+    status = validate_backend_factory_product(
+        factory_context, *contract, product);
+    if (!status.ok()) {
+        return Result<std::unique_ptr<TuttiRuntime>>::Failure(status);
+    }
+
+    RuntimeComponents components;
+    StorageTargetResolver* resolver = nullptr;
+    DataPath* datapath = nullptr;
+    try {
+        resolver = tr->register_resolver(
+            std::move(product.resolver), product.scheme);
+        if (resolver == nullptr) {
+            return Result<std::unique_ptr<TuttiRuntime>>::Failure(
+                error(StatusCode::INVALID_ARGUMENT,
+                      "TuttiRuntime rejected resolver registration"));
+        }
+        datapath = tr->register_datapath(
+            std::move(product.datapath), product.data_path_key);
+        if (datapath == nullptr) {
+            return Result<std::unique_ptr<TuttiRuntime>>::Failure(
+                error(StatusCode::INVALID_ARGUMENT,
+                      "TuttiRuntime rejected DataPath registration"));
+        }
+        components.resolvers.push_back({product.scheme, resolver});
+        components.data_paths.push_back({
+            product.data_path_key, datapath, product.data_path_config});
+    } catch (const std::exception& exception) {
+        return Result<std::unique_ptr<TuttiRuntime>>::Failure(
+            error(StatusCode::INTERNAL,
+                  std::string("backend component registration threw: ") +
+                      exception.what()));
+    } catch (...) {
+        return Result<std::unique_ptr<TuttiRuntime>>::Failure(
+            error(StatusCode::INTERNAL,
+                  "backend component registration threw"));
     }
 
     status = TuttiRuntimeAssemblyAccess::register_backend(
         *tr,
         BackendManifest{backend.id, backend.contract, backend.resolver,
                         backend.datapath, backend.resource},
-        resource, backend_components.resolver, backend_components.datapath);
+        resource, resolver, datapath);
     if (!status.ok()) {
         return Result<std::unique_ptr<TuttiRuntime>>::Failure(status);
     }
 
-    auto created = options.runtime_factory
-        ? options.runtime_factory(runtime_config, std::move(components))
-        : default_runtime_factory(runtime_config, std::move(components));
+    auto created = invoke_runtime_factory(
+        options, runtime_config, std::move(components));
     if (!created.ok()) {
         return Result<std::unique_ptr<TuttiRuntime>>::Failure(
             created.status());

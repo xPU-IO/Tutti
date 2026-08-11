@@ -388,7 +388,8 @@ struct StripedEnv {
             const auto& device = g_devices.at(i);
             v.push_back({device.ssnvme_path, device.bar0_size,
                          device.namespace_id, (std::uint32_t)g_gpu_id,
-                         /*num_user_queues=*/16, device.block_size});
+                         /*num_user_queues=*/16, device.block_size,
+                         device.pci_bdf});
         }
         return v;
     }
