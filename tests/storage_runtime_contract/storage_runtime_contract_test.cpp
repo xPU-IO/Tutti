@@ -1182,8 +1182,6 @@ static int test_progress_serialization() {
     if (!io1.valid() || !io2.valid()) return 1;
 
     std::atomic<int> started{0};
-    std::atomic<bool> done{false};
-
     auto querier = [&]() {
         // query() drives progress internally.  Two concurrent queries should
         // not both enter progress() at the same time.
@@ -1197,7 +1195,6 @@ static int test_progress_serialization() {
     while (started.load() < 2) std::this_thread::yield();
 
     // Unblock progress; both queries should complete.
-    fr.data_path.block_progress_flag = false;
     fr.data_path.unblock_progress();
 
     // Complete ops manually so query can harvest terminal state.

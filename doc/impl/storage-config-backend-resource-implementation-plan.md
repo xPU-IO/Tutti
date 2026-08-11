@@ -5,7 +5,7 @@
 - **状态**：实施路线设计，尚未开始本设计的代码迁移。
 - **依据**：[`doc/design/storage-config-backend-resource.md`](../design/storage-config-backend-resource.md)。
 - **适用分支基线**：当前 `fix/multi-gpu` 工作树。
-- **本地实机配置**：`config/local/daemon_2disk.yaml`，两块 NVMe，daemon endpoint
+- **本地实机配置**：`config/local/daemon_2_disk.yaml`，两块 NVMe，daemon endpoint
   `127.0.0.1:50051`。
 - **推进方式**：一次只实施一个阶段；每阶段完成代码、测试和
   `doc/impl/storage-config-backend-resource-phase-N.md`，形成独立提交后再进入下一阶段。
@@ -53,7 +53,7 @@ YAML
 
 ### 2.2 明确不在本计划内的事项
 
-- 不修改 daemon 的 YAML schema、protobuf/gRPC RPC 或 `config/local/daemon_2disk.yaml`；
+- 不修改 daemon 的 YAML schema、protobuf/gRPC RPC 或 `config/local/daemon_2_disk.yaml`；
 - 不把 NVMe path、PCI BDF、allocation ID 或 lease 字段加入公共
   `ResourceProvider`、resolver SPI 或 DataPath SPI；
 - 不改变 `StorageRuntime` 现有多 scheme、多 DataPath key 的核心能力；
@@ -80,7 +80,7 @@ YAML
 - [`tests/runtime_bundle_loader_contract/runtime_bundle_loader_contract_test.cpp`](../../tests/runtime_bundle_loader_contract/runtime_bundle_loader_contract_test.cpp)
   仍直接读取 `TuttiRuntime::allocation_slices` 来创建 scratch file、核对 RPC metadata
   和重启持久性。它必须先迁移到只读诊断 seam，才能删除平行 public 字段；
-- `config/local/daemon_2disk.yaml` 只由 daemon 使用。应用 loader 必须继续消费
+- `config/local/daemon_2_disk.yaml` 只由 daemon 使用。应用 loader 必须继续消费
   `AcquireNvmeSlices` 返回的实际 `chrdev_path`、`block_path`、`view_path`、BAR0、MDTS、
   namespace 和 granted queues，不能从 device ID、数组顺序或 daemon YAML 推导路径。
 
@@ -374,7 +374,7 @@ P7 只在 P6 通过后进行。实机验证使用用户指定的两盘配置，�
 # 先确认没有遗留 daemon；若已有实例，先按既有清理流程停止并确认 50051 释放。
 sudo -S env TUTTI_VERBOSE=1 \
   build/cuda-module/tutti/device_manager/nvme/nvmeservice/examples/tutti_daemon \
-  --config config/local/daemon_2disk.yaml < ~/.passwd/1
+  --config config/local/daemon_2_disk.yaml < ~/.passwd/1
 ```
 
 实际路径以当前 build 产物为准；启动前后不得把密码放入命令行、YAML、日志或实施文档。

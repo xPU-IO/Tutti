@@ -170,7 +170,10 @@ public:
 
     // ---- Unblock progress (for block_progress_flag tests) ----
     void unblock_progress() {
-        block_progress_flag.store(false);
+        {
+            std::lock_guard<std::mutex> lock(block_progress_mtx_);
+            block_progress_flag.store(false);
+        }
         block_progress_cv_.notify_all();
     }
 
