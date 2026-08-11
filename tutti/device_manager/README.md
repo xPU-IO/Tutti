@@ -31,6 +31,7 @@ tutti/device_manager/
 ├── kernel_modules/                      # snvme kernel module
 │   ├── snvme-5.15.0-public/            # Linux 5.15.0 version
 │   ├── snvme-5.4.241-1-tlinux4-0017/   # Linux 5.4.241 version
+│   ├── snvme-6.8.0-public/             # Linux 6.8 version
 │   ├── PORTING.md                       # Kernel porting guide
 │   └── test/                            # Kernel module tests
 ├── libnvm/                              # User-space NVMe library
@@ -77,7 +78,7 @@ Device Manager implements a **two-level allocation model**:
 **Features:**
 - User-space queue creation via ioctls
 - GPU memory DMA mapping
-- Support for multiple kernel versions (5.15.0, 5.4.241)
+- Support for multiple kernel versions (6.8.0, 5.15.0, 5.4.241)
 
 **Key ioctls:**
 - `NVM_CREATE_QUEUE_GROUP` - Create queue group

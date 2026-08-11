@@ -62,7 +62,7 @@ symmetric per-vendor backends (nvidia done, metax symmetric).
 
 **Environment (tested)**
 
-- OS: Linux, kernel 5.15.x (`snvme-5.15.0-public` baseline); a 5.4.241 (tlinux4) module lineage is also maintained
+- OS: Linux, kernel 6.8.x (`snvme-6.8.0-public`) or 5.15.x (`snvme-5.15.0-public`); a 5.4.241 (tlinux4) module lineage is also maintained
 - Accelerator: NVIDIA GPU + CUDA toolkit (`nvcc`); bare metal with IOMMU in passthrough mode. MUSA/MACA build profiles configure-checked only (no hardware validation yet)
 - Runtime: daemon-only — `tutti_daemon` bring-up creates `/dev/snvme*`; queue depth is fixed at module install (`io_queue_depth=1024` for production)
 - Host deps: CMake, protobuf / gRPC / uuid / yaml-cpp — one-shot setup via `scripts/prepare_env.sh`

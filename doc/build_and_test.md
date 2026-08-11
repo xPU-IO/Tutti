@@ -151,12 +151,16 @@ cmake --build --preset musa --target modules --parallel 8
 The snvme kernel module is maintained per kernel baseline under `tutti/device_manager/nvme/kernel_modules/snvme-<tag>/`, e.g.:
 
 - `snvme-5.15.0-public` — upstream 5.15.0
+- `snvme-6.8.0-public` — Linux 6.8
 
-CMake matches the baseline against `uname -r` by default. Distribution kernels often include an ABI/flavour suffix that does not literally match the source tag; for example, `5.15.0-185-generic` needs the compatible `5.15.0-public` baseline selected explicitly:
+CMake matches the numeric baseline prefix against `uname -r` by default and
+ignores the descriptive `-public` suffix. For example, both
+`6.8.0-90-generic` and upstream `6.8.0` select `6.8.0-public`. Set the value
+explicitly only when auto-selection is ambiguous or when cross-building:
 
 ```bash
 cmake --preset cuda-module --fresh \
-  -DSNVME_KERNEL_VERSION=5.15.0-public
+  -DSNVME_KERNEL_VERSION=6.8.0-public
 ```
 
 To see the available values, list the baseline directories:
