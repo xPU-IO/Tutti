@@ -6,6 +6,9 @@
 #include <utility>
 #include <vector>
 
+#include <tutti/spi/data_path.h>
+#include <tutti/spi/storage_target_resolver.h>
+#include <tutti/storage_runtime.h>
 #include <tutti/tutti_runtime.h>
 
 namespace tutti::config {
@@ -22,6 +25,21 @@ public:
         return runtime.find_resource_(id);
     }
 
+    static Status register_datapath(TuttiRuntime& runtime, std::string id,
+                                    std::unique_ptr<DataPath> data_path,
+                                    std::string key, DataPath*& borrowed) {
+        return runtime.register_datapath_(
+            std::move(id), std::move(data_path), std::move(key), borrowed);
+    }
+
+    static Status register_resolver(
+        TuttiRuntime& runtime, std::string id,
+        std::unique_ptr<StorageTargetResolver> resolver,
+        std::string scheme, StorageTargetResolver*& borrowed) {
+        return runtime.register_resolver_(
+            std::move(id), std::move(resolver), std::move(scheme), borrowed);
+    }
+
     static Status register_backend(TuttiRuntime& runtime,
                                    BackendManifest manifest,
                                    const Resource* resource,
@@ -29,6 +47,11 @@ public:
                                    DataPath* datapath) {
         return runtime.register_backend_(std::move(manifest), resource,
                                          resolver, datapath);
+    }
+
+    static Status set_storage_runtime(
+        TuttiRuntime& runtime, std::unique_ptr<StorageRuntime> storage_runtime) {
+        return runtime.set_storage_runtime_(std::move(storage_runtime));
     }
 };
 
@@ -58,6 +81,18 @@ public:
     static Status shutdown_resource(TuttiRuntime& runtime,
                                     std::string_view id) {
         return runtime.shutdown_resource_(id);
+    }
+
+    static void set_runtime_shutdown_hook(
+        TuttiRuntime& runtime,
+        std::function<Status(StorageRuntime&)> hook) {
+        runtime.runtime_shutdown_hook_ = std::move(hook);
+    }
+
+    static void set_shutdown_observer(
+        TuttiRuntime& runtime,
+        std::function<void(TuttiRuntimeShutdownStage)> observer) {
+        runtime.shutdown_observer_ = std::move(observer);
     }
 };
 

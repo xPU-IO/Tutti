@@ -86,10 +86,20 @@ Also runnable as a gated test: `ctest -R tutti_layerwise_kv_overlap`.
 
 ## Configuration
 
-Two files, two roles — one topology source of truth:
+Two files have strictly separate roles:
 
-- **`config/local_nvme_config.yaml`** — the local-NVMe deployment fact file: NVMe controllers (`nvmes[]` with `allowed_gpus` ACL), GPU enumeration, mount points, queue/lease policy. Read by **both** the daemon (bring-up/mount) and the application loader (the CUDA↔ssd device map is derived from `nvmes[]` order + `allowed_gpus`). Daemon lookup: `--config` > `config/local_nvme_config.yaml` > legacy `sys_config.yaml` names (deprecation warnings).
-- **`config/tutti_config.yaml`** — the application's entry point: DataPath cache knobs (`handle_cache_capacity`, `prp_cache_capacity`, L2), capacity knobs (`max_in_flight_operations`, `max_batch_entries`, `num_user_queues`), `io_granularity`, and a `local_nvme_config` link key pointing at the file above. Priority: programmatic injection > config file > built-in defaults (`TUTTI_*_CACHE_CAP` env vars are test-only backdoors). Queue depth is *not* here — it is kernel-authoritative (`io_queue_depth` at module install).
+- **`config/local_nvme_config.yaml`** is the daemon deployment fact file. It owns controller identity, accelerator ACLs, mount/view paths, queue policy, and lease policy. The application loader never reads it or derives device paths from its array order.
+- **`config/tutti_config.yaml`** is the canonical application graph. `storage.resources[]` requests a logical resource, `resolvers[]` and `datapaths[]` select implementations, and `backends[]` binds their IDs through a compiled payload contract. Runtime paths, BAR sizes, namespaces, and actual queue grants come only from the daemon allocation response.
+
+Legacy application fields (`gpu`, `nvme_service`, `nvme`, `local_nvme`,
+`local_nvme_config`, `storage.backend`, and `storage.default_stripe_unit`) were
+removed in P6 on 2026-08-11. There is no compatibility grace period or legacy
+adapter; legacy-only and mixed files fail with a migration diagnostic. This
+does not change the daemon configuration compatibility policy.
+
+DataPath cache precedence remains programmatic override > canonical DataPath
+config > test-only `TUTTI_*_CACHE_CAP` environment override > built-in default.
+Queue depth remains kernel-authoritative (`io_queue_depth` at module install).
 
 The repository root is the only supported CMake entry. All component
 `CMakeLists.txt` files are reached from that target graph and are not

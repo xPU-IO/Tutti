@@ -14,11 +14,6 @@ enum class NvmeSelection {
     Striped,
 };
 
-enum class ConfigSyntax {
-    Legacy,
-    Canonical,
-};
-
 struct ProviderSpec {
     std::string type;
     std::string endpoint;

@@ -6,7 +6,7 @@
 
 #include <yaml-cpp/yaml.h>
 
-#include "tutti/config/tutti_config.h"
+#include <tutti/config/tutti_config.h>
 
 namespace tutti::config::detail {
 
@@ -86,14 +86,5 @@ Status parse_memfs_backend_config(const YAML::Node& config,
 Status validate_memfs_backend(const ResourceSpec& resource,
                               const BackendSpec& backend,
                               const StorageContract& contract);
-
-Status parse_legacy_nvme(const YAML::Node& root, ParsedConfig& config);
-
-CanonicalStorageConfig adapt_legacy_nvme(const ParsedConfig& config);
-
-void apply_nvme_compatibility(const ResourceSpec& resource,
-                              const DataPathSpec& datapath,
-                              const BackendSpec& backend,
-                              ParsedConfig& config);
 
 } // namespace tutti::config::detail

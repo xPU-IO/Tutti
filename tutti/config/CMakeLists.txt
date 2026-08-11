@@ -12,7 +12,6 @@
 # Pure-host parse library (no CUDA, no DataPath).
 add_library(tutti_config_parse STATIC
     tutti_config_parse.cpp
-    tutti_config_legacy_nvme_parse.cpp
     storage/resource/memory_config_parse.cpp
     storage/resource/nvme_config_parse.cpp
     storage/resolver/local_file_config_parse.cpp
@@ -27,7 +26,7 @@ add_library(tutti_config_parse STATIC
     storage/backend/striped_local_nvme_config_parse.cpp
 )
 
-target_include_directories(tutti_config_parse PUBLIC
+target_include_directories(tutti_config_parse PRIVATE
     "${TUTTI_REPOSITORY_ROOT}"
     "${CMAKE_CURRENT_SOURCE_DIR}"
 )
@@ -47,6 +46,11 @@ add_library(tutti_runtime STATIC
 )
 
 target_include_directories(tutti_runtime PUBLIC
+    $<BUILD_INTERFACE:${TUTTI_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+)
+
+target_include_directories(tutti_runtime PRIVATE
     "${TUTTI_REPOSITORY_ROOT}"
 )
 
@@ -68,6 +72,11 @@ function(tutti_add_config_loader)
     )
 
     target_include_directories(tutti_config PUBLIC
+        $<BUILD_INTERFACE:${TUTTI_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+    )
+
+    target_include_directories(tutti_config PRIVATE
         "${TUTTI_REPOSITORY_ROOT}"
         "${TUTTI_SOURCE_DIR}/config"
     )
@@ -87,4 +96,16 @@ function(tutti_add_config_loader)
         CXX_STANDARD 17
         CXX_STANDARD_REQUIRED ON
     )
+
+    install(TARGETS tutti_config
+        ARCHIVE DESTINATION lib
+        LIBRARY DESTINATION lib
+        RUNTIME DESTINATION bin
+    )
 endfunction()
+
+install(TARGETS tutti_config_parse tutti_runtime
+    ARCHIVE DESTINATION lib
+    LIBRARY DESTINATION lib
+    RUNTIME DESTINATION bin
+)

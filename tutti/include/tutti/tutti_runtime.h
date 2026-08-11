@@ -1,8 +1,6 @@
 // tutti/include/tutti/tutti_runtime.h
 //
-// Application runtime ownership and lifecycle. Config parsing and loader
-// assembly may populate this aggregate, but cleanup is implemented in the
-// companion source file so parsing cannot accidentally own runtime policy.
+// Application runtime ownership and lifecycle.
 
 #pragma once
 
@@ -50,46 +48,21 @@ struct BackendManifest {
     std::string resource_id;
 };
 
-// Owned runtime bundle. Component vectors remain as a compatibility surface;
-// Resource ownership and backend relationships are private ID registries.
-struct TuttiRuntime {
-    std::unique_ptr<StorageRuntime> runtime;
-    std::vector<std::unique_ptr<DataPath>> datapaths;
-    std::vector<std::unique_ptr<StorageTargetResolver>> resolvers;
-    std::vector<std::string> resolver_schemes;
-    std::vector<std::string> data_path_keys;
-
+class TuttiRuntime {
+public:
     TuttiRuntime();
     ~TuttiRuntime();
     Status shutdown();
 
     TuttiRuntimeState state() const noexcept { return state_; }
+    StorageRuntime* storage_runtime() noexcept { return runtime_.get(); }
+    const StorageRuntime* storage_runtime() const noexcept {
+        return runtime_.get();
+    }
     Result<ResourceInfo> resource_info(std::string_view id) const;
     std::vector<ResourceInfo> resource_infos() const;
     Result<BackendManifest> backend_manifest(std::string_view id) const;
     std::vector<BackendManifest> backend_manifests() const;
-
-    // Single-resource compatibility seam retained for current callers.
-    Result<ResourceInfo> resource_info() const;
-
-    // Transfer component ownership into the runtime and register its route
-    // key. The returned pointer is borrowed and remains valid until shutdown.
-    // Registration is rejected after shutdown has started.
-    DataPath* register_datapath(std::unique_ptr<DataPath> data_path,
-                                std::string key);
-    StorageTargetResolver* register_resolver(
-        std::unique_ptr<StorageTargetResolver> resolver,
-        std::string scheme);
-
-    // Test-only lifecycle injection. Ownership remains with TuttiRuntime.
-    void set_runtime_shutdown_hook(
-        std::function<Status(StorageRuntime&)> hook) {
-        runtime_shutdown_hook_ = std::move(hook);
-    }
-    void set_shutdown_observer(
-        std::function<void(TuttiRuntimeShutdownStage)> observer) {
-        shutdown_observer_ = std::move(observer);
-    }
 
 private:
     friend class TuttiRuntimeTestingAccess;
@@ -106,15 +79,33 @@ private:
     Status adopt_resource_(std::string id,
                            std::unique_ptr<Resource> resource);
     const Resource* find_resource_(std::string_view id) const noexcept;
+    Status register_datapath_(std::string id,
+                              std::unique_ptr<DataPath> data_path,
+                              std::string key,
+                              DataPath*& borrowed);
+    Status register_resolver_(
+        std::string id,
+        std::unique_ptr<StorageTargetResolver> resolver,
+        std::string scheme,
+        StorageTargetResolver*& borrowed);
     Status register_backend_(BackendManifest manifest,
                              const Resource* resource,
                              StorageTargetResolver* resolver,
                              DataPath* datapath);
+    Status set_storage_runtime_(std::unique_ptr<StorageRuntime> runtime);
     Status shutdown_resource_(std::string_view id);
 
     TuttiRuntimeState state_ = TuttiRuntimeState::RUNNING;
+    std::unique_ptr<StorageRuntime> runtime_;
     std::unordered_map<std::string, std::unique_ptr<Resource>> resources_;
     std::vector<std::string> resource_initialization_order_;
+    std::unordered_map<std::string, std::unique_ptr<StorageTargetResolver>>
+        resolvers_;
+    std::vector<std::string> resolver_registration_order_;
+    std::unordered_map<std::string, std::string> resolver_schemes_;
+    std::unordered_map<std::string, std::unique_ptr<DataPath>> datapaths_;
+    std::vector<std::string> datapath_registration_order_;
+    std::unordered_map<std::string, std::string> data_path_keys_;
     std::unordered_map<std::string, BackendInstance> backends_;
     std::vector<std::string> backend_registration_order_;
     std::function<Status(StorageRuntime&)> runtime_shutdown_hook_;

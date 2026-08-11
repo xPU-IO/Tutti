@@ -97,10 +97,12 @@ Status TuttiRuntime::register_backend_(BackendManifest manifest,
         return lifecycle_error(StatusCode::INVALID_ARGUMENT,
                                "backend Resource does not match registry ID");
     }
-    if (std::none_of(resolvers.begin(), resolvers.end(),
-                     [&](const auto& owned) { return owned.get() == resolver; }) ||
-        std::none_of(datapaths.begin(), datapaths.end(),
-                     [&](const auto& owned) { return owned.get() == datapath; })) {
+    const auto owned_resolver = resolvers_.find(manifest.resolver_id);
+    const auto owned_datapath = datapaths_.find(manifest.datapath_id);
+    if (owned_resolver == resolvers_.end() ||
+        owned_resolver->second.get() != resolver ||
+        owned_datapath == datapaths_.end() ||
+        owned_datapath->second.get() != datapath) {
         return lifecycle_error(StatusCode::INVALID_ARGUMENT,
                                "backend components are not owned by TuttiRuntime");
     }
@@ -129,38 +131,100 @@ Status TuttiRuntime::register_backend_(BackendManifest manifest,
     return Status::Ok();
 }
 
-DataPath* TuttiRuntime::register_datapath(
-    std::unique_ptr<DataPath> data_path, std::string key) {
-    if (!data_path || state_ != TuttiRuntimeState::RUNNING) return nullptr;
-    DataPath* borrowed = data_path.get();
-    try {
-        datapaths.push_back(std::move(data_path));
-        data_path_keys.push_back(std::move(key));
-    } catch (...) {
-        // Keep the aggregate internally consistent if route registration
-        // cannot allocate its diagnostic key.
-        if (!datapaths.empty() && datapaths.back().get() == borrowed) {
-            datapaths.pop_back();
+Status TuttiRuntime::register_datapath_(
+    std::string id, std::unique_ptr<DataPath> data_path, std::string key,
+    DataPath*& borrowed) {
+    borrowed = nullptr;
+    if (id.empty() || key.empty() || !data_path) {
+        return lifecycle_error(StatusCode::INVALID_ARGUMENT,
+                               "DataPath registration is incomplete");
+    }
+    if (state_ != TuttiRuntimeState::RUNNING) {
+        return lifecycle_error(StatusCode::BUSY,
+                               "TuttiRuntime cannot register DataPath");
+    }
+    if (datapaths_.count(id) != 0) {
+        return lifecycle_error(StatusCode::INVALID_ARGUMENT,
+                               "TuttiRuntime DataPath ID is already registered");
+    }
+    for (const auto& route : data_path_keys_) {
+        if (route.second == key) {
+            return lifecycle_error(StatusCode::INVALID_ARGUMENT,
+                                   "TuttiRuntime DataPath key is already registered");
         }
+    }
+    DataPath* candidate = data_path.get();
+    auto inserted = datapaths_.emplace(id, std::move(data_path));
+    try {
+        datapath_registration_order_.push_back(id);
+        data_path_keys_.emplace(id, std::move(key));
+    } catch (...) {
+        data_path_keys_.erase(id);
+        if (!datapath_registration_order_.empty() &&
+            datapath_registration_order_.back() == id) {
+            datapath_registration_order_.pop_back();
+        }
+        if (inserted.second && inserted.first->second.get() == candidate)
+            datapaths_.erase(inserted.first);
         throw;
     }
-    return borrowed;
+    borrowed = candidate;
+    return Status::Ok();
 }
 
-StorageTargetResolver* TuttiRuntime::register_resolver(
-    std::unique_ptr<StorageTargetResolver> resolver, std::string scheme) {
-    if (!resolver || state_ != TuttiRuntimeState::RUNNING) return nullptr;
-    StorageTargetResolver* borrowed = resolver.get();
-    try {
-        resolvers.push_back(std::move(resolver));
-        resolver_schemes.push_back(std::move(scheme));
-    } catch (...) {
-        if (!resolvers.empty() && resolvers.back().get() == borrowed) {
-            resolvers.pop_back();
+Status TuttiRuntime::register_resolver_(
+    std::string id, std::unique_ptr<StorageTargetResolver> resolver,
+    std::string scheme, StorageTargetResolver*& borrowed) {
+    borrowed = nullptr;
+    if (id.empty() || scheme.empty() || !resolver) {
+        return lifecycle_error(StatusCode::INVALID_ARGUMENT,
+                               "resolver registration is incomplete");
+    }
+    if (state_ != TuttiRuntimeState::RUNNING) {
+        return lifecycle_error(StatusCode::BUSY,
+                               "TuttiRuntime cannot register resolver");
+    }
+    if (resolvers_.count(id) != 0) {
+        return lifecycle_error(StatusCode::INVALID_ARGUMENT,
+                               "TuttiRuntime resolver ID is already registered");
+    }
+    for (const auto& route : resolver_schemes_) {
+        if (route.second == scheme) {
+            return lifecycle_error(StatusCode::INVALID_ARGUMENT,
+                                   "TuttiRuntime resolver scheme is already registered");
         }
+    }
+    StorageTargetResolver* candidate = resolver.get();
+    auto inserted = resolvers_.emplace(id, std::move(resolver));
+    try {
+        resolver_registration_order_.push_back(id);
+        resolver_schemes_.emplace(id, std::move(scheme));
+    } catch (...) {
+        resolver_schemes_.erase(id);
+        if (!resolver_registration_order_.empty() &&
+            resolver_registration_order_.back() == id) {
+            resolver_registration_order_.pop_back();
+        }
+        if (inserted.second && inserted.first->second.get() == candidate)
+            resolvers_.erase(inserted.first);
         throw;
     }
-    return borrowed;
+    borrowed = candidate;
+    return Status::Ok();
+}
+
+Status TuttiRuntime::set_storage_runtime_(
+    std::unique_ptr<StorageRuntime> runtime) {
+    if (!runtime) {
+        return lifecycle_error(StatusCode::INVALID_ARGUMENT,
+                               "cannot register a null StorageRuntime");
+    }
+    if (state_ != TuttiRuntimeState::RUNNING || runtime_) {
+        return lifecycle_error(StatusCode::BUSY,
+                               "TuttiRuntime already owns a StorageRuntime");
+    }
+    runtime_ = std::move(runtime);
+    return Status::Ok();
 }
 
 void TuttiRuntime::observe_(TuttiRuntimeShutdownStage stage) noexcept {
@@ -181,18 +245,18 @@ Status TuttiRuntime::shutdown() {
     Status first_error;
 
     observe_(TuttiRuntimeShutdownStage::STORAGE_RUNTIME_SHUTDOWN);
-    if (runtime) {
+    if (runtime_) {
         try {
             Status status = runtime_shutdown_hook_
-                ? runtime_shutdown_hook_(*runtime)
-                : runtime->shutdown(0);
+                ? runtime_shutdown_hook_(*runtime_)
+                : runtime_->shutdown(0);
             keep_first_error(first_error, std::move(status));
         } catch (...) {
             keep_first_error(first_error,
                              lifecycle_error(StatusCode::INTERNAL,
                                              "StorageRuntime shutdown threw"));
         }
-        runtime.reset();
+        runtime_.reset();
     }
     observe_(TuttiRuntimeShutdownStage::STORAGE_RUNTIME_DESTROYED);
 
@@ -204,12 +268,20 @@ Status TuttiRuntime::shutdown() {
 
     // Destroy owned components in reverse construction order while their
     // route bindings are no longer used by StorageRuntime.
-    while (!resolvers.empty()) resolvers.pop_back();
+    for (auto id = resolver_registration_order_.rbegin();
+         id != resolver_registration_order_.rend(); ++id) {
+        resolvers_.erase(*id);
+    }
+    resolver_registration_order_.clear();
+    resolver_schemes_.clear();
     observe_(TuttiRuntimeShutdownStage::RESOLVERS_DESTROYED);
-    while (!datapaths.empty()) datapaths.pop_back();
+    for (auto id = datapath_registration_order_.rbegin();
+         id != datapath_registration_order_.rend(); ++id) {
+        datapaths_.erase(*id);
+    }
+    datapath_registration_order_.clear();
+    data_path_keys_.clear();
     observe_(TuttiRuntimeShutdownStage::DATAPATHS_DESTROYED);
-    // Keep route strings as immutable diagnostics for the temporary P2
-    // inspection seam; the owning component vectors above are empty.
 
     for (auto id = resource_initialization_order_.rbegin();
          id != resource_initialization_order_.rend(); ++id) {
@@ -228,15 +300,6 @@ Status TuttiRuntime::shutdown() {
     state_ = TuttiRuntimeState::STOPPED;
     observe_(TuttiRuntimeShutdownStage::COMPLETE);
     return first_error;
-}
-
-Result<ResourceInfo> TuttiRuntime::resource_info() const {
-    if (resource_initialization_order_.size() != 1) {
-        return Result<ResourceInfo>::Failure(
-            lifecycle_error(StatusCode::NOT_FOUND,
-                            "TuttiRuntime does not have exactly one Resource"));
-    }
-    return resource_info(resource_initialization_order_.front());
 }
 
 Result<ResourceInfo> TuttiRuntime::resource_info(std::string_view id) const {

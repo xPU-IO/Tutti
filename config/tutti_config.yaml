@@ -1,109 +1,48 @@
-# ============================================================================
-# tutti_config.yaml -- application-level user configuration
+# Tutti application configuration (canonical schema only).
 #
-# This file is consumed by the tutti_config loader (tutti/config/), which
-# translates it into a RuntimeComponents struct passed to
-# StorageRuntime::create().  The loader is a thin adapter — it does NOT
-# create DataPaths directly; it constructs them via the same public API
-# that programmatic callers use, so there is a single source of truth.
-#
-# Priority (highest wins):
-#   1. Programmatic injection (RuntimeComponents passed to StorageRuntime::create)
-#   2. This config file (via load_tutti_config)
-#   3. Built-in defaults in DataPath constructors
-#
-# The TUTTI_HANDLE_CACHE_CAP / TUTTI_PRP_CACHE_CAP environment variables are
-# TEST-ONLY backdoors.  When the loader is given an explicit value (or the
-# config file sets one), the env var does NOT take effect.  Env vars only
-# apply when the config file omits the key AND no programmatic override is
-# provided.
-#
-# queue_depth is NOT a key here — ring depth is kernel-authoritative
-# (kernel module parameter io_queue_depth; see sys_config.yaml docs).
-# ============================================================================
+# This file describes one logical storage backend. Deployment facts such as
+# PCI BDFs, device paths, BAR sizes, mounts, and actual queue grants belong to
+# the daemon configuration and are returned by nvmeservice at allocation time.
 
-# ---------------------------------------------------------------------------
-# Accelerator profile and Runtime identity.
-#   profile must match the compiled profile (CUDA/HOST/MUSA/MACA).
-#   accel_id >= 0 creates an accelerator Runtime and acquires NVMe slices
-#   from the daemon. HOST profile uses accel_id: -1 and does not contact
-#   the daemon.
-# ---------------------------------------------------------------------------
 accelerator:
   profile: CUDA
 
 runtime:
   accel_id: 0
 
-nvme_service:
-  endpoint: "127.0.0.1:50051"
-
-# ---------------------------------------------------------------------------
-# Storage backend selection.
-#   local-nvme  — direct NVMe via libnvm + snvme kernel module (default)
-#   rdma        — RDMA transport (placeholder, reports unimplemented)
-#
-# Default stripe unit for striped-local-nvme DataPath (bytes).
-#   0  = use DataPath default (512 KiB)
-#   N  = custom stripe unit (must be multiple of block_size and MDTS)
-# ---------------------------------------------------------------------------
 storage:
-  backend: local-nvme
-  default_stripe_unit: 524288   # 512 KiB
+  resources:
+    - id: nvme-local-0
+      type: nvme
+      provider:
+        type: nvme-service
+        endpoint: "127.0.0.1:50051"
+      allocation:
+        selection: explicit
+        device_ids: [0]
+        queues_per_controller: 4
 
-# ---------------------------------------------------------------------------
-# Local NVMe DataPath tuning knobs.
-#
-#   handle_cache_capacity    L1 (GPU-resident) handle cache slots.
-#                            0 = OFF (default; every open rebuilds the
-#                            DeviceTargetHandle from scratch).
-#                            KV-cache workloads should set this to the
-#                            number of concurrently-open files per GPU.
-#
-#   prp_cache_capacity       L1 PRP page cache slots (content-addressed).
-#                            0 = OFF (default; PRP lists rebuilt per IO).
-#                            KV-cache workloads should set this to the
-#                            number of distinct PRP-list shapes.
-#
-#   handle_cache_l2_capacity L2 (host-pinned) handle cache slots.
-#                            0 = 4×L1 when L1 is enabled (default).
-#                            Set explicitly to control the L2 tier.
-#
-#   max_in_flight_operations Max concurrent IO operations in flight per
-#                            DataPath.  0 = default (16).
-#
-#   max_batch_entries        Max entries per batch submit.  0 = default (256).
-#
-#   num_user_queues          User queue pairs per NVMe device.  0 = default (16).
-#                            Capped by kernel module's max_queues_per_group
-#                            (currently 16).
-#
-#   io_granularity           IO granularity hint for registration-time PRP
-#                            pre-build.  0 = dynamic (default;
-#                            PRP built per-IO).  >0 = pre-build at
-#                            register_memory when granularity matches.
-#                            KV-cache workloads: set to tensor/chunk size
-#                            (e.g. 524288 for 512 KiB).
-# ---------------------------------------------------------------------------
-local_nvme:
-  handle_cache_capacity: 0
-  prp_cache_capacity: 0
-  handle_cache_l2_capacity: 0
-  max_in_flight_operations: 0
-  max_batch_entries: 0
-  num_user_queues: 0
-  io_granularity: 0
+  resolvers:
+    - id: file-resolver-0
+      type: local-file
+      scheme: file
+      config: {}
 
-# ---------------------------------------------------------------------------
-# NVMe allocation policy. All device paths and queue grants come from daemon
-# allocation metadata; the loader does not read daemon YAML or derive /dev
-# names from device_ids.
-# ---------------------------------------------------------------------------
-nvme:
-  selection: explicit          # allowed | explicit | striped
-  device_ids: [0]              # allowed: []; explicit: 1 id; striped: >=2 ids
-  queues_per_controller: 4     # 0 = daemon default
-  stripe_unit: 65536           # striped only
+  datapaths:
+    - id: local-nvme-datapath-0
+      type: local-nvme
+      config:
+        handle_cache_capacity: 0
+        prp_cache_capacity: 0
+        handle_cache_l2_capacity: 0
+        max_in_flight_operations: 0
+        max_batch_entries: 0
+        io_granularity: 0
 
-# Legacy parse-only compatibility key. New load_tutti_config() does not use it.
-local_nvme_config: local_nvme_config.yaml
+  backends:
+    - id: model-storage
+      contract: ext4-local-nvme
+      resolver: file-resolver-0
+      datapath: local-nvme-datapath-0
+      resource: nvme-local-0
+      config: {}

@@ -3,7 +3,7 @@
 // Allocation-driven config loader. Parse/resolve logic lives in
 // tutti_config_parse.cpp (pure host).
 
-#include "tutti/config/tutti_config.h"
+#include "tutti/config/tutti_config_internal.h"
 
 #include <cctype>
 #include <exception>
@@ -380,15 +380,23 @@ Result<std::unique_ptr<TuttiRuntime>> load_tutti_config(
                 created.status());
         }
         auto tr = std::make_unique<TuttiRuntime>();
-        tr->runtime = std::move(created).value();
-        tr->set_runtime_shutdown_hook(std::move(options.runtime_shutdown_hook));
-        tr->set_shutdown_observer(std::move(options.shutdown_observer));
+        status = TuttiRuntimeAssemblyAccess::set_storage_runtime(
+            *tr, std::move(created).value());
+        if (!status.ok()) {
+            return Result<std::unique_ptr<TuttiRuntime>>::Failure(status);
+        }
+        TuttiRuntimeTestingAccess::set_runtime_shutdown_hook(
+            *tr, std::move(options.runtime_shutdown_hook));
+        TuttiRuntimeTestingAccess::set_shutdown_observer(
+            *tr, std::move(options.shutdown_observer));
         return Result<std::unique_ptr<TuttiRuntime>>::Success(std::move(tr));
     }
 
     auto tr = std::make_unique<TuttiRuntime>();
-    tr->set_runtime_shutdown_hook(std::move(options.runtime_shutdown_hook));
-    tr->set_shutdown_observer(std::move(options.shutdown_observer));
+    TuttiRuntimeTestingAccess::set_runtime_shutdown_hook(
+        *tr, std::move(options.runtime_shutdown_hook));
+    TuttiRuntimeTestingAccess::set_shutdown_observer(
+        *tr, std::move(options.shutdown_observer));
 
     const BackendSpec& backend = parsed.canonical_storage.backends.front();
     const StorageContract* contract = find_storage_contract(backend.contract);
@@ -506,19 +514,19 @@ Result<std::unique_ptr<TuttiRuntime>> load_tutti_config(
     StorageTargetResolver* resolver = nullptr;
     DataPath* datapath = nullptr;
     try {
-        resolver = tr->register_resolver(
-            std::move(product.resolver), product.scheme);
-        if (resolver == nullptr) {
+        status = TuttiRuntimeAssemblyAccess::register_resolver(
+            *tr, backend.resolver, std::move(product.resolver),
+            product.scheme, resolver);
+        if (!status.ok()) {
             return Result<std::unique_ptr<TuttiRuntime>>::Failure(
-                error(StatusCode::INVALID_ARGUMENT,
-                      "TuttiRuntime rejected resolver registration"));
+                status);
         }
-        datapath = tr->register_datapath(
-            std::move(product.datapath), product.data_path_key);
-        if (datapath == nullptr) {
+        status = TuttiRuntimeAssemblyAccess::register_datapath(
+            *tr, backend.datapath, std::move(product.datapath),
+            product.data_path_key, datapath);
+        if (!status.ok()) {
             return Result<std::unique_ptr<TuttiRuntime>>::Failure(
-                error(StatusCode::INVALID_ARGUMENT,
-                      "TuttiRuntime rejected DataPath registration"));
+                status);
         }
         components.resolvers.push_back({product.scheme, resolver});
         components.data_paths.push_back({
@@ -549,7 +557,11 @@ Result<std::unique_ptr<TuttiRuntime>> load_tutti_config(
         return Result<std::unique_ptr<TuttiRuntime>>::Failure(
             created.status());
     }
-    tr->runtime = std::move(created).value();
+    status = TuttiRuntimeAssemblyAccess::set_storage_runtime(
+        *tr, std::move(created).value());
+    if (!status.ok()) {
+        return Result<std::unique_ptr<TuttiRuntime>>::Failure(status);
+    }
     return Result<std::unique_ptr<TuttiRuntime>>::Success(std::move(tr));
 }
 

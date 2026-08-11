@@ -322,8 +322,13 @@ bool validate_metadata(const TuttiRuntime& bundle,
     const auto inspection = inspect_nvme_resource(bundle);
     bool ok = !inspection.allocation.allocation_id.empty() &&
               inspection.allocation.slices.size() == selected.size();
-    ok = ok && bundle.resolver_schemes.size() == 1 &&
-         bundle.data_path_keys.size() == 1;
+    const auto resource_info = bundle.resource_info("nvme-resource");
+    const auto manifests = bundle.backend_manifests();
+    ok = ok && resource_info.ok() &&
+         resource_info.value().state == tutti::ResourceState::INITIALIZED &&
+         manifests.size() == 1 &&
+         manifests.front().resource_id == "nvme-resource" &&
+         bundle.storage_runtime() != nullptr;
     for (std::size_t i = 0; i < inspection.allocation.slices.size(); ++i) {
         const RuntimeNvmeSlice& slice = inspection.allocation.slices[i];
         const auto resource_it = baseline.find(slice.device_id);
@@ -517,11 +522,11 @@ bool cleanup_runtime_objects(TuttiRuntime& bundle, TargetHandle target,
                              const std::string& label) {
     Status closed = call_preserving_device(
         label + "/close", caller_device,
-        [&] { return bundle.runtime->close(target); });
+        [&] { return bundle.storage_runtime()->close(target); });
     check(closed.ok(), label + ": target closed");
     Status unregistered = call_preserving_device(
         label + "/unregister", caller_device,
-        [&] { return bundle.runtime->unregister_memory(memory); });
+        [&] { return bundle.storage_runtime()->unregister_memory(memory); });
     check(unregistered.ok(), label + ": memory unregistered");
     return closed.ok() && unregistered.ok();
 }
@@ -569,9 +574,9 @@ bool run_local_scenario(const Options& options, const std::string& config_path,
     if (!bundle) return false;
     bool ok = validate_metadata(*bundle, baseline, accel_id, {device_id},
                                 static_cast<std::uint32_t>(options.queues));
-    ok = bundle->resolver_schemes == std::vector<std::string>{"file"} &&
-         bundle->data_path_keys ==
-             std::vector<std::string>{"local-nvme-ext4"} && ok;
+    const auto manifest = bundle->backend_manifest("storage-backend");
+    ok = manifest.ok() &&
+         manifest.value().contract == "ext4-local-nvme" && ok;
     check(ok, label + ": loader publishes one Local top-level binding");
     const ResourceMap acquired = snapshot_resources(observer);
     print_snapshot((label + " acquired").c_str(), acquired);
@@ -589,8 +594,8 @@ bool run_local_scenario(const Options& options, const std::string& config_path,
 
     auto opened = call_preserving_device(
         label + "/open", caller_device,
-        [&] { return bundle->runtime->open("file://" + scratch,
-                                          OpenOptions{"file"}); });
+        [&] { return bundle->storage_runtime()->open("file://" + scratch,
+                                                    OpenOptions{"file"}); });
     check(opened.ok(), label + ": file target opened");
     if (!opened.ok()) {
         (void)shutdown_and_check_ledger(bundle, caller_device, observer,
@@ -604,7 +609,7 @@ bool run_local_scenario(const Options& options, const std::string& config_path,
     auto registered = call_preserving_device(
         label + "/register", caller_device,
         [&] {
-            return bundle->runtime->register_memory(MemoryView{
+            return bundle->storage_runtime()->register_memory(MemoryView{
                 buffer.aligned, buffer.size, MemoryKind::DEVICE,
                 MemoryOwnership::CALLER_OWNED, accel_id, "CUDA"});
         });
@@ -612,7 +617,7 @@ bool run_local_scenario(const Options& options, const std::string& config_path,
     if (!registered.ok()) {
         (void)call_preserving_device(
             label + "/close", caller_device,
-            [&] { return bundle->runtime->close(opened.value()); });
+            [&] { return bundle->storage_runtime()->close(opened.value()); });
         free_gpu_buffer(accel_id, caller_device, buffer);
         (void)shutdown_and_check_ledger(bundle, caller_device, observer,
                                         baseline, label);
@@ -627,12 +632,12 @@ bool run_local_scenario(const Options& options, const std::string& config_path,
         ExecutionDomain::DEVICE_EXECUTION, accel_id, buffer.stream};
     IoRequest write{IoDirection::WRITE, registered.value(), 0,
                     opened.value(), 0, io_size};
-    ok = submit_and_wait(*bundle->runtime, &write, 1, context,
+    ok = submit_and_wait(*bundle->storage_runtime(), &write, 1, context,
                          caller_device, label + "/write") && ok;
     ok = fill_value(buffer, accel_id, caller_device, 0, io_size, 0xff) && ok;
     IoRequest read{IoDirection::READ, registered.value(), 0,
                    opened.value(), 0, io_size};
-    ok = submit_and_wait(*bundle->runtime, &read, 1, context,
+    ok = submit_and_wait(*bundle->storage_runtime(), &read, 1, context,
                          caller_device, label + "/read") && ok;
     ok = verify_value(buffer, accel_id, caller_device, 0, io_size, pattern) && ok;
     check(ok, label + ": Local write/read is byte-exact");
@@ -752,9 +757,9 @@ bool run_striped_bundle_phase(
     if (!bundle) return false;
     bool ok = validate_metadata(*bundle, baseline, accel_id, devices,
                                 static_cast<std::uint32_t>(options.queues));
-    ok = bundle->resolver_schemes == std::vector<std::string>{"striped"} &&
-         bundle->data_path_keys ==
-             std::vector<std::string>{"striped-local-nvme"} && ok;
+    const auto manifest = bundle->backend_manifest("storage-backend");
+    ok = manifest.ok() &&
+         manifest.value().contract == "striped-local-nvme" && ok;
     check(ok, label + ": loader publishes one Striped top-level binding");
     const ResourceMap acquired = snapshot_resources(observer);
     print_snapshot((label + " acquired").c_str(), acquired);
@@ -783,7 +788,8 @@ bool run_striped_bundle_phase(
         name, inspect_nvme_resource(*bundle).allocation.slices);
     auto opened = call_preserving_device(
         label + "/open", caller_device,
-        [&] { return bundle->runtime->open(uri, OpenOptions{"striped"}); });
+        [&] { return bundle->storage_runtime()->open(
+            uri, OpenOptions{"striped"}); });
     check(opened.ok(), label + ": striped target opened");
     if (!opened.ok()) {
         (void)shutdown_and_check_ledger(bundle, caller_device, observer,
@@ -797,7 +803,7 @@ bool run_striped_bundle_phase(
     auto registered = call_preserving_device(
         label + "/register", caller_device,
         [&] {
-            return bundle->runtime->register_memory(MemoryView{
+            return bundle->storage_runtime()->register_memory(MemoryView{
                 buffer.aligned, buffer.size, MemoryKind::DEVICE,
                 MemoryOwnership::CALLER_OWNED, accel_id, "CUDA"});
         });
@@ -805,14 +811,15 @@ bool run_striped_bundle_phase(
     if (!registered.ok()) {
         (void)call_preserving_device(
             label + "/close", caller_device,
-            [&] { return bundle->runtime->close(opened.value()); });
+            [&] { return bundle->storage_runtime()->close(opened.value()); });
         free_gpu_buffer(accel_id, caller_device, buffer);
         (void)shutdown_and_check_ledger(bundle, caller_device, observer,
                                         baseline, label);
         return false;
     }
 
-    ok = run_striped_io(*bundle->runtime, opened.value(), registered.value(),
+    ok = run_striped_io(*bundle->storage_runtime(), opened.value(),
+                        registered.value(),
                         buffer, accel_id, caller_device, write_phase, label) && ok;
     ok = cleanup_runtime_objects(*bundle, opened.value(), registered.value(),
                                  caller_device, label) && ok;

@@ -1,6 +1,7 @@
 #include "tutti/config/storage/parse_internal.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -112,10 +113,6 @@ Result<T> failure(Status status) {
 }
 
 Status parse_common(const YAML::Node& root, ParsedConfig& config) {
-    if (const YAML::Node gpu = root["gpu"]) {
-        if (const YAML::Node vendor = gpu["vendor"])
-            config.gpu_vendor = vendor.as<std::string>();
-    }
     if (const YAML::Node accelerator = root["accelerator"]) {
         if (const YAML::Node profile = accelerator["profile"])
             config.accelerator_profile = profile.as<std::string>();
@@ -417,28 +414,6 @@ Status parse_storage_arrays(const YAML::Node& storage_node,
     return validate_canonical(storage);
 }
 
-void apply_canonical_compatibility(ParsedConfig& config) {
-    if (!config.canonical_storage.present ||
-        config.canonical_storage.backends.empty()) {
-        return;
-    }
-    const BackendSpec& backend = config.canonical_storage.backends.front();
-    const auto resource_it = std::find_if(
-        config.canonical_storage.resources.begin(),
-        config.canonical_storage.resources.end(),
-        [&](const ResourceSpec& resource) { return resource.id == backend.resource; });
-    const auto datapath_it = std::find_if(
-        config.canonical_storage.datapaths.begin(),
-        config.canonical_storage.datapaths.end(),
-        [&](const DataPathSpec& datapath) { return datapath.id == backend.datapath; });
-    if (resource_it != config.canonical_storage.resources.end() &&
-        resource_it->type == "nvme" &&
-        datapath_it != config.canonical_storage.datapaths.end()) {
-        detail::apply_nvme_compatibility(
-            *resource_it, *datapath_it, backend, config);
-    }
-}
-
 Result<ParsedConfig> parse_canonical(const YAML::Node& root) {
     Status status = validate_keys(root, "root", {"accelerator", "runtime", "storage"});
     if (!status.ok()) return failure<ParsedConfig>(status);
@@ -452,7 +427,6 @@ Result<ParsedConfig> parse_canonical(const YAML::Node& root) {
     }
 
     ParsedConfig config;
-    config.syntax = ConfigSyntax::Canonical;
     status = parse_common(root, config);
     if (!status.ok()) return failure<ParsedConfig>(status);
     if (!root["storage"]) {
@@ -463,20 +437,6 @@ Result<ParsedConfig> parse_canonical(const YAML::Node& root) {
         return Result<ParsedConfig>::Success(std::move(config));
     }
     status = parse_storage_arrays(root["storage"], config.canonical_storage);
-    if (!status.ok()) return failure<ParsedConfig>(status);
-    apply_canonical_compatibility(config);
-    return Result<ParsedConfig>::Success(std::move(config));
-}
-
-Result<ParsedConfig> parse_legacy(const YAML::Node& root) {
-    ParsedConfig config;
-    config.syntax = ConfigSyntax::Legacy;
-    Status status = parse_common(root, config);
-    if (!status.ok()) return failure<ParsedConfig>(status);
-    status = detail::parse_legacy_nvme(root, config);
-    if (!status.ok()) return failure<ParsedConfig>(status);
-    config.canonical_storage = detail::adapt_legacy_nvme(config);
-    status = validate_canonical(config.canonical_storage);
     if (!status.ok()) return failure<ParsedConfig>(status);
     return Result<ParsedConfig>::Success(std::move(config));
 }
@@ -496,25 +456,19 @@ Result<ParsedConfig> parse_tutti_config(const std::string& path) {
         }
 
         const YAML::Node storage = root["storage"];
-        const bool canonical_storage =
-            has_key(storage, "resources") || has_key(storage, "resolvers") ||
-            has_key(storage, "datapaths") || has_key(storage, "backends");
-        const bool legacy_storage =
-            has_key(storage, "backend") || has_key(storage, "default_stripe_unit");
+        const bool legacy_storage = has_key(storage, "backend") ||
+                                    has_key(storage, "default_stripe_unit");
         const bool legacy_root =
             has_key(root, "gpu") || has_key(root, "nvme_service") ||
             has_key(root, "nvme") || has_key(root, "local_nvme") ||
             has_key(root, "local_nvme_config");
 
-        if (canonical_storage && (legacy_storage || legacy_root)) {
+        if (legacy_storage || legacy_root) {
             return failure<ParsedConfig>(
-                invalid("canonical and legacy storage fields cannot be mixed"));
+                invalid("legacy Tutti config schema was removed in P6; "
+                        "migrate to storage.resources/resolvers/datapaths/backends"));
         }
-        if (canonical_storage) return parse_canonical(root);
-        if (legacy_storage || legacy_root) return parse_legacy(root);
-        if (storage || root["accelerator"] || root["runtime"] || root.size() != 0)
-            return parse_canonical(root);
-        return parse_legacy(root);
+        return parse_canonical(root);
     } catch (const YAML::Exception& exception) {
         return failure<ParsedConfig>(
             invalid("yaml parse error: " + std::string(exception.what())));
@@ -522,6 +476,50 @@ Result<ParsedConfig> parse_tutti_config(const std::string& path) {
         return failure<ParsedConfig>(
             invalid("config parse error: " + std::string(exception.what())));
     }
+}
+
+EffectiveCacheConfig resolve_cache_config(
+    const ParsedConfig& parsed, const ProgrammaticOverrides& overrides) {
+    const DataPathSpec* datapath = nullptr;
+    if (!parsed.canonical_storage.backends.empty()) {
+        const std::string& datapath_id =
+            parsed.canonical_storage.backends.front().datapath;
+        const auto found = std::find_if(
+            parsed.canonical_storage.datapaths.begin(),
+            parsed.canonical_storage.datapaths.end(),
+            [&](const DataPathSpec& candidate) {
+                return candidate.id == datapath_id;
+            });
+        if (found != parsed.canonical_storage.datapaths.end()) {
+            datapath = &*found;
+        }
+    }
+
+    const auto env_or_zero = [](const char* name) {
+        const char* value = std::getenv(name);
+        return value ? static_cast<std::uint32_t>(std::atoi(value)) : 0;
+    };
+    const std::uint32_t config_handle =
+        datapath == nullptr ? 0 : datapath->handle_cache_capacity;
+    const std::uint32_t config_prp =
+        datapath == nullptr ? 0 : datapath->prp_cache_capacity;
+    const std::uint32_t config_l2 =
+        datapath == nullptr ? 0 : datapath->handle_cache_l2_capacity;
+
+    EffectiveCacheConfig effective;
+    effective.handle_cache_capacity = overrides.handle_cache_capacity > 0
+        ? overrides.handle_cache_capacity
+        : (config_handle > 0 ? config_handle
+                             : env_or_zero("TUTTI_HANDLE_CACHE_CAP"));
+    effective.prp_cache_capacity = overrides.prp_cache_capacity > 0
+        ? overrides.prp_cache_capacity
+        : (config_prp > 0 ? config_prp
+                          : env_or_zero("TUTTI_PRP_CACHE_CAP"));
+    effective.handle_cache_l2_capacity =
+        overrides.handle_cache_l2_capacity > 0
+            ? overrides.handle_cache_l2_capacity
+            : config_l2;
+    return effective;
 }
 
 } // namespace tutti::config

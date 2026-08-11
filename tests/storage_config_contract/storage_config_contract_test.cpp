@@ -149,25 +149,41 @@ int main() {
     using namespace tutti::config;
 
     {
+        auto parsed = parse_tutti_config(TUTTI_REPOSITORY_TUTTI_CONFIG);
+        check(parsed.ok(), "repository Tutti config is canonical");
+        if (parsed.ok()) {
+            check(parsed.value().canonical_storage.resources.front().id ==
+                      "nvme-local-0" &&
+                      parsed.value().canonical_storage.backends.front().id ==
+                          "model-storage",
+                  "repository Tutti config preserves canonical IDs");
+        }
+    }
+
+    {
         TempConfig config(local_yaml());
         auto parsed = parse_tutti_config(config.path());
         check(parsed.ok(), "canonical local accepted");
         if (parsed.ok()) {
             const ParsedConfig& value = parsed.value();
-            check(value.syntax == ConfigSyntax::Canonical, "canonical syntax tagged");
             check(value.canonical_storage.resources.size() == 1,
                   "canonical local resource count");
             check(value.canonical_storage.backends.front().contract ==
                       "ext4-local-nvme",
                   "canonical local contract");
-            check(value.nvme_service_endpoint == "127.0.0.1:50051",
-                  "canonical endpoint compatibility");
-            check(value.nvme_selection == NvmeSelection::Explicit &&
-                      value.nvme_device_ids == std::vector<std::int32_t>{0},
-                  "canonical allocation compatibility");
-            check(value.handle_cache_capacity == 11 &&
-                      value.max_batch_entries == 15,
-                  "canonical datapath compatibility");
+            const ResourceSpec& resource =
+                value.canonical_storage.resources.front();
+            const DataPathSpec& datapath =
+                value.canonical_storage.datapaths.front();
+            check(resource.provider.endpoint == "127.0.0.1:50051",
+                  "canonical endpoint preserved");
+            check(resource.allocation.selection == NvmeSelection::Explicit &&
+                      resource.allocation.device_ids ==
+                          std::vector<std::int32_t>{0},
+                  "canonical allocation preserved");
+            check(datapath.handle_cache_capacity == 11 &&
+                      datapath.max_batch_entries == 15,
+                  "canonical datapath tuning preserved");
         }
     }
 
@@ -177,9 +193,13 @@ int main() {
         check(parsed.ok(), "canonical striped accepted");
         if (parsed.ok()) {
             const auto& value = parsed.value();
-            check(value.nvme_device_ids == std::vector<std::int32_t>({1, 0}),
+            check(value.canonical_storage.resources.front()
+                          .allocation.device_ids ==
+                      std::vector<std::int32_t>({1, 0}),
                   "striped device order preserved");
-            check(value.stripe_unit == 65536, "striped unit adapted");
+            check(value.canonical_storage.backends.front().stripe_unit ==
+                      65536,
+                  "striped unit preserved");
             check(value.canonical_storage.backends.front().contract ==
                       "striped-local-nvme",
                   "striped contract preserved");
@@ -191,33 +211,21 @@ int main() {
         auto parsed = parse_tutti_config(config.path());
         check(parsed.ok(), "HOST without storage accepted");
         if (parsed.ok()) {
-            check(parsed.value().syntax == ConfigSyntax::Canonical,
-                  "HOST no-storage canonical syntax");
             check(!parsed.value().canonical_storage.present,
                   "HOST no-storage model empty");
         }
     }
 
-    {
-        TempConfig config(
-            "accelerator: {profile: CUDA}\n"
-            "runtime: {accel_id: 0}\n"
-            "nvme_service: {endpoint: legacy}\n"
-            "nvme: {selection: striped, device_ids: [0, 1], queues_per_controller: 4, stripe_unit: 65536}\n"
-            "local_nvme: {handle_cache_capacity: 7}\n");
-        auto parsed = parse_tutti_config(config.path());
-        check(parsed.ok(), "legacy config accepted");
-        if (parsed.ok()) {
-            check(parsed.value().syntax == ConfigSyntax::Legacy,
-                  "legacy syntax tagged");
-            check(parsed.value().canonical_storage.backends.front().contract ==
-                      "striped-local-nvme",
-                  "legacy converted once to canonical contract");
-            check(parsed.value().canonical_storage.resources.front().provider.endpoint ==
-                      "legacy",
-                  "legacy provider adapted");
-        }
-    }
+    expect_failure(
+        "accelerator: {profile: CUDA}\n"
+        "runtime: {accel_id: 0}\n"
+        "nvme_service: {endpoint: legacy}\n"
+        "nvme: {selection: striped, device_ids: [0, 1], queues_per_controller: 4, stripe_unit: 65536}\n"
+        "local_nvme: {handle_cache_capacity: 7}\n",
+        "legacy root schema removed");
+    expect_failure(
+        "storage: {backend: local-nvme}\n",
+        "legacy storage schema removed");
 
     const std::string duplicate_resource =
         "    - id: nvme-local-0\n"

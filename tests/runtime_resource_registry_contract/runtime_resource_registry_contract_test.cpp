@@ -112,8 +112,8 @@ void test_registry_and_reverse_shutdown() {
               infos[1].id == "resource-1",
           "ResourceInfo snapshots follow initialization order");
     CHECK(runtime.resource_info("resource-0").ok() &&
-              !runtime.resource_info().ok(),
-          "multi-Resource lookup is ID-addressed");
+              !runtime.resource_info("missing").ok(),
+          "Resource lookup is ID-addressed");
     CHECK(TuttiRuntimeTestingAccess::resource_initialization_order(runtime) ==
               std::vector<std::string>({"resource-0", "resource-1"}),
           "Runtime records successful initialization order");

@@ -25,6 +25,7 @@
 #include <tutti/resolvers/striped_file/resolver.h>
 #include "tutti/data_paths/local_nvme/local_nvme_data_path.h"
 #include "tutti/data_paths/striped_local_nvme/striped_data_path.h"
+#include "tutti/config/tutti_config_internal.h"
 #include "tutti/resource/nvme/nvme_resource_internal.h"
 #include "tutti/testing/mock_data_path.h"
 #include "tutti/tutti_runtime/tutti_runtime_internal.h"
@@ -48,8 +49,12 @@ static std::string write_tmp(const std::string& content) {
     char tmpl[] = "/tmp/tutti_cfg_XXXXXX";
     int fd = mkstemp(tmpl);
     assert(fd >= 0);
-    write(fd, content.data(), content.size());
+    const ssize_t written = write(fd, content.data(), content.size());
     close(fd);
+    if (written != static_cast<ssize_t>(content.size())) {
+        ::unlink(tmpl);
+        return {};
+    }
     return std::string(tmpl);
 }
 
@@ -248,7 +253,8 @@ static std::string canonical_local_yaml(
 }
 
 static std::string canonical_striped_yaml(const std::string& device_ids,
-                                          const std::string& stripe_unit) {
+                                          const std::string& stripe_unit,
+                                          const std::string& datapath_config = "{}") {
     return "accelerator: {profile: CUDA}\n"
            "runtime: {accel_id: 0}\n"
            "storage:\n"
@@ -261,7 +267,9 @@ static std::string canonical_striped_yaml(const std::string& device_ids,
            "  resolvers:\n"
            "    - {id: striped-resolver-0, type: striped-file, scheme: striped, config: {}}\n"
            "  datapaths:\n"
-           "    - {id: striped-datapath-0, type: striped-local-nvme, config: {}}\n"
+           "    - id: striped-datapath-0\n"
+           "      type: striped-local-nvme\n"
+           "      config: " + datapath_config + "\n"
            "  backends:\n"
            "    - id: striped-storage\n"
            "      contract: striped-local-nvme\n"
@@ -269,6 +277,15 @@ static std::string canonical_striped_yaml(const std::string& device_ids,
            "      datapath: striped-datapath-0\n"
            "      resource: nvme-striped-0\n"
            "      config: {stripe_unit: " + stripe_unit + "}\n";
+}
+
+static std::string replace_once(std::string value, const std::string& from,
+                                const std::string& to) {
+    const std::size_t position = value.find(from);
+    if (position != std::string::npos) {
+        value.replace(position, from.size(), to);
+    }
+    return value;
 }
 
 static LoadTuttiConfigOptions fake_options(
@@ -317,74 +334,59 @@ static LoadTuttiConfigOptions fake_options(
 }
 
 int main() {
-    // 1. Valid parse — all keys.
+    // 1. Canonical parse preserves all values in the canonical graph.
     {
-        std::string yaml = R"(
-gpu:
-  vendor: nvidia
-storage:
-  backend: local-nvme
-  default_stripe_unit: 524288
-local_nvme:
-  handle_cache_capacity: 64
-  prp_cache_capacity: 128
-  handle_cache_l2_capacity: 256
-  max_in_flight_operations: 32
-  max_batch_entries: 512
-  num_user_queues: 8
-  io_granularity: 524288
-local_nvme_config: local_nvme_config.yaml
-accelerator:
-  profile: CUDA
-runtime:
-  accel_id: 0
-nvme_service:
-  endpoint: "127.0.0.1:50051"
-nvme:
-  selection: "striped"
-  device_ids: [0, 1]
-  queues_per_controller: 4
-  stripe_unit: 65536
-)";
+        std::string yaml = canonical_striped_yaml(
+            "[0, 1]", "65536",
+            "{handle_cache_capacity: 64, prp_cache_capacity: 128, "
+            "handle_cache_l2_capacity: 256, max_in_flight_operations: 32, "
+            "max_batch_entries: 512, io_granularity: 524288}");
         auto path = write_tmp(yaml);
         auto r = parse_tutti_config(path);
         CHECK(r.ok(), "valid parse: ok");
         if (r.ok()) {
             const auto& c = r.value();
-            CHECK(c.gpu_vendor == "nvidia", "gpu_vendor");
-            CHECK(c.storage_backend == "local-nvme", "storage_backend");
-            CHECK(c.default_stripe_unit == 524288, "stripe_unit");
-            CHECK(c.handle_cache_capacity == 64, "handle_cache_capacity");
-            CHECK(c.prp_cache_capacity == 128, "prp_cache_capacity");
-            CHECK(c.handle_cache_l2_capacity == 256, "l2_capacity");
-            CHECK(c.max_in_flight_operations == 32, "max_in_flight");
-            CHECK(c.max_batch_entries == 512, "max_batch_entries");
-            CHECK(c.num_user_queues == 8, "num_user_queues");
-            CHECK(c.io_granularity == 524288, "io_granularity");
-            CHECK(c.local_nvme_config == "local_nvme_config.yaml",
-                  "local_nvme_config link");
             CHECK(c.accelerator_profile == "CUDA", "accelerator profile");
             CHECK(c.runtime_accel_id == 0, "runtime accel_id");
-            CHECK(c.nvme_selection == NvmeSelection::Striped,
+            const auto& resource = c.canonical_storage.resources.front();
+            const auto& datapath = c.canonical_storage.datapaths.front();
+            const auto& backend = c.canonical_storage.backends.front();
+            CHECK(resource.allocation.selection == NvmeSelection::Striped,
                   "nvme selection");
-            CHECK(c.nvme_device_ids.size() == 2 &&
-                  c.nvme_device_ids[1] == 1, "nvme device ids");
-            CHECK(c.queues_per_controller == 4, "queues per controller");
-            CHECK(c.stripe_unit == 65536, "stripe unit");
+            CHECK(resource.allocation.device_ids ==
+                      std::vector<std::int32_t>({0, 1}),
+                  "nvme device ids");
+            CHECK(resource.allocation.queues_per_controller == 4,
+                  "queues per controller");
+            CHECK(datapath.handle_cache_capacity == 64 &&
+                      datapath.prp_cache_capacity == 128 &&
+                      datapath.handle_cache_l2_capacity == 256 &&
+                      datapath.max_in_flight_operations == 32 &&
+                      datapath.max_batch_entries == 512 &&
+                      datapath.io_granularity == 524288,
+                  "canonical DataPath tuning");
+            CHECK(backend.stripe_unit == 65536, "stripe unit");
         }
         ::unlink(path.c_str());
     }
 
-    // 2. RDMA placeholder → UNSUPPORTED.
+    // 2. Legacy application config is removed, including mixed files.
     {
-        std::string yaml = "storage:\n  backend: rdma\n";
+        std::string yaml = "storage:\n  backend: local-nvme\n";
         auto path = write_tmp(yaml);
         auto r = parse_tutti_config(path);
-        CHECK(!r.ok(), "rdma: fail-closed");
+        CHECK(!r.ok(), "legacy storage: fail-closed");
         if (!r.ok()) {
-            CHECK((int)r.status().code() == (int)tutti::StatusCode::UNSUPPORTED,
-                  "rdma: UNSUPPORTED status");
+            CHECK(r.status().message().find("removed in P6") !=
+                      std::string::npos,
+                  "legacy storage: migration diagnostic");
         }
+        ::unlink(path.c_str());
+
+        path = write_tmp(canonical_local_yaml() +
+                         "nvme_service: {endpoint: legacy}\n");
+        CHECK(!parse_tutti_config(path).ok(),
+              "canonical and legacy mix fail-closed");
         ::unlink(path.c_str());
     }
 
@@ -397,26 +399,21 @@ nvme:
         ::unlink(path.c_str());
     }
 
-    // 4. Empty/minimal config → defaults.
+    // 4. Accelerator configs cannot rely on legacy defaults.
     {
         std::string yaml = "";
         auto path = write_tmp(yaml);
         auto r = parse_tutti_config(path);
-        CHECK(r.ok(), "empty yaml: ok (defaults)");
-        if (r.ok()) {
-            const auto& c = r.value();
-            CHECK(c.gpu_vendor == "nvidia", "default vendor");
-            CHECK(c.storage_backend == "local-nvme", "default backend");
-            CHECK(c.handle_cache_capacity == 0, "default cache cap=0");
-            CHECK(c.local_nvme_config.empty(), "default no link");
-        }
+        CHECK(!r.ok(), "empty CUDA yaml: storage required");
         ::unlink(path.c_str());
     }
 
     // 5. Priority chain: programmatic > config > env > default.
     {
-        // Config sets handle_cache_capacity=64.
-        std::string yaml = "local_nvme:\n  handle_cache_capacity: 64\n";
+        std::string yaml = replace_once(
+            canonical_local_yaml(),
+            "      config: {}\n  backends:\n",
+            "      config: {handle_cache_capacity: 64}\n  backends:\n");
         auto path = write_tmp(yaml);
         auto r = parse_tutti_config(path);
         CHECK(r.ok(), "priority: parse ok");
@@ -458,40 +455,37 @@ nvme:
         CHECK(!r.ok(), "non-existent file: fail-closed");
     }
 
-    // 7. New nvme selection validation.
+    // 7. Canonical NVMe selection validation.
     {
-        auto bad_selection = write_tmp(
-            "nvme:\n  selection: mystery\n");
+        auto bad_selection = write_tmp(canonical_local_yaml("mystery"));
         CHECK(!parse_tutti_config(bad_selection).ok(),
               "unknown selection fail-closed");
         ::unlink(bad_selection.c_str());
 
-        auto explicit_zero = write_tmp(
-            "nvme:\n  selection: explicit\n  device_ids: []\n");
+        auto explicit_zero = write_tmp(canonical_local_yaml("explicit", "[]"));
         CHECK(!parse_tutti_config(explicit_zero).ok(),
               "explicit zero ids fail-closed");
         ::unlink(explicit_zero.c_str());
 
         auto explicit_many = write_tmp(
-            "nvme:\n  selection: explicit\n  device_ids: [0, 1]\n");
+            canonical_local_yaml("explicit", "[0, 1]"));
         CHECK(!parse_tutti_config(explicit_many).ok(),
               "explicit many ids fail-closed");
         ::unlink(explicit_many.c_str());
 
-        auto striped_one = write_tmp(
-            "nvme:\n  selection: striped\n  device_ids: [0]\n");
+        auto striped_one = write_tmp(canonical_striped_yaml("[0]", "65536"));
         CHECK(!parse_tutti_config(striped_one).ok(),
               "striped one id fail-closed");
         ::unlink(striped_one.c_str());
 
         auto duplicate = write_tmp(
-            "nvme:\n  selection: striped\n  device_ids: [0, 0]\n");
+            canonical_striped_yaml("[0, 0]", "65536"));
         CHECK(!parse_tutti_config(duplicate).ok(),
               "duplicate ids fail-closed");
         ::unlink(duplicate.c_str());
     }
 
-    // 8. derive_local_nvme_devices — legacy parse-only topology helper.
+    // 8. Daemon topology files are not application configs.
     {
         std::string yaml = R"(
 nvmes:
@@ -504,102 +498,75 @@ nvmes:
   - pci_addr: "0000:57:00.0"
 )";
         auto path = write_tmp(yaml);
-        auto r = derive_local_nvme_devices(path);
-        CHECK(r.ok(), "derive: ok");
-        if (r.ok()) {
-            const auto& d = r.value();
-            CHECK(d.size() == 3, "derive: 3 specs (1+2, third skipped)");
-            if (d.size() == 3) {
-                CHECK(d[0].snvme_dev == "/dev/ssnvme0" &&
-                      d[0].cuda_device == 0, "derive: nvme0 -> gpu0");
-                CHECK(d[1].snvme_dev == "/dev/ssnvme1" &&
-                      d[1].cuda_device == 1 &&
-                      d[1].namespace_id == 2, "derive: nvme1 -> gpu1 ns2");
-                CHECK(d[2].cuda_device == 2, "derive: nvme1 -> gpu2");
-            }
-        }
+        auto r = parse_tutti_config(path);
+        CHECK(!r.ok(), "daemon topology rejected as Tutti config");
         ::unlink(path.c_str());
-
-        auto r2 = derive_local_nvme_devices("/tmp/tutti_nonexistent_lnvc.yaml");
-        CHECK(!r2.ok(), "derive: missing file fail-closed");
     }
 
     // 9. Fake-client loader: single-slice allocation produces one top-level
     // file resolver and one local DataPath binding, then releases once.
     {
-        std::string yaml = R"(
-accelerator: {profile: CUDA}
-runtime: {accel_id: 0}
-nvme_service: {endpoint: "fake-endpoint"}
-nvme:
-  selection: explicit
-  device_ids: [0]
-  queues_per_controller: 4
-)";
+        std::string yaml = canonical_local_yaml();
         auto path = write_tmp(yaml);
         auto state = make_state({make_slice(0)});
         auto r = load_tutti_config(path, fake_options(state));
         CHECK(r.ok(), "loader single-slice: ok");
         if (r.ok()) {
             auto bundle = std::move(r).value();
-            CHECK(bundle->resolver_schemes.size() == 1 &&
-                  bundle->resolver_schemes[0] == "file",
-                  "loader single-slice: file resolver");
-            CHECK(bundle->data_path_keys.size() == 1 &&
-                  bundle->data_path_keys[0] == "local-nvme-ext4",
-                  "loader single-slice: local DataPath key");
+            CHECK(bundle->storage_runtime() != nullptr,
+                  "loader single-slice: StorageRuntime available");
             CHECK(state->acquire_calls == 1, "loader single-slice: acquire once");
             CHECK(bundle->state() == TuttiRuntimeState::RUNNING,
                   "loader single-slice: runtime starts RUNNING");
-            auto resource_info = bundle->resource_info();
+            auto resource_info = bundle->resource_info("nvme-local-0");
             CHECK(resource_info.ok() &&
-                      resource_info.value().id == "legacy-nvme-resource" &&
+                      resource_info.value().id == "nvme-local-0" &&
                       resource_info.value().type == "nvme" &&
                       resource_info.value().state ==
                           tutti::ResourceState::INITIALIZED,
                   "loader single-slice: Resource identity and state");
             if (resource_info.ok()) {
                 resource_info.value().id = "mutated";
-                CHECK(bundle->resource_info().value().id ==
-                          "legacy-nvme-resource",
+                CHECK(bundle->resource_info("nvme-local-0").value().id ==
+                          "nvme-local-0",
                       "loader single-slice: ResourceInfo is a copy");
             }
-            CHECK(bundle->resource_info("legacy-nvme-resource").ok() &&
+            CHECK(bundle->resource_info("nvme-local-0").ok() &&
                       bundle->resource_infos().size() == 1,
                   "loader single-slice: Resource registry is ID-addressed");
             CHECK(TuttiRuntimeTestingAccess::resource_initialization_order(
                       *bundle) ==
-                      std::vector<std::string>{"legacy-nvme-resource"},
+                      std::vector<std::string>{"nvme-local-0"},
                   "loader single-slice: initialization order records ID once");
             auto backend_manifest =
-                bundle->backend_manifest("legacy-backend");
+                bundle->backend_manifest("model-storage");
             CHECK(backend_manifest.ok() &&
                       backend_manifest.value().contract ==
                           "ext4-local-nvme" &&
                       backend_manifest.value().resolver_id ==
-                          "legacy-resolver" &&
+                          "file-resolver-0" &&
                       backend_manifest.value().datapath_id ==
-                          "legacy-datapath" &&
+                          "local-nvme-datapath-0" &&
                       backend_manifest.value().resource_id ==
-                          "legacy-nvme-resource",
+                          "nvme-local-0",
                   "loader single-slice: manifest preserves backend IDs");
             if (backend_manifest.ok()) {
                 backend_manifest.value().resource_id = "mutated";
-                CHECK(bundle->backend_manifest("legacy-backend")
+                CHECK(bundle->backend_manifest("model-storage")
                               .value().resource_id ==
-                          "legacy-nvme-resource",
+                          "nvme-local-0",
                       "loader single-slice: BackendManifest is a copy");
             }
             const auto busy = TuttiRuntimeTestingAccess::shutdown_resource(
-                *bundle, "legacy-nvme-resource");
+                *bundle, "nvme-local-0");
             CHECK(!busy.ok() && busy.code() == tutti::StatusCode::BUSY &&
                       state->release_calls == 0,
                   "loader single-slice: bound Resource shutdown is BUSY");
             CHECK(bundle->shutdown().ok(), "loader single-slice: shutdown ok");
             CHECK(bundle->state() == TuttiRuntimeState::STOPPED,
                   "loader single-slice: runtime stops");
-            CHECK(bundle->resource_info().ok() &&
-                      bundle->resource_info().value().state ==
+            CHECK(bundle->resource_info("nvme-local-0").ok() &&
+                      bundle->resource_info("nvme-local-0").value().state ==
                           tutti::ResourceState::STOPPED,
                   "loader single-slice: Resource stops after components");
             CHECK(bundle->shutdown().ok(),
@@ -616,13 +583,7 @@ nvme:
 
     // 10a. Destructor fallback and reverse lifecycle observation release once.
     {
-        std::string yaml = R"(
-accelerator: {profile: CUDA}
-runtime: {accel_id: 0}
-nvme:
-  selection: explicit
-  device_ids: [0]
-)";
+        std::string yaml = canonical_local_yaml();
         auto path = write_tmp(yaml);
         auto state = make_state({make_slice(0)});
         auto options = fake_options(state);
@@ -652,13 +613,7 @@ nvme:
     // 10b. A StorageRuntime shutdown error is returned first, while resource
     // release still runs and remains idempotent.
     {
-        std::string yaml = R"(
-accelerator: {profile: CUDA}
-runtime: {accel_id: 0}
-nvme:
-  selection: explicit
-  device_ids: [0]
-)";
+        std::string yaml = canonical_local_yaml();
         auto path = write_tmp(yaml);
         auto state = make_state({make_slice(0)});
         auto options = fake_options(state);
@@ -685,13 +640,7 @@ nvme:
 
     // 10c. A release error is returned, but the client is not called twice.
     {
-        std::string yaml = R"(
-accelerator: {profile: CUDA}
-runtime: {accel_id: 0}
-nvme:
-  selection: explicit
-  device_ids: [0]
-)";
+        std::string yaml = canonical_local_yaml();
         auto path = write_tmp(yaml);
         auto state = make_state({make_slice(0)});
         state->release_status = tutti::Status(
@@ -713,28 +662,17 @@ nvme:
 
     // 10. Fake-client loader: two slices produce one striped top-level pair.
     {
-        std::string yaml = R"(
-accelerator: {profile: CUDA}
-runtime: {accel_id: 0}
-nvme_service: {endpoint: "fake-endpoint"}
-nvme:
-  selection: striped
-  device_ids: [0, 1]
-  queues_per_controller: 4
-  stripe_unit: 65536
-)";
+        std::string yaml = canonical_striped_yaml("[0, 1]", "65536");
         auto path = write_tmp(yaml);
         auto state = make_state({make_slice(0), make_slice(1)});
         auto r = load_tutti_config(path, fake_options(state));
         CHECK(r.ok(), "loader striped: ok");
         if (r.ok()) {
             auto bundle = std::move(r).value();
-            CHECK(bundle->resolver_schemes.size() == 1 &&
-                  bundle->resolver_schemes[0] == "striped",
-                  "loader striped: striped resolver");
-            CHECK(bundle->data_path_keys.size() == 1 &&
-                  bundle->data_path_keys[0] == "striped-local-nvme",
-                  "loader striped: striped DataPath key");
+            auto manifest = bundle->backend_manifest("striped-storage");
+            CHECK(manifest.ok() &&
+                      manifest.value().contract == "striped-local-nvme",
+                  "loader striped: canonical backend manifest");
             (void)bundle->shutdown();
             CHECK(state->release_calls == 1, "loader striped: release once");
         }
@@ -744,13 +682,7 @@ nvme:
     // 11. Failures after Acquire release the allocation; preflight failures
     // do not acquire.
     {
-        std::string yaml = R"(
-accelerator: {profile: CUDA}
-runtime: {accel_id: 0}
-nvme:
-  selection: striped
-  device_ids: [0, 1]
-)";
+        std::string yaml = canonical_striped_yaml("[0, 1]", "65536");
         auto path = write_tmp(yaml);
         auto state = make_state({make_slice(1), make_slice(0)});
         auto r = load_tutti_config(path, fake_options(state));
@@ -765,13 +697,7 @@ nvme:
     }
 
     {
-        std::string yaml = R"(
-accelerator: {profile: CUDA}
-runtime: {accel_id: 0}
-nvme:
-  selection: explicit
-  device_ids: [0]
-)";
+        std::string yaml = canonical_local_yaml();
         auto path = write_tmp(yaml);
         auto state = make_state({make_slice(0, 1)});
         auto r = load_tutti_config(path, fake_options(state));
@@ -933,13 +859,9 @@ nvme:
     }
 
     {
-        std::string yaml = R"(
-accelerator: {profile: CUDA}
-runtime: {accel_id: 1}
-nvme:
-  selection: explicit
-  device_ids: [0]
-)";
+        std::string yaml = replace_once(
+            canonical_local_yaml(),
+            "runtime: {accel_id: 0}", "runtime: {accel_id: 1}");
         auto path = write_tmp(yaml);
         auto state = make_state({make_slice(0, 1)});
         state->accelerators = {{0, "/views/zero"}};
@@ -951,13 +873,7 @@ nvme:
     }
 
     {
-        std::string yaml = R"(
-accelerator: {profile: CUDA}
-runtime: {accel_id: 0}
-nvme:
-  selection: explicit
-  device_ids: [0]
-)";
+        std::string yaml = canonical_local_yaml();
         auto path = write_tmp(yaml);
         auto state = make_state({make_slice(0)});
         state->acquire_status = tutti::Status(
@@ -970,13 +886,7 @@ nvme:
     }
 
     {
-        std::string yaml = R"(
-accelerator: {profile: CUDA}
-runtime: {accel_id: 0}
-nvme:
-  selection: explicit
-  device_ids: [0]
-)";
+        std::string yaml = canonical_local_yaml();
         auto path = write_tmp(yaml);
         auto state = make_state({make_slice(0)});
         auto lifetime = std::make_shared<ComponentLifetimeState>();
@@ -1025,7 +935,7 @@ nvme:
         ::unlink(path.c_str());
     }
 
-    // 12. Canonical configs feed the unchanged assembly compatibility layer.
+    // 12. Canonical configs feed the owning registry assembly path.
     {
         auto path = write_tmp(canonical_local_yaml());
         auto state = make_state({make_slice(0)});
@@ -1078,11 +988,8 @@ nvme:
                           "local-nvme-datapath-0" &&
                       manifest.value().resource_id == "nvme-local-0",
                   "canonical loader local: manifest preserves canonical IDs");
-            CHECK(bundle->resolver_schemes == std::vector<std::string>{"file"},
-                  "canonical loader local: resolver route");
-            CHECK(bundle->data_path_keys ==
-                      std::vector<std::string>{"local-nvme-ext4"},
-                  "canonical loader local: DataPath route");
+            CHECK(bundle->storage_runtime() != nullptr,
+                  "canonical loader local: StorageRuntime available");
             (void)bundle->shutdown();
             CHECK(state->release_calls == 1,
                   "canonical loader local: release once");
@@ -1128,11 +1035,10 @@ nvme:
               "canonical loader striped: ordered views and minimum MDTS");
         if (r.ok()) {
             auto bundle = std::move(r).value();
-            CHECK(bundle->resolver_schemes == std::vector<std::string>{"striped"},
-                  "canonical loader striped: resolver route");
-            CHECK(bundle->data_path_keys ==
-                      std::vector<std::string>{"striped-local-nvme"},
-                  "canonical loader striped: DataPath route");
+            auto manifest = bundle->backend_manifest("striped-storage");
+            CHECK(manifest.ok() &&
+                      manifest.value().contract == "striped-local-nvme",
+                  "canonical loader striped: manifest route contract");
             (void)bundle->shutdown();
             CHECK(state->release_calls == 1,
                   "canonical loader striped: release once");
