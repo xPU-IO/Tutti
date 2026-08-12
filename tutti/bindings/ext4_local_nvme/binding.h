@@ -270,7 +270,9 @@ inline Result<ResolvedTarget> make_resolved_target(
     std::string resolver_type_id,
     std::uint64_t logical_size,
     std::shared_ptr<const Ext4LocalNvmePayload> payload,
-    std::shared_ptr<OwnerLease> owner_lease) {
+    std::shared_ptr<OwnerLease> owner_lease,
+    std::string recommended_data_path_key =
+        std::string(kRecommendedDataPathKey)) {
 
     // Safe const_cast: object was heap-allocated non-const by create().
     auto mutable_payload = std::const_pointer_cast<Ext4LocalNvmePayload>(
@@ -281,7 +283,7 @@ inline Result<ResolvedTarget> make_resolved_target(
         std::string(kPayloadTypeId),
         kPayloadApiVersion,
         logical_size,
-        std::string(kRecommendedDataPathKey),
+        std::move(recommended_data_path_key),
         std::move(mutable_payload),
         std::move(owner_lease));
 }

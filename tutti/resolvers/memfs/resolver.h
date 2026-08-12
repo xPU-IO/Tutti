@@ -39,6 +39,13 @@ namespace tutti::resolver::memfs {
 
 class MemfsResolver : public StorageTargetResolver {
 public:
+    explicit MemfsResolver(
+        std::uint64_t capacity_bytes = 0,
+        std::string data_path_key =
+            std::string(tutti::binding::memfs::kRecommendedDataPathKey))
+        : capacity_bytes_(capacity_bytes),
+          data_path_key_(std::move(data_path_key)) {}
+
     Result<ResolvedTarget> resolve(
         std::string_view uri,
         const ResolveOptions& options) override {
@@ -83,6 +90,11 @@ public:
                 Status(StatusCode::INVALID_ARGUMENT,
                        "memfs URI size must be > 0"));
         }
+        if (capacity_bytes_ > 0 && size > capacity_bytes_) {
+            return Result<ResolvedTarget>::Failure(
+                Status(StatusCode::RESOURCE_EXHAUSTED,
+                       "memfs URI size exceeds Resource capacity"));
+        }
 
         // Create the payload (backing buffer).
         auto payload = tutti::binding::memfs::MemfsPayload::create(
@@ -94,8 +106,14 @@ public:
         // Pack into a ResolvedTarget.
         return tutti::binding::memfs::make_resolved_target(
             static_cast<std::uint64_t>(size),
-            std::move(payload).value());
+            std::move(payload).value(),
+            std::make_shared<tutti::binding::memfs::MemfsOwnerLease>(),
+            data_path_key_);
     }
+
+private:
+    std::uint64_t capacity_bytes_ = 0;
+    std::string data_path_key_;
 };
 
 } // namespace tutti::resolver::memfs

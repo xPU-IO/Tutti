@@ -185,6 +185,8 @@ add_subdirectory(bindings/ext4_local_nvme)
 add_subdirectory(resolvers/local_file)
 add_subdirectory(bindings/striped_local_nvme)
 add_subdirectory(resolvers/striped_file)
+add_subdirectory(resolvers)
+add_subdirectory(data_paths)
 
 # SAMPLE-ONLY: community extension sample (doc/extending_tutti.md).
 # The subdirectory is added inside BUILD_TESTING (below) because its
@@ -285,6 +287,7 @@ if(TUTTI_BUILD_HARDWARE_STACK)
         # above (lines ~170-171).
         add_subdirectory(data_paths/striped_local_nvme)
 
+        tutti_enable_data_path_factory_local_nvme()
         tutti_enable_runtime_local_nvme()
 
     else()
@@ -428,6 +431,16 @@ if(BUILD_TESTING)
         "${CMAKE_CURRENT_BINARY_DIR}/tests_resource"
     )
     message(STATUS "Tutti: added tests/resource (hardware-free Resource contract)")
+
+    add_subdirectory(
+        "${TUTTI_REPOSITORY_ROOT}/tests/resolvers"
+        "${CMAKE_CURRENT_BINARY_DIR}/tests_resolvers"
+    )
+    add_subdirectory(
+        "${TUTTI_REPOSITORY_ROOT}/tests/datapaths"
+        "${CMAKE_CURRENT_BINARY_DIR}/tests_datapaths"
+    )
+    message(STATUS "Tutti: added resolver and DataPath factory tests")
 
     # Round 17 S1: MountManager host-side unit tests (hardware-free).
     # Tests config parsing, /proc scanning, mount/unmount lifecycle

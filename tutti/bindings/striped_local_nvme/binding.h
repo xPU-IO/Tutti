@@ -222,14 +222,16 @@ private:
 template <typename OwnerLease>
 inline Result<ResolvedTarget> make_resolved_target(
     std::shared_ptr<StripedLocalNvmePayload> payload,
-    std::shared_ptr<OwnerLease> owner_lease) {
+    std::shared_ptr<OwnerLease> owner_lease,
+    std::string recommended_data_path_key =
+        std::string(kRecommendedDataPathKey)) {
 
     return ResolvedTarget::make<StripedLocalNvmePayload, OwnerLease>(
         std::string(kResolverTypeId),
         std::string(kPayloadTypeId),
         kPayloadApiVersion,
         payload->logical_size(),
-        std::string(kRecommendedDataPathKey),
+        std::move(recommended_data_path_key),
         std::move(payload),
         std::move(owner_lease));
 }

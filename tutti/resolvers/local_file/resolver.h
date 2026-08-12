@@ -142,7 +142,10 @@ public:
                       std::uint32_t namespace_id,
                       std::uint32_t block_size,
                       BackingDeviceConfig backing_config,
-                      std::uint32_t exts_per_call = kFiemapMaxExtentsPerCall)
+                      std::uint32_t exts_per_call = kFiemapMaxExtentsPerCall,
+                      std::string data_path_key =
+                          std::string(binding::ext4_local_nvme::
+                                          kRecommendedDataPathKey))
         : ns_{
               std::move(controller_pci_addr),
               namespace_id,
@@ -150,7 +153,8 @@ public:
           backing_config_(std::move(backing_config)),
           exts_per_call_(exts_per_call == 0
                           ? kFiemapMaxExtentsPerCall
-                          : exts_per_call) {
+                          : exts_per_call),
+          data_path_key_(std::move(data_path_key)) {
 
         // Validate namespace_base alignment at construction.
         // If misaligned, resolve() will reject all files.
@@ -318,7 +322,8 @@ public:
             std::string(binding::ext4_local_nvme::kResolverTypeId),
             file_size,
             std::move(payload_result).value(),
-            std::move(lease));
+            std::move(lease),
+            data_path_key_);
     }
 
 private:
@@ -534,6 +539,7 @@ private:
     binding::ext4_local_nvme::NamespaceIdentity ns_;
     BackingDeviceConfig backing_config_;
     std::uint32_t exts_per_call_;
+    std::string data_path_key_;
 };
 
 } // namespace tutti::resolvers::local_file

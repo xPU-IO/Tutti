@@ -4,13 +4,10 @@
 #include <memory>
 #include <string>
 
+#include <tutti/config/spec/resource/resource_spec.h>
 #include <tutti/status.h>
 
 namespace tutti {
-
-namespace config {
-struct ResourceSpec;
-}
 
 enum class ResourceState {
     CREATED,

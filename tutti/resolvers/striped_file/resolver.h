@@ -56,9 +56,13 @@ inline constexpr std::uint64_t kMinStripeUnit = 4096;
 class StripedResolver : public StorageTargetResolver {
 public:
     StripedResolver(std::vector<std::unique_ptr<StorageTargetResolver>> shard_resolvers,
-                    std::uint64_t stripe_unit)
+                    std::uint64_t stripe_unit,
+                    std::string data_path_key =
+                        std::string(binding::striped_local_nvme::
+                                        kRecommendedDataPathKey))
         : shard_resolvers_(std::move(shard_resolvers)),
-          stripe_unit_(stripe_unit) {
+          stripe_unit_(stripe_unit),
+          data_path_key_(std::move(data_path_key)) {
 
         // Validate stripe unit at construction.
         // If invalid, resolve() will reject all URIs.
@@ -302,7 +306,7 @@ public:
             std::string(binding::striped_local_nvme::kPayloadTypeId),
             binding::striped_local_nvme::kPayloadApiVersion,
             logical,
-            std::string(binding::striped_local_nvme::kRecommendedDataPathKey),
+            data_path_key_,
             std::move(payload),
             std::move(bundle_lease));
     }
@@ -310,6 +314,7 @@ public:
 private:
     std::vector<std::unique_ptr<StorageTargetResolver>> shard_resolvers_;
     std::uint64_t stripe_unit_;
+    std::string data_path_key_;
 };
 
 } // namespace tutti::resolvers::striped_file
