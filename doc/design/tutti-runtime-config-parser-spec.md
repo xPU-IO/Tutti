@@ -135,6 +135,7 @@ Parser 可以尽早返回带 YAML 路径的错误，但 `TuttiRuntimeSpec::valid
 tutti/
   config/
     CMakeLists.txt
+    tutti_runtime_spec.h
     parser/
       tutti_runtime_config_parser.cpp
       parser_internal.h
@@ -159,17 +160,33 @@ tutti/
       tutti_runtime_spec.cpp
       spec_internal.h
       resource/
+        resource_spec.h
+        memory_spec.h
+        nvme_spec.h
         memory_spec.cpp
         nvme_spec.cpp
       resolver/
+        resolver_spec.h
+        local_file_spec.h
+        memfs_spec.h
+        striped_file_spec.h
         local_file_spec.cpp
         memfs_spec.cpp
         striped_file_spec.cpp
       datapath/
+        datapath_spec.h
+        nvme_datapath_spec.h
+        local_nvme_spec.h
+        memfs_spec.h
+        striped_local_nvme_spec.h
         local_nvme_spec.cpp
         memfs_spec.cpp
         striped_local_nvme_spec.cpp
       backend/
+        backend_spec.h
+        ext4_local_nvme_spec.h
+        memfs_spec.h
+        striped_local_nvme_spec.h
         ext4_local_nvme_spec.cpp
         memfs_spec.cpp
         striped_local_nvme_spec.cpp
@@ -186,17 +203,25 @@ tutti/
 | 路径 | 公有/公共逻辑 | 特定私有逻辑 |
 | --- | --- | --- |
 | `config/parser` | YAML 加载、根节点分发、公共读值和错误上下文 helper | 各 resource/resolver/datapath/backend 的 YAML 字段映射 |
-| `config/spec` | `TuttiRuntimeSpec::validate()` 调度、ID index、引用和拓扑校验、debug formatter | 各 resource/resolver/datapath/backend 的字段默认值和领域校验 |
+| `config/spec` | 公开 value header 定义各类 Spec 的字段和默认值；`TuttiRuntimeSpec::validate()` 调度、ID index、引用和拓扑校验、debug formatter | 各 resource/resolver/datapath/backend 的领域校验实现 |
 | `tutti_runtime` | `TuttiRuntime::create()`、ownership registry、shutdown 和 rollback | concrete backend factory、Resource factory 和运行时 contract registration |
 
 ### 4.2 公共头文件
 
-实现目录按 common/specific 拆分，但对调用方保持较小的公共 API：
+公开 Spec value header 与 config 实现共置于 `tutti/config`；对外 include
+名和安装布局仍保持 `<tutti/config/...>`：
 
 ```text
+tutti/config/
+  tutti_runtime_spec.h
+  spec/
+    resource/*.h
+    resolver/*.h
+    datapath/*.h
+    backend/*.h
+
 tutti/include/tutti/config/
   tutti_runtime_config_parser.h
-  tutti_runtime_spec.h
 
 tutti/include/tutti/
   tutti_runtime.h
@@ -205,12 +230,15 @@ tutti/include/tutti/
 | 头文件 | 公开内容 | 不得公开的内容 |
 | --- | --- | --- |
 | `tutti_runtime_config_parser.h` | `parse_tutti_runtime_config(path)` | `YAML::Node`、parser helper、backend parser function |
-| `tutti_runtime_spec.h` | `TuttiRuntimeSpec`、各类 spec value type、枚举、`validate()`、`to_debug_string()` | yaml-cpp、concrete Runtime component、allocation metadata |
+| `tutti/config/tutti_runtime_spec.h` | `TuttiRuntimeSpec`、顶层 Spec、`validate()`、`to_debug_string()` | yaml-cpp、concrete Runtime component、allocation metadata |
+| `tutti/config/spec/<kind>/*.h` | 各 resource/resolver/datapath/backend 的 aggregate 与 specific value type、枚举、字段默认值 | parser helper、validator 实现、运行时分配结果 |
 | `tutti_runtime.h` | `TuttiRuntime::create()`、查询和 shutdown API | parser internal、factory product internal、test hook |
 
-Backend-specific spec 类型是 Runtime factory 需要读取的稳定 value contract，因此可以
-出现在 `tutti_runtime_spec.h` 或由它包含的公开 value header 中。Backend-specific 的
-解析和校验函数仍是 `config/parser/*`、`config/spec/*` 下的私有实现。
+Backend-specific spec 类型是 Runtime factory 需要读取的稳定 value contract，因此
+放在 `tutti/config/spec/backend` 的公开 value header 中，并由
+`tutti_runtime_spec.h` 间接包含。Backend-specific 的解析和校验函数仍是
+`config/parser/*`、`config/spec/*` 下的私有实现。Build tree 仅镜像上述公开头，
+安装后它们位于 `include/tutti/config/...`。
 
 ### 4.3 命名空间
 

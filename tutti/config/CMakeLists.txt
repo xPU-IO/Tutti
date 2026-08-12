@@ -1,3 +1,49 @@
+set(_tutti_runtime_spec_public_headers
+    tutti_runtime_spec.h
+    spec/resource/resource_spec.h
+    spec/resource/nvme_spec.h
+    spec/resource/memory_spec.h
+    spec/resolver/resolver_spec.h
+    spec/resolver/local_file_spec.h
+    spec/resolver/striped_file_spec.h
+    spec/resolver/memfs_spec.h
+    spec/datapath/datapath_spec.h
+    spec/datapath/nvme_datapath_spec.h
+    spec/datapath/local_nvme_spec.h
+    spec/datapath/striped_local_nvme_spec.h
+    spec/datapath/memfs_spec.h
+    spec/backend/backend_spec.h
+    spec/backend/ext4_local_nvme_spec.h
+    spec/backend/striped_local_nvme_spec.h
+    spec/backend/memfs_spec.h
+)
+
+# The public source headers live with their config implementation.  Mirror
+# only that explicit set into a conventional build-tree include root so
+# consumers can keep using <tutti/config/...> without exposing all of tutti/.
+set(TUTTI_CONFIG_PUBLIC_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/include")
+foreach(_tutti_config_header IN LISTS _tutti_runtime_spec_public_headers)
+    set(_tutti_config_header_source
+        "${CMAKE_CURRENT_SOURCE_DIR}/${_tutti_config_header}")
+    set(_tutti_config_header_build
+        "${TUTTI_CONFIG_PUBLIC_INCLUDE_DIR}/tutti/config/${_tutti_config_header}")
+    get_filename_component(_tutti_config_header_build_dir
+        "${_tutti_config_header_build}" DIRECTORY)
+    file(MAKE_DIRECTORY "${_tutti_config_header_build_dir}")
+    configure_file(
+        "${_tutti_config_header_source}"
+        "${_tutti_config_header_build}"
+        COPYONLY
+    )
+
+    get_filename_component(_tutti_config_header_subdir
+        "${_tutti_config_header}" DIRECTORY)
+    install(FILES "${_tutti_config_header_source}"
+        DESTINATION "include/tutti/config/${_tutti_config_header_subdir}")
+endforeach()
+set(TUTTI_CONFIG_PUBLIC_INCLUDE_DIR
+    "${TUTTI_CONFIG_PUBLIC_INCLUDE_DIR}" PARENT_SCOPE)
+
 add_library(tutti_runtime_spec STATIC
     spec/tutti_runtime_spec.cpp
     spec/resource/memory_spec.cpp
@@ -14,6 +60,7 @@ add_library(tutti_runtime_spec STATIC
 )
 target_include_directories(tutti_runtime_spec PUBLIC
     $<BUILD_INTERFACE:${TUTTI_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${TUTTI_CONFIG_PUBLIC_INCLUDE_DIR}>
     $<INSTALL_INTERFACE:include>
 )
 target_include_directories(tutti_runtime_spec PRIVATE

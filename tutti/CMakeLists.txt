@@ -137,14 +137,16 @@ tutti_configure_cuda_like(tutti_cuda_like)
 # ---------------------------------------------------------------------------
 # tutti_api -- public usage-requirements target
 #
-# Consumers link only tutti_api to obtain: public headers (tutti/include),
-# profile definition (TUTTI_USE_<PROFILE>), and CUDA-like vendor requirements.
-# No source files; no direct CUDA links — all inherited via tutti_cuda_like.
+# Consumers link only tutti_api to obtain: public headers (tutti/include plus
+# the generated config public-header view), profile definition
+# (TUTTI_USE_<PROFILE>), and CUDA-like vendor requirements. No source files;
+# no direct CUDA links — all inherited via tutti_cuda_like.
 # ---------------------------------------------------------------------------
 
 add_library(tutti_api INTERFACE)
 target_include_directories(tutti_api INTERFACE
     $<BUILD_INTERFACE:${TUTTI_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${TUTTI_CONFIG_PUBLIC_INCLUDE_DIR}>
     $<INSTALL_INTERFACE:include>
 )
 target_link_libraries(tutti_api INTERFACE tutti_cuda_like)

@@ -168,7 +168,8 @@ spec 默认值 512 KiB；ext4 YAML 声明同名字段会在 parser 层作为 unk
 
 | Header | 公开内容 |
 | --- | --- |
-| `tutti/include/tutti/config/tutti_runtime_spec.h` | spec value types、默认值、`validate()`、`to_debug_string()` |
+| `tutti/config/tutti_runtime_spec.h` | 顶层 spec value types、`validate()`、`to_debug_string()` |
+| `tutti/config/spec/<kind>/*.h` | 各组件 aggregate/specific value types 及其字段默认值 |
 | `tutti/include/tutti/config/tutti_runtime_config_parser.h` | `parse_tutti_runtime_config(path)` |
 | `tutti/include/tutti/tutti_runtime.h` | 两个 `create()` 重载、只读查询、state、`shutdown()` |
 
@@ -248,7 +249,7 @@ StorageRuntime::shutdown()
 
 | 重构前文件/目录 | 重构后文件/目录 | 代码差异 |
 | --- | --- | --- |
-| `tutti/include/tutti/config/storage_config.h` | `tutti/include/tutti/config/tutti_runtime_spec.h` | 删除旧 storage aggregate，改为唯一 typed spec model |
+| `tutti/include/tutti/config/storage_config.h` | `tutti/config/tutti_runtime_spec.h` + `tutti/config/spec/<kind>/*.h` | 删除旧 storage aggregate，顶层模型与组件 value type 按所属目录拆分 |
 | `tutti/include/tutti/config/tutti_config.h` | `tutti_runtime_config_parser.h` + `tutti_runtime.h` | parser API 与 Runtime factory API 分离 |
 | `tutti/config/tutti_config_parse.cpp` | `tutti/config/parser/tutti_runtime_config_parser.cpp` | 只保留 YAML 主流程、字段分发和表示检查 |
 | `tutti/config/storage/*/*_config_parse.cpp` | `tutti/config/parser/<kind>/*_config_parser.cpp` | specific YAML mapping 按类型归档 |
