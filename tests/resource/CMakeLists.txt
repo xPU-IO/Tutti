@@ -5,6 +5,7 @@ add_executable(tutti_resource_contract_test
 )
 
 target_link_libraries(tutti_resource_contract_test PRIVATE
+    tutti_resource
     tutti_nvme_resource
 )
 

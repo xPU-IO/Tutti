@@ -6,6 +6,7 @@
 #include <vector>
 
 #include <tutti/resource.h>
+#include "tutti/resource/memory/memory_resource.h"
 #include "tutti/resource/nvme/nvme_resource_internal.h"
 
 namespace {
@@ -23,7 +24,6 @@ using tutti::resources::nvme::NvmeProviderResource;
 using tutti::resources::nvme::NvmeResolverResourceView;
 using tutti::resources::nvme::NvmeResource;
 using tutti::resources::nvme::NvmeResourceClient;
-using tutti::resources::nvme::NvmeResourceSpec;
 using tutti::resources::nvme::NvmeResourceTestingAccess;
 using tutti::resources::nvme::RuntimeNvmeAllocation;
 using tutti::resources::nvme::RuntimeNvmeSlice;
@@ -134,22 +134,21 @@ std::shared_ptr<FakeState> valid_state() {
     return state;
 }
 
-NvmeResourceSpec valid_spec() {
-    NvmeResourceSpec spec;
-    spec.id = "nvme-local-0";
-    spec.accel_id = 0;
-    spec.provider.type = "nvme-service";
-    spec.provider.endpoint = "fake-endpoint";
-    spec.allocation.selection = NvmeSelection::Explicit;
-    spec.allocation.device_ids = {0};
-    spec.allocation.queues_per_controller = 4;
-    return spec;
+tutti::config::NvmeResourceConfig valid_config() {
+    tutti::config::NvmeResourceConfig config;
+    config.provider.type = "nvme-service";
+    config.provider.endpoint = "fake-endpoint";
+    config.allocation.selection = NvmeSelection::Explicit;
+    config.allocation.device_ids = {0};
+    config.allocation.queues_per_controller = 4;
+    return config;
 }
 
 std::unique_ptr<NvmeResource> make_resource(
     const std::shared_ptr<FakeState>& state) {
     return NvmeResourceTestingAccess::make(
-        valid_spec(), std::make_unique<FakeNvmeResourceClient>(state));
+        "nvme-local-0", valid_config(), 0,
+        std::make_unique<FakeNvmeResourceClient>(state));
 }
 
 void test_success_and_read_only_views() {
@@ -176,32 +175,36 @@ void test_success_and_read_only_views() {
               NvmeLeaseState::ACQUIRED,
           "successful initialize owns the lease");
 
-    auto resolver_view = resource->resolver_view();
-    auto datapath_view = resource->datapath_view();
-    CHECK(resolver_view.ok() && resolver_view.value().slices.size() == 1 &&
-              resolver_view.value().slices.front().block_path ==
+    auto resolver_view = common->get_resolver_view();
+    auto datapath_view = common->get_datapath_view();
+    const auto* nvme_resolver_view = resolver_view.ok()
+        ? dynamic_cast<const NvmeResolverResourceView*>(
+              resolver_view.value().get())
+        : nullptr;
+    const auto* nvme_datapath_view = datapath_view.ok()
+        ? dynamic_cast<const NvmeDataPathResourceView*>(
+              datapath_view.value().get())
+        : nullptr;
+    CHECK(nvme_resolver_view != nullptr &&
+              nvme_resolver_view->slices.size() == 1 &&
+              nvme_resolver_view->slices.front().block_path ==
                   "/dev/snvme0n1",
           "resolver view contains resolver-only metadata");
-    CHECK(resolver_view.ok() && datapath_view.ok() &&
-              datapath_view.value().slices.size() == 1 &&
-              datapath_view.value().slices.front().chrdev_path ==
+    CHECK(nvme_resolver_view != nullptr && nvme_datapath_view != nullptr &&
+              nvme_datapath_view->slices.size() == 1 &&
+              nvme_datapath_view->slices.front().chrdev_path ==
                   "/dev/ssnvme0" &&
-              datapath_view.value().slices.front().pci_bdf ==
-                  resolver_view.value().slices.front().pci_bdf &&
-              datapath_view.value().slices.front().namespace_id ==
-                  resolver_view.value().slices.front().namespace_id &&
-              datapath_view.value().slices.front().logical_block_size ==
-                  resolver_view.value().slices.front().logical_block_size,
+              nvme_datapath_view->slices.front().pci_bdf ==
+                  nvme_resolver_view->slices.front().pci_bdf &&
+              nvme_datapath_view->slices.front().namespace_id ==
+                  nvme_resolver_view->slices.front().namespace_id &&
+              nvme_datapath_view->slices.front().logical_block_size ==
+                  nvme_resolver_view->slices.front().logical_block_size,
           "DataPath view contains datapath-only metadata");
-    if (resolver_view.ok() && datapath_view.ok()) {
-        resolver_view.value().slices.front().block_path = "mutated";
-        datapath_view.value().slices.front().chrdev_path = "mutated";
-        CHECK(resource->resolver_view().value().slices.front().block_path ==
-                  "/dev/snvme0n1" &&
-                  resource->datapath_view().value().slices.front().chrdev_path ==
-                      "/dev/ssnvme0",
-              "NVMe construction views are detached read-only copies");
-    }
+    auto second_resolver_view = common->get_resolver_view();
+    CHECK(resolver_view.ok() && second_resolver_view.ok() &&
+              second_resolver_view.value().get() != resolver_view.value().get(),
+          "Resource returns independently owned view snapshots");
     auto info = common->info();
     info.id = "mutated";
     CHECK(common->info().id == "nvme-local-0",
@@ -341,8 +344,9 @@ void test_destructor_fallback_and_preinit_view() {
     auto state = valid_state();
     {
         auto resource = make_resource(state);
-        CHECK(!resource->resolver_view().ok() &&
-                  !resource->datapath_view().ok(),
+        Resource* common = resource.get();
+        CHECK(!common->get_resolver_view().ok() &&
+                  !common->get_datapath_view().ok(),
               "construction views reject CREATED resource");
         CHECK(resource->initialize().ok(),
               "destructor fallback case initializes");
@@ -351,11 +355,54 @@ void test_destructor_fallback_and_preinit_view() {
           "destructor fallback releases exactly once");
 
     auto null_client = NvmeResourceTestingAccess::make(
-        valid_spec(), nullptr);
+        "nvme-local-0", valid_config(), 0, nullptr);
     const Status status = null_client->initialize();
     CHECK(!status.ok() && status.code() == StatusCode::INVALID_ARGUMENT &&
               null_client->info().state == ResourceState::FAILED,
           "null client fails closed without transport access");
+}
+
+void test_resource_factory_dispatches_memory_config() {
+    tutti::config::ResourceSpec spec{
+        "memory-0", "memory",
+        tutti::config::MemoryResourceConfig{8192}};
+    auto created = tutti::resources::create_resource(
+        spec, tutti::resources::ResourceCreateContext{0});
+    CHECK(created.ok(),
+          "Resource factory creates memory Resource from variant config");
+    if (!created.ok()) return;
+
+    std::unique_ptr<Resource> resource = std::move(created).value();
+    CHECK(resource->info().id == "memory-0" &&
+              resource->info().type == "memory" &&
+              resource->info().state == ResourceState::CREATED,
+          "memory Resource preserves ResourceSpec identity");
+    CHECK(!resource->get_resolver_view().ok() &&
+              !resource->get_datapath_view().ok(),
+          "memory view rejects CREATED Resource");
+    CHECK(resource->initialize().ok(),
+          "memory Resource initialize succeeds");
+    auto view = resource->get_resolver_view();
+    const auto* memory_view = view.ok()
+        ? dynamic_cast<const tutti::resources::memory::MemoryResourceView*>(
+              view.value().get())
+        : nullptr;
+    CHECK(memory_view != nullptr && memory_view->capacity_bytes == 8192,
+          "memory view exposes configured capacity");
+    CHECK(resource->shutdown().ok() && resource->shutdown().ok() &&
+              resource->info().state == ResourceState::STOPPED,
+          "memory Resource shutdown is idempotent");
+}
+
+void test_resource_factory_rejects_variant_type_mismatch() {
+    tutti::config::ResourceSpec spec{
+        "memory-0", "nvme",
+        tutti::config::MemoryResourceConfig{4096}};
+    auto created = tutti::resources::create_resource(
+        spec, tutti::resources::ResourceCreateContext{0});
+    CHECK(!created.ok() &&
+              created.status().code() == StatusCode::INVALID_ARGUMENT,
+          "Resource factory rejects type and variant mismatch");
 }
 
 } // namespace
@@ -367,6 +414,8 @@ int main() {
     test_invalid_allocation_releases_once();
     test_release_failures_are_not_retried();
     test_destructor_fallback_and_preinit_view();
+    test_resource_factory_dispatches_memory_config();
+    test_resource_factory_rejects_variant_type_mismatch();
 
     std::printf("passed: %d\nfailed: %d\n", passed, failed);
     return failed == 0 ? 0 : 1;

@@ -12,14 +12,12 @@
 #include <tutti/cuda_like.h>
 #include <tutti/storage_runtime.h>
 
-#include "tutti/resource/nvme/nvme_resource.h"
+#include <tutti/resource.h>
 #include "tutti/tutti_runtime/backend_factory.h"
 #include "tutti/tutti_runtime/tutti_runtime_internal.h"
 
 namespace tutti {
 namespace {
-
-namespace nvme_resource = tutti::resources::nvme;
 
 Status create_error(StatusCode code, std::string message) {
     return Status(code, std::move(message));
@@ -87,30 +85,6 @@ void discard_resource(std::unique_ptr<Resource>& resource) noexcept {
     resource.reset();
 }
 
-Result<std::unique_ptr<Resource>> default_resource_factory(
-    const config::ResourceSpec& resource_spec, std::int32_t accel_id) {
-    if (resource_spec.type != "nvme") {
-        return failure<std::unique_ptr<Resource>>(create_error(
-            StatusCode::UNSUPPORTED,
-            "configured Resource type is not implemented"));
-    }
-    const auto* nvme =
-        std::get_if<config::NvmeResourceConfig>(&resource_spec.config);
-    if (nvme == nullptr) {
-        return failure<std::unique_ptr<Resource>>(create_error(
-            StatusCode::INVALID_ARGUMENT,
-            "NVMe Resource config has the wrong typed value"));
-    }
-    auto created = nvme_resource::make_nvme_resource(
-        nvme_resource::NvmeResourceSpec{
-            resource_spec.id, accel_id, nvme->provider, nvme->allocation});
-    if (!created.ok()) {
-        return failure<std::unique_ptr<Resource>>(created.status());
-    }
-    std::unique_ptr<Resource> resource = std::move(created).value();
-    return Result<std::unique_ptr<Resource>>::Success(std::move(resource));
-}
-
 Result<std::unique_ptr<Resource>> create_and_initialize_resource(
     const config::ResourceSpec& spec, std::int32_t accel_id,
     const tutti_runtime::TuttiRuntimeCreateInternalOptions& options) {
@@ -120,7 +94,8 @@ Result<std::unique_ptr<Resource>> create_and_initialize_resource(
     try {
         created = options.resource_factory
             ? options.resource_factory(spec, accel_id)
-            : default_resource_factory(spec, accel_id);
+            : resources::create_resource(
+                  spec, resources::ResourceCreateContext{accel_id});
     } catch (const std::exception& exception) {
         return failure<std::unique_ptr<Resource>>(create_error(
             StatusCode::INTERNAL,

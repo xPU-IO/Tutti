@@ -5,17 +5,10 @@
 #include <string>
 #include <vector>
 
+#include <tutti/config/spec/resource/nvme_spec.h>
 #include <tutti/resource.h>
-#include <tutti/config/tutti_runtime_spec.h>
 
 namespace tutti::resources::nvme {
-
-struct NvmeResourceSpec {
-    std::string id;
-    std::int32_t accel_id = -1;
-    config::NvmeProviderSpec provider;
-    config::NvmeAllocationSpec allocation;
-};
 
 struct NvmeResolverSliceView {
     std::int32_t device_id = -1;
@@ -27,7 +20,7 @@ struct NvmeResolverSliceView {
     std::uint32_t logical_block_size = 0;
 };
 
-struct NvmeResolverResourceView {
+struct NvmeResolverResourceView final : ResourceView {
     std::vector<NvmeResolverSliceView> slices;
 };
 
@@ -43,7 +36,7 @@ struct NvmeDataPathSliceView {
     std::uint32_t granted_queues = 0;
 };
 
-struct NvmeDataPathResourceView {
+struct NvmeDataPathResourceView final : ResourceView {
     std::vector<NvmeDataPathSliceView> slices;
 };
 
@@ -55,6 +48,10 @@ public:
     Status initialize() override;
     Status shutdown() override;
     ResourceInfo info() const override;
+    Result<std::unique_ptr<const ResourceView>>
+    get_resolver_view() const override;
+    Result<std::unique_ptr<const ResourceView>>
+    get_datapath_view() const override;
 
     Result<NvmeResolverResourceView> resolver_view() const;
     Result<NvmeDataPathResourceView> datapath_view() const;
@@ -62,19 +59,28 @@ public:
 private:
     struct Impl;
 
-    NvmeResource(NvmeResourceSpec spec, std::unique_ptr<Impl> impl);
+    NvmeResource(std::string id,
+                 std::int32_t runtime_accel_id,
+                 config::NvmeResourceConfig config,
+                 std::unique_ptr<Impl> impl);
     Status validate_allocation_metadata_() const;
     Status release_owned_allocation_();
 
-    NvmeResourceSpec spec_;
+    std::string id_;
+    std::int32_t runtime_accel_id_ = -1;
+    config::NvmeAllocationSpec allocation_;
     std::unique_ptr<Impl> impl_;
 
     friend class NvmeResourceTestingAccess;
-    friend Result<std::unique_ptr<NvmeResource>> make_nvme_resource(
-        NvmeResourceSpec spec);
+    friend Result<std::unique_ptr<NvmeResource>> create_nvme_resource(
+        std::string resource_id,
+        const config::NvmeResourceConfig& config,
+        std::int32_t runtime_accel_id);
 };
 
-Result<std::unique_ptr<NvmeResource>> make_nvme_resource(
-    NvmeResourceSpec spec);
+Result<std::unique_ptr<NvmeResource>> create_nvme_resource(
+    std::string resource_id,
+    const config::NvmeResourceConfig& config,
+    std::int32_t runtime_accel_id);
 
 } // namespace tutti::resources::nvme

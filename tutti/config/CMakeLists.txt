@@ -126,7 +126,7 @@ target_include_directories(tutti_runtime PRIVATE
 target_link_libraries(tutti_runtime PUBLIC
     tutti_config_parser
     tutti_runtime_spec
-    tutti_nvme_resource
+    tutti_resource
     tutti_api
 )
 set_target_properties(tutti_runtime PROPERTIES

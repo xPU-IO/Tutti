@@ -75,7 +75,9 @@ public:
 class NvmeResourceTestingAccess {
 public:
     static std::unique_ptr<NvmeResource> make(
-        NvmeResourceSpec spec,
+        std::string resource_id,
+        const config::NvmeResourceConfig& config,
+        std::int32_t runtime_accel_id,
         std::unique_ptr<NvmeResourceClient> client);
 
     static NvmeResourceInspection inspection(const NvmeResource& resource);

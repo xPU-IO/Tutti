@@ -66,6 +66,16 @@ public:
         result.state = state_value_;
         return result;
     }
+    tutti::Result<std::unique_ptr<const tutti::ResourceView>>
+    get_resolver_view() const override {
+        return tutti::Result<std::unique_ptr<const tutti::ResourceView>>::Failure(
+            tutti::Status(tutti::StatusCode::UNSUPPORTED, "unused"));
+    }
+    tutti::Result<std::unique_ptr<const tutti::ResourceView>>
+    get_datapath_view() const override {
+        return tutti::Result<std::unique_ptr<const tutti::ResourceView>>::Failure(
+            tutti::Status(tutti::StatusCode::UNSUPPORTED, "unused"));
+    }
 private:
     std::shared_ptr<State> state_;
     std::string id_;

@@ -424,10 +424,10 @@ if(BUILD_TESTING)
     message(STATUS "Tutti: added tests/mock_data_path_kit_contract (MockDataPath kit self-contract test)")
 
     add_subdirectory(
-        "${TUTTI_REPOSITORY_ROOT}/tests/resource_contract"
-        "${CMAKE_CURRENT_BINARY_DIR}/tests_resource_contract"
+        "${TUTTI_REPOSITORY_ROOT}/tests/resource"
+        "${CMAKE_CURRENT_BINARY_DIR}/tests_resource"
     )
-    message(STATUS "Tutti: added tests/resource_contract (hardware-free Resource contract)")
+    message(STATUS "Tutti: added tests/resource (hardware-free Resource contract)")
 
     # Round 17 S1: MountManager host-side unit tests (hardware-free).
     # Tests config parsing, /proc scanning, mount/unmount lifecycle
