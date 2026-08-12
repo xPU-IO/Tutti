@@ -283,7 +283,7 @@ if(TUTTI_BUILD_HARDWARE_STACK)
         # above (lines ~170-171).
         add_subdirectory(data_paths/striped_local_nvme)
 
-        tutti_add_config_loader()
+        tutti_enable_runtime_local_nvme()
 
     else()
         message(STATUS "Tutti: TUTTI_FEATURE_LOCAL_NVME=OFF -- skipping device_manager, data_paths/local_nvme")
@@ -305,6 +305,15 @@ endif()
 option(TUTTI_BUILD_HARDWARE_TESTS "Register hardware-dependent tests" OFF)
 
 if(BUILD_TESTING)
+    add_subdirectory(
+        "${TUTTI_REPOSITORY_ROOT}/tests/config"
+        "${CMAKE_CURRENT_BINARY_DIR}/tests_config"
+    )
+    add_subdirectory(
+        "${TUTTI_REPOSITORY_ROOT}/tests/tutti_runtime"
+        "${CMAKE_CURRENT_BINARY_DIR}/tests_tutti_runtime"
+    )
+
     # SAMPLE-ONLY: community extension sample (doc/extending_tutti.md).
     # Must live inside this block: add_test() only registers in directories
     # processed after include(CTest) has enabled testing.
@@ -413,22 +422,10 @@ if(BUILD_TESTING)
     message(STATUS "Tutti: added tests/mock_data_path_kit_contract (MockDataPath kit self-contract test)")
 
     add_subdirectory(
-        "${TUTTI_REPOSITORY_ROOT}/tests/storage_config_contract"
-        "${CMAKE_CURRENT_BINARY_DIR}/tests_storage_config_contract"
-    )
-    message(STATUS "Tutti: added tests/storage_config_contract (hardware-free parser contract)")
-
-    add_subdirectory(
         "${TUTTI_REPOSITORY_ROOT}/tests/resource_contract"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_resource_contract"
     )
     message(STATUS "Tutti: added tests/resource_contract (hardware-free Resource contract)")
-
-    add_subdirectory(
-        "${TUTTI_REPOSITORY_ROOT}/tests/runtime_resource_registry_contract"
-        "${CMAKE_CURRENT_BINARY_DIR}/tests_runtime_resource_registry_contract"
-    )
-    message(STATUS "Tutti: added Runtime Resource registry contract test")
 
     # Round 17 S1: MountManager host-side unit tests (hardware-free).
     # Tests config parsing, /proc scanning, mount/unmount lifecycle
@@ -501,20 +498,6 @@ if(BUILD_TESTING)
                 "${CMAKE_CURRENT_BINARY_DIR}/tests_register_perf"
             )
 
-            # Round 20 S1: tutti_config loader unit test (ctest).
-            add_subdirectory(
-                "${TUTTI_REPOSITORY_ROOT}/tests/config_loader"
-                "${CMAKE_CURRENT_BINARY_DIR}/tests_config_loader"
-            )
-
-            # Phase 5: allocation-driven loader -> public Runtime -> real I/O.
-            # Labelled "hardware;loader_e2e;runtime_e2e" and run manually
-            # against a live two-disk nvmeservice daemon.
-            add_subdirectory(
-                "${TUTTI_REPOSITORY_ROOT}/tests/runtime_bundle_loader_contract"
-                "${CMAKE_CURRENT_BINARY_DIR}/tests_runtime_bundle_loader_contract"
-            )
-            message(STATUS "Tutti: added tests/runtime_bundle_loader_contract (hardware;loader_e2e;runtime_e2e)")
         else()
             message(STATUS "Tutti: TUTTI_FEATURE_LOCAL_NVME=OFF -- skipping local_nvme hardware tests")
         endif()

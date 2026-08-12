@@ -9,7 +9,7 @@
 #include <tutti/spi/storage_target_resolver.h>
 #include <tutti/storage_runtime.h>
 
-namespace tutti::config {
+namespace tutti {
 namespace {
 
 Status lifecycle_error(StatusCode code, const char* message) {
@@ -32,36 +32,61 @@ TuttiRuntime::~TuttiRuntime() {
 
 Status TuttiRuntime::adopt_resource_(std::string id,
                                     std::unique_ptr<Resource> resource) {
+    const auto reject = [&](Status status) {
+        try { (void)resource->shutdown(); } catch (...) {}
+        return status;
+    };
     if (!resource) {
         return lifecycle_error(StatusCode::INVALID_ARGUMENT,
                                "cannot adopt a null Resource");
     }
     const ResourceInfo info = resource->info();
     if (id.empty() || info.id != id) {
-        return lifecycle_error(StatusCode::INVALID_ARGUMENT,
-                               "Resource registry ID does not match ResourceInfo");
+        return reject(lifecycle_error(
+            StatusCode::INVALID_ARGUMENT,
+            "Resource registry ID does not match ResourceInfo"));
     }
     if (info.state != ResourceState::INITIALIZED) {
-        return lifecycle_error(StatusCode::NOT_READY,
-                               "Resource must be INITIALIZED before registration");
+        return reject(lifecycle_error(
+            StatusCode::NOT_READY,
+            "Resource must be INITIALIZED before registration"));
     }
-    if (state_ != TuttiRuntimeState::RUNNING) {
-        return lifecycle_error(StatusCode::BUSY,
-                               "TuttiRuntime cannot adopt Resource");
+    if (state_ != TuttiRuntimeState::INITIALIZING) {
+        return reject(lifecycle_error(
+            StatusCode::BUSY,
+            "TuttiRuntime cannot adopt Resource"));
     }
     if (resources_.count(id) != 0) {
-        return lifecycle_error(StatusCode::INVALID_ARGUMENT,
-                               "TuttiRuntime Resource ID is already registered");
+        return reject(lifecycle_error(
+            StatusCode::INVALID_ARGUMENT,
+            "TuttiRuntime Resource ID is already registered"));
     }
 
     Resource* borrowed = resource.get();
-    auto inserted = resources_.emplace(id, std::move(resource));
     try {
-        resource_initialization_order_.push_back(std::move(id));
+        resource_initialization_order_.push_back(id);
     } catch (...) {
-        if (inserted.second && inserted.first->second.get() == borrowed) {
-            resources_.erase(inserted.first);
+        try { (void)resource->shutdown(); } catch (...) {}
+        throw;
+    }
+    try {
+        const auto inserted = resources_.emplace(id, std::move(resource));
+        if (!inserted.second) {
+            resource_initialization_order_.pop_back();
+            return lifecycle_error(
+                StatusCode::INVALID_ARGUMENT,
+                "TuttiRuntime Resource ID is already registered");
         }
+    } catch (...) {
+        auto inserted = resources_.find(id);
+        if (inserted != resources_.end() &&
+            inserted->second.get() == borrowed) {
+            try { (void)inserted->second->shutdown(); } catch (...) {}
+            resources_.erase(inserted);
+        } else if (resource) {
+            try { (void)resource->shutdown(); } catch (...) {}
+        }
+        resource_initialization_order_.pop_back();
         throw;
     }
     return Status::Ok();
@@ -82,7 +107,7 @@ Status TuttiRuntime::register_backend_(BackendManifest manifest,
                                       const Resource* resource,
                                       StorageTargetResolver* resolver,
                                       DataPath* datapath) {
-    if (state_ != TuttiRuntimeState::RUNNING) {
+    if (state_ != TuttiRuntimeState::INITIALIZING) {
         return lifecycle_error(StatusCode::BUSY,
                                "TuttiRuntime cannot register backend");
     }
@@ -139,7 +164,7 @@ Status TuttiRuntime::register_datapath_(
         return lifecycle_error(StatusCode::INVALID_ARGUMENT,
                                "DataPath registration is incomplete");
     }
-    if (state_ != TuttiRuntimeState::RUNNING) {
+    if (state_ != TuttiRuntimeState::INITIALIZING) {
         return lifecycle_error(StatusCode::BUSY,
                                "TuttiRuntime cannot register DataPath");
     }
@@ -180,7 +205,7 @@ Status TuttiRuntime::register_resolver_(
         return lifecycle_error(StatusCode::INVALID_ARGUMENT,
                                "resolver registration is incomplete");
     }
-    if (state_ != TuttiRuntimeState::RUNNING) {
+    if (state_ != TuttiRuntimeState::INITIALIZING) {
         return lifecycle_error(StatusCode::BUSY,
                                "TuttiRuntime cannot register resolver");
     }
@@ -219,7 +244,7 @@ Status TuttiRuntime::set_storage_runtime_(
         return lifecycle_error(StatusCode::INVALID_ARGUMENT,
                                "cannot register a null StorageRuntime");
     }
-    if (state_ != TuttiRuntimeState::RUNNING || runtime_) {
+    if (state_ != TuttiRuntimeState::INITIALIZING || runtime_) {
         return lifecycle_error(StatusCode::BUSY,
                                "TuttiRuntime already owns a StorageRuntime");
     }
@@ -294,8 +319,10 @@ Status TuttiRuntime::shutdown() {
                              lifecycle_error(StatusCode::INTERNAL,
                                              "Resource shutdown threw"));
         }
+        resources_.erase(resource);
     }
     observe_(TuttiRuntimeShutdownStage::RESOURCE_SHUTDOWN);
+    resource_initialization_order_.clear();
 
     state_ = TuttiRuntimeState::STOPPED;
     observe_(TuttiRuntimeShutdownStage::COMPLETE);
@@ -360,4 +387,4 @@ Status TuttiRuntime::shutdown_resource_(std::string_view id) {
     return found->second->shutdown();
 }
 
-} // namespace tutti::config
+} // namespace tutti

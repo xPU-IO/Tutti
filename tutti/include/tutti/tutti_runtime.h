@@ -1,9 +1,6 @@
-// tutti/include/tutti/tutti_runtime.h
-//
-// Application runtime ownership and lifecycle.
-
 #pragma once
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -11,6 +8,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <tutti/config/tutti_runtime_spec.h>
 #include <tutti/resource.h>
 #include <tutti/status.h>
 
@@ -20,9 +18,15 @@ class DataPath;
 class StorageRuntime;
 class StorageTargetResolver;
 
-namespace config {
+namespace tutti_runtime {
+struct TuttiRuntimeCreateInternalOptions;
+}
+namespace testing {
+class TuttiRuntimeTestAccess;
+}
 
 enum class TuttiRuntimeState {
+    INITIALIZING,
     RUNNING,
     SHUTTING_DOWN,
     STOPPED,
@@ -37,8 +41,12 @@ enum class TuttiRuntimeShutdownStage {
     COMPLETE,
 };
 
-class TuttiRuntimeTestingAccess;
-class TuttiRuntimeAssemblyAccess;
+struct TuttiRuntimeCreateOptions {
+    std::uint32_t handle_cache_capacity = 0;
+    std::uint32_t prp_cache_capacity = 0;
+    std::uint32_t handle_cache_l2_capacity = 0;
+    std::function<void(std::string_view)> spec_debug_logger;
+};
 
 struct BackendManifest {
     std::string id;
@@ -50,7 +58,13 @@ struct BackendManifest {
 
 class TuttiRuntime {
 public:
-    TuttiRuntime();
+    static Result<std::unique_ptr<TuttiRuntime>> create(
+        const std::string& config_path,
+        TuttiRuntimeCreateOptions options = {});
+    static Result<std::unique_ptr<TuttiRuntime>> create(
+        config::TuttiRuntimeSpec spec,
+        TuttiRuntimeCreateOptions options = {});
+
     ~TuttiRuntime();
     Status shutdown();
 
@@ -65,8 +79,7 @@ public:
     std::vector<BackendManifest> backend_manifests() const;
 
 private:
-    friend class TuttiRuntimeTestingAccess;
-    friend class TuttiRuntimeAssemblyAccess;
+    friend class testing::TuttiRuntimeTestAccess;
 
     struct BackendInstance {
         BackendManifest manifest;
@@ -74,6 +87,11 @@ private:
         StorageTargetResolver* resolver = nullptr;
         DataPath* datapath = nullptr;
     };
+
+    TuttiRuntime();
+    static Result<std::unique_ptr<TuttiRuntime>> create_with_options_(
+        config::TuttiRuntimeSpec spec,
+        tutti_runtime::TuttiRuntimeCreateInternalOptions options);
 
     void observe_(TuttiRuntimeShutdownStage stage) noexcept;
     Status adopt_resource_(std::string id,
@@ -83,11 +101,10 @@ private:
                               std::unique_ptr<DataPath> data_path,
                               std::string key,
                               DataPath*& borrowed);
-    Status register_resolver_(
-        std::string id,
-        std::unique_ptr<StorageTargetResolver> resolver,
-        std::string scheme,
-        StorageTargetResolver*& borrowed);
+    Status register_resolver_(std::string id,
+                              std::unique_ptr<StorageTargetResolver> resolver,
+                              std::string scheme,
+                              StorageTargetResolver*& borrowed);
     Status register_backend_(BackendManifest manifest,
                              const Resource* resource,
                              StorageTargetResolver* resolver,
@@ -95,7 +112,8 @@ private:
     Status set_storage_runtime_(std::unique_ptr<StorageRuntime> runtime);
     Status shutdown_resource_(std::string_view id);
 
-    TuttiRuntimeState state_ = TuttiRuntimeState::RUNNING;
+    TuttiRuntimeState state_ = TuttiRuntimeState::INITIALIZING;
+    std::string validated_spec_debug_;
     std::unique_ptr<StorageRuntime> runtime_;
     std::unordered_map<std::string, std::unique_ptr<Resource>> resources_;
     std::vector<std::string> resource_initialization_order_;
@@ -112,5 +130,4 @@ private:
     std::function<void(TuttiRuntimeShutdownStage)> shutdown_observer_;
 };
 
-} // namespace config
 } // namespace tutti

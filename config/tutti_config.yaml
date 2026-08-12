@@ -1,4 +1,4 @@
-# Tutti application configuration (canonical schema only).
+# Tutti application configuration for TuttiRuntimeSpec.
 #
 # This file describes one logical storage backend. Deployment facts such as
 # PCI BDFs, device paths, BAR sizes, mounts, and actual queue grants belong to

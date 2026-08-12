@@ -88,8 +88,8 @@ Also runnable as a gated test: `ctest -R tutti_layerwise_kv_overlap`.
 
 Two files have strictly separate roles:
 
-- **`config/local_nvme_config.yaml`** is the daemon deployment fact file. It owns controller identity, accelerator ACLs, mount/view paths, queue policy, and lease policy. The application loader never reads it or derives device paths from its array order.
-- **`config/tutti_config.yaml`** is the canonical application graph. `storage.resources[]` requests a logical resource, `resolvers[]` and `datapaths[]` select implementations, and `backends[]` binds their IDs through a compiled payload contract. Runtime paths, BAR sizes, namespaces, and actual queue grants come only from the daemon allocation response.
+- **`config/local_nvme_config.yaml`** is the daemon deployment fact file. It owns controller identity, accelerator ACLs, mount/view paths, queue policy, and lease policy. The application Runtime config parser never reads it or derives device paths from its array order.
+- **`config/tutti_config.yaml`** is the application `TuttiRuntimeSpec` graph. `storage.resources[]` requests a logical resource, `resolvers[]` and `datapaths[]` select implementations, and `backends[]` binds their IDs through a compiled payload contract. Runtime paths, BAR sizes, namespaces, and actual queue grants come only from the daemon allocation response.
 
 Legacy application fields (`gpu`, `nvme_service`, `nvme`, `local_nvme`,
 `local_nvme_config`, `storage.backend`, and `storage.default_stripe_unit`) were
@@ -97,7 +97,7 @@ removed in P6 on 2026-08-11. There is no compatibility grace period or legacy
 adapter; legacy-only and mixed files fail with a migration diagnostic. This
 does not change the daemon configuration compatibility policy.
 
-DataPath cache precedence remains programmatic override > canonical DataPath
+DataPath cache precedence remains programmatic override > DataPath spec
 config > test-only `TUTTI_*_CACHE_CAP` environment override > built-in default.
 Queue depth remains kernel-authoritative (`io_queue_depth` at module install).
 

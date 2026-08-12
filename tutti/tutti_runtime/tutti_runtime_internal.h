@@ -1,113 +1,87 @@
 #pragma once
 
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
+#include <tutti/config/tutti_runtime_spec.h>
 #include <tutti/spi/data_path.h>
 #include <tutti/spi/storage_target_resolver.h>
 #include <tutti/storage_runtime.h>
 #include <tutti/tutti_runtime.h>
 
-namespace tutti::config {
+#include "tutti/tutti_runtime/backend_factory.h"
 
-class TuttiRuntimeAssemblyAccess {
-public:
-    static Status adopt_resource(TuttiRuntime& runtime, std::string id,
-                                 std::unique_ptr<Resource> resource) {
-        return runtime.adopt_resource_(std::move(id), std::move(resource));
-    }
+namespace tutti::tutti_runtime {
 
-    static const Resource* resource(const TuttiRuntime& runtime,
-                                    std::string_view id) noexcept {
-        return runtime.find_resource_(id);
-    }
-
-    static Status register_datapath(TuttiRuntime& runtime, std::string id,
-                                    std::unique_ptr<DataPath> data_path,
-                                    std::string key, DataPath*& borrowed) {
-        return runtime.register_datapath_(
-            std::move(id), std::move(data_path), std::move(key), borrowed);
-    }
-
-    static Status register_resolver(
-        TuttiRuntime& runtime, std::string id,
-        std::unique_ptr<StorageTargetResolver> resolver,
-        std::string scheme, StorageTargetResolver*& borrowed) {
-        return runtime.register_resolver_(
-            std::move(id), std::move(resolver), std::move(scheme), borrowed);
-    }
-
-    static Status register_backend(TuttiRuntime& runtime,
-                                   BackendManifest manifest,
-                                   const Resource* resource,
-                                   StorageTargetResolver* resolver,
-                                   DataPath* datapath) {
-        return runtime.register_backend_(std::move(manifest), resource,
-                                         resolver, datapath);
-    }
-
-    static Status set_storage_runtime(
-        TuttiRuntime& runtime, std::unique_ptr<StorageRuntime> storage_runtime) {
-        return runtime.set_storage_runtime_(std::move(storage_runtime));
-    }
+struct EffectiveCacheConfig {
+    std::uint32_t handle_cache_capacity = 0;
+    std::uint32_t prp_cache_capacity = 0;
+    std::uint32_t handle_cache_l2_capacity = 0;
 };
 
-class TuttiRuntimeTestingAccess {
+struct TuttiRuntimeCreateInternalOptions {
+    TuttiRuntimeCreateOptions public_options;
+    std::function<Result<int>()> backend_device_count;
+    std::function<Result<std::unique_ptr<StorageRuntime>>(
+        RuntimeConfig, RuntimeComponents)> runtime_factory;
+    std::function<Result<std::unique_ptr<Resource>>(
+        const config::ResourceSpec&, std::int32_t)> resource_factory;
+    BackendFactory backend_factory;
+    std::function<Status(StorageRuntime&)> runtime_shutdown_hook;
+    std::function<void(TuttiRuntimeShutdownStage)> shutdown_observer;
+};
+
+EffectiveCacheConfig resolve_cache_config(
+    const config::TuttiRuntimeSpec& spec,
+    const TuttiRuntimeCreateOptions& options);
+
+} // namespace tutti::tutti_runtime
+
+namespace tutti::testing {
+
+class TuttiRuntimeTestAccess {
 public:
+    static Result<std::unique_ptr<TuttiRuntime>> create(
+        config::TuttiRuntimeSpec spec,
+        tutti_runtime::TuttiRuntimeCreateInternalOptions options) {
+        return TuttiRuntime::create_with_options_(
+            std::move(spec), std::move(options));
+    }
+
     static const Resource* resource(const TuttiRuntime& runtime) noexcept {
         if (runtime.resource_initialization_order_.empty()) return nullptr;
         return runtime.find_resource_(
             runtime.resource_initialization_order_.front());
     }
-
-    static const Resource* resource(const TuttiRuntime& runtime,
-                                    std::string_view id) noexcept {
-        return runtime.find_resource_(id);
-    }
-
     static StorageTargetResolver* backend_resolver(
         TuttiRuntime& runtime, std::string_view id) noexcept {
         const auto found = runtime.backends_.find(std::string(id));
-        return found == runtime.backends_.end()
-            ? nullptr : found->second.resolver;
+        return found == runtime.backends_.end() ? nullptr
+                                                : found->second.resolver;
     }
-
     static const DataPath* backend_datapath(
         const TuttiRuntime& runtime, std::string_view id) noexcept {
         const auto found = runtime.backends_.find(std::string(id));
-        return found == runtime.backends_.end()
-            ? nullptr : found->second.datapath;
+        return found == runtime.backends_.end() ? nullptr
+                                                : found->second.datapath;
     }
-
     static const std::vector<std::string>& resource_initialization_order(
         const TuttiRuntime& runtime) noexcept {
         return runtime.resource_initialization_order_;
     }
-
-    static Status adopt_resource(TuttiRuntime& runtime, std::string id,
-                                 std::unique_ptr<Resource> resource) {
-        return runtime.adopt_resource_(std::move(id), std::move(resource));
+    static const std::string& validated_spec_debug(
+        const TuttiRuntime& runtime) noexcept {
+        return runtime.validated_spec_debug_;
     }
-
     static Status shutdown_resource(TuttiRuntime& runtime,
                                     std::string_view id) {
         return runtime.shutdown_resource_(id);
     }
-
-    static void set_runtime_shutdown_hook(
-        TuttiRuntime& runtime,
-        std::function<Status(StorageRuntime&)> hook) {
-        runtime.runtime_shutdown_hook_ = std::move(hook);
-    }
-
-    static void set_shutdown_observer(
-        TuttiRuntime& runtime,
-        std::function<void(TuttiRuntimeShutdownStage)> observer) {
-        runtime.shutdown_observer_ = std::move(observer);
-    }
 };
 
-} // namespace tutti::config
+} // namespace tutti::testing

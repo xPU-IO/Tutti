@@ -6,15 +6,15 @@
 #include <vector>
 
 #include <tutti/resource.h>
-#include "tutti/config/storage_config.h"
+#include <tutti/config/tutti_runtime_spec.h>
 
 namespace tutti::resources::nvme {
 
 struct NvmeResourceSpec {
     std::string id;
     std::int32_t accel_id = -1;
-    config::ProviderSpec provider;
-    config::AllocationSpec allocation;
+    config::NvmeProviderSpec provider;
+    config::NvmeAllocationSpec allocation;
 };
 
 struct NvmeResolverSliceView {

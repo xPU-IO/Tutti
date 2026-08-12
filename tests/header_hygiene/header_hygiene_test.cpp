@@ -23,8 +23,8 @@
 #include <tutti/io_types.h>
 #include <tutti/memory_types.h>
 #include <tutti/cuda_like.h>
-#include <tutti/config/storage_config.h>
-#include <tutti/config/tutti_config.h>
+#include <tutti/config/tutti_runtime_config_parser.h>
+#include <tutti/config/tutti_runtime_spec.h>
 #include <tutti/resource.h>
 #include <tutti/spi/data_path.h>
 #include <tutti/spi/storage_target_resolver.h>
@@ -45,11 +45,11 @@
 
 #if defined(__has_include)
 
-#  if __has_include(<tutti/config/backend_factory.h>)
+#  if __has_include(<tutti/tutti_runtime/backend_factory.h>)
 #    error "HYGIENE VIOLATION: backend factory test seam is publicly reachable"
 #  endif
-#  if __has_include(<tutti/config/tutti_config_internal.h>)
-#    error "HYGIENE VIOLATION: config loader test seam is publicly reachable"
+#  if __has_include(<tutti/tutti_runtime/tutti_runtime_internal.h>)
+#    error "HYGIENE VIOLATION: Runtime test seam is publicly reachable"
 #  endif
 #  if __has_include(<tutti/resource/nvme/nvme_resource.h>)
 #    error "HYGIENE VIOLATION: NVMe Resource implementation is publicly reachable"
@@ -175,10 +175,10 @@ int main() {
     req.memory = mh;
     req.target = th;
 
-    tutti::config::ParsedConfig parsed;
-    tutti::config::BackendManifest manifest;
+    tutti::config::TuttiRuntimeSpec spec;
+    tutti::BackendManifest manifest;
     tutti::ResourceInfo resource_info;
-    if (parsed.canonical_storage.present || !manifest.id.empty() ||
+    if (!spec.storage.resources.empty() || !manifest.id.empty() ||
         !resource_info.id.empty()) {
         return 1;
     }

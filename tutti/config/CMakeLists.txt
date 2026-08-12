@@ -1,110 +1,105 @@
-# tutti/config/CMakeLists.txt
-#
-# Round 20 S1 — application config loader.
-#
-# Split into three libraries:
-#   tutti_config_parse — pure host (yaml-cpp only), no CUDA.
-#                         Used by unit tests.
-#   tutti_runtime      — profile-independent ownership/registry lifecycle.
-#   tutti_config       — full loader (constructs DataPaths + Runtime).
-#                         Needs tutti_local_nvme_datapath (CUDA).
-
-# Pure-host parse library (no CUDA, no DataPath).
-add_library(tutti_config_parse STATIC
-    tutti_config_parse.cpp
-    storage/resource/memory_config_parse.cpp
-    storage/resource/nvme_config_parse.cpp
-    storage/resolver/local_file_config_parse.cpp
-    storage/resolver/memfs_config_parse.cpp
-    storage/resolver/striped_file_config_parse.cpp
-    storage/datapath/local_nvme_config_parse.cpp
-    storage/datapath/memfs_config_parse.cpp
-    storage/datapath/striped_local_nvme_config_parse.cpp
-    storage/backend/contract_registry.cpp
-    storage/backend/ext4_local_nvme_config_parse.cpp
-    storage/backend/memfs_config_parse.cpp
-    storage/backend/striped_local_nvme_config_parse.cpp
+add_library(tutti_runtime_spec STATIC
+    spec/tutti_runtime_spec.cpp
+    spec/resource/memory_spec.cpp
+    spec/resource/nvme_spec.cpp
+    spec/resolver/local_file_spec.cpp
+    spec/resolver/memfs_spec.cpp
+    spec/resolver/striped_file_spec.cpp
+    spec/datapath/local_nvme_spec.cpp
+    spec/datapath/memfs_spec.cpp
+    spec/datapath/striped_local_nvme_spec.cpp
+    spec/backend/ext4_local_nvme_spec.cpp
+    spec/backend/memfs_spec.cpp
+    spec/backend/striped_local_nvme_spec.cpp
 )
-
-target_include_directories(tutti_config_parse PRIVATE
+target_include_directories(tutti_runtime_spec PUBLIC
+    $<BUILD_INTERFACE:${TUTTI_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+)
+target_include_directories(tutti_runtime_spec PRIVATE
     "${TUTTI_REPOSITORY_ROOT}"
-    "${CMAKE_CURRENT_SOURCE_DIR}"
+)
+if(TUTTI_ACCELERATOR STREQUAL "HOST")
+    set(_tutti_spec_default_accel_id -1)
+else()
+    set(_tutti_spec_default_accel_id 0)
+endif()
+target_compile_definitions(tutti_runtime_spec PUBLIC
+    TUTTI_COMPILED_ACCELERATOR_PROFILE="${TUTTI_ACCELERATOR}"
+    TUTTI_DEFAULT_ACCEL_ID=${_tutti_spec_default_accel_id}
+)
+set_target_properties(tutti_runtime_spec PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
 )
 
-target_link_libraries(tutti_config_parse PUBLIC
-    tutti_api
+add_library(tutti_config_parser STATIC
+    parser/tutti_runtime_config_parser.cpp
+    parser/resource/memory_config_parser.cpp
+    parser/resource/nvme_config_parser.cpp
+    parser/resolver/local_file_config_parser.cpp
+    parser/resolver/memfs_config_parser.cpp
+    parser/resolver/striped_file_config_parser.cpp
+    parser/datapath/local_nvme_config_parser.cpp
+    parser/datapath/memfs_config_parser.cpp
+    parser/datapath/striped_local_nvme_config_parser.cpp
+    parser/backend/ext4_local_nvme_config_parser.cpp
+    parser/backend/memfs_config_parser.cpp
+    parser/backend/striped_local_nvme_config_parser.cpp
+)
+target_include_directories(tutti_config_parser PUBLIC
+    $<BUILD_INTERFACE:${TUTTI_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+)
+target_include_directories(tutti_config_parser PRIVATE
+    "${TUTTI_REPOSITORY_ROOT}"
+)
+target_link_libraries(tutti_config_parser PUBLIC
+    tutti_runtime_spec
     ${TUTTI_YAML_CPP_TARGET}
 )
-
-set_target_properties(tutti_config_parse PROPERTIES
+set_target_properties(tutti_config_parser PROPERTIES
     CXX_STANDARD 17
     CXX_STANDARD_REQUIRED ON
 )
 
 add_library(tutti_runtime STATIC
     "${TUTTI_SOURCE_DIR}/tutti_runtime/tutti_runtime.cpp"
+    "${TUTTI_SOURCE_DIR}/tutti_runtime/tutti_runtime_create.cpp"
+    "${TUTTI_SOURCE_DIR}/tutti_runtime/backend_factory.cpp"
 )
-
 target_include_directories(tutti_runtime PUBLIC
     $<BUILD_INTERFACE:${TUTTI_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
-
 target_include_directories(tutti_runtime PRIVATE
     "${TUTTI_REPOSITORY_ROOT}"
 )
-
 target_link_libraries(tutti_runtime PUBLIC
+    tutti_config_parser
+    tutti_runtime_spec
+    tutti_nvme_resource
     tutti_api
 )
-
 set_target_properties(tutti_runtime PROPERTIES
     CXX_STANDARD 17
     CXX_STANDARD_REQUIRED ON
 )
 
-function(tutti_add_config_loader)
+function(tutti_enable_runtime_local_nvme)
     tutti_enable_nvme_resource_grpc()
-
-    add_library(tutti_config STATIC
-        "${TUTTI_SOURCE_DIR}/config/backend_factory.cpp"
-        "${TUTTI_SOURCE_DIR}/config/tutti_config.cpp"
+    target_compile_definitions(tutti_runtime PRIVATE
+        TUTTI_RUNTIME_HAS_LOCAL_NVME=1
     )
-
-    target_include_directories(tutti_config PUBLIC
-        $<BUILD_INTERFACE:${TUTTI_SOURCE_DIR}/include>
-        $<INSTALL_INTERFACE:include>
-    )
-
-    target_include_directories(tutti_config PRIVATE
-        "${TUTTI_REPOSITORY_ROOT}"
-        "${TUTTI_SOURCE_DIR}/config"
-    )
-
-    target_link_libraries(tutti_config PUBLIC
-        tutti_config_parse
-        tutti_runtime
+    target_link_libraries(tutti_runtime PRIVATE
         tutti_local_nvme_datapath
         tutti_striped_local_nvme_datapath
         tutti_local_file_resolver
         tutti_striped_file_resolver
-        tutti_nvme_resource
-        tutti_api
-    )
-
-    set_target_properties(tutti_config PROPERTIES
-        CXX_STANDARD 17
-        CXX_STANDARD_REQUIRED ON
-    )
-
-    install(TARGETS tutti_config
-        ARCHIVE DESTINATION lib
-        LIBRARY DESTINATION lib
-        RUNTIME DESTINATION bin
     )
 endfunction()
 
-install(TARGETS tutti_config_parse tutti_runtime
+install(TARGETS tutti_runtime_spec tutti_config_parser tutti_runtime
     ARCHIVE DESTINATION lib
     LIBRARY DESTINATION lib
     RUNTIME DESTINATION bin
