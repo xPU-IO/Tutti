@@ -9,12 +9,12 @@
 #include <vector>
 
 #include <tutti/config/tutti_runtime_spec.h>
+#include <tutti/data_paths/data_path_factory.h>
+#include <tutti/resolvers/resolver_factory.h>
 #include <tutti/spi/data_path.h>
 #include <tutti/spi/storage_target_resolver.h>
 #include <tutti/storage_runtime.h>
 #include <tutti/tutti_runtime.h>
-
-#include "tutti/tutti_runtime/backend_factory.h"
 
 namespace tutti::tutti_runtime {
 
@@ -26,18 +26,24 @@ struct EffectiveCacheConfig {
 
 struct TuttiRuntimeCreateInternalOptions {
     TuttiRuntimeCreateOptions public_options;
-    std::function<Result<int>()> backend_device_count;
+    std::function<Result<int>()> accelerator_device_count;
     std::function<Result<std::unique_ptr<StorageRuntime>>(
         RuntimeConfig, RuntimeComponents)> runtime_factory;
     std::function<Result<std::unique_ptr<Resource>>(
-        const config::ResourceSpec&, std::int32_t)> resource_factory;
-    BackendFactory backend_factory;
+        const config::ResourceSpec&,
+        const resources::ResourceCreateContext&)> resource_factory;
+    std::function<Result<std::unique_ptr<StorageTargetResolver>>(
+        const config::ResolverSpec&,
+        const resolvers::ResolverCreateContext&)> resolver_factory;
+    std::function<Result<data_paths::CreatedDataPath>(
+        const config::DataPathSpec&,
+        const data_paths::DataPathCreateContext&)> data_path_factory;
     std::function<Status(StorageRuntime&)> runtime_shutdown_hook;
     std::function<void(TuttiRuntimeShutdownStage)> shutdown_observer;
 };
 
 EffectiveCacheConfig resolve_cache_config(
-    const config::TuttiRuntimeSpec& spec,
+    const config::DataPathSpec& spec,
     const TuttiRuntimeCreateOptions& options);
 
 } // namespace tutti::tutti_runtime
@@ -58,29 +64,27 @@ public:
         return runtime.find_resource_(
             runtime.resource_initialization_order_.front());
     }
-    static StorageTargetResolver* backend_resolver(
+    static StorageTargetResolver* resolver(
         TuttiRuntime& runtime, std::string_view id) noexcept {
-        const auto found = runtime.backends_.find(std::string(id));
-        return found == runtime.backends_.end() ? nullptr
-                                                : found->second.resolver;
+        const auto found = runtime.resolvers_.find(std::string(id));
+        return found == runtime.resolvers_.end() ? nullptr
+                                                 : found->second.get();
     }
-    static const DataPath* backend_datapath(
+    static const DataPath* data_path(
         const TuttiRuntime& runtime, std::string_view id) noexcept {
-        const auto found = runtime.backends_.find(std::string(id));
-        return found == runtime.backends_.end() ? nullptr
-                                                : found->second.datapath;
+        const auto found = runtime.datapaths_.find(std::string(id));
+        return found == runtime.datapaths_.end() ? nullptr
+                                                 : found->second.get();
     }
     static const std::vector<std::string>& resource_initialization_order(
         const TuttiRuntime& runtime) noexcept {
         return runtime.resource_initialization_order_;
     }
-    static const std::string& validated_spec_debug(
-        const TuttiRuntime& runtime) noexcept {
-        return runtime.validated_spec_debug_;
+    static std::size_t resolver_count(const TuttiRuntime& runtime) noexcept {
+        return runtime.resolvers_.size();
     }
-    static Status shutdown_resource(TuttiRuntime& runtime,
-                                    std::string_view id) {
-        return runtime.shutdown_resource_(id);
+    static std::size_t data_path_count(const TuttiRuntime& runtime) noexcept {
+        return runtime.datapaths_.size();
     }
 };
 

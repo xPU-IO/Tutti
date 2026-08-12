@@ -1,16 +1,17 @@
 #include <tutti/tutti_runtime.h>
 
 #include <cstdio>
-#include <fstream>
 #include <memory>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
-#include <unistd.h>
 
+#include <tutti/data_paths/data_path_factory.h>
+#include <tutti/resolvers/resolver_factory.h>
 #include <tutti/storage_runtime.h>
 
-#include "tutti/bindings/memfs/binding.h"
 #include "tutti/testing/mock_data_path.h"
 #include "tutti/tutti_runtime/tutti_runtime_internal.h"
 
@@ -18,67 +19,78 @@ namespace {
 
 int failures = 0;
 #define CHECK(condition)                                                       \
-    do { if (!(condition)) {                                                   \
-        std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__,          \
-                     #condition); ++failures;                                  \
-    } } while (false)
+    do {                                                                       \
+        if (!(condition)) {                                                    \
+            std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__,    \
+                         #condition);                                          \
+            ++failures;                                                        \
+        }                                                                      \
+    } while (false)
 
 struct State {
-    int resource_initialize = 0;
-    int resource_shutdown = 0;
-    int resolver_destroy = 0;
-    int datapath_initialize = 0;
-    int datapath_destroy = 0;
-    int storage_factory = 0;
-    std::vector<tutti::TuttiRuntimeShutdownStage> stages;
+    int resource_factory_calls = 0;
+    int resource_initialize_calls = 0;
+    int resource_shutdown_calls = 0;
+    int resolver_factory_calls = 0;
+    int resolver_destroy_calls = 0;
+    int data_path_factory_calls = 0;
+    int data_path_initialize_calls = 0;
+    int data_path_shutdown_calls = 0;
+    int data_path_destroy_calls = 0;
+    int runtime_factory_calls = 0;
+    tutti::StorageTargetResolver* resolver = nullptr;
+    tutti::DataPath* data_path = nullptr;
     std::vector<std::string> events;
+    std::vector<tutti::TuttiRuntimeShutdownStage> stages;
 };
 
 class FakeResource final : public tutti::Resource {
 public:
-    explicit FakeResource(std::shared_ptr<State> state,
-                          std::string id = "memory")
-        : state_(std::move(state)), id_(std::move(id)) {
+    explicit FakeResource(std::shared_ptr<State> state)
+        : state_(std::move(state)) {
         capabilities_.resource_type = "memory";
         capabilities_.provides_resolver_view = true;
         capabilities_.provides_datapath_view = true;
     }
+
     const tutti::ResourceCapabilities& capabilities() const override {
         return capabilities_;
     }
+
     tutti::Status initialize() override {
-        state_->events.push_back("resource_initialize");
-        ++state_->resource_initialize;
+        state_->events.push_back("resource.initialize");
+        ++state_->resource_initialize_calls;
         state_value_ = tutti::ResourceState::INITIALIZED;
         return tutti::Status::Ok();
     }
+
     tutti::Status shutdown() override {
         if (state_value_ != tutti::ResourceState::STOPPED) {
-            ++state_->resource_shutdown;
+            state_->events.push_back("resource.shutdown");
+            ++state_->resource_shutdown_calls;
             state_value_ = tutti::ResourceState::STOPPED;
         }
         return tutti::Status::Ok();
     }
+
     tutti::ResourceInfo info() const override {
-        tutti::ResourceInfo result;
-        result.id = id_;
-        result.type = "memory";
-        result.state = state_value_;
-        return result;
+        return {"memory-resource", "memory", state_value_};
     }
+
     tutti::Result<std::unique_ptr<const tutti::ResourceView>>
     get_resolver_view() const override {
         return tutti::Result<std::unique_ptr<const tutti::ResourceView>>::Failure(
-            tutti::Status(tutti::StatusCode::UNSUPPORTED, "unused"));
+            tutti::Status(tutti::StatusCode::UNSUPPORTED, "unused in test"));
     }
+
     tutti::Result<std::unique_ptr<const tutti::ResourceView>>
     get_datapath_view() const override {
         return tutti::Result<std::unique_ptr<const tutti::ResourceView>>::Failure(
-            tutti::Status(tutti::StatusCode::UNSUPPORTED, "unused"));
+            tutti::Status(tutti::StatusCode::UNSUPPORTED, "unused in test"));
     }
+
 private:
     std::shared_ptr<State> state_;
-    std::string id_;
     tutti::ResourceCapabilities capabilities_;
     tutti::ResourceState state_value_ = tutti::ResourceState::CREATED;
 };
@@ -87,33 +99,54 @@ class FakeResolver final : public tutti::StorageTargetResolver {
 public:
     explicit FakeResolver(std::shared_ptr<State> state)
         : state_(std::move(state)) {}
-    ~FakeResolver() override { ++state_->resolver_destroy; }
+
+    ~FakeResolver() override {
+        state_->events.push_back("resolver.destroy");
+        ++state_->resolver_destroy_calls;
+    }
+
     tutti::Result<tutti::ResolvedTarget> resolve(
         std::string_view, const tutti::ResolveOptions&) override {
         return tutti::Result<tutti::ResolvedTarget>::Failure(
-            tutti::Status(tutti::StatusCode::NOT_FOUND, "unused"));
+            tutti::Status(tutti::StatusCode::NOT_FOUND, "unused in test"));
     }
+
 private:
     std::shared_ptr<State> state_;
 };
 
 class FakeDataPath final : public tutti::testing::MockDataPath {
 public:
-    FakeDataPath(std::shared_ptr<State> state, tutti::Status status,
-                 std::int32_t accel_id)
-        : state_(std::move(state)), status_(std::move(status)) {
+    FakeDataPath(std::shared_ptr<State> state, std::int32_t accel_id)
+        : state_(std::move(state)) {
         caps.bound_accel_id = accel_id;
     }
-    ~FakeDataPath() override { ++state_->datapath_destroy; }
-    void bind_accel_id(std::int32_t accel_id) { caps.bound_accel_id = accel_id; }
-    tutti::Status initialize(const tutti::DataPathConfig&,
-                             tutti::ResourceProvider&) override {
-        ++state_->datapath_initialize;
-        return status_;
+
+    ~FakeDataPath() override {
+        state_->events.push_back("datapath.destroy");
+        ++state_->data_path_destroy_calls;
     }
+
+    tutti::Status initialize(const tutti::DataPathConfig& config,
+                             tutti::ResourceProvider&) override {
+        CHECK(config.name == "factory-config");
+        state_->events.push_back("datapath.initialize");
+        ++state_->data_path_initialize_calls;
+        return tutti::Status::Ok();
+    }
+
+    tutti::Status shutdown(std::uint64_t) override {
+        state_->events.push_back("datapath.shutdown");
+        ++state_->data_path_shutdown_calls;
+        return tutti::Status::Ok();
+    }
+
+    void bind_accel_id(std::int32_t accel_id) {
+        caps.bound_accel_id = accel_id;
+    }
+
 private:
     std::shared_ptr<State> state_;
-    tutti::Status status_;
 };
 
 tutti::config::TuttiRuntimeSpec memfs_spec() {
@@ -122,227 +155,280 @@ tutti::config::TuttiRuntimeSpec memfs_spec() {
     spec.accelerator.profile = TUTTI_COMPILED_ACCELERATOR_PROFILE;
     spec.runtime.accel_id = TUTTI_DEFAULT_ACCEL_ID;
     spec.storage.resources.push_back(
-        {"memory", "memory", MemoryResourceConfig{4096}});
+        {"memory-resource", "memory", MemoryResourceConfig{4096}});
     spec.storage.resolvers.push_back(
-        {"resolver", "memfs", "memfs", MemfsResolverConfig{}});
+        {"memfs-resolver", "memfs", "memfs", MemfsResolverConfig{}});
     spec.storage.datapaths.push_back(
-        {"datapath", "memfs", MemfsDataPathConfig{}});
+        {"memfs-datapath", "memfs", MemfsDataPathConfig{}});
     spec.storage.backends.push_back(
-        {"backend", "memfs", "resolver", "datapath", "memory",
-         MemfsBackendConfig{}});
+        {"assembly-relation", "memfs", "memfs-resolver", "memfs-datapath",
+         "memory-resource", MemfsBackendConfig{}});
     return spec;
 }
 
-tutti::tutti_runtime::TuttiRuntimeCreateInternalOptions options(
-    const std::shared_ptr<State>& state) {
-    tutti::tutti_runtime::TuttiRuntimeCreateInternalOptions result;
-    result.backend_device_count = [] {
-        return tutti::Result<int>::Success(1);
-    };
-    result.resource_factory = [state](const tutti::config::ResourceSpec&,
-                                      std::int32_t) {
-        std::unique_ptr<tutti::Resource> resource =
-            std::make_unique<FakeResource>(state);
-        return tutti::Result<std::unique_ptr<tutti::Resource>>::Success(
-            std::move(resource));
-    };
-    result.shutdown_observer = [state](tutti::TuttiRuntimeShutdownStage stage) {
-        state->stages.push_back(stage);
-    };
-    return result;
-}
-
-void install_backend_factory(
-    tutti::tutti_runtime::TuttiRuntimeCreateInternalOptions& options,
-    const std::shared_ptr<State>& state, tutti::Status initialize_status) {
-    options.backend_factory =
-        [state, initialize_status = std::move(initialize_status)](
-            const tutti::tutti_runtime::BackendFactoryContext& context) {
-            tutti::tutti_runtime::BackendFactoryProduct product;
-            product.resolver = std::make_unique<FakeResolver>(state);
-            product.datapath = std::make_unique<FakeDataPath>(
-                state, initialize_status, context.runtime_accel_id);
-            product.scheme = context.resolver.scheme;
-            product.data_path_key = "memfs";
-            product.data_path_config = tutti::DataPathConfig{"memfs"};
-            product.resolver_type_id =
-                std::string(tutti::binding::memfs::kResolverTypeId);
-            product.payload_type_id =
-                std::string(tutti::binding::memfs::kPayloadTypeId);
-            product.payload_api_version =
-                tutti::binding::memfs::kPayloadApiVersion;
-            return tutti::Result<tutti::tutti_runtime::BackendFactoryProduct>::
-                Success(std::move(product));
-        };
-}
-
-tutti::Result<std::unique_ptr<tutti::StorageRuntime>>
-create_fake_storage_runtime(
-    const std::shared_ptr<State>& state, tutti::RuntimeConfig config,
+tutti::Result<std::unique_ptr<tutti::StorageRuntime>> create_test_runtime(
+    std::shared_ptr<State> state, tutti::RuntimeConfig config,
     tutti::RuntimeComponents components) {
-    ++state->storage_factory;
+    state->events.push_back("runtime.factory");
+    ++state->runtime_factory_calls;
+    CHECK(config.profile_name == TUTTI_COMPILED_ACCELERATOR_PROFILE);
+    CHECK(config.accel_id == TUTTI_DEFAULT_ACCEL_ID);
+    CHECK(components.resolvers.size() == 1);
+    CHECK(components.data_paths.size() == 1);
+    if (components.resolvers.size() == 1) {
+        CHECK(components.resolvers.front().scheme == "memfs");
+        CHECK(components.resolvers.front().resolver == state->resolver);
+    }
+    if (components.data_paths.size() == 1) {
+        CHECK(components.data_paths.front().key == "memfs-datapath");
+        CHECK(components.data_paths.front().data_path == state->data_path);
+        CHECK(components.data_paths.front().config.name == "factory-config");
+    }
+
 #if !defined(TUTTI_USE_HOST)
-    // StorageRuntime performs its own device discovery. Keep this fake-only
-    // lifecycle test independent of installed accelerator hardware after
-    // TuttiRuntime's injected preflight has already been exercised.
     config.accel_id = -1;
-    for (auto& binding : components.data_paths) {
-        if (auto* datapath = dynamic_cast<FakeDataPath*>(binding.data_path)) {
-            datapath->bind_accel_id(-1);
-        }
+    if (auto* data_path = dynamic_cast<FakeDataPath*>(state->data_path)) {
+        data_path->bind_accel_id(-1);
     }
 #endif
     return tutti::StorageRuntime::create(
         std::move(config), std::move(components));
 }
 
+tutti::tutti_runtime::TuttiRuntimeCreateInternalOptions injected_options(
+    const std::shared_ptr<State>& state) {
+    tutti::tutti_runtime::TuttiRuntimeCreateInternalOptions options;
+    options.public_options.handle_cache_capacity = 11;
+    options.public_options.prp_cache_capacity = 12;
+    options.public_options.handle_cache_l2_capacity = 13;
+    options.accelerator_device_count = [] {
+        return tutti::Result<int>::Success(1);
+    };
+    options.resource_factory =
+        [state](const tutti::config::ResourceSpec& spec,
+                const tutti::resources::ResourceCreateContext& context) {
+            state->events.push_back("resource.factory");
+            ++state->resource_factory_calls;
+            CHECK(spec.id == "memory-resource");
+            CHECK(spec.type == "memory");
+            CHECK(context.runtime_accel_id == TUTTI_DEFAULT_ACCEL_ID);
+            std::unique_ptr<tutti::Resource> resource =
+                std::make_unique<FakeResource>(state);
+            return tutti::Result<std::unique_ptr<tutti::Resource>>::Success(
+                std::move(resource));
+        };
+    options.resolver_factory =
+        [state](const tutti::config::ResolverSpec& spec,
+                const tutti::resolvers::ResolverCreateContext& context) {
+            state->events.push_back("resolver.factory");
+            ++state->resolver_factory_calls;
+            CHECK(spec.id == "memfs-resolver");
+            CHECK(spec.scheme == "memfs");
+            CHECK(context.resource.info().id == "memory-resource");
+            CHECK(context.resource.info().state ==
+                  tutti::ResourceState::INITIALIZED);
+            CHECK(context.relation.id == "assembly-relation");
+            CHECK(context.relation.resolver == spec.id);
+            CHECK(context.data_path_key == "memfs-datapath");
+            auto resolver = std::make_unique<FakeResolver>(state);
+            state->resolver = resolver.get();
+            std::unique_ptr<tutti::StorageTargetResolver> result =
+                std::move(resolver);
+            return tutti::Result<
+                std::unique_ptr<tutti::StorageTargetResolver>>::Success(
+                    std::move(result));
+        };
+    options.data_path_factory =
+        [state](const tutti::config::DataPathSpec& spec,
+                const tutti::data_paths::DataPathCreateContext& context) {
+            state->events.push_back("datapath.factory");
+            ++state->data_path_factory_calls;
+            CHECK(spec.id == "memfs-datapath");
+            CHECK(context.resource.info().id == "memory-resource");
+            CHECK(context.resource.info().state ==
+                  tutti::ResourceState::INITIALIZED);
+            CHECK(context.relation.id == "assembly-relation");
+            CHECK(context.relation.datapath == spec.id);
+            CHECK(context.runtime_accel_id == TUTTI_DEFAULT_ACCEL_ID);
+            CHECK(context.cache.handle_cache_capacity == 11);
+            CHECK(context.cache.prp_cache_capacity == 12);
+            CHECK(context.cache.handle_cache_l2_capacity == 13);
+            tutti::data_paths::CreatedDataPath result;
+            result.instance =
+                std::make_unique<FakeDataPath>(state, context.runtime_accel_id);
+            state->data_path = result.instance.get();
+            result.initialize_config = tutti::DataPathConfig{"factory-config"};
+            return tutti::Result<tutti::data_paths::CreatedDataPath>::Success(
+                std::move(result));
+        };
+    options.runtime_factory =
+        [state](tutti::RuntimeConfig config,
+                tutti::RuntimeComponents components) {
+            return create_test_runtime(
+                state, std::move(config), std::move(components));
+        };
+    options.shutdown_observer =
+        [state](tutti::TuttiRuntimeShutdownStage stage) {
+            state->stages.push_back(stage);
+        };
+    return options;
+}
+
+void check_successful_assembly() {
+    auto state = std::make_shared<State>();
+    auto result = tutti::testing::TuttiRuntimeTestAccess::create(
+        memfs_spec(), injected_options(state));
+    CHECK(result.ok());
+    if (!result.ok()) return;
+
+    auto runtime = std::move(result).value();
+    CHECK(runtime->state() == tutti::TuttiRuntimeState::RUNNING);
+    CHECK(runtime->storage_runtime() != nullptr);
+    CHECK(runtime->resource_infos().size() == 1);
+    CHECK(runtime->resource_info("memory-resource").ok());
+    CHECK(tutti::testing::TuttiRuntimeTestAccess::resolver_count(*runtime) == 1);
+    CHECK(tutti::testing::TuttiRuntimeTestAccess::data_path_count(*runtime) == 1);
+    CHECK(tutti::testing::TuttiRuntimeTestAccess::resolver(
+              *runtime, "memfs-resolver") == state->resolver);
+    CHECK(tutti::testing::TuttiRuntimeTestAccess::data_path(
+              *runtime, "memfs-datapath") == state->data_path);
+    CHECK(tutti::testing::TuttiRuntimeTestAccess::resolver(
+              *runtime, "assembly-relation") == nullptr);
+    CHECK(tutti::testing::TuttiRuntimeTestAccess::data_path(
+              *runtime, "assembly-relation") == nullptr);
+
+    const std::vector<std::string> creation_events{
+        "resource.factory", "resource.initialize", "resolver.factory",
+        "datapath.factory", "runtime.factory", "datapath.initialize"};
+    CHECK(state->events == creation_events);
+
+    CHECK(runtime->shutdown().ok());
+    CHECK(runtime->state() == tutti::TuttiRuntimeState::STOPPED);
+    CHECK(runtime->shutdown().ok());
+    CHECK(state->resource_shutdown_calls == 1);
+    CHECK(state->resolver_destroy_calls == 1);
+    CHECK(state->data_path_shutdown_calls == 1);
+    CHECK(state->data_path_destroy_calls == 1);
+    const std::vector<std::string> lifecycle_events{
+        "resource.factory", "resource.initialize", "resolver.factory",
+        "datapath.factory", "runtime.factory", "datapath.initialize",
+        "datapath.shutdown", "resolver.destroy", "datapath.destroy",
+        "resource.shutdown"};
+    CHECK(state->events == lifecycle_events);
+    const std::vector<tutti::TuttiRuntimeShutdownStage> expected_stages{
+        tutti::TuttiRuntimeShutdownStage::STORAGE_RUNTIME_SHUTDOWN,
+        tutti::TuttiRuntimeShutdownStage::STORAGE_RUNTIME_DESTROYED,
+        tutti::TuttiRuntimeShutdownStage::RESOLVERS_DESTROYED,
+        tutti::TuttiRuntimeShutdownStage::DATAPATHS_DESTROYED,
+        tutti::TuttiRuntimeShutdownStage::RESOURCE_SHUTDOWN,
+        tutti::TuttiRuntimeShutdownStage::COMPLETE,
+    };
+    CHECK(state->stages == expected_stages);
+}
+
+void check_resolver_failure_rolls_back_resource() {
+    auto state = std::make_shared<State>();
+    auto options = injected_options(state);
+    options.resolver_factory =
+        [state](const tutti::config::ResolverSpec&,
+                const tutti::resolvers::ResolverCreateContext&) {
+            state->events.push_back("resolver.factory.failure");
+            ++state->resolver_factory_calls;
+            return tutti::Result<
+                std::unique_ptr<tutti::StorageTargetResolver>>::Failure(
+                    tutti::Status(tutti::StatusCode::NOT_READY,
+                                  "resolver unavailable"));
+        };
+    auto result = tutti::testing::TuttiRuntimeTestAccess::create(
+        memfs_spec(), std::move(options));
+    CHECK(!result.ok());
+    CHECK(result.status().code() == tutti::StatusCode::NOT_READY);
+    CHECK(state->data_path_factory_calls == 0);
+    CHECK(state->runtime_factory_calls == 0);
+    CHECK(state->resource_shutdown_calls == 1);
+}
+
+void check_null_datapath_rolls_back_resolver_and_resource() {
+    auto state = std::make_shared<State>();
+    auto options = injected_options(state);
+    options.data_path_factory =
+        [state](const tutti::config::DataPathSpec&,
+                const tutti::data_paths::DataPathCreateContext&) {
+            state->events.push_back("datapath.factory.null");
+            ++state->data_path_factory_calls;
+            return tutti::Result<tutti::data_paths::CreatedDataPath>::Success(
+                tutti::data_paths::CreatedDataPath{});
+        };
+    auto result = tutti::testing::TuttiRuntimeTestAccess::create(
+        memfs_spec(), std::move(options));
+    CHECK(!result.ok());
+    CHECK(result.status().code() == tutti::StatusCode::INVALID_ARGUMENT);
+    CHECK(result.status().message().find("DataPath factory returned null") !=
+          std::string::npos);
+    CHECK(state->resolver_destroy_calls == 1);
+    CHECK(state->resource_shutdown_calls == 1);
+    CHECK(state->runtime_factory_calls == 0);
+}
+
+void check_runtime_factory_throw_rolls_back_registries() {
+    auto state = std::make_shared<State>();
+    auto options = injected_options(state);
+    options.runtime_factory =
+        [state](tutti::RuntimeConfig, tutti::RuntimeComponents) ->
+            tutti::Result<std::unique_ptr<tutti::StorageRuntime>> {
+            state->events.push_back("runtime.factory.throw");
+            ++state->runtime_factory_calls;
+            throw std::runtime_error("injected runtime failure");
+        };
+    auto result = tutti::testing::TuttiRuntimeTestAccess::create(
+        memfs_spec(), std::move(options));
+    CHECK(!result.ok());
+    CHECK(result.status().code() == tutti::StatusCode::INTERNAL);
+    CHECK(result.status().message().find("StorageRuntime factory threw") !=
+          std::string::npos);
+    CHECK(state->data_path_initialize_calls == 0);
+    CHECK(state->resolver_destroy_calls == 1);
+    CHECK(state->data_path_destroy_calls == 1);
+    CHECK(state->resource_shutdown_calls == 1);
+}
+
+void check_invalid_spec_stops_before_factories() {
+    auto state = std::make_shared<State>();
+    auto spec = memfs_spec();
+    spec.storage.backends.front().resource = "missing";
+    auto result = tutti::testing::TuttiRuntimeTestAccess::create(
+        std::move(spec), injected_options(state));
+    CHECK(!result.ok());
+    CHECK(result.status().code() == tutti::StatusCode::INVALID_ARGUMENT);
+    CHECK(state->resource_factory_calls == 0);
+    CHECK(state->resolver_factory_calls == 0);
+    CHECK(state->data_path_factory_calls == 0);
+}
+
+#if defined(TUTTI_USE_HOST)
+void check_real_factories_assemble_memfs() {
+    auto result = tutti::TuttiRuntime::create(memfs_spec());
+    CHECK(result.ok());
+    if (!result.ok()) return;
+    auto runtime = std::move(result).value();
+    CHECK(runtime->state() == tutti::TuttiRuntimeState::RUNNING);
+    CHECK(runtime->resource_info("memory-resource").ok());
+    CHECK(runtime->shutdown().ok());
+}
+#endif
+
 } // namespace
 
 int main() {
-    {
-        char path[] = "/tmp/tutti-runtime-path-XXXXXX";
-        const int descriptor = ::mkstemp(path);
-        CHECK(descriptor >= 0);
-        if (descriptor >= 0) ::close(descriptor);
-        std::ofstream stream(path);
-        stream <<
-            "accelerator: {profile: "
-               << TUTTI_COMPILED_ACCELERATOR_PROFILE << "}\n"
-            "runtime: {accel_id: " << TUTTI_DEFAULT_ACCEL_ID << "}\n"
-            "storage:\n"
-            "  resources: []\n"
-            "  resolvers: []\n"
-            "  datapaths: []\n"
-            "  backends: []\n";
-        stream.close();
-        auto result = tutti::TuttiRuntime::create(path);
-        CHECK(!result.ok());
-        CHECK(result.status().message().find("exactly one backend") !=
-              std::string::npos);
-        ::unlink(path);
-    }
-#if !defined(TUTTI_USE_HOST)
-    {
-        auto spec = memfs_spec();
-        spec.runtime.accel_id = 1;
-        auto state = std::make_shared<State>();
-        auto injected = options(state);
-        injected.backend_device_count = [] {
-            return tutti::Result<int>::Success(1);
-        };
-        auto result = tutti::testing::TuttiRuntimeTestAccess::create(
-            std::move(spec), std::move(injected));
-        CHECK(!result.ok());
-        CHECK(result.status().code() == tutti::StatusCode::NOT_FOUND);
-        CHECK(result.status().message().find("device count") !=
-              std::string::npos);
-        CHECK(state->resource_initialize == 0);
-    }
+    check_invalid_spec_stops_before_factories();
+    check_resolver_failure_rolls_back_resource();
+    check_null_datapath_rolls_back_resolver_and_resource();
+    check_runtime_factory_throw_rolls_back_registries();
+    check_successful_assembly();
+#if defined(TUTTI_USE_HOST)
+    check_real_factories_assemble_memfs();
 #endif
-    {
-        auto state = std::make_shared<State>();
-        auto injected = options(state);
-        injected.resource_factory =
-            [state](const tutti::config::ResourceSpec&, std::int32_t) {
-                std::unique_ptr<tutti::Resource> resource =
-                    std::make_unique<FakeResource>(state, "wrong-id");
-                return tutti::Result<std::unique_ptr<tutti::Resource>>::Success(
-                    std::move(resource));
-            };
-        auto result = tutti::testing::TuttiRuntimeTestAccess::create(
-            memfs_spec(), std::move(injected));
-        CHECK(!result.ok());
-        CHECK(result.status().code() == tutti::StatusCode::INVALID_ARGUMENT);
-        CHECK(state->resource_initialize == 0);
-        CHECK(state->resource_shutdown == 1);
-    }
-    {
-        auto state = std::make_shared<State>();
-        auto injected = options(state);
-        injected.public_options.spec_debug_logger =
-            [state](std::string_view debug) {
-                CHECK(debug.find("storage.backends[0].contract") !=
-                      std::string_view::npos);
-                state->events.push_back("spec_debug");
-            };
-        auto result = tutti::testing::TuttiRuntimeTestAccess::create(
-            memfs_spec(), std::move(injected));
-        CHECK(!result.ok());
-        CHECK(result.status().code() == tutti::StatusCode::UNSUPPORTED);
-        CHECK(state->resource_initialize == 1);
-        CHECK(state->resource_shutdown == 1);
-        const std::vector<std::string> expected_events{
-            "spec_debug", "resource_initialize"};
-        CHECK(state->events == expected_events);
-    }
-    {
-        auto state = std::make_shared<State>();
-        auto injected = options(state);
-        install_backend_factory(
-            injected, state,
-            tutti::Status(tutti::StatusCode::NOT_READY, "injected failure"));
-        injected.runtime_factory =
-            [state](tutti::RuntimeConfig config,
-                    tutti::RuntimeComponents components) {
-                return create_fake_storage_runtime(
-                    state,
-                    std::move(config), std::move(components));
-            };
-        auto result = tutti::testing::TuttiRuntimeTestAccess::create(
-            memfs_spec(), std::move(injected));
-        if (!result.ok()) {
-            std::fprintf(stderr, "initialize failure status: %s\n",
-                         result.status().message().c_str());
-        }
-        CHECK(!result.ok());
-        CHECK(result.status().code() == tutti::StatusCode::NOT_READY);
-        CHECK(state->datapath_initialize == 1);
-        CHECK(state->resolver_destroy == 1);
-        CHECK(state->datapath_destroy == 1);
-        CHECK(state->resource_shutdown == 1);
-    }
-    {
-        auto state = std::make_shared<State>();
-        auto injected = options(state);
-        install_backend_factory(injected, state, tutti::Status::Ok());
-        injected.runtime_factory =
-            [state](tutti::RuntimeConfig config,
-                    tutti::RuntimeComponents components) {
-                return create_fake_storage_runtime(
-                    state,
-                    std::move(config), std::move(components));
-            };
-        auto result = tutti::testing::TuttiRuntimeTestAccess::create(
-            memfs_spec(), std::move(injected));
-        if (!result.ok()) {
-            std::fprintf(stderr, "success path status: %s\n",
-                         result.status().message().c_str());
-        }
-        CHECK(result.ok());
-        if (result.ok()) {
-            auto runtime = std::move(result).value();
-            CHECK(runtime->state() == tutti::TuttiRuntimeState::RUNNING);
-            CHECK(runtime->storage_runtime() != nullptr);
-            CHECK(!tutti::testing::TuttiRuntimeTestAccess::validated_spec_debug(
-                       *runtime).empty());
-            CHECK(runtime->shutdown().ok());
-            CHECK(runtime->state() == tutti::TuttiRuntimeState::STOPPED);
-            CHECK(runtime->shutdown().ok());
-            CHECK(state->resource_shutdown == 1);
-            CHECK(state->resolver_destroy == 1);
-            CHECK(state->datapath_destroy == 1);
-            const std::vector<tutti::TuttiRuntimeShutdownStage> expected{
-                tutti::TuttiRuntimeShutdownStage::STORAGE_RUNTIME_SHUTDOWN,
-                tutti::TuttiRuntimeShutdownStage::STORAGE_RUNTIME_DESTROYED,
-                tutti::TuttiRuntimeShutdownStage::RESOLVERS_DESTROYED,
-                tutti::TuttiRuntimeShutdownStage::DATAPATHS_DESTROYED,
-                tutti::TuttiRuntimeShutdownStage::RESOURCE_SHUTDOWN,
-                tutti::TuttiRuntimeShutdownStage::COMPLETE,
-            };
-            CHECK(state->stages == expected);
-        }
-    }
-    std::printf("TuttiRuntime tests: %s\n",
+    std::printf("TuttiRuntime assembly tests: %s\n",
                 failures == 0 ? "PASS" : "FAIL");
     return failures == 0 ? 0 : 1;
 }

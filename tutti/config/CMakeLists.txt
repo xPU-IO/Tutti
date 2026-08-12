@@ -114,7 +114,6 @@ set_target_properties(tutti_config_parser PROPERTIES
 add_library(tutti_runtime STATIC
     "${TUTTI_SOURCE_DIR}/tutti_runtime/tutti_runtime.cpp"
     "${TUTTI_SOURCE_DIR}/tutti_runtime/tutti_runtime_create.cpp"
-    "${TUTTI_SOURCE_DIR}/tutti_runtime/backend_factory.cpp"
 )
 target_include_directories(tutti_runtime PUBLIC
     $<BUILD_INTERFACE:${TUTTI_SOURCE_DIR}/include>
@@ -129,23 +128,14 @@ target_link_libraries(tutti_runtime PUBLIC
     tutti_resource
     tutti_api
 )
+target_link_libraries(tutti_runtime PRIVATE
+    tutti_resolver_factory
+    tutti_data_path_factory
+)
 set_target_properties(tutti_runtime PROPERTIES
     CXX_STANDARD 17
     CXX_STANDARD_REQUIRED ON
 )
-
-function(tutti_enable_runtime_local_nvme)
-    tutti_enable_nvme_resource_grpc()
-    target_compile_definitions(tutti_runtime PRIVATE
-        TUTTI_RUNTIME_HAS_LOCAL_NVME=1
-    )
-    target_link_libraries(tutti_runtime PRIVATE
-        tutti_local_nvme_datapath
-        tutti_striped_local_nvme_datapath
-        tutti_local_file_resolver
-        tutti_striped_file_resolver
-    )
-endfunction()
 
 install(TARGETS tutti_runtime_spec tutti_config_parser tutti_runtime
     ARCHIVE DESTINATION lib

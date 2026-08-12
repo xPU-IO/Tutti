@@ -10,10 +10,11 @@
 
 #include <tutti/config/tutti_runtime_config_parser.h>
 #include <tutti/cuda_like.h>
+#include <tutti/data_paths/data_path_factory.h>
+#include <tutti/resolvers/resolver_factory.h>
 #include <tutti/storage_runtime.h>
 
 #include <tutti/resource.h>
-#include "tutti/tutti_runtime/backend_factory.h"
 #include "tutti/tutti_runtime/tutti_runtime_internal.h"
 
 namespace tutti {
@@ -36,7 +37,7 @@ std::string upper(std::string value) {
     return value;
 }
 
-Result<int> default_backend_device_count() {
+Result<int> default_accelerator_device_count() {
 #if defined(TUTTI_USE_HOST)
     return Result<int>::Success(0);
 #elif defined(TUTTI_USE_CUDA) || defined(TUTTI_USE_MUSA) || defined(TUTTI_USE_MACA)
@@ -65,8 +66,9 @@ Status validate_runtime_environment(
             "accelerator.profile does not match compiled profile");
     }
     if (spec.runtime.accel_id == -1) return Status::Ok();
-    auto count = options.backend_device_count
-        ? options.backend_device_count() : default_backend_device_count();
+    auto count = options.accelerator_device_count
+        ? options.accelerator_device_count()
+        : default_accelerator_device_count();
     if (!count.ok()) return count.status();
     if (spec.runtime.accel_id >= count.value()) {
         return create_error(
@@ -92,10 +94,10 @@ Result<std::unique_ptr<Resource>> create_and_initialize_resource(
         failure<std::unique_ptr<Resource>>(create_error(
             StatusCode::INTERNAL, "Resource factory did not return a result"));
     try {
+        const resources::ResourceCreateContext context{accel_id};
         created = options.resource_factory
-            ? options.resource_factory(spec, accel_id)
-            : resources::create_resource(
-                  spec, resources::ResourceCreateContext{accel_id});
+            ? options.resource_factory(spec, context)
+            : resources::create_resource(spec, context);
     } catch (const std::exception& exception) {
         return failure<std::unique_ptr<Resource>>(create_error(
             StatusCode::INTERNAL,
@@ -172,6 +174,60 @@ Result<std::unique_ptr<StorageRuntime>> create_storage_runtime(
     }
 }
 
+Result<std::unique_ptr<StorageTargetResolver>> create_resolver_component(
+    const config::ResolverSpec& spec,
+    const resolvers::ResolverCreateContext& context,
+    const tutti_runtime::TuttiRuntimeCreateInternalOptions& options) {
+    Result<std::unique_ptr<StorageTargetResolver>> created =
+        failure<std::unique_ptr<StorageTargetResolver>>(create_error(
+            StatusCode::INTERNAL, "resolver factory did not return a result"));
+    try {
+        created = options.resolver_factory
+            ? options.resolver_factory(spec, context)
+            : resolvers::create_resolver(spec, context);
+    } catch (const std::exception& exception) {
+        return failure<std::unique_ptr<StorageTargetResolver>>(create_error(
+            StatusCode::INTERNAL,
+            std::string("resolver factory threw: ") + exception.what()));
+    } catch (...) {
+        return failure<std::unique_ptr<StorageTargetResolver>>(create_error(
+            StatusCode::INTERNAL, "resolver factory threw"));
+    }
+    if (!created.ok()) return created;
+    if (!created.value()) {
+        return failure<std::unique_ptr<StorageTargetResolver>>(create_error(
+            StatusCode::INVALID_ARGUMENT, "resolver factory returned null"));
+    }
+    return created;
+}
+
+Result<data_paths::CreatedDataPath> create_data_path_component(
+    const config::DataPathSpec& spec,
+    const data_paths::DataPathCreateContext& context,
+    const tutti_runtime::TuttiRuntimeCreateInternalOptions& options) {
+    Result<data_paths::CreatedDataPath> created =
+        failure<data_paths::CreatedDataPath>(create_error(
+            StatusCode::INTERNAL, "DataPath factory did not return a result"));
+    try {
+        created = options.data_path_factory
+            ? options.data_path_factory(spec, context)
+            : data_paths::create_data_path(spec, context);
+    } catch (const std::exception& exception) {
+        return failure<data_paths::CreatedDataPath>(create_error(
+            StatusCode::INTERNAL,
+            std::string("DataPath factory threw: ") + exception.what()));
+    } catch (...) {
+        return failure<data_paths::CreatedDataPath>(create_error(
+            StatusCode::INTERNAL, "DataPath factory threw"));
+    }
+    if (!created.ok()) return created;
+    if (!created.value().instance) {
+        return failure<data_paths::CreatedDataPath>(create_error(
+            StatusCode::INVALID_ARGUMENT, "DataPath factory returned null"));
+    }
+    return created;
+}
+
 template <typename Spec>
 const Spec* find_by_id(const std::vector<Spec>& specs,
                        const std::string& id) {
@@ -186,23 +242,16 @@ const Spec* find_by_id(const std::vector<Spec>& specs,
 namespace tutti_runtime {
 
 EffectiveCacheConfig resolve_cache_config(
-    const config::TuttiRuntimeSpec& spec,
+    const config::DataPathSpec& spec,
     const TuttiRuntimeCreateOptions& options) {
     const config::NvmeDataPathTuning* tuning = nullptr;
-    if (!spec.storage.backends.empty()) {
-        const config::DataPathSpec* datapath = find_by_id(
-            spec.storage.datapaths, spec.storage.backends.front().datapath);
-        if (datapath != nullptr) {
-            if (const auto* local =
-                    std::get_if<config::LocalNvmeDataPathConfig>(
-                        &datapath->config)) {
-                tuning = local;
-            } else if (const auto* striped =
-                           std::get_if<config::StripedLocalNvmeDataPathConfig>(
-                               &datapath->config)) {
-                tuning = striped;
-            }
-        }
+    if (const auto* local = std::get_if<config::LocalNvmeDataPathConfig>(
+            &spec.config)) {
+        tuning = local;
+    } else if (const auto* striped =
+                   std::get_if<config::StripedLocalNvmeDataPathConfig>(
+                       &spec.config)) {
+        tuning = striped;
     }
     const auto env_or_zero = [](const char* name) {
         const char* value = std::getenv(name);
@@ -261,12 +310,10 @@ Result<std::unique_ptr<TuttiRuntime>> TuttiRuntime::create_with_options_(
         return failure<std::unique_ptr<TuttiRuntime>>(debug.status());
     }
 
-    auto runtime = std::unique_ptr<TuttiRuntime>(new TuttiRuntime());
-    runtime->validated_spec_debug_ = std::move(debug).value();
     if (options.public_options.spec_debug_logger) {
         try {
             options.public_options.spec_debug_logger(
-                runtime->validated_spec_debug_);
+                debug.value());
         } catch (const std::exception& exception) {
             return failure<std::unique_ptr<TuttiRuntime>>(create_error(
                 StatusCode::INTERNAL,
@@ -277,13 +324,11 @@ Result<std::unique_ptr<TuttiRuntime>> TuttiRuntime::create_with_options_(
         }
     }
 
+    auto runtime = std::unique_ptr<TuttiRuntime>(new TuttiRuntime());
     status = validate_runtime_environment(spec, options);
     if (!status.ok()) {
         return failure<std::unique_ptr<TuttiRuntime>>(std::move(status));
     }
-    const auto cache = tutti_runtime::resolve_cache_config(
-        spec, options.public_options);
-
     runtime->runtime_shutdown_hook_ = std::move(options.runtime_shutdown_hook);
     runtime->shutdown_observer_ = std::move(options.shutdown_observer);
 
@@ -311,109 +356,78 @@ Result<std::unique_ptr<TuttiRuntime>> TuttiRuntime::create_with_options_(
         }
     }
 
-    const config::BackendSpec& backend = spec.storage.backends.front();
-    const config::ResourceSpec* resource_spec = find_by_id(
-        spec.storage.resources, backend.resource);
-    const config::ResolverSpec* resolver_spec = find_by_id(
-        spec.storage.resolvers, backend.resolver);
-    const config::DataPathSpec* datapath_spec = find_by_id(
-        spec.storage.datapaths, backend.datapath);
-    const Resource* resource = runtime->find_resource_(backend.resource);
-    if (resource_spec == nullptr || resolver_spec == nullptr ||
-        datapath_spec == nullptr || resource == nullptr) {
-        return failure<std::unique_ptr<TuttiRuntime>>(create_error(
-            StatusCode::INTERNAL,
-            "validated backend IDs are missing during Runtime assembly"));
-    }
-
-    const tutti_runtime::RuntimeBackendRegistration* registration =
-        tutti_runtime::find_backend_factory(backend.contract);
-    if (registration == nullptr) {
-        return failure<std::unique_ptr<TuttiRuntime>>(create_error(
-            StatusCode::UNSUPPORTED,
-            "backend contract has no Runtime registration"));
-    }
-
-    const tutti_runtime::BackendFactoryContext context{
-        backend, *resolver_spec, *datapath_spec, *resource_spec, *resource,
-        spec.runtime.accel_id,
-        {cache.handle_cache_capacity, cache.prp_cache_capacity,
-         cache.handle_cache_l2_capacity},
-    };
-    Result<tutti_runtime::BackendFactoryProduct> factory_result =
-        failure<tutti_runtime::BackendFactoryProduct>(create_error(
-            StatusCode::INTERNAL,
-            "backend factory did not return a result"));
-    try {
-        factory_result = options.backend_factory
-            ? options.backend_factory(context)
-            : tutti_runtime::create_backend_from_registry(context);
-    } catch (const std::exception& exception) {
-        return failure<std::unique_ptr<TuttiRuntime>>(create_error(
-            StatusCode::INVALID_ARGUMENT,
-            std::string("backend factory threw: ") + exception.what()));
-    } catch (...) {
-        return failure<std::unique_ptr<TuttiRuntime>>(create_error(
-            StatusCode::INTERNAL, "backend factory threw"));
-    }
-    if (!factory_result.ok()) {
-        return failure<std::unique_ptr<TuttiRuntime>>(factory_result.status());
-    }
-    tutti_runtime::BackendFactoryProduct product =
-        std::move(factory_result).value();
-    status = tutti_runtime::validate_backend_factory_product(
-        context, *registration, product);
-    if (!status.ok()) {
-        return failure<std::unique_ptr<TuttiRuntime>>(std::move(status));
-    }
-
     RuntimeComponents components;
-    StorageTargetResolver* resolver = nullptr;
-    DataPath* datapath = nullptr;
-    try {
-        status = runtime->register_resolver_(
-            backend.resolver, std::move(product.resolver), product.scheme,
-            resolver);
-        if (!status.ok()) {
-            return failure<std::unique_ptr<TuttiRuntime>>(std::move(status));
+    components.resolvers.reserve(spec.storage.resolvers.size());
+    components.data_paths.reserve(spec.storage.datapaths.size());
+    for (const config::BackendSpec& relation : spec.storage.backends) {
+        const config::ResolverSpec* resolver_spec = find_by_id(
+            spec.storage.resolvers, relation.resolver);
+        const config::DataPathSpec* data_path_spec = find_by_id(
+            spec.storage.datapaths, relation.datapath);
+        const Resource* resource = runtime->find_resource_(relation.resource);
+        if (resolver_spec == nullptr || data_path_spec == nullptr ||
+            resource == nullptr) {
+            return failure<std::unique_ptr<TuttiRuntime>>(create_error(
+                StatusCode::INTERNAL,
+                "validated component IDs are missing during Runtime assembly"));
         }
-        status = runtime->register_datapath_(
-            backend.datapath, std::move(product.datapath),
-            product.data_path_key, datapath);
-        if (!status.ok()) {
-            return failure<std::unique_ptr<TuttiRuntime>>(std::move(status));
-        }
-        components.resolvers.push_back({product.scheme, resolver});
-        components.data_paths.push_back(
-            {product.data_path_key, datapath, product.data_path_config});
-    } catch (const std::exception& exception) {
-        return failure<std::unique_ptr<TuttiRuntime>>(create_error(
-            StatusCode::INTERNAL,
-            std::string("backend component registration threw: ") +
-                exception.what()));
-    } catch (...) {
-        return failure<std::unique_ptr<TuttiRuntime>>(create_error(
-            StatusCode::INTERNAL,
-            "backend component registration threw"));
-    }
 
-    try {
-        status = runtime->register_backend_(
-            {backend.id, backend.contract, backend.resolver, backend.datapath,
-             backend.resource},
-            resource, resolver, datapath);
-    } catch (const std::exception& exception) {
-        return failure<std::unique_ptr<TuttiRuntime>>(create_error(
-            StatusCode::INTERNAL,
-            std::string("backend manifest registration threw: ") +
-                exception.what()));
-    } catch (...) {
-        return failure<std::unique_ptr<TuttiRuntime>>(create_error(
-            StatusCode::INTERNAL,
-            "backend manifest registration threw"));
-    }
-    if (!status.ok()) {
-        return failure<std::unique_ptr<TuttiRuntime>>(std::move(status));
+        auto resolver_result = create_resolver_component(
+            *resolver_spec,
+            resolvers::ResolverCreateContext{
+                *resource, relation, data_path_spec->id},
+            options);
+        if (!resolver_result.ok()) {
+            return failure<std::unique_ptr<TuttiRuntime>>(
+                resolver_result.status());
+        }
+
+        const auto cache = tutti_runtime::resolve_cache_config(
+            *data_path_spec, options.public_options);
+        auto data_path_result = create_data_path_component(
+            *data_path_spec,
+            data_paths::DataPathCreateContext{
+                *resource, relation, spec.runtime.accel_id,
+                {cache.handle_cache_capacity, cache.prp_cache_capacity,
+                 cache.handle_cache_l2_capacity}},
+            options);
+        if (!data_path_result.ok()) {
+            return failure<std::unique_ptr<TuttiRuntime>>(
+                data_path_result.status());
+        }
+        data_paths::CreatedDataPath created_data_path =
+            std::move(data_path_result).value();
+
+        StorageTargetResolver* resolver = nullptr;
+        DataPath* data_path = nullptr;
+        try {
+            status = runtime->register_resolver_(
+                resolver_spec->id, std::move(resolver_result).value(), resolver);
+            if (!status.ok()) {
+                return failure<std::unique_ptr<TuttiRuntime>>(
+                    std::move(status));
+            }
+            status = runtime->register_datapath_(
+                data_path_spec->id, std::move(created_data_path.instance),
+                data_path);
+            if (!status.ok()) {
+                return failure<std::unique_ptr<TuttiRuntime>>(
+                    std::move(status));
+            }
+            components.resolvers.push_back(
+                {resolver_spec->scheme, resolver});
+            components.data_paths.push_back(
+                {data_path_spec->id, data_path,
+                 std::move(created_data_path.initialize_config)});
+        } catch (const std::exception& exception) {
+            return failure<std::unique_ptr<TuttiRuntime>>(create_error(
+                StatusCode::INTERNAL,
+                std::string("component registration threw: ") +
+                    exception.what()));
+        } catch (...) {
+            return failure<std::unique_ptr<TuttiRuntime>>(create_error(
+                StatusCode::INTERNAL, "component registration threw"));
+        }
     }
 
     RuntimeConfig runtime_config;

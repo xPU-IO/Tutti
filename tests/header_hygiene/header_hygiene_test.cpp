@@ -45,9 +45,6 @@
 
 #if defined(__has_include)
 
-#  if __has_include(<tutti/tutti_runtime/backend_factory.h>)
-#    error "HYGIENE VIOLATION: backend factory test seam is publicly reachable"
-#  endif
 #  if __has_include(<tutti/tutti_runtime/tutti_runtime_internal.h>)
 #    error "HYGIENE VIOLATION: Runtime test seam is publicly reachable"
 #  endif
@@ -176,10 +173,8 @@ int main() {
     req.target = th;
 
     tutti::config::TuttiRuntimeSpec spec;
-    tutti::BackendManifest manifest;
     tutti::ResourceInfo resource_info;
-    if (!spec.storage.resources.empty() || !manifest.id.empty() ||
-        !resource_info.id.empty()) {
+    if (!spec.storage.resources.empty() || !resource_info.id.empty()) {
         return 1;
     }
 

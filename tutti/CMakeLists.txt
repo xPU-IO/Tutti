@@ -288,7 +288,7 @@ if(TUTTI_BUILD_HARDWARE_STACK)
         add_subdirectory(data_paths/striped_local_nvme)
 
         tutti_enable_data_path_factory_local_nvme()
-        tutti_enable_runtime_local_nvme()
+        tutti_enable_nvme_resource_grpc()
 
     else()
         message(STATUS "Tutti: TUTTI_FEATURE_LOCAL_NVME=OFF -- skipping device_manager, data_paths/local_nvme")
