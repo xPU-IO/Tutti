@@ -1,4 +1,5 @@
-set(_tutti_runtime_spec_public_headers
+set(_tutti_config_public_headers
+    tutti_runtime_config_parser.h
     tutti_runtime_spec.h
     spec/resource/resource_spec.h
     spec/resource/nvme_spec.h
@@ -22,7 +23,7 @@ set(_tutti_runtime_spec_public_headers
 # only that explicit set into a conventional build-tree include root so
 # consumers can keep using <tutti/config/...> without exposing all of tutti/.
 set(TUTTI_CONFIG_PUBLIC_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/include")
-foreach(_tutti_config_header IN LISTS _tutti_runtime_spec_public_headers)
+foreach(_tutti_config_header IN LISTS _tutti_config_public_headers)
     set(_tutti_config_header_source
         "${CMAKE_CURRENT_SOURCE_DIR}/${_tutti_config_header}")
     set(_tutti_config_header_build

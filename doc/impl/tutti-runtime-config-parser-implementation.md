@@ -170,7 +170,7 @@ spec 默认值 512 KiB；ext4 YAML 声明同名字段会在 parser 层作为 unk
 | --- | --- |
 | `tutti/config/tutti_runtime_spec.h` | 顶层 spec value types、`validate()`、`to_debug_string()` |
 | `tutti/config/spec/<kind>/*.h` | 各组件 aggregate/specific value types 及其字段默认值 |
-| `tutti/include/tutti/config/tutti_runtime_config_parser.h` | `parse_tutti_runtime_config(path)` |
+| `tutti/config/tutti_runtime_config_parser.h` | `parse_tutti_runtime_config(path)` |
 | `tutti/include/tutti/tutti_runtime.h` | 两个 `create()` 重载、只读查询、state、`shutdown()` |
 
 ## 5. Spec 校验实现

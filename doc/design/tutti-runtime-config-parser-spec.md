@@ -135,6 +135,7 @@ Parser 可以尽早返回带 YAML 路径的错误，但 `TuttiRuntimeSpec::valid
 tutti/
   config/
     CMakeLists.txt
+    tutti_runtime_config_parser.h
     tutti_runtime_spec.h
     parser/
       tutti_runtime_config_parser.cpp
@@ -213,6 +214,7 @@ tutti/
 
 ```text
 tutti/config/
+  tutti_runtime_config_parser.h
   tutti_runtime_spec.h
   spec/
     resource/*.h
@@ -220,16 +222,13 @@ tutti/config/
     datapath/*.h
     backend/*.h
 
-tutti/include/tutti/config/
-  tutti_runtime_config_parser.h
-
 tutti/include/tutti/
   tutti_runtime.h
 ```
 
 | 头文件 | 公开内容 | 不得公开的内容 |
 | --- | --- | --- |
-| `tutti_runtime_config_parser.h` | `parse_tutti_runtime_config(path)` | `YAML::Node`、parser helper、backend parser function |
+| `tutti/config/tutti_runtime_config_parser.h` | `parse_tutti_runtime_config(path)` | `YAML::Node`、parser helper、backend parser function |
 | `tutti/config/tutti_runtime_spec.h` | `TuttiRuntimeSpec`、顶层 Spec、`validate()`、`to_debug_string()` | yaml-cpp、concrete Runtime component、allocation metadata |
 | `tutti/config/spec/<kind>/*.h` | 各 resource/resolver/datapath/backend 的 aggregate 与 specific value type、枚举、字段默认值 | parser helper、validator 实现、运行时分配结果 |
 | `tutti_runtime.h` | `TuttiRuntime::create()`、查询和 shutdown API | parser internal、factory product internal、test hook |
