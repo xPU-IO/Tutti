@@ -1,7 +1,7 @@
 // tutti/data_paths/local_nvme/io/nvme_queue_group.cu
 //
 // NvmeQueueGroup implementation — ported from main's device_manager.
-// Creation/destruction order is verbatim from libnvm's init_queues (B3).
+// Creation/destruction order matches libnvm's queue-group init_queues path.
 
 #include "tutti/data_paths/local_nvme/io/nvme_queue_group.h"
 
@@ -51,7 +51,7 @@ NvmeQueueGroup::NvmeQueueGroup(nvm_ctrl_t*       borrowed_ctrl,
     if (ctrl_->mm_ptr == nullptr) {
         throw std::runtime_error(
             "NvmeQueueGroup: ctrl->mm_ptr is null (BAR0 not mapped; "
-            "ctrl bring-up via nvm_controller_init_b3_gpu / "
+            "ctrl bring-up via nvm_controller_init_gpu / "
             "nvm_ctrl_attach_client did not complete)");
     }
     if (num_queues == 0) {

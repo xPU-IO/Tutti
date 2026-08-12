@@ -15,7 +15,7 @@
 #
 # The kernel owns all real queue accounting.  YAML does NOT carry a
 # total_queues budget, queue_groups[].count, queue_depth, or any
-# per-GPU queue ledger -- those were the pre-B3 design and have been
+# per-GPU queue ledger -- those belonged to the previous design and have been
 # removed.
 #
 # Run `sudo scripts/pci_topology_check.sh` to discover NUMA / PCIe-

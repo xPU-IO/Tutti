@@ -161,19 +161,19 @@ void ServiceState::init_device(const NvmeEntry& nvme, int32_t device_id) {
     dev.mount_path   = nvme.mount_path;
     dev.namespace_id = nvme.namespace_id;
 
-    // Owner-side bring-up (B3): chrdev_create + cap + bind + probe.
+    // Owner-side bring-up: chrdev_create + cap + bind + probe.
     nvm_ctrl_t* ctrl = nullptr;
     struct disk disk;
     std::memset(&disk, 0, sizeof(disk));
 
-    int rc = nvm_controller_init_b3_owner(&ctrl,
-                                          kSnvmeControlPath,
-                                          nvme.pci_addr.c_str(),
-                                          nvme.kernel_ioq_cap,
-                                          &disk);
+    int rc = nvm_controller_init_owner(&ctrl,
+                                       kSnvmeControlPath,
+                                       nvme.pci_addr.c_str(),
+                                       nvme.kernel_ioq_cap,
+                                       &disk);
     if (rc != 0) {
         throw std::runtime_error(
-            "nvm_controller_init_b3_owner failed for pci=" + nvme.pci_addr +
+            "nvm_controller_init_owner failed for pci=" + nvme.pci_addr +
             " errno=" + std::to_string(rc));
     }
 

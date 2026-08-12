@@ -71,7 +71,7 @@ struct Controller
     void* d_ctrl_ptr;
     BufferPtr d_ctrl_buff;
 
-    // B3 queue group id assigned by NVM_CREATE_QUEUE_GROUP during
+    // Queue group id assigned by NVM_CREATE_QUEUE_GROUP during
     // init_queues().  ~Controller() destroys the group when non-zero.
     uint32_t                group_id = 0;
 
@@ -170,7 +170,7 @@ inline Controller::Controller(const char* snvme_control_path,
 
     int status;
 
-    /* GPU-capable B3 bring-up: chrdev_create -> SET_KERNEL_IOQ_CAP -> BIND ->
+    /* GPU-capable bring-up: chrdev_create -> SET_KERNEL_IOQ_CAP -> BIND ->
      * wait probe -> GET_DEV_INFO -> ctrl_init -> cudaHostRegister.
      *
      * kernel_ioq_cap=0 means "no cap, use upstream nvme default of
@@ -178,13 +178,13 @@ inline Controller::Controller(const char* snvme_control_path,
      * kernel-side IOQ count (e.g. Intel DC SSD: MSI-X=136 vs 192
      * vCPUs) should expose a separate Controller ctor / param;
      * for now the cap is left at 0 to match the upstream default. */
-    status = nvm_controller_init_b3_gpu(&ctrl,
-                                        snvme_control_path,
-                                        pci_addr,
-                                        /* kernel_ioq_cap */ 0,
-                                        &this->disk);
+    status = nvm_controller_init_gpu(&ctrl,
+                                     snvme_control_path,
+                                     pci_addr,
+                                     /* kernel_ioq_cap */ 0,
+                                     &this->disk);
     if (status != 0){
-        nvm_throw_error("Failed to nvm_controller_init_b3_gpu", status);
+        nvm_throw_error("Failed to nvm_controller_init_gpu", status);
     }
     this->disk.ns_id = ns_id;
 
@@ -224,18 +224,18 @@ inline int Controller::init_queues(uint32_t ns_id,
                                     const std::vector<QueueMemTarget>& queue_targets,
                                     uint64_t queueDepth){
     /*
-     * B3 init_queues.
+     * Queue-group based init_queues.
      *
      * Replaces the legacy:
      *   nvm_queue_set(n_sq+n_cq) -> per-q create_queue_Dma rings
      *   -> nvm_device_init (BIND) -> init_userioq_device
      *
-     * with the explicit B3 sequence (BIND already happened in the
-     * Controller ctor via nvm_controller_init_b3_gpu):
+     * with the explicit sequence (BIND already happened in the
+     * Controller ctor via nvm_controller_init_gpu):
      *
      *   1. nvm_create_group()                   -> group_id
      *   2. for each requested queue:
-     *        new QueuePair(B3 ctor) which calls
+     *        new QueuePair(queue-group ctor) which calls
      *          create_ring_Dma(group_id, RING_SQ)
      *          create_ring_Dma(group_id, RING_CQ)
      *          (defers init_gpu_specific_struct)
@@ -251,7 +251,7 @@ inline int Controller::init_queues(uint32_t ns_id,
      * returns BAR0-relative byte offsets in out_pairs[].sq/cq_doorbell_offset
      * rather than us re-deriving the doorbell address from QID via the
      * SQ_DBL/CQ_DBL macros.  This is the kernel's documented invariant
-     * for B3.  Doorbell GPU VAs are still obtained per-queue via
+     * for the queue-group API.  Doorbell GPU VAs are still obtained per-queue via
      * cudaHostGetDevicePointer on the BAR0 host mapping (with cudaSetDevice
      * to the per-queue device first), preserving multi-GPU semantics.
      */
@@ -350,7 +350,7 @@ inline int Controller::init_queues(uint32_t ns_id,
     // host VA (ctrl->mm_ptr) to get the host-side doorbell address,
     // then translate to a GPU VA via cudaHostGetDevicePointer on the
     // current cudaDevice (which was already cudaHostRegister'd in
-    // nvm_controller_init_b3_gpu via cudaHostRegisterIoMemory).
+    // nvm_controller_init_gpu via cudaHostRegisterIoMemory).
     for (size_t i = 0; i < n_qps; i++) {
         const uint32_t per_queue_dev = queue_targets[i].cuda_device;
         cuda_err_chk(cudaSetDevice(per_queue_dev));
@@ -361,7 +361,7 @@ inline int Controller::init_queues(uint32_t ns_id,
         volatile uint32_t* cq_db_host = (volatile uint32_t*)
             ((uintptr_t) this->ctrl->mm_ptr + req.out_pairs[i].cq_doorbell_offset);
 
-        // Populate the host-side nvm_queue_t skeleton (B3 replaces
+        // Populate the host-side nvm_queue_t skeleton.  This replaces
         // nvm_queue_clear's macro-derived db with the kernel-returned
         // offset; the rest of the fields match nvm_queue_clear's
         // semantics).  qid uses the kernel-assigned value, NOT

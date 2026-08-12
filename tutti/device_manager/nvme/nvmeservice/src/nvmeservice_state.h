@@ -15,7 +15,7 @@
  *
  * What ServiceState tracks:
  *
- *   * One nvm_ctrl_t* per configured NVMe (owner-side B3 bring-up;
+ *   * One nvm_ctrl_t* per configured NVMe (owner-side bring-up;
  *     freed at daemon shutdown).
  *   * The kernel-reported metadata (max_user_qid, max_queues_per_group,
  *     queue_depth, dstrd, bar0_size) -- read once from NVM_GET_DEV_INFO.

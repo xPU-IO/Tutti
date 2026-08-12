@@ -96,8 +96,8 @@ Device Manager implements a **two-level allocation model**:
 - `nvm_dma_t` - DMA mapping handle
 
 **Key Functions:**
-- `nvm_controller_init_b3_owner()` - Bootstrap a daemon-owned controller without CUDA
-- `nvm_controller_init_b3_gpu()` - Bootstrap a standalone GPU-owned controller and register BAR0
+- `nvm_controller_init_owner()` - Bootstrap a daemon-owned controller without CUDA
+- `nvm_controller_init_gpu()` - Bootstrap a standalone GPU-owned controller and register BAR0
 - `nvm_ctrl_attach_client()` - Attach to daemon-owned controller
 - `nvm_create_group()` - Create queue group
 - `nvm_add_user_queue()` - Add queue to group

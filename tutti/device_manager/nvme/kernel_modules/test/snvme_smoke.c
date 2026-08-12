@@ -28,7 +28,7 @@
  *   [ 3] open /dev/ssnvme<minor>                                     (UAPI: per-controller chrdev usable)
  *   [ 4] mmap(BAR0)                                                  (UAPI: BAR0 mapped, register reachable)
  *   [ 5] read NVMe CAP from BAR0                                     (sanity: register decoder agrees with spec)
- *   [ 6] NVM_SET_KERNEL_IOQ_CAP                                     (B3 pre-bind budget hint, matches nvm_controller_init_b3)
+ *   [ 6] NVM_SET_KERNEL_IOQ_CAP                                     (pre-bind budget hint, matches nvm_controller_init_owner)
  *   [F2] munmap(BAR0) + close(/dev/ssnvme<N>)                        (chrdev release path)
  *   [F3] SNVM_CHRDEV_REMOVE(BDF)                                     (release minor)
  *
@@ -268,7 +268,7 @@ int main(int argc, char** argv) {
     /* [6] NVM_SET_KERNEL_IOQ_CAP -- the B3 pre-bind budget hint.          */
     /*                                                                    */
     /* This mirrors the current application startup path                 */
-    /* (nvm_controller_init_b3 in libnvm/src/linux/device.cpp, driven by */
+    /* (nvm_controller_init_owner in libnvm/src/linux/device.cpp, driven by */
     /* NVMeService's sys_config.yaml `kernel_ioq_cap`): declare an upper */
     /* bound on kernel-side IO queues so the remainder of the            */
     /* controller's grant is left for the NVM_ADD_USER_QUEUE user pool.  */
@@ -305,7 +305,7 @@ int main(int argc, char** argv) {
     /*  namespaces its disks away from the in-tree nvme driver; see       */
     /*  PORTING.md §2).                                                    */
     /*                                                                    */
-    /*  This is exactly the bring-up nvm_controller_init_b3() performs:   */
+    /*  This is exactly the bring-up nvm_controller_init_owner() performs: */
     /*  the NVM_SET_KERNEL_IOQ_CAP hint above, then BIND, then poll        */
     /*  NVM_GET_DEV_INFO until the async probe/scan completes.  User IO    */
     /*  queues are created afterwards via NVM_ADD_USER_QUEUE (see          */

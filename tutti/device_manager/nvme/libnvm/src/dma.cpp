@@ -30,7 +30,7 @@ struct map
     va_range_free_t     release;// Callback for releasing address range
     va_unmap_t          unmap;// Callback for unmapping address range
     unsigned int        on_host;
-    uint32_t            group_id;   // B3 queue-group id (0 = legacy / DATA)
+    uint32_t            group_id;   // queue-group id (0 = legacy / DATA)
     uint8_t             map_kind;   // enum nvm_map_kind (B6); 0 = UNSPECIFIED
 };
 
@@ -181,7 +181,7 @@ static int dma_map(struct container* container)
     /*
      * Pick the matching unmap routine.
      *
-     *   B3/B6 new-mode paths (map_kind != UNSPECIFIED):
+     *   Explicit-map paths (map_kind != UNSPECIFIED):
      *     RING_SQ / RING_CQ -- do NOT install an explicit unmap.  These
      *                          maps are released by NVM_DESTROY_QUEUE_
      *                          GROUP cascade (kernel side), so calling
@@ -196,7 +196,7 @@ static int dma_map(struct container* container)
      *                          gracefully).
      *
      *   Legacy (map_kind == UNSPECIFIED):
-     *     keep the historical behaviour bit-for-bit so the pre-B3
+     *     keep the historical behaviour bit-for-bit so the legacy
      *     bring-up path (NVM_SET_IOQ_NUM + per-queue NVM_MAP_DEVICE_
      *     QUEUE_MEMORY) still rolls back symmetrically.
      */
@@ -533,4 +533,3 @@ const struct va_range* _nvm_dma_va(const nvm_dma_t* handle)
 
     return NULL;
 }
-

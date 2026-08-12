@@ -3,7 +3,7 @@
  *
  * The owner half of the SERVICE_CLIENT data plane.  This process is
  * the sole owner of every NVMe controller named in sys_config.yaml:
- * it does the libnvm B3 bring-up (chrdev_create + cap + bind + probe),
+ * it does the libnvm owner bring-up (chrdev_create + cap + bind + probe),
  * mounts each block device, publishes per-GPU view symlinks, and serves
  * gRPC so that Coordinator
  * instances running in SERVICE_CLIENT mode (see

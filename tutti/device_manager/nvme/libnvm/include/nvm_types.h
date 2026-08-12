@@ -318,7 +318,7 @@ typedef struct
     struct queue*           queues;   
     struct pci_device_addr  pdev_addr;
 
-    /* === NEW for B3 (sourced from NVM_GET_DEV_INFO) ===
+    /* === Queue metadata sourced from NVM_GET_DEV_INFO ===
      *
      * These mirror the like-named fields in struct nvm_ioctl_dev and are
      * the single source of truth for q_depth / user QID pool / BAR0 size

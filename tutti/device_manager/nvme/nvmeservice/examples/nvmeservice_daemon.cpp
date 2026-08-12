@@ -2,7 +2,7 @@
  * nvmeservice_daemon.cpp -- NVMeService daemon entry point.
  *
  * Reads sys_config.yaml, brings up every NVMe controller described
- * there as the *owner* (libnvm B3: chrdev_create + cap + bind + probe),
+ * there as the *owner* (libnvm: chrdev_create + cap + bind + probe),
  * publishes per-GPU view symlinks for filesystems already mounted by
  * the operator, starts the gRPC server, and runs until SIGINT/SIGTERM.
  * No quota ledger is maintained -- the kernel owns user QID accounting.

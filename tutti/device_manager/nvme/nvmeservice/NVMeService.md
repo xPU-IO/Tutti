@@ -198,7 +198,7 @@ Validator rules (`config.cpp::validate_config`):
 
 Anything outside that list (`total_queues`, `queue_depth`,
 `queue_groups[].count`, the entire `queue_setup` block) is **ignored** —
-those were the pre-B3 design's knobs and have no daemon-side meaning.
+those were the previous design's knobs and have no daemon-side meaning.
 
 ---
 
@@ -267,7 +267,7 @@ nvmeservice_client [--endpoint host:port] [--list-only]
 ```
 Daemon boot
   └─ for each nvmes[]:
-       nvm_controller_init_b3_owner()    → /dev/ssnvmeN, ctrl held forever; no CUDA context
+       nvm_controller_init_owner()       → /dev/ssnvmeN, ctrl held forever; no CUDA context
        mount /dev/snvmeMn<ns>            → /mnt/nvmeM
        publish /mnt/gpu<G>/ssnvmeN       → /mnt/nvmeM/GPU<G>
 
@@ -438,7 +438,7 @@ has to come from the client.  Two options:
 | Symptom | Likely cause | Where to look |
 |---------|--------------|---------------|
 | daemon: `Failed to bind to '127.0.0.1:50051'` | another daemon still up, or stale port | `lsof -i :50051`, `pkill -f nvmeservice_daemon`. |
-| daemon: `nvm_controller_init_b3_owner failed: ENOENT` | snvme kmod not loaded | `lsmod \| grep snvme`, `modprobe snvme`. |
+| daemon: `nvm_controller_init_owner failed: ENOENT` | snvme kmod not loaded | `lsmod \| grep snvme`, `modprobe snvme`. |
 | daemon: `Failed to bring up NVMe ... EBUSY` | `nvme0n1` still bound to the stock driver | `nvme reset` / unmount. dmesg shows the racy unbind. |
 | client: `Connect rejected: cuda_device=N not in allowed_gpus` | YAML `allowed_gpus` doesn't list this GPU | edit `sys_config.yaml`, restart daemon. |
 | client: `nvm_ctrl_attach_client … EACCES` | perms on `/dev/ssnvmeN` (default root-only) | run client as root or chmod the chrdev. |
@@ -529,7 +529,7 @@ context:
   ship the namespace id, drop the YAML field.
 - The daemon parses the chrdev minor out of `disk.disk_name` (e.g.
   `"snvme0n1"` → `0`) because the libnvm bring-up doesn't return it
-  explicitly.  Cleaner once `nvm_controller_init_b3_owner` exposes the
+  explicitly.  Cleaner once `nvm_controller_init_owner` exposes the
   minor directly.
 - No telemetry RPC yet (see *Extension points / telemetry* above for
   the suggested shape).

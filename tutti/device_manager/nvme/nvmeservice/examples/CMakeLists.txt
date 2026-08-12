@@ -58,7 +58,7 @@ install(TARGETS nvmeservice_daemon_example nvmeservice_client_example
         DESTINATION "bin")
 
 # ---- tutti_daemon (production) -------------------------------------------
-# The owner-side daemon: brings up NVMe controllers via libnvm B3 and
+# The owner-side daemon: brings up NVMe controllers via libnvm and
 # serves gRPC so SERVICE_CLIENT Coordinators can attach.  Plain host C++
 # (no CUDA device code).  Migrated from root examples/ in Round 13 S3.
 add_executable(tutti_daemon tutti_daemon.cpp)
