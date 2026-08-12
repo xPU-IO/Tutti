@@ -198,9 +198,6 @@ tutti::Result<std::unique_ptr<tutti::StorageRuntime>> create_test_runtime(
 tutti::tutti_runtime::TuttiRuntimeCreateInternalOptions injected_options(
     const std::shared_ptr<State>& state) {
     tutti::tutti_runtime::TuttiRuntimeCreateInternalOptions options;
-    options.public_options.handle_cache_capacity = 11;
-    options.public_options.prp_cache_capacity = 12;
-    options.public_options.handle_cache_l2_capacity = 13;
     options.accelerator_device_count = [] {
         return tutti::Result<int>::Success(1);
     };
@@ -250,9 +247,6 @@ tutti::tutti_runtime::TuttiRuntimeCreateInternalOptions injected_options(
             CHECK(context.relation.id == "assembly-relation");
             CHECK(context.relation.datapath == spec.id);
             CHECK(context.runtime_accel_id == TUTTI_DEFAULT_ACCEL_ID);
-            CHECK(context.cache.handle_cache_capacity == 11);
-            CHECK(context.cache.prp_cache_capacity == 12);
-            CHECK(context.cache.handle_cache_l2_capacity == 13);
             tutti::data_paths::CreatedDataPath result;
             result.instance =
                 std::make_unique<FakeDataPath>(state, context.runtime_accel_id);

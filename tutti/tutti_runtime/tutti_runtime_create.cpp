@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <cctype>
-#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <string>
@@ -239,49 +238,6 @@ const Spec* find_by_id(const std::vector<Spec>& specs,
 
 } // namespace
 
-namespace tutti_runtime {
-
-EffectiveCacheConfig resolve_cache_config(
-    const config::DataPathSpec& spec,
-    const TuttiRuntimeCreateOptions& options) {
-    const config::NvmeDataPathTuning* tuning = nullptr;
-    if (const auto* local = std::get_if<config::LocalNvmeDataPathConfig>(
-            &spec.config)) {
-        tuning = local;
-    } else if (const auto* striped =
-                   std::get_if<config::StripedLocalNvmeDataPathConfig>(
-                       &spec.config)) {
-        tuning = striped;
-    }
-    const auto env_or_zero = [](const char* name) {
-        const char* value = std::getenv(name);
-        return value == nullptr
-            ? 0U : static_cast<std::uint32_t>(std::atoi(value));
-    };
-    const std::uint32_t config_handle =
-        tuning == nullptr ? 0 : tuning->handle_cache_capacity;
-    const std::uint32_t config_prp =
-        tuning == nullptr ? 0 : tuning->prp_cache_capacity;
-    const std::uint32_t config_l2 =
-        tuning == nullptr ? 0 : tuning->handle_cache_l2_capacity;
-
-    EffectiveCacheConfig effective;
-    effective.handle_cache_capacity = options.handle_cache_capacity > 0
-        ? options.handle_cache_capacity
-        : (config_handle > 0 ? config_handle
-                             : env_or_zero("TUTTI_HANDLE_CACHE_CAP"));
-    effective.prp_cache_capacity = options.prp_cache_capacity > 0
-        ? options.prp_cache_capacity
-        : (config_prp > 0 ? config_prp
-                          : env_or_zero("TUTTI_PRP_CACHE_CAP"));
-    effective.handle_cache_l2_capacity =
-        options.handle_cache_l2_capacity > 0
-            ? options.handle_cache_l2_capacity : config_l2;
-    return effective;
-}
-
-} // namespace tutti_runtime
-
 Result<std::unique_ptr<TuttiRuntime>> TuttiRuntime::create(
     const std::string& config_path, TuttiRuntimeCreateOptions options) {
     auto parsed = config::parse_tutti_runtime_config(config_path);
@@ -382,14 +338,10 @@ Result<std::unique_ptr<TuttiRuntime>> TuttiRuntime::create_with_options_(
                 resolver_result.status());
         }
 
-        const auto cache = tutti_runtime::resolve_cache_config(
-            *data_path_spec, options.public_options);
         auto data_path_result = create_data_path_component(
             *data_path_spec,
             data_paths::DataPathCreateContext{
-                *resource, relation, spec.runtime.accel_id,
-                {cache.handle_cache_capacity, cache.prp_cache_capacity,
-                 cache.handle_cache_l2_capacity}},
+                *resource, relation, spec.runtime.accel_id},
             options);
         if (!data_path_result.ok()) {
             return failure<std::unique_ptr<TuttiRuntime>>(

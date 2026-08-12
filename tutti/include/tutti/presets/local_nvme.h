@@ -54,6 +54,7 @@ struct LocalNvmePreset {
     // Capacity knobs (0 = use defaults)
     std::uint32_t max_batch_entries = 4096;
     std::uint32_t max_in_flight_operations = 4;
+    std::uint32_t threads_per_block = 16;
     std::uint32_t handle_cache_capacity = 4096;
     std::uint32_t prp_cache_capacity = 4096;
 };
@@ -66,6 +67,7 @@ struct StripedNvmePreset {
     std::uint64_t stripe_unit = 524288;     // 512 KiB (tensor-aligned)
     std::uint32_t max_batch_entries = 8192;
     std::uint32_t max_in_flight_operations = 4;
+    std::uint32_t threads_per_block = 16;
     std::uint32_t prp_cache_capacity = 4096;
 };
 

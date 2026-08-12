@@ -7,6 +7,10 @@
 
 #include "tutti/resource/memory/memory_resource.h"
 #include "tutti/resource/nvme/nvme_resource.h"
+#if defined(TUTTI_TEST_HAS_LOCAL_NVME)
+#include "tutti/data_paths/local_nvme/local_nvme_data_path.h"
+#include "tutti/data_paths/striped_local_nvme/striped_data_path.h"
+#endif
 
 namespace {
 
@@ -93,7 +97,8 @@ tutti::config::BackendSpec relation(std::string contract,
     return result;
 }
 
-std::unique_ptr<const tutti::ResourceView> nvme_view(std::size_t count) {
+std::unique_ptr<const tutti::ResourceView> nvme_view(
+    std::size_t count, std::uint32_t granted_queues = 4) {
     auto view = std::make_unique<
         tutti::resources::nvme::NvmeDataPathResourceView>();
     for (std::size_t index = 0; index < count; ++index) {
@@ -106,7 +111,7 @@ std::unique_ptr<const tutti::ResourceView> nvme_view(std::size_t count) {
             4096,
             16384,
             128 * 1024,
-            4,
+            granted_queues,
         });
     }
     return view;
@@ -123,7 +128,7 @@ void test_memfs_creation() {
     auto backend = relation("memfs", "configured-memfs-dp", "memory0");
 
     auto created = tutti::data_paths::create_data_path(
-        spec, {resource, backend, -1, {}});
+        spec, {resource, backend, -1});
     CHECK(created.ok(), "memfs DataPath factory should accept memory view");
     CHECK(created.ok() && created.value().instance != nullptr,
           "memfs DataPath factory should return an instance");
@@ -136,16 +141,20 @@ void test_memfs_creation() {
 }
 
 void test_local_nvme_creation_boundary() {
-    ViewResource resource("nvme0", "nvme", nvme_view(1));
+    ViewResource resource("nvme0", "nvme", nvme_view(1, 64));
     tutti::config::LocalNvmeDataPathConfig config;
     config.max_batch_entries = 64;
     config.max_in_flight_operations = 4;
+    config.handle_cache_capacity = 8;
+    config.prp_cache_capacity = 16;
+    config.handle_cache_l2_capacity = 32;
+    config.threads_per_block = 64;
     tutti::config::DataPathSpec spec{
         "configured-local-dp", "local-nvme", config};
     auto backend = relation("ext4-local-nvme", "configured-local-dp", "nvme0");
 
     auto created = tutti::data_paths::create_data_path(
-        spec, {resource, backend, 0, {8, 16, 32}});
+        spec, {resource, backend, 0});
 #if defined(TUTTI_TEST_HAS_LOCAL_NVME)
     CHECK(created.ok(), "local-NVMe factory should construct at creation boundary");
     CHECK(created.ok() &&
@@ -154,6 +163,32 @@ void test_local_nvme_creation_boundary() {
     CHECK(created.ok() &&
               created.value().initialize_config.name == "local_nvme",
           "local-NVMe factory should return initialize config");
+    const auto* local = dynamic_cast<const
+        tutti::data_paths::local_nvme::LocalNvmeDataPath*>(
+            created.value().instance.get());
+    CHECK(local != nullptr && local->test_threads_per_block() == 64,
+          "local-NVMe factory should pass threads_per_block from spec");
+#else
+    CHECK(!created.ok() &&
+              created.status().code() == tutti::StatusCode::UNSUPPORTED,
+          "local-NVMe factory should be unavailable without hardware stack");
+#endif
+}
+
+void test_local_nvme_rejects_unsafe_block_size() {
+    ViewResource resource("nvme0", "nvme", nvme_view(1));
+    tutti::config::LocalNvmeDataPathConfig config;
+    config.threads_per_block = 8;
+    tutti::config::DataPathSpec spec{
+        "configured-local-dp", "local-nvme", config};
+    auto backend = relation("ext4-local-nvme", "configured-local-dp", "nvme0");
+
+    auto created = tutti::data_paths::create_data_path(
+        spec, {resource, backend, 0});
+#if defined(TUTTI_TEST_HAS_LOCAL_NVME)
+    CHECK(!created.ok() &&
+              created.status().code() == tutti::StatusCode::INVALID_ARGUMENT,
+          "local-NVMe factory should reject block sizes above queue grant");
 #else
     CHECK(!created.ok() &&
               created.status().code() == tutti::StatusCode::UNSUPPORTED,
@@ -162,17 +197,20 @@ void test_local_nvme_creation_boundary() {
 }
 
 void test_striped_nvme_creation_boundary() {
-    ViewResource resource("nvme0", "nvme", nvme_view(2));
+    ViewResource resource("nvme0", "nvme", nvme_view(2, 128));
     tutti::config::StripedLocalNvmeDataPathConfig config;
     config.max_batch_entries = 64;
     config.max_in_flight_operations = 4;
+    config.handle_cache_capacity = 8;
+    config.prp_cache_capacity = 16;
+    config.threads_per_block = 128;
     tutti::config::DataPathSpec spec{
         "configured-striped-dp", "striped-local-nvme", config};
     auto backend = relation("striped-local-nvme",
                             "configured-striped-dp", "nvme0");
 
     auto created = tutti::data_paths::create_data_path(
-        spec, {resource, backend, 0, {8, 16, 32}});
+        spec, {resource, backend, 0});
 #if defined(TUTTI_TEST_HAS_LOCAL_NVME)
     CHECK(created.ok(), "striped factory should construct at creation boundary");
     CHECK(created.ok() &&
@@ -183,6 +221,33 @@ void test_striped_nvme_creation_boundary() {
               created.value().initialize_config.name ==
                   "striped-local-nvme",
           "striped factory should return initialize config");
+    const auto* striped = dynamic_cast<const
+        tutti::data_paths::striped_local_nvme::StripedDataPath*>(
+            created.value().instance.get());
+    CHECK(striped != nullptr && striped->test_threads_per_block() == 128,
+          "striped factory should pass threads_per_block from spec");
+#else
+    CHECK(!created.ok() &&
+              created.status().code() == tutti::StatusCode::UNSUPPORTED,
+          "striped factory should be unavailable without hardware stack");
+#endif
+}
+
+void test_striped_nvme_rejects_unsafe_block_size() {
+    ViewResource resource("nvme0", "nvme", nvme_view(2));
+    tutti::config::StripedLocalNvmeDataPathConfig config;
+    config.threads_per_block = 8;
+    tutti::config::DataPathSpec spec{
+        "configured-striped-dp", "striped-local-nvme", config};
+    auto backend = relation("striped-local-nvme",
+                            "configured-striped-dp", "nvme0");
+
+    auto created = tutti::data_paths::create_data_path(
+        spec, {resource, backend, 0});
+#if defined(TUTTI_TEST_HAS_LOCAL_NVME)
+    CHECK(!created.ok() &&
+              created.status().code() == tutti::StatusCode::INVALID_ARGUMENT,
+          "striped factory should reject block sizes above any queue grant");
 #else
     CHECK(!created.ok() &&
               created.status().code() == tutti::StatusCode::UNSUPPORTED,
@@ -200,7 +265,7 @@ void test_relation_mismatch_rejected() {
     auto backend = relation("memfs", "another-dp", "memory0");
 
     auto created = tutti::data_paths::create_data_path(
-        spec, {resource, backend, -1, {}});
+        spec, {resource, backend, -1});
     CHECK(!created.ok() &&
               created.status().code() == tutti::StatusCode::INVALID_ARGUMENT,
           "DataPath factory should reject relation mismatch");
@@ -211,7 +276,9 @@ void test_relation_mismatch_rejected() {
 int main() {
     test_memfs_creation();
     test_local_nvme_creation_boundary();
+    test_local_nvme_rejects_unsafe_block_size();
     test_striped_nvme_creation_boundary();
+    test_striped_nvme_rejects_unsafe_block_size();
     test_relation_mismatch_rejected();
     if (failures == 0) {
         std::puts("DataPath factory tests passed");

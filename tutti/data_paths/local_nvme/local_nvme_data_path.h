@@ -118,6 +118,8 @@ public:
     // cq_poll_budget: max CQ poll iterations before timeout (0 = default 10000000)
     // handle_cache_capacity: handle cache slots (0 = disabled)
     // prp_cache_capacity: PRP cache slots (0 = disabled)
+    // threads_per_block: submit kernel block size (1..1024, default 16).
+    //                    Must not exceed the queue group's actual queue count.
     // max_in_flight_operations: cap on concurrent IN_FLIGHT ops (0 = default 16)
     // max_batch_requests: cap on input request count per submit() call
     //                     (0 = default: follow max_batch_entries, i.e. the
@@ -157,7 +159,8 @@ public:
                       // Round 16 S6b: L2 (host-pinned content) tier for the
                       // handle cache.  0 = default 4×L1 when L1 enabled.
                       std::uint32_t handle_cache_l2_capacity = 0,
-                      std::string controller_pci_addr = {});
+                      std::string controller_pci_addr = {},
+                      std::uint32_t threads_per_block = 16);
 
     ~LocalNvmeDataPath() override;
 
@@ -215,6 +218,9 @@ public:
     std::uint64_t test_effective_mdts() const;
     std::uint64_t test_prp_list_page_capacity() const;
     std::uint32_t test_in_flight_count() const;
+    std::uint32_t test_threads_per_block() const {
+        return threads_per_block_;
+    }
     // Returns true if the op's arena lease is still held (not yet released).
     bool test_op_has_resources(DataPathOp op) const;
 
@@ -511,6 +517,7 @@ private:
     // Constructor override for max_request_bytes_ (0 = compute in initialize()
     // as max_batch_entries_ * effective_mdts_bytes_, the pre-S4 formula).
     std::uint64_t max_request_bytes_override_ = 0;
+    std::uint32_t threads_per_block_ = 16;
     std::uint64_t prp_list_page_capacity_ = 0; // max data pages per single PRP-list page
 
     // Test-only submit failure injection seams.

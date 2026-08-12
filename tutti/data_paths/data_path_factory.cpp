@@ -127,6 +127,11 @@ Result<CreatedDataPath> create_local_nvme(
     }
 
     const auto& slice = view->slices.front();
+    const auto& config = tuning(spec);
+    if (config.threads_per_block > slice.granted_queues) {
+        return failure<CreatedDataPath>(invalid(
+            "local-nvme threads_per_block exceeds granted queues"));
+    }
     auto bar0_size = checked_u32(slice.bar0_size, "bar0_size");
     if (!bar0_size.ok()) return failure<CreatedDataPath>(bar0_size.status());
     auto max_batch_entries = checked_u32(
@@ -135,7 +140,6 @@ Result<CreatedDataPath> create_local_nvme(
         return failure<CreatedDataPath>(max_batch_entries.status());
     }
 
-    const auto& config = tuning(spec);
     CreatedDataPath result;
     result.instance = std::make_unique<local_nvme::LocalNvmeDataPath>(
         slice.chrdev_path,
@@ -147,13 +151,14 @@ Result<CreatedDataPath> create_local_nvme(
         slice.max_data_size,
         max_batch_entries.value(),
         0,
-        context.cache.handle_cache_capacity,
-        context.cache.prp_cache_capacity,
+        config.handle_cache_capacity,
+        config.prp_cache_capacity,
         config.max_in_flight_operations,
         config.max_batch_entries,
         0,
-        context.cache.handle_cache_l2_capacity,
-        slice.pci_bdf);
+        config.handle_cache_l2_capacity,
+        slice.pci_bdf,
+        config.threads_per_block);
     result.initialize_config = DataPathConfig{"local_nvme"};
     return Result<CreatedDataPath>::Success(std::move(result));
 }
@@ -196,7 +201,13 @@ Result<CreatedDataPath> create_striped_local_nvme(
     std::vector<striped_local_nvme::DeviceDescriptor> descriptors;
     descriptors.reserve(view->slices.size());
     std::uint64_t effective_mdts = 0;
-    for (const auto& slice : view->slices) {
+    for (std::size_t index = 0; index < view->slices.size(); ++index) {
+        const auto& slice = view->slices[index];
+        if (config.threads_per_block > slice.granted_queues) {
+            return failure<CreatedDataPath>(invalid(
+                "striped-local-nvme threads_per_block exceeds granted queues "
+                "for slice " + std::to_string(index)));
+        }
         striped_local_nvme::DeviceDescriptor descriptor;
         descriptor.snvme_dev_path = slice.chrdev_path;
         descriptor.bar0_size = slice.bar0_size;
@@ -219,8 +230,9 @@ Result<CreatedDataPath> create_striped_local_nvme(
         0,
         max_batch_entries.value(),
         max_in_flight.value(),
-        context.cache.handle_cache_capacity,
-        context.cache.prp_cache_capacity);
+        config.handle_cache_capacity,
+        config.prp_cache_capacity,
+        config.threads_per_block);
     result.initialize_config = DataPathConfig{"striped-local-nvme"};
     return Result<CreatedDataPath>::Success(std::move(result));
 }

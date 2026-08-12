@@ -1888,7 +1888,9 @@ int main(int argc, char** argv) {
 
     // Phase 2 direct-DataPath probe: resource setup/teardown must be
     // independent of the caller's current accelerator.
-    if (available >= 2) {
+    int cuda_device_count = 0;
+    if (cudaGetDeviceCount(&cuda_device_count) == cudaSuccess &&
+        cuda_device_count >= 2) {
         const int caller_gpu = g_gpu_id == 0 ? 1 : 0;
         CHECK(cudaSetDevice(caller_gpu) == cudaSuccess,
               "direct StripedDataPath probe selects non-target caller device");

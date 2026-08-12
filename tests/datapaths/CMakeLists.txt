@@ -16,6 +16,10 @@ if(TUTTI_BUILD_HARDWARE_STACK AND TUTTI_FEATURE_LOCAL_NVME)
     target_compile_definitions(tutti_data_path_factory_test PRIVATE
         TUTTI_TEST_HAS_LOCAL_NVME=1
     )
+    target_link_libraries(tutti_data_path_factory_test PRIVATE
+        tutti_local_nvme_datapath
+        tutti_striped_local_nvme_datapath
+    )
 endif()
 
 set_target_properties(tutti_data_path_factory_test PROPERTIES

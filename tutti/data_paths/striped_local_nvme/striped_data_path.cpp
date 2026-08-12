@@ -51,7 +51,8 @@ StripedDataPath::StripedDataPath(std::vector<DeviceDescriptor> devices,
                                  std::uint32_t max_batch_entries,
                                  std::uint32_t max_in_flight_operations,
                                  std::uint32_t handle_cache_capacity,
-                                 std::uint32_t prp_cache_capacity)
+                                 std::uint32_t prp_cache_capacity,
+                                 std::uint32_t threads_per_block)
     : device_descs_(std::move(devices)),
       cuda_device_(cuda_device),
       mdts_override_(mdts_override),
@@ -59,6 +60,7 @@ StripedDataPath::StripedDataPath(std::vector<DeviceDescriptor> devices,
       max_batch_entries_(max_batch_entries == 0 ? 256 : max_batch_entries),
       max_in_flight_operations_(max_in_flight_operations == 0
                                  ? 16 : max_in_flight_operations),
+      threads_per_block_(threads_per_block),
       handle_cache_capacity_(handle_cache_capacity),
       prp_cache_capacity_(prp_cache_capacity) {
 
@@ -232,6 +234,23 @@ Status StripedDataPath::initialize_impl_(const DataPathConfig& config,
     if (initialized_) {
         return Status(StatusCode::BUSY, "already initialized");
     }
+    if (threads_per_block_ == 0 || threads_per_block_ > 1024) {
+        return Status(StatusCode::INVALID_ARGUMENT,
+                      "threads_per_block must be in [1, 1024]");
+    }
+    cudaDeviceProp device_properties{};
+    const cudaError_t properties_error = cudaGetDeviceProperties(
+        &device_properties, static_cast<int>(cuda_device_));
+    if (properties_error != cudaSuccess) {
+        return Status(StatusCode::DEVICE_ERROR,
+                      std::string("cudaGetDeviceProperties failed: ") +
+                          cudaGetErrorString(properties_error));
+    }
+    if (threads_per_block_ >
+        static_cast<std::uint32_t>(device_properties.maxThreadsPerBlock)) {
+        return Status(StatusCode::INVALID_ARGUMENT,
+                      "threads_per_block exceeds device maximum");
+    }
     if (device_descs_.empty()) {
         return Status(StatusCode::INVALID_ARGUMENT, "no devices configured");
     }
@@ -320,6 +339,16 @@ Status StripedDataPath::initialize_impl_(const DataPathConfig& config,
                          "queue group creation failed for device " +
                          std::to_string(i) + ": " + e.what());
         }
+        if (threads_per_block_ > slot.queue_group->n_qps()) {
+            slot.queue_group.reset();
+            nvm_ctrl_free_client(slot.ctrl);
+            slot.ctrl = nullptr;
+            rollback_devices();
+            return Status(
+                StatusCode::INVALID_ARGUMENT,
+                "threads_per_block exceeds the granted NVMe queue count for "
+                "device " + std::to_string(i));
+        }
 
         devices_.push_back(std::move(slot));
     }
@@ -395,11 +424,6 @@ Status StripedDataPath::initialize_impl_(const DataPathConfig& config,
     }
 
     // Round 16 S5: initialize per-device PRP cache if enabled.
-    // Read env override (aligned to LocalNvmeDataPath).
-    if (prp_cache_capacity_ == 0) {
-        const char* env = std::getenv("TUTTI_PRP_CACHE_CAP");
-        if (env) prp_cache_capacity_ = static_cast<std::uint32_t>(std::atoi(env));
-    }
     if (prp_cache_capacity_ > 0) {
         prp_caches_.resize(devices_.size());
         for (std::size_t i = 0; i < devices_.size(); ++i) {
@@ -1388,7 +1412,8 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
     cudaError_t launch_err = launch_fused_submit(
         d_entries, d_status,
         reinterpret_cast<const DeviceTargetHandle* const*>(lease.d_dev_table),
-        total_entries, total_dev_table, cq_poll_budget_, 0, ctx.stream);
+        total_entries, total_dev_table, cq_poll_budget_, threads_per_block_,
+        0, ctx.stream);
     if (launch_err != cudaSuccess) {
         arena_.release(lease.slot_index);
         reject_all(StatusCode::DEVICE_ERROR,

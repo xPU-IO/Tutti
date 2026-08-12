@@ -65,6 +65,7 @@ struct StripedDeviceSubmitEntry {
 //   count       — number of entries
 //   num_devs    — number of devices in the table (N)
 //   cq_poll_budget — max CQ poll iterations before timeout
+//   threads_per_block — configured CUDA block size
 //   inject_flag — test seam bitmask (0 = normal production)
 // Returns cudaError_t from cudaGetLastError() after the launch.
 cudaError_t launch_fused_submit(
@@ -74,6 +75,7 @@ cudaError_t launch_fused_submit(
     std::uint32_t                   count,
     std::uint32_t                   num_devs,
     std::uint32_t                   cq_poll_budget,
+    std::uint32_t                   threads_per_block,
     std::uint32_t                   inject_flag,
     void*                           stream);
 

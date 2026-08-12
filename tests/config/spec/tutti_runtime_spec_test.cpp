@@ -39,6 +39,23 @@ int main() {
     CHECK(local_spec().validate().ok());
     {
         auto spec = local_spec();
+        auto& config = std::get<LocalNvmeDataPathConfig>(
+            spec.storage.datapaths.front().config);
+        config.threads_per_block = 0;
+        const auto status = spec.validate();
+        CHECK(!status.ok());
+        CHECK(status.message().find("threads_per_block must be in [1, 1024]") !=
+              std::string::npos);
+    }
+    {
+        auto spec = local_spec();
+        auto& config = std::get<LocalNvmeDataPathConfig>(
+            spec.storage.datapaths.front().config);
+        config.threads_per_block = 1025;
+        CHECK(!spec.validate().ok());
+    }
+    {
+        auto spec = local_spec();
         spec.accelerator.profile = "cuda";
         CHECK(spec.validate().ok());
     }

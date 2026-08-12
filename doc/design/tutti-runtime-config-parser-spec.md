@@ -402,6 +402,7 @@ storage.resolvers[0].scheme = "file"
 storage.datapaths[0].id = "local-nvme-datapath-0"
 storage.datapaths[0].type = "local-nvme"
 storage.datapaths[0].config.handle_cache_capacity = 0
+storage.datapaths[0].config.threads_per_block = 4
 storage.backends[0].id = "local-backend-0"
 storage.backends[0].contract = "ext4-local-nvme"
 storage.backends[0].resolver = "file-resolver-0"
@@ -581,7 +582,7 @@ CMake 从现有测试聚合位置添加 `tests/config`，`tests/tutti_runtime`�
 | `config/backend_factory.*` | `tutti_runtime/backend_factory.*` | 从 config 移出 |
 | `config/tutti_config.cpp` 的 assembly | `tutti_runtime/tutti_runtime_create.cpp` | 成为 `TuttiRuntime::create()` |
 | `config/tutti_config_internal.h` 的 factory options | `tutti_runtime/tutti_runtime_internal.h` | 测试 dependency injection 跟随 Runtime |
-| `resolve_cache_config()` | 暂时保持当前实现和调用点 | 本阶段不改环境变量行为 |
+| DataPath cache 配置 | 解析到 `storage.datapaths[].config` | factory 只读取 spec，不接受 context 或环境变量旁路 |
 | public `load_tutti_config()` | `TuttiRuntime::create(path)` | 直接删除旧入口，不提供 deprecated wrapper |
 | `config::TuttiRuntime` | `tutti::TuttiRuntime` | 直接修改 namespace，不提供 alias |
 

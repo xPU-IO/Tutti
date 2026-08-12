@@ -42,9 +42,6 @@ enum class TuttiRuntimeShutdownStage {
 };
 
 struct TuttiRuntimeCreateOptions {
-    std::uint32_t handle_cache_capacity = 0;
-    std::uint32_t prp_cache_capacity = 0;
-    std::uint32_t handle_cache_l2_capacity = 0;
     std::function<void(std::string_view)> spec_debug_logger;
 };
 

@@ -254,6 +254,7 @@ storage:
         handle_cache_capacity: 0
         prp_cache_capacity: 0
         handle_cache_l2_capacity: 0
+        threads_per_block: 4
         max_in_flight_operations: 0
         max_batch_entries: 0
         io_granularity: 0
@@ -297,6 +298,7 @@ storage:
       config:
         handle_cache_capacity: 0
         prp_cache_capacity: 0
+        threads_per_block: 4
         max_in_flight_operations: 0
         max_batch_entries: 0
 

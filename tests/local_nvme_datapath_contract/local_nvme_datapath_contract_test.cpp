@@ -7386,7 +7386,13 @@ int main(int argc, char** argv) {
                                 /*mdts*/0, /*max_batch_entries*/256,
                                 /*cq_poll_budget*/0,
                                 /*handle_cache_capacity*/1,
-                                /*prp_cache_capacity*/0);
+                                /*prp_cache_capacity*/0,
+                                /*max_in_flight_operations*/0,
+                                /*max_batch_requests*/0,
+                                /*max_request_bytes_override*/0,
+                                /*handle_cache_l2_capacity*/0,
+                                /*controller_pci_addr*/{},
+                                /*threads_per_block*/kNumQueues);
 
         // Assemble through StorageRuntime so we get public API (IoRequest with MemoryHandle).
         MultiDeviceResolverWrapper resolver_hc(

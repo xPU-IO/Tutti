@@ -193,6 +193,7 @@ void debug_datapath_tuning(std::ostringstream& output,
     line(output, path + ".prp_cache_capacity", config.prp_cache_capacity);
     line(output, path + ".handle_cache_l2_capacity",
          config.handle_cache_l2_capacity);
+    line(output, path + ".threads_per_block", config.threads_per_block);
     line(output, path + ".max_in_flight_operations",
          config.max_in_flight_operations);
     line(output, path + ".max_batch_entries", config.max_batch_entries);

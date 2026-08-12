@@ -113,7 +113,6 @@ struct DataPathCreateContext {
     const Resource& resource;
     const config::BackendSpec& relation;
     std::int32_t runtime_accel_id;
-    EffectiveCacheConfig cache;
 };
 
 struct CreatedDataPath {
@@ -128,8 +127,8 @@ Result<CreatedDataPath> create_data_path(
 
 | DataPath 类型 | 创建输入 |
 | --- | --- |
-| `local-nvme` | 单个 NVMe DataPath slice、tuning、cache、accelerator ID |
-| `striped-local-nvme` | N 个 slices、tuning、cache、accelerator ID |
+| `local-nvme` | spec 中的 tuning、单个 NVMe DataPath slice、accelerator ID |
+| `striped-local-nvme` | spec 中的 tuning、N 个 slices、accelerator ID |
 | `memfs` | Memory Resource 能力和 memfs 配置 |
 
 Resource slice 数量、namespace 一致性、MDTS、accelerator 等运行期事实，由对应组件 factory 在构造时校验。这些校验属于具体组件的创建过程。

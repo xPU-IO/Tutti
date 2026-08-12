@@ -10,17 +10,10 @@
 
 namespace tutti::data_paths {
 
-struct DataPathCreateCacheConfig {
-    std::uint32_t handle_cache_capacity = 0;
-    std::uint32_t prp_cache_capacity = 0;
-    std::uint32_t handle_cache_l2_capacity = 0;
-};
-
 struct DataPathCreateContext {
     const Resource& resource;
     const config::BackendSpec& relation;
     std::int32_t runtime_accel_id = -1;
-    DataPathCreateCacheConfig cache;
 };
 
 struct CreatedDataPath {

@@ -26,6 +26,7 @@ static_assert(std::is_default_constructible_v<tutti::config::BackendSpec>);
 static_assert(std::is_default_constructible_v<tutti::config::TuttiRuntimeSpec>);
 static_assert(tutti::config::kDefaultStripedStripeUnit ==
               std::uint64_t{512} * 1024);
+static_assert(tutti::config::NvmeDataPathTuning::kDefaultThreadsPerBlock == 16);
 
 int main() {
     tutti::config::StripedLocalNvmeBackendConfig striped;

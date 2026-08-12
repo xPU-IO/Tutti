@@ -42,6 +42,7 @@ int main() {
         "storage.datapaths[0].config.handle_cache_capacity = 0\n"
         "storage.datapaths[0].config.prp_cache_capacity = 0\n"
         "storage.datapaths[0].config.handle_cache_l2_capacity = 0\n"
+        "storage.datapaths[0].config.threads_per_block = 16\n"
         "storage.datapaths[0].config.max_in_flight_operations = 0\n"
         "storage.datapaths[0].config.max_batch_entries = 0\n"
         "storage.datapaths[0].config.io_granularity = 0\n"

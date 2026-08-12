@@ -115,6 +115,8 @@ public:
     // handle_cache_capacity: 0 = OFF (default); >0 = GPU LRU handle cache slots.
     // prp_cache_capacity: 0 = OFF (default); >0 = PRP LIST page cache slots.
     //   (Round 16 S5: aligned to LocalNvmeDataPath's prp_cache_capacity.)
+    // threads_per_block: fused submit kernel block size (1..1024, default 16).
+    //   Must not exceed any device's actual queue count.
     StripedDataPath(std::vector<DeviceDescriptor> devices,
                     std::uint32_t cuda_device = 0,
                     std::uint64_t mdts_override = 0,
@@ -122,7 +124,8 @@ public:
                     std::uint32_t max_batch_entries = 256,
                     std::uint32_t max_in_flight_operations = 16,
                     std::uint32_t handle_cache_capacity = 0,
-                    std::uint32_t prp_cache_capacity = 0);
+                    std::uint32_t prp_cache_capacity = 0,
+                    std::uint32_t threads_per_block = 16);
     ~StripedDataPath() override;
 
     StripedDataPath(const StripedDataPath&) = delete;
@@ -159,6 +162,9 @@ public:
         return device_descs_;
     }
     std::uint64_t test_effective_mdts() const { return effective_mdts_bytes_; }
+    std::uint32_t test_threads_per_block() const {
+        return threads_per_block_;
+    }
     std::uint64_t test_submit_call_count() const { return test_submit_call_count_; }
     std::uint64_t test_kernel_launch_count() const { return test_kernel_launch_count_; }
     void test_reset_submit_counters() {
@@ -312,6 +318,7 @@ private:
     std::uint32_t cq_poll_budget_ = 0;
     std::uint32_t max_batch_entries_ = 0;
     std::uint64_t max_in_flight_operations_ = 0;
+    std::uint32_t threads_per_block_ = 16;
     // Round 16 S5: cache capacities (default OFF, aligned to LocalNvme).
     std::uint32_t handle_cache_capacity_ = 0;
     std::uint32_t prp_cache_capacity_ = 0;

@@ -15,7 +15,6 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <set>
 #include <stdexcept>
@@ -78,7 +77,8 @@ LocalNvmeDataPath::LocalNvmeDataPath(
     std::uint64_t max_batch_requests,
     std::uint64_t max_request_bytes_override,
     std::uint32_t handle_cache_l2_capacity,
-    std::string controller_pci_addr)
+    std::string controller_pci_addr,
+    std::uint32_t threads_per_block)
     : snvme_dev_path_(std::move(snvme_dev_path)), bar0_size_(bar0_size),
       cuda_device_(cuda_device), num_user_queues_(num_user_queues),
       namespace_id_(namespace_id),
@@ -92,6 +92,7 @@ LocalNvmeDataPath::LocalNvmeDataPath(
       max_in_flight_operations_(max_in_flight_operations == 0
                                  ? 16 : max_in_flight_operations),
       max_request_bytes_override_(max_request_bytes_override),
+      threads_per_block_(threads_per_block),
       cq_poll_budget_(cq_poll_budget == 0 ? 10000000 : cq_poll_budget),
       handle_cache_capacity_(handle_cache_capacity),
       handle_cache_l2_capacity_(handle_cache_l2_capacity),
@@ -364,9 +365,26 @@ Status LocalNvmeDataPath::release(DataPathOp op) {
 }
 
 Status LocalNvmeDataPath::initialize_impl_(const DataPathConfig& config,
-                                          ResourceProvider& /*resources*/) {
+                                           ResourceProvider& /*resources*/) {
     if (initialized_) {
         return Status(StatusCode::BUSY, "already initialized");
+    }
+    if (threads_per_block_ == 0 || threads_per_block_ > 1024) {
+        return Status(StatusCode::INVALID_ARGUMENT,
+                      "threads_per_block must be in [1, 1024]");
+    }
+    cudaDeviceProp device_properties{};
+    const cudaError_t properties_error = cudaGetDeviceProperties(
+        &device_properties, static_cast<int>(cuda_device_));
+    if (properties_error != cudaSuccess) {
+        return Status(StatusCode::DEVICE_ERROR,
+                      std::string("cudaGetDeviceProperties failed: ") +
+                          cudaGetErrorString(properties_error));
+    }
+    if (threads_per_block_ >
+        static_cast<std::uint32_t>(device_properties.maxThreadsPerBlock)) {
+        return Status(StatusCode::INVALID_ARGUMENT,
+                      "threads_per_block exceeds device maximum");
     }
 
     if (!config.name.empty()) {
@@ -490,6 +508,14 @@ Status LocalNvmeDataPath::initialize_impl_(const DataPathConfig& config,
                               std::string("queue group creation failed: ") +
                               e.what());
             }
+            if (threads_per_block_ > queue_group_->n_qps()) {
+                queue_group_.reset();
+                nvm_ctrl_free_client(ctrl_);
+                ctrl_ = nullptr;
+                return Status(
+                    StatusCode::INVALID_ARGUMENT,
+                    "threads_per_block exceeds the granted NVMe queue count");
+            }
 
             // Initialize the MetadataArena: pre-allocate all per-op
             // workspace (events, entry/status arrays, PRP-list pool).
@@ -510,16 +536,6 @@ Status LocalNvmeDataPath::initialize_impl_(const DataPathConfig& config,
                 ctrl_ = nullptr;
                 return Status(StatusCode::NOT_READY,
                               "MetadataArena init failed");
-            }
-
-            // Initialize caches (env var override for testing).
-            if (handle_cache_capacity_ == 0) {
-                const char* env = std::getenv("TUTTI_HANDLE_CACHE_CAP");
-                if (env) handle_cache_capacity_ = static_cast<std::uint32_t>(std::atoi(env));
-            }
-            if (prp_cache_capacity_ == 0) {
-                const char* env = std::getenv("TUTTI_PRP_CACHE_CAP");
-                if (env) prp_cache_capacity_ = static_cast<std::uint32_t>(std::atoi(env));
             }
 
             if (handle_cache_capacity_ > 0) {
@@ -1768,7 +1784,8 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
         if (test_inject_nvme_error_)          inject_flag |= 0x2u;
 
         launch_err = launch_submit_one(d_entries, d_status, total_entries,
-                                        cq_poll_budget_, inject_flag,
+                                        cq_poll_budget_, threads_per_block_,
+                                        inject_flag,
                                         ctx.stream);
     }
     if (launch_err != cudaSuccess) {

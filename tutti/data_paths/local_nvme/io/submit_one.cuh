@@ -72,6 +72,7 @@ struct DeviceSubmitEntry {
 // mirroring main's launch_nvme_batch_xfer pattern.
 // d_status is the device array of EntryCompletionStatus (one per entry).
 // cq_poll_budget is the max CQ poll iterations before timeout.
+// threads_per_block is the configured CUDA block size.
 // inject_flag is a scalar bitmask passed by value (FIX 1: no per-op
 // device allocation): bit0 = force resolve_lba failure, bit1 = synthesize
 // NVMe CQ error on normal completion (test seams, 0 = normal production).
@@ -80,6 +81,7 @@ cudaError_t launch_submit_one(
     EntryCompletionStatus*   d_status,
     std::uint32_t            count,
     std::uint32_t            cq_poll_budget,
+    std::uint32_t            threads_per_block,
     std::uint32_t            inject_flag,
     void*                    stream);
 

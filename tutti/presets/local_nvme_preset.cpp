@@ -39,7 +39,10 @@ RuntimeWithTelemetry make_local_nvme_runtime(const LocalNvmePreset& p) {
         p.prp_cache_capacity,
         p.max_in_flight_operations,
         /*max_batch_requests=*/0,
-        /*max_request_bytes_override=*/0);
+        /*max_request_bytes_override=*/0,
+        /*handle_cache_l2_capacity=*/0,
+        p.device.pci_bdf,
+        p.threads_per_block);
 
     auto* resolver = new LocalFileResolver(
         p.device.pci_bdf,
@@ -81,7 +84,8 @@ RuntimeWithTelemetry make_striped_nvme_runtime(const StripedNvmePreset& p) {
         std::move(sdevs), (std::uint32_t)p.gpu_id,
         /*mdts_override=*/0, /*cq_poll_budget=*/0,
         p.max_batch_entries, p.max_in_flight_operations,
-        /*handle_cache_capacity=*/0, p.prp_cache_capacity);
+        /*handle_cache_capacity=*/0, p.prp_cache_capacity,
+        p.threads_per_block);
 
     std::vector<std::unique_ptr<StorageTargetResolver>> sub_resolvers;
     for (const auto& d : p.devices) {

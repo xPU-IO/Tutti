@@ -1,6 +1,5 @@
 #pragma once
 
-#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -17,12 +16,6 @@
 #include <tutti/tutti_runtime.h>
 
 namespace tutti::tutti_runtime {
-
-struct EffectiveCacheConfig {
-    std::uint32_t handle_cache_capacity = 0;
-    std::uint32_t prp_cache_capacity = 0;
-    std::uint32_t handle_cache_l2_capacity = 0;
-};
 
 struct TuttiRuntimeCreateInternalOptions {
     TuttiRuntimeCreateOptions public_options;
@@ -41,10 +34,6 @@ struct TuttiRuntimeCreateInternalOptions {
     std::function<Status(StorageRuntime&)> runtime_shutdown_hook;
     std::function<void(TuttiRuntimeShutdownStage)> shutdown_observer;
 };
-
-EffectiveCacheConfig resolve_cache_config(
-    const config::DataPathSpec& spec,
-    const TuttiRuntimeCreateOptions& options);
 
 } // namespace tutti::tutti_runtime
 
