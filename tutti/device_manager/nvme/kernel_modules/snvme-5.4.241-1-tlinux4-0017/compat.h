@@ -32,7 +32,8 @@ struct page;
  * kernel versions:
  *   <= 4.5.7 : get_user_pages(ts, mm, start, nr, write, force, pages, vmas)
  *   <= 4.8.17: get_user_pages(start, nr, write, force, pages, vmas)
- *   >= 4.9   : get_user_pages(start, nr, gup_flags, pages, vmas)
+ *   4.9-6.4  : get_user_pages(start, nr, gup_flags, pages, vmas)
+ *   >= 6.5   : get_user_pages(start, nr, gup_flags, pages)
  *
  * @start:    starting user virtual address (page-aligned by caller).
  * @nr_pages: number of pages to pin.

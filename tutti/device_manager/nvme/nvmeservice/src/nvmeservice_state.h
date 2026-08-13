@@ -198,6 +198,7 @@ public:
     /**
      * Production constructor. Brings up every configured controller in the
      * owner role. Views are published separately after backing mounts exist.
+     * Mixed namespace block sizes leave the affected resources unavailable.
      */
     explicit ServiceState(const ServiceConfig& config);
 

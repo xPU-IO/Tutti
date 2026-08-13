@@ -521,6 +521,19 @@ generate_cmake_presets() {
         "TUTTI_BUILD_KERNEL_MODULE": { "type": "BOOL", "value": "OFF" },
         "MACA_ROOT": { "type": "PATH", "value": "/opt/maca" }
       }
+    },
+    {
+      "name": "maca-module",
+      "displayName": "MXMACA | userspace + snvme module (${provider_label})",
+      "description": "CUDA stack with kernel-specific snvme module targets enabled.",
+      "inherits": "maca",
+      "binaryDir": "\${sourceDir}/build/maca-module",
+      "cacheVariables": {
+        "TUTTI_BUILD_KERNEL_MODULE": { "type": "BOOL", "value": "ON" },
+        "TUTTI_P2P_BACKEND": { "type": "STRING", "value": "metax" },
+        "SNVME_KERNEL_VERSION": { "type": "STRING", "value": "" },
+        "SNVME_P2P_INCLUDE_DIR": { "type": "PATH", "value": "" }
+      }
     }
   ],
   "buildPresets": [
@@ -528,7 +541,8 @@ generate_cmake_presets() {
     { "name": "cuda",        "configurePreset": "cuda" },
     { "name": "cuda-module", "configurePreset": "cuda-module" },
     { "name": "musa",        "configurePreset": "musa" },
-    { "name": "maca",        "configurePreset": "maca" }
+    { "name": "maca",        "configurePreset": "maca" },
+    { "name": "maca-module", "configurePreset": "maca-module" }
   ],
   "testPresets": [
     {

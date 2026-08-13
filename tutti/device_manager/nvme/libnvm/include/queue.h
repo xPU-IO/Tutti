@@ -163,7 +163,7 @@ struct QueuePair
     }
 
     /*
-     * B3/B6 QueuePair ctor.
+     * Queue-group QueuePair ctor.
      *
      * Successor to the legacy ctor above.  Differences:
      *
@@ -171,7 +171,7 @@ struct QueuePair
      *     the supplied queue group_id, so the kernel registers them
      *     as RING_SQ / RING_CQ and links them onto g->maps.  This is
      *     the only ABI-correct way to feed rings into
-     *     NVM_ADD_USER_QUEUE under B3+B6.
+     *     NVM_ADD_USER_QUEUE with the queue-group ABI.
      *   - Drops the (cqr, MQES)-derived sizing and uses ctrl->q_depth
      *     (NVM_GET_DEV_INFO authoritative value) clipped to queueDepth.
      *     This eliminates the BAR0-derived MQES read which the kernel
@@ -181,7 +181,7 @@ struct QueuePair
      *     succeeds, so a per-pair allocation is paired with a
      *     per-pair Create I/O CQ + Create I/O SQ on the controller.
      *
-     * The caller (Controller::init_queues_b3) owns the rollback path:
+     * The caller (Controller::init_queues) owns the rollback path:
      * if NVM_ADD_USER_QUEUE later fails, deleting this QueuePair will
      * drop the DmaPtrs which trigger nvm_dma_unmap.  Because the
      * group has not been destroyed yet that's a real unmap, not a
@@ -195,12 +195,12 @@ struct QueuePair
                      bool              defer_gpu_init)
     {
         if (group_id == 0) {
-            throw error(string("QueuePair(B3): group_id must be non-zero "
+            throw error(string("QueuePair: group_id must be non-zero "
                                "(see nvm_dma_map_ring_device contract)"));
         }
         if (ctrl->q_depth == 0) {
-            throw error(string("QueuePair(B3): ctrl->q_depth == 0 -- did "
-                               "B3 owner bring-up / NVM_GET_DEV_INFO "
+            throw error(string("QueuePair: ctrl->q_depth == 0 -- did "
+                               "controller owner bring-up / NVM_GET_DEV_INFO "
                                "run successfully?"));
         }
 
@@ -239,19 +239,19 @@ struct QueuePair
 };
 
 /*
- * Legacy bring-up tail.  Pre-B3, after Controller::init_queues had
+ * Legacy bring-up tail.  Before the queue-group API, Controller::init_queues
  * pre-mapped all rings + run nvm_queue_set + nvm_device_init (BIND),
  * this function ran NVM_GET_DEV_INFO and called nvm_queue_clear() on
  * every QueuePair to derive doorbell host VAs from the controller's
  * dstrd via the SQ_DBL/CQ_DBL macros.
  *
- * In the B3 flow the kernel returns BAR0-relative doorbell offsets
+ * In the queue-group flow the kernel returns BAR0-relative doorbell offsets
  * directly via NVM_ADD_USER_QUEUE.out_pairs[].sq/cq_doorbell_offset,
  * and Controller::init_queues writes those into nvm_queue_t.db
  * itself.  This function is kept only for binary compatibility with
  * any external caller; the Controller class no longer uses it.
  */
-__attribute__((deprecated("B3 flow handles per-queue init inside "
+__attribute__((deprecated("Queue-group flow handles per-queue init inside "
                           "Controller::init_queues; use nvm_add_user_queue() "
                           "+ out_pairs[].*_doorbell_offset directly")))
 inline int init_userioq_device(nvm_ctrl_t* ctrl, QueuePair** qps, struct disk* d)

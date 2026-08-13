@@ -11,13 +11,19 @@
 // Reference: third_pkgs/Mooncake/mooncake-transfer-engine/include/gpu_vendor/maca.h
 // License: Apache 2.0 (see third_pkgs/Mooncake/LICENSE-APACHE)
 
+#include <cstddef>
 #include <mcr/maca.h>
 #include <mcr/mc_runtime.h>
 #include <mcr/mc_runtime_api.h>
+#include <cuda/atomic>
 
 // ---------------------------------------------------------------------------
 // Runtime API macro mapping (cuda* -> mc*)
 // ---------------------------------------------------------------------------
+// maca's cu-bridge already defines CUDA/CU compatibility macros after
+// ATen/cuda headers are included. Keep this fallback mapping for translation
+// units that include Mooncake's cuda_alike.h without cu-bridge first.
+#ifndef __CUDA_TO_MACA_ADAPTOR_H__
 #define cudaError_t mcError_t
 #define cudaSuccess mcSuccess
 #define cudaErrorNotReady mcErrorNotReady
@@ -86,7 +92,11 @@
 #define cudaHostAllocMapped mcMallocHostMapped
 #define cudaHostAllocPortable mcMallocHostPortable
 #define cudaHostAllocWriteCombined mcMallocHostWriteCombined
-
+#define cudaHostRegisterIoMemory mcHostRegisterIoMemory
+#define cudaErrorUnknown mcErrorUnknown
+#define cudaDeviceGetStreamPriorityRange mcDeviceGetStreamPriorityRange
+#define cudaStreamCreateWithPriority mcStreamCreateWithPriority
+#define cudaStreamDefault mcStreamDefault
 // ---------------------------------------------------------------------------
 // Templated wrappers that MACA's cu-bridge provides as functions (not macros)
 // ---------------------------------------------------------------------------
@@ -107,4 +117,5 @@ static inline mcError_t cudaHostGetDevicePointer(void **dev_ptr, void *host_ptr,
                                                  unsigned int flags) {
     return mcHostGetDevicePointer(dev_ptr, host_ptr, flags);
 }
+#endif
 #endif

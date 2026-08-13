@@ -59,7 +59,7 @@ static int create_mapping_descriptor(struct ioctl_mapping** handle, size_t page_
     md->is_cq = -1;
     md->ioq_idx = -1;
     md->n_entries = 0;
-    /* B3/B6 defaults: legacy fallback path. Callers that want new-mode
+    /* Explicit-map defaults: legacy fallback path. Callers that want new-mode
      * behaviour overwrite group_id / map_kind on the returned descriptor
      * before calling _nvm_dma_init(). */
     md->group_id = 0;
@@ -207,7 +207,7 @@ int nvm_dma_map_queue_device(nvm_dma_t** handle, const nvm_ctrl_t* ctrl, void* d
 
 
 /* ===================================================================
- * B3/B6 explicit-intent DMA mapping API.
+ * Explicit-intent DMA mapping API.
  *
  * All four follow the same shape:
  *   1) allocate ioctl_mapping descriptor (default: legacy fallback).

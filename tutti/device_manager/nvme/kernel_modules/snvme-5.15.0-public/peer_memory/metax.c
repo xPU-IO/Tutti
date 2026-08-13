@@ -38,27 +38,12 @@
 
 #include "peer_memory.h"
 
-/* Metax P2P header — provided by the Metax SDK (like nv-p2p.h for NVIDIA).
- * Ensure the Metax driver source tree is installed and its path is passed
- * via the module ccflags (-I<metax_include_path>). */
-#if defined(__has_include)
-#  if __has_include("metax_p2p.h")
-#    include "metax_p2p.h"
-#  else
-#    error "metax_p2p.h not found: Metax P2P headers are required to build" \
-           " the metax backend. Ensure the Metax driver source tree is" \
-           " installed and its path is passed via the module ccflags" \
-           " (-I<metax_include_path>)."
-#  endif
-#else
-#  include "metax_p2p.h"
-#endif
-
-#define nvfs_err(FMT, ARGS...) pr_err("nvidia-fs: " FMT, ## ARGS)
+/* remove dependency for metax_p2p.h */
+#define nvfs_err(FMT, ARGS...) pr_err("metax-fs: " FMT, ## ARGS)
 #define nvfs_dbg(FMT, ARGS...)                               \
         do {                                                 \
                 if (unlikely(nvfs_dbg_enabled))             \
-                        pr_info("nvidia-fs: " FMT, ## ARGS); \
+                        pr_info("metax-fs: " FMT, ## ARGS); \
         } while (0)
 
 int nvfs_dbg_enabled = 0;
@@ -66,10 +51,13 @@ int nvfs_dbg_enabled = 0;
 struct peer_page_table {
 	void *handle;             /* metax_p2p_acquire_mem handle */
 	struct sg_table *sgt;     /* from metax_p2p_get_mem */
+	uint32_t entries;         /* requested page count (length / page_size) */
+	uint64_t length;
 };
 
 struct peer_dma_mapping {
 	struct sg_table *sgt;     /* bus addresses (same sgt as page_table) */
+	uint64_t *dma_addresses;  /* allocated array of bus addresses with offset applied */
 };
 
 /* Function-pointer typedefs (resolved at runtime via __symbol_get). */
@@ -171,12 +159,16 @@ static int metax_peer_get_pages(uint64_t p2p_token, uint32_t va_space,
 
 	ret = metax_acquire_mem_p(vaddr, (size_t)length, &handle,
 				   (int (*)(void *))free_cb, data);
+	nvfs_dbg("metax_p2p_acquire_mem: virtual_address=0x%llx, length=0x%llx, handle=%p, pt=%p, ret=%d\n",
+		 (unsigned long long)vaddr, (unsigned long long)length, handle, pt, ret);
 	if (ret) {
 		nvfs_err("metax_p2p_acquire_mem failed: %d\n", ret);
 		return ret;
 	}
 
 	ret = metax_get_mem_p(handle, &sgt);
+	nvfs_dbg("metax_p2p_get_mem: handle=%p, sgt=%p, nents=%d, err=%d\n", handle, sgt,
+			(NULL != sgt ?sgt->nents: 0), ret);
 	if (ret) {
 		nvfs_err("metax_p2p_get_mem failed: %d\n", ret);
 		metax_release_mem_p(handle);
@@ -191,6 +183,7 @@ static int metax_peer_get_pages(uint64_t p2p_token, uint32_t va_space,
 	}
 	npt->handle = handle;
 	npt->sgt = sgt;
+	npt->length = length;
 
 	*pt = npt;
 	return 0;
@@ -200,23 +193,61 @@ static int metax_peer_put_pages(uint64_t p2p_token, uint32_t va_space,
 			  uint64_t vaddr, struct peer_page_table *pt)
 {
 	if (!pt) return -EINVAL;
-	if (metax_put_mem_p)
+	if (metax_put_mem_p) {
+		nvfs_dbg("metax_p2p_put_mem: handle=%p, sgt=%p\n", pt->handle, pt->sgt);
 		metax_put_mem_p(pt->handle, pt->sgt);
-	if (metax_release_mem_p)
+	}
+
+	if (metax_release_mem_p) {
+		nvfs_dbg("metax_release_mem: handle=%p\n", pt->handle);
 		metax_release_mem_p(pt->handle);
+	}
+
 	kfree(pt);
 	return 0;
 }
 
 static int metax_peer_dma_map_pages(struct pci_dev *peer,
 			      struct peer_page_table *pt,
-			      struct peer_dma_mapping **dm)
+			      struct peer_dma_mapping **dm,
+				  uint32_t expect_page_size)
 {
 	struct peer_dma_mapping *ndm;
-	if (!pt || !pt->sgt) return -EINVAL;
+	struct scatterlist *sg;
+	uint32_t expect_page_num;
+	uint32_t i;
+	uint32_t entry = 0;
+	uint64_t *dma_addrs;
+
+	if (!pt || !pt->sgt || !pt->sgt->sgl) return -EINVAL;
+
 	ndm = kzalloc(sizeof(*ndm), GFP_KERNEL);
 	if (!ndm) return -ENOMEM;
+
+	expect_page_num = (pt->length)/ expect_page_size;
+	dma_addrs = kmalloc(expect_page_num * sizeof(uint64_t), GFP_KERNEL);
+	if (!dma_addrs) {
+		kfree(ndm);
+		return -ENOMEM;
+	}
+
+	for_each_sg(pt->sgt->sgl, sg, pt->sgt->nents, i) {
+		uint64_t addr = sg_dma_address(sg);
+		uint32_t len = sg_dma_len(sg);
+		uint32_t pages = len / expect_page_size;
+		uint32_t j;
+
+		for (j = 0; j < pages; j++) {
+			if (entry < expect_page_num) {
+				dma_addrs[entry] = addr + j * expect_page_size;
+				entry++;
+			}
+		}
+	}
+
 	ndm->sgt = pt->sgt;
+	ndm->dma_addresses = dma_addrs;
+	pt->entries = entry;
 	*dm = ndm;
 	return 0;
 }
@@ -225,21 +256,27 @@ static int metax_peer_dma_unmap_pages(struct pci_dev *peer,
 				struct peer_page_table *pt,
 				struct peer_dma_mapping *dm)
 {
-	if (dm) kfree(dm);
+	if (dm) {
+		if (dm->dma_addresses)
+			kfree(dm->dma_addresses);
+		kfree(dm);
+	}
 	return 0;
 }
 
 static int metax_peer_free_dma_mapping(struct peer_dma_mapping *dm)
 {
-	kfree(dm);
+	if (dm) {
+		if (dm->dma_addresses)
+			kfree(dm->dma_addresses);
+		kfree(dm);
+	}
 	return 0;
 }
 
 static int metax_peer_free_page_table(struct peer_page_table *pt)
 {
 	if (!pt) return -EINVAL;
-	if (metax_release_mem_p)
-		metax_release_mem_p(pt->handle);
 	kfree(pt);
 	return 0;
 }
@@ -247,14 +284,14 @@ static int metax_peer_free_page_table(struct peer_page_table *pt)
 static uint32_t metax_pt_entries(const struct peer_page_table *pt)
 {
 	if (!pt || !pt->sgt) return 0;
-	return pt->sgt->nents;
+	return pt->entries;
 }
 
 static const uint64_t *metax_dm_addresses(const struct peer_dma_mapping *dm)
 {
 	static uint64_t fallback = 0;
-	if (!dm || !dm->sgt || !dm->sgt->sgl) return &fallback;
-	return (const uint64_t *)&sg_dma_address(dm->sgt->sgl);
+	if (!dm || !dm->dma_addresses) return &fallback;
+	return dm->dma_addresses;
 }
 
 const struct peer_memory_ops peer_memory_ops = {

@@ -78,7 +78,8 @@ struct peer_memory_ops {
 	 */
 	int  (*dma_map_pages)(struct pci_dev *peer,
 			      struct peer_page_table *pt,
-			      struct peer_dma_mapping **dm);
+			      struct peer_dma_mapping **dm,
+				  uint32_t expect_page_size);
 	int  (*dma_unmap_pages)(struct pci_dev *peer,
 				struct peer_page_table *pt,
 				struct peer_dma_mapping *dm);

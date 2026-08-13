@@ -224,9 +224,8 @@ void nvm_ctrl_free(nvm_ctrl_t* ctrl)
     if (ctrl != NULL)
     {
         if (ctrl->bar0_cuda_registered && ctrl->mm_ptr != NULL) {
-            /* Paired with nvm_controller_init_b3_gpu() or the legacy
-             * nvm_controller_init() path.  Host-only daemon owners never
-             * enter the accelerator runtime here. */
+            /* Paired with nvm_controller_init_gpu().  Host-only daemon
+             * owners never enter the accelerator runtime here. */
             (void) cudaHostUnregister((void*) ctrl->mm_ptr);
             ctrl->bar0_cuda_registered = false;
         }

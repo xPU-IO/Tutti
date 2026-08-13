@@ -111,7 +111,7 @@ static struct map* create_descriptor(const struct ctrl* ctrl, u64 vaddr, unsigne
     unsigned long i;
     struct map* map = NULL;
 
-    map = kvmalloc(sizeof(struct map) + (n_pages - 1) * sizeof(uint64_t), GFP_KERNEL);
+    map = kvmalloc(struct_size(map, addrs, n_pages), GFP_KERNEL);
     if (map == NULL)
     {
         pr_crit("Failed to allocate mapping descriptor\n");
@@ -619,7 +619,7 @@ int map_gpu_memory(struct map* map, struct list* list)
     {
         ctrl = container_of(element, struct ctrl, list);
 
-        err = peer_memory_ops.dma_map_pages(ctrl->pdev, gd->pages, gd->mappings + j);
+        err = peer_memory_ops.dma_map_pages(ctrl->pdev, gd->pages, gd->mappings + j, map->page_size);
         if (err != 0)
         {
             //printk(KERN_ERR "peer_memory_ops.dma_map_pages() failed for nvme%u: %d\n", j-1, err);
@@ -695,7 +695,7 @@ int map_gpu_ioqueue_memory(struct map* map)
         return err;
     }
 
-    err = peer_memory_ops.dma_map_pages(map->pdev, gd->pages, &gd->mappings[0]);
+    err = peer_memory_ops.dma_map_pages(map->pdev, gd->pages, &gd->mappings[0], map->page_size);
     if (err != 0)
     {
         //printk(KERN_ERR "peer_memory_ops.dma_map_pages() failed for nvme%u: %d\n", j-1, err);

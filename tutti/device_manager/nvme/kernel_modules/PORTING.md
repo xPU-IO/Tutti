@@ -12,17 +12,18 @@ tutti/device_manager/nvme/kernel_modules/
 ├── PORTING.md                       (this document)
 ├── test/                            kernel smoke-test suite (see §9)
 ├── snvme-5.4.241-1-tlinux4-0017/    Tencent tlinux4 production lineage
-└── snvme-5.15.0-public/             upstream-ish public baseline
+├── snvme-5.15.0-public/             upstream-ish public baseline
+└── snvme-6.8.0-public/              Linux 6.8 public baseline
 ```
 
 Each tree is a **full NVMe driver source tree** (the `nvme.ko` / `nvme-core.ko`
-/ `nvme-fabrics` stack) with the snvme modifications applied. The two trees
+/ `nvme-fabrics` stack) with the snvme modifications applied. The trees
 share an identical set of modified files (`compat.{c,h}`, `map.{c,h}`,
 `ctrl.{c,h}`, `list.{c,h}`, `pci.c`, `peer_memory/`); tree-specific files
 are only the parts that genuinely differ between the kernel versions
 (see §7).
 
-**Rule: a change to any shared file must be applied to BOTH trees.**
+**Rule: a change to any shared file must be applied to ALL trees.**
 There is no build-time sharing — each tree is self-contained.
 
 ## 2. Module pair
@@ -155,7 +156,7 @@ to change.
 Per tree:
 
 ```bash
-cd snvme-5.4.241-1-tlinux4-0017     # or snvme-5.15.0-public
+cd snvme-6.8.0-public               # or another matching baseline
 make TUTTI_P2P_BACKEND=nvidia       # backend selector; default nvidia
 make insmod IO_QDEPTH=1024          # insmod with io_queue_depth=1024
 ```
@@ -174,16 +175,16 @@ Details:
   mount. `/dev/ssnvme*` block devices exist only after daemon bring-up.
   Removing the module removes `/dev/snvme*` and `/dev/ssnvme*` together.
 
-## 7. 5.4 vs 5.15 tree differences
+## 7. Kernel tree differences
 
-| Aspect | 5.4.241 tlinux4 | 5.15.0-public |
-|--------|-----------------|---------------|
-| `ioctl.c` | none — `NVME_IOCTL_*` lives in `core.c` | separate file |
-| `zns.c` | none (Zoned Namespaces landed post-5.4) | present |
-| `hwmon.c` | none (hwmon support landed post-5.4) | present |
-| `fault_inject.c` / `lightnvm.c` / `trace.c` / `fc.c` | present upstream; snvme **drops** fault_inject / fc / trace, and lightnvm (removed upstream by 5.15) | absent |
-| `snvme-rename.sed` | present (symbol-rename sync script) | absent |
-| `use_sreg` queue negotiation | present (§3.1) | absent |
+| Aspect | 5.4.241 tlinux4 | 5.15.0-public | 6.8.0-public |
+|--------|-----------------|---------------|--------------|
+| `ioctl.c` | none — `NVME_IOCTL_*` lives in `core.c` | separate file | separate file |
+| `zns.c` / `hwmon.c` | absent | present | present |
+| Split `sysfs.c` / `pr.c` / `auth.c` | absent | absent | present |
+| `snvme-rename.sed` | present (symbol-rename sync script) | absent | absent |
+| `use_sreg` queue negotiation | present (§3.1) | absent | absent |
+| `get_user_pages` wrapper | five-argument GUP | five-argument GUP | four-argument GUP |
 
 Do **not** pull upstream-5.15 internal refactors (e.g. the
 `nvme_setup_io_queues_trylock` / `shutdown_lock` churn) into 5.4: that
@@ -217,8 +218,8 @@ would change lock acquisition order against `nvme_dev_disable()` /
    module and userspace (a mismatched pair is rejected with `ENODEV`,
    never silently mis-interpreted). Changing UAPI means a coordinated
    userspace rebuild.
-7. **Dual-tree sync:** apply the shared-file changes to both trees and
-   rebuild both before committing.
+7. **All-tree sync:** apply shared-file changes to every maintained tree and
+   rebuild the affected baselines before committing.
 
 ## 9. Smoke tests (`test/`)
 
@@ -237,9 +238,10 @@ insmod → daemon → mount order).
 
 ## 10. Development conventions
 
-- Shared files (`compat.*`, `map.*`, `ctrl.*`, `list.*`, `pci.c`,
-  `peer_memory/`) are **identical across both trees**; keep them that
-  way.
+- Shared helper files (`compat.*`, `map.*`, `ctrl.*`, `list.*`,
+  `peer_memory/`) should stay synchronized across maintained trees unless a
+  kernel API difference is explicitly documented. `pci.c` is ported onto each
+  kernel's native NVMe lifecycle and is therefore version-specific.
 - The `PORTING STATUS` banner at the top of `pci.c` records per-segment
   port status — update it when you change port-relevant code.
 - Kernel module changes land only in

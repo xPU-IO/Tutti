@@ -229,7 +229,7 @@ void ServiceState::add_hardware_resource(const NvmeEntry& entry) {
 
     struct disk disk {};
     struct nvm_owner_bringup_result bringup {};
-    int status = nvm_controller_init_b3_owner_with_result(
+    int status = nvm_controller_init_owner_with_result(
         &device.ctrl, kSnvmeControlPath, entry.pci_addr.c_str(),
         entry.kernel_ioq_cap, &disk, &bringup);
     if (status != 0) {

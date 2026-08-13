@@ -337,7 +337,7 @@ inline DmaPtr create_queue_Dma(const nvm_ctrl_t* ctrl, size_t size, int cudaDevi
 }
 
 /*
- * B3/B6 ring DMA helper.
+ * Queue-group ring DMA helper.
  *
  * Successor to create_queue_Dma above.  Allocates a GPU buffer (pinned
  * for DMA + reachable from host VA via cudaHostRegister inside

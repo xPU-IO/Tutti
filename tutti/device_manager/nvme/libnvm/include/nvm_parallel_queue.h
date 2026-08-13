@@ -312,9 +312,13 @@ uint16_t sq_enqueue(nvm_queue_t* sq, nvm_cmd_t* cmd, cuda::atomic<uint64_t, cuda
                     if (pc_tail) {
                         *cur_pc_tail = pc_tail->load(cuda::memory_order_acquire);
                     }
+#if defined(TUTTI_USE_MACA)
+                    __threadfence_system();
+                    *(sq->db) = new_db;
+#else
 //                    *(sq->db) = new_db;
 		    asm volatile ("st.mmio.relaxed.sys.global.u32 [%0], %1;" :: "l"(sq->db),"r"(new_db) : "memory");
-
+#endif
                     //sq->tail_copy.store(new_tail, cuda::memory_order_release);
 //	            printf("wrote SQ_db: %llu\tcur_tail: %llu\tmove_count: %llu\tsq_tail: %llu\tsq_head: %llu\n", (unsigned long long) new_db, (unsigned long long) cur_tail, (unsigned long long) tail_move_count, (unsigned long long) (new_tail),  (unsigned long long)(sq->head.load(cuda::memory_order_acquire)));
                     sq->tail.store(new_tail, cuda::memory_order_release);
@@ -425,7 +429,7 @@ uint32_t cq_poll(nvm_queue_t* cq, uint16_t search_cid, uint32_t* loc_ = NULL, ui
                     printf("NVM Error: %llx\tcid: %llu\n", (unsigned long long) (cpl_entry >> 17), (unsigned long long) search_cid);
                     assert(false);
                  }
-                     
+
                 // *cq_head = head;
                 // *loc_ = cur_head;
                 return loc;
@@ -440,6 +444,9 @@ uint32_t cq_poll(nvm_queue_t* cq, uint16_t search_cid, uint32_t* loc_ = NULL, ui
          if (ns < 256) {
              ns *= 2;
          }
+#endif
+#if defined(TUTTI_USE_MACA)
+        __threadfence_system();
 #endif
     }
 }
@@ -484,6 +491,9 @@ uint32_t cq_poll_bounded(nvm_queue_t* cq, uint16_t search_cid,
          if (ns < 256) {
              ns *= 2;
          }
+#endif
+#if defined(TUTTI_USE_MACA)
+        __threadfence_system();
 #endif
     }
     return NVM_CQ_TIMEOUT;
@@ -551,10 +561,12 @@ void cq_dequeue(nvm_queue_t* cq, uint16_t pos, nvm_queue_t* sq, uint32_t loc_ = 
                     uint32_t new_head = cur_head + head_move_count;
 
                     uint32_t new_db = (new_head) & (cq->qs_minus_1);
-
+#if defined(TUTTI_USE_MACA)
+                    *(cq->db) = new_db;
+#else
                     //*(cq->db) = new_db;
                     asm volatile ("st.mmio.relaxed.sys.global.u32 [%0], %1;" :: "l"(cq->db),"r"(new_db) : "memory");
-
+#endif
 		    //cq->head_copy.store(new_head, cuda::memory_order_release);
 //                    printf("wrote CQ_db: %llu\tcur_head: %llu\tmove_count: %llu\tcq_head: %llu\tcq_tail: %llu\n", (unsigned long long) new_db, (unsigned long long) cur_head, (unsigned long long) head_move_count, (unsigned long long) (new_head),  (unsigned long long)(cq->tail.load(cuda::memory_order_acquire)));
                     cq->head.store(new_head, cuda::memory_order_release);//axed);

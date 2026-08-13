@@ -56,7 +56,7 @@
  */
 #define NVM_PAGE_TO_BLOCK(page_size, block_size, pageno)    \
     (((page_size) * (pageno)) / (block_size))
-    
+
 
 
 /*
@@ -131,7 +131,7 @@
 
 
 /*
- * Calculate number of pages needed for a 
+ * Calculate number of pages needed for a
  * submission queue (SQ) with a given size.
  */
 #define NVM_SQ_PAGES(ctrl_ptr, qs) \
@@ -139,7 +139,7 @@
 
 
 /*
- * Calculate number of pages needed for a 
+ * Calculate number of pages needed for a
  * completion queue (CQ) with a given size.
  */
 #define NVM_CQ_PAGES(ctrl_ptr, qs) \
@@ -203,26 +203,48 @@ const nvm_ctrl_t* nvm_ctrl_from_dma(const nvm_dma_t* dma);
 #endif
 
 
+#ifndef __CUDACC__
+__forceinline__  uint32_t lane_id()
+{
+    return 0;
+}
 
+#else
 __forceinline__ __device__ uint32_t lane_id()
 {
+#if defined(TUTTI_USE_MACA)
+    return __lane_id();
+#else
     uint32_t ret;
     asm volatile ("mov.u32 %0, %laneid;" : "=r"(ret));
     return ret;
+#endif
 }
 
 __forceinline__ __device__ unsigned warp_id()
 {
+#if defined(TUTTI_USE_MACA)
+    unsigned tid = threadIdx.x
+                 + threadIdx.y * blockDim.x
+                 + threadIdx.z * blockDim.x * blockDim.y;
+    return tid / warpSize;
+#else
     // this is not equal to threadIdx.x / 32
     unsigned ret;
     asm volatile ("mov.u32 %0, %warpid;" : "=r"(ret));
     return ret;
+#endif
 }
 
 __forceinline__ __device__ uint32_t get_smid() {
+#if defined(TUTTI_USE_MACA)
+    return 0;
+#else
      uint32_t ret;
      asm  ("mov.u32 %0, %smid;" : "=r"(ret) );
      return ret;
+#endif
 }
+#endif
 
 #endif /* __NVM_UTIL_H__ */

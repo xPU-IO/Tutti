@@ -7,6 +7,20 @@
 #   - TUTTI_BUILD_HARDWARE_STACK default ON
 #   - tutti_configure_cuda_like() function (MACA variant)
 
+# example for cu-bridge build with MACA SDK (Metax) and SNVMe kernel module
+# #build_ko & insmod/rmmod
+# cmake_maca --preset=maca-module --fresh -DSNVME_KERNEL_VERSION=5.15.0-public -DTUTTI_BUILD_HARDWARE_TESTS=ON
+# cmake_maca --build build/maca-module --preset=maca-module --target modules
+# cmake --build build/maca-module --target insmod
+# cmake --build build/maca-module --target rmmod
+#
+# #build daemon
+# cmake_maca --build build/maca-module/ --preset maca-module --target tutti_daemon -j8
+#
+# #build_lib
+# cmake_maca --preset maca -DTUTTI_BUILD_HARDWARE_TESTS=ON -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
+# cmake_maca  --build build/maca/ --preset maca --target tutti_layerwise_kv_overlap  -j8
+
 set(TUTTI_BUILD_HARDWARE_STACK ON CACHE BOOL
     "Build hardware stack (accel/device_manager/backends/io_engine)")
 
@@ -34,18 +48,24 @@ function(tutti_configure_cuda_like target_name)
         endif()
     endif()
 
-    set(MACA_INCLUDE_DIR "${MACA_ROOT}/include" CACHE PATH "MACA SDK include dir")
+    set(MACA_INCLUDE_DIR
+        "${MACA_ROOT}/include"
+        "${MACA_ROOT}/mcr/include"
+        CACHE STRING "MACA SDK include dir")
+
     if(EXISTS "${MACA_ROOT}/lib64")
         set(MACA_LIB_DIR "${MACA_ROOT}/lib64" CACHE PATH "MACA SDK lib dir" FORCE)
     else()
         set(MACA_LIB_DIR "${MACA_ROOT}/lib" CACHE PATH "MACA SDK lib dir" FORCE)
     endif()
 
-    target_compile_definitions(${target_name} INTERFACE
-        TUTTI_USE_MACA=1
-        TUTTI_COMPILED_ACCELERATOR_PROFILE=\"MACA\"
-        TUTTI_DEFAULT_ACCEL_ID=0
-    )
+    # MACA runtime libraries (Mooncake-confirmed: mcruntime mxc-runtime64 rt).
+    # mcruntime provides the mc* runtime API (mcMalloc/mcStreamCreate/...);
+    # mxc-runtime64 is the MXMACA runtime.  Override with -DMACA_RUNTIME_LIBS.
+    set(MACA_RUNTIME_LIBS "mcruntime;mxc-runtime64;runtime_cu" CACHE STRING
+        "MACA runtime libraries" FORCE)
+
+    target_compile_definitions(${target_name} INTERFACE TUTTI_USE_MACA=1)
 
     target_include_directories(${target_name} INTERFACE
         ${MACA_INCLUDE_DIR}
@@ -53,20 +73,16 @@ function(tutti_configure_cuda_like target_name)
     )
 
     target_link_directories(${target_name} INTERFACE ${MACA_LIB_DIR})
+    target_link_libraries(${target_name} INTERFACE
+        ${MACA_RUNTIME_LIBS}
+    )
+
+    enable_language(CUDA)
+    list(APPEND CMAKE_MODULE_PATH "${MACA_ROOT}/tools/cu-bridge/cmake_module/maca/")
 
     # Expose for downstream CMakeLists that link ${TUTTI_ACCEL_RUNTIME_LIBS}
-    # TODO(Metax): confirm the MACA runtime/driver library target names
-    # (Mooncake does not link a named target — it uses link_directories +
-    # the mc* symbols resolved by the compiler).  If MACA SDK ships named
-    # libraries (e.g. mcrt), set them here.
-    set(TUTTI_ACCEL_RUNTIME_LIBS "" CACHE INTERNAL "MACA runtime lib (Metax confirm)")
-    set(TUTTI_ACCEL_DRIVER_LIBS  "" CACHE INTERNAL "MACA driver lib (Metax confirm)")
+    set(TUTTI_ACCEL_RUNTIME_LIBS "${MACA_RUNTIME_LIBS}" CACHE INTERNAL "MACA runtime lib")
+    set(TUTTI_ACCEL_DRIVER_LIBS  "" CACHE INTERNAL "MACA driver lib")
 
-    message(STATUS "Tutti: MACA profile — root=${MACA_ROOT} include=${MACA_INCLUDE_DIR} lib=${MACA_LIB_DIR}")
+    message(STATUS "Tutti: MACA profile — root=${MACA_ROOT} include=${MACA_INCLUDE_DIR} lib=${MACA_LIB_DIR} runtime=${MACA_RUNTIME_LIBS}")
 endfunction()
-
-# TODO(Metax): set MACA runtime/driver library target names.
-# Empty by default — downstream CMakeLists.txt link ${TUTTI_ACCEL_RUNTIME_LIBS}
-# / ${TUTTI_ACCEL_DRIVER_LIBS} (see CUDA.cmake for the CUDA equivalent).
-set(TUTTI_ACCEL_RUNTIME_LIBS "" CACHE INTERNAL "Vendor runtime lib (MACA stub)")
-set(TUTTI_ACCEL_DRIVER_LIBS  "" CACHE INTERNAL "Vendor driver lib (MACA stub)")

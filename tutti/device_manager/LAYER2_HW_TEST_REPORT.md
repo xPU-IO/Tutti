@@ -56,8 +56,8 @@ needed the explicit variable. After the fix both examples link and run.
 
 ## 3. Results
 
-### Daemon B3 owner bring-up
-`nvm_controller_init_b3` succeeded on `0000:b1:00.0`: created `/dev/ssnvme0`,
+### Daemon owner bring-up
+`nvm_controller_init_owner` succeeded on `0000:b1:00.0`: created `/dev/ssnvme0`,
 probed the controller, installed the GPU-view symlink.
 
 ```

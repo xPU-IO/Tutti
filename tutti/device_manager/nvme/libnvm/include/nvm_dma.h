@@ -67,12 +67,12 @@ void nvm_dma_unmap(nvm_dma_t* map);
  *
  * Note: vaddr can not be NULL, and must be aligned to system page size.
  *
- * LEGACY API (pre-B3): kernel registers the map against the controller-
+ * LEGACY API: kernel registers the map against the controller-
  * global host_list and `map_kind` defaults to NVM_MAP_KIND_UNSPECIFIED.
  * is_cq / ioq_idx are honoured by the legacy NVM_SET_IOQ_NUM bring-up
- * path only.  For B3 callers prefer:
- *   - nvm_dma_map_data_host()         (DATA buffer, fd-scoped, B6)
- *   - nvm_dma_map_ring_host(group_id) (SQ/CQ ring, group-scoped, B3+B6)
+ * path only.  New callers should prefer:
+ *   - nvm_dma_map_data_host()         (DATA buffer, fd-scoped)
+ *   - nvm_dma_map_ring_host(group_id) (SQ/CQ ring, group-scoped)
  */
 int nvm_dma_map_host(nvm_dma_t** handle, const nvm_ctrl_t* ctrl, void* vaddr, size_t size,int is_cq, int ioq_idx);
 
@@ -90,7 +90,7 @@ int nvm_dma_map_host(nvm_dma_t** handle, const nvm_ctrl_t* ctrl, void* vaddr, si
  *
  * Note: vaddr can not be NULL, and must be aligned to GPU page size.
  *
- * LEGACY API.  See nvm_dma_map_host() above for the B3/B6 successors:
+ * LEGACY API.  See nvm_dma_map_host() above for the explicit-map successors:
  *   - nvm_dma_map_data_device()         (DATA buffer, fd-scoped)
  *   - nvm_dma_map_ring_device(group_id) (SQ/CQ ring, group-scoped)
  */
@@ -99,9 +99,9 @@ int nvm_dma_map_device(nvm_dma_t** map, const nvm_ctrl_t* ctrl, void* devptr, si
 //#endif /* __CUDA__ */
 
 /*
- * LEGACY API (pre-B3): registers a GPU IO-queue ring via the now-deprecated
+ * LEGACY API: registers a GPU IO-queue ring via the now-deprecated
  * NVM_MAP_DEVICE_QUEUE_MEMORY ioctl, which encoded is_cq / qno through the
- * struct nvm_ioctl_map.{ioq_idx,is_cq} fields.  In B3+ rings are registered
+ * struct nvm_ioctl_map.{ioq_idx,is_cq} fields.  New code registers rings
  * via NVM_MAP_DEVICE_MEMORY with map_kind == NVM_MAP_KIND_RING_{SQ,CQ} and a
  * non-zero group_id; see nvm_dma_map_ring_device() below.
  */
@@ -110,7 +110,7 @@ int nvm_dma_map_queue_device(nvm_dma_t** map, const nvm_ctrl_t* ctrl, void* devp
 
 
 /* ===================================================================
- * B3/B6 explicit-intent DMA mapping API.
+ * Explicit-intent DMA mapping API.
  *
  * These four entry points replace the overloaded legacy nvm_dma_map_*
  * functions above by encoding the map's role (DATA vs ring) and its

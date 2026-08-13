@@ -136,7 +136,9 @@ bool validate_config(const ServiceConfig& cfg, std::string* error = nullptr);
 
 // Validate the invariant required by striped operation: every namespace
 // brought up by one daemon must report the same logical block size in bytes.
-// A uniform non-4 KiB value is allowed and is warned about by the daemon.
+// A non-4 KiB value is intentionally not rejected here; callers warn about it
+// separately so a uniform non-default namespace remains usable for
+// non-striped workloads.
 bool validate_uniform_block_size(const std::vector<uint32_t>& block_sizes,
                                  std::string* error = nullptr);
 

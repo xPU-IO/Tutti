@@ -11,8 +11,8 @@
 #error "Both TUTTI_USE_CUDA and TUTTI_USE_HOST are defined; exactly one must be set"
 #endif
 
-#if !defined(TUTTI_USE_CUDA) && !defined(TUTTI_USE_HOST)
-#error "Neither TUTTI_USE_CUDA nor TUTTI_USE_HOST is defined; exactly one must be set"
+#if !defined(TUTTI_USE_CUDA) && !defined(TUTTI_USE_HOST) && !defined(TUTTI_USE_MACA) && !defined(TUTTI_USE_MUSA)
+#error "Neither TUTTI_USE_CUDA , TUTTI_USE_MACA, TUTTI_USE_MUSA, nor TUTTI_USE_HOST is defined; exactly one must be set"
 #endif
 
 #if defined(TUTTI_USE_MACA) && defined(TUTTI_USE_MUSA)

@@ -1,0 +1,44 @@
+src := @module_root@
+obj-m += snvme-core.o
+obj-m += snvme.o
+
+
+ccflags-y += @module_ccflags@ -I$(src)/peer_memory
+
+snvme-core-y				:= core.o ioctl.o sysfs.o pr.o
+snvme-core-$(CONFIG_NVME_VERBOSE_ERRORS)	+= constants.o
+snvme-core-$(CONFIG_NVME_MULTIPATH)	+= multipath.o
+snvme-core-$(CONFIG_BLK_DEV_ZONED)	+= zns.o
+snvme-core-$(CONFIG_NVME_HWMON)		+= hwmon.o
+snvme-core-$(CONFIG_NVME_HOST_AUTH)	+= auth.o
+
+# peer_memory/ contains one .c per GPU P2P backend (nvidia/metax).
+# Select at build time:  make TUTTI_P2P_BACKEND=nvidia (or metax)
+TUTTI_P2P_BACKEND ?= nvidia
+snvme-objs := peer_memory/$(TUTTI_P2P_BACKEND).o compat.o list.o ctrl.o map.o pci.o
+
+KERNEL_SRC := /lib/modules/$(shell uname -r)/build
+
+# blk_set_queue_dying() was removed upstream in v5.17 and replaced by
+# blk_mark_disk_dead(gendisk); the change was backported into some 5.15
+# point-releases (e.g. Ubuntu HWE 5.15.0-185).  Decide by whether the target
+# kernel actually EXPORTS blk_mark_disk_dead -- do not gate on the version
+# number, because the Ubuntu ABI number is not the upstream stable SUBLEVEL.
+have_bmdd := $(shell grep -qsw blk_mark_disk_dead $(KERNEL_SRC)/Module.symvers && echo 1)
+ifeq ($(have_bmdd),1)
+ccflags-y += -DHAVE_BLK_MARK_DISK_DEAD
+endif
+
+all:
+	@mkdir -p @module_output@/peer_memory
+	$(MAKE) -C $(KERNEL_SRC) M=@module_output@ modules
+# io_queue_depth: kernel default 64 is the conservative built-in; production
+# deployments use 1024 (maintainer 2026-08-04). Override: make insmod IO_QDEPTH=64
+IO_QDEPTH ?= 1024
+
+insmod:
+	sudo insmod snvme-core.ko && sudo insmod snvme.ko io_queue_depth=$(IO_QDEPTH)
+rmmod:
+	sudo rmmod snvme && sudo rmmod snvme_core
+clean:
+	rm -fr *.o *.ko *.mod* .*.cmd .*.d
