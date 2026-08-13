@@ -139,7 +139,7 @@ nvmes:
 
 queue_pool:
   default_per_client: 16
-  max_per_client: 16
+  max_per_client: 32
 
 lease:
   heartbeat_interval_sec: 10

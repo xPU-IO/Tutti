@@ -3750,9 +3750,8 @@ struct snvm_qgroup {
 	 * back to ctrl->user_qid_bitmap.
 	 *
 	 * Layout choice -- inline array vs list:
-	 *   - max_queues is a fixed compile-time cap (16), so the
-	 *     overhead is bounded (16 * sizeof(struct snvm_user_queue)
-	 *     ~= 256 B per group).
+	 *   - max_queues is a fixed compile-time cap, so the overhead is
+	 *     bounded by NVM_MAX_QUEUES_PER_GROUP per group.
 	 *   - inline array means destroy/cascade walk is cache-
 	 *     friendly and we don't need yet another list_head
 	 *     pair on struct map.

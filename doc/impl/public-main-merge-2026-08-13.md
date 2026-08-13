@@ -137,3 +137,79 @@ Linux 6.8 SNVMe 源码已经合入，但本机没有对应 6.8 kernel headers，
 - 自动合并审查发现并修复 1 处重复函数定义。
 - 通用 CUDA/NVIDIA 代码和本机可用的 5.15 SNVMe 模块编译通过。
 - MetaX/MACA 专属改动与 `public/main` 一致，留待具备相应环境的人员验证。
+
+## 合并后真实硬件验证
+
+合并完成后另行获得真实硬件测试授权，并于 2026-08-13 UTC 在两块 NVIDIA H100
+PCIe、两个 NVMe controller（`0000:41:00.0`、`0000:44:00.0`）和 Linux 5.15
+SNVMe 环境完成验证。本节是合并后的追加记录，不改变上一节关于“创建 merge commit
+之前只编译、不运行”的事实。
+
+### 文件系统恢复
+
+测试初期确认两个 ext4 文件系统均为 `clean with errors`，内核报告
+`ext4_validate_block_bitmap`/`EFSCORRUPTED`。按授权卸载并重建：
+
+- `/dev/snvme0n1`：新 UUID `1c55b85b-78bf-42a0-94d9-56f936a33b00`。
+- `/dev/snvme1n1`：新 UUID `22bc5872-a250-4ac8-9d90-490470543257`。
+
+重建后由 daemon 首次挂载，两盘均报告 `Filesystem state: clean`、mount count 1。
+完成全部 example、contract 和 client I/O 后仍为 clean，重建后的内核日志没有新的
+ext4 warning、error、bad bitmap checksum 或 `EFSCORRUPTED`。
+
+### 每组 queue 上限
+
+原始单 Runtime example 请求 32 queues，但合并后的共享 UAPI 将
+`NVM_MAX_QUEUES_PER_GROUP` 固定为 16，首次运行在发起 I/O 前被 Runtime 拒绝。该
+限制不是本机 controller 能力：两盘的 user queue capacity 均为 96。最终处理如下：
+
+- 将共享 UAPI 每组上限从 16 提升到 32，并同步扩大
+  `nvm_ioctl_add_user_queue` 的输入/输出固定数组。
+- 因 `_IOC_SIZE` 和 ioctl 编码发生变化，将 `TUTTI_SNVME_ABI_VERSION` 从 1 提升到
+  2；新 payload 为 1056 bytes，`out_pairs` offset 为 544。
+- 三套 SNVMe kernel baseline、libnvm 和用户态均继续引用同一个共享 UAPI，不存在
+  kernel/userspace 独立常量。
+- daemon 的 `QueuePoolConfig::max_per_client` 默认值，以及 tracked 示例配置
+  `config/local_nvme_config.yaml`、`sys_config.yaml` 的单客户端上限均同步提升到 32；
+  `default_per_client` 保持原值，未显式请求 queue 数量的客户端不会增加资源占用。
+- 本机 `config/local/daemon_2disk.yaml` 的 `queue_pool.max_per_client` 提升到 32；
+  daemon 仍按 controller capacity、每组上限和当前可用 queue 三者取最小值。
+- 内核日志确认实际创建并回收 32 queues（QID 33..64）和对应 64 个 ring maps。
+
+加载模块的 `srcversion` 与本次构建产物一致，`io_queue_depth=1024`；daemon 报告两盘
+均为 `capacity=96, max_q_per_group=32`。UAPI contract 为 78/78 PASS。
+
+### Example 结果
+
+| Example | 场景 | 结果 |
+| --- | --- | --- |
+| `tutti_runtime_example` | accelerator 0、device 0、32 queues、4 MiB 单盘写/清空/读回/byte-exact | PASS |
+| `tutti_runtime_example` | accelerator 0、devices 0/1、每盘 32 queues、64 KiB stripe、4 MiB byte-exact | PASS |
+| `tutti_runtime_multi_accelerator_example` | accelerator 0/1 并发共享 device 0，各 16 queues | PASS；两个 Runtime 均 byte-exact |
+| `tutti_runtime_multi_accelerator_example` | accelerator 0 -> device 1，accelerator 1 -> device 0 | PASS；排除 ordinal/device ID 错绑 |
+| `tutti_runtime_multi_accelerator_example` | 两个 accelerator 各自 stripe devices 0/1，各盘合计 32 queues | PASS；四个 shard byte-exact |
+| `tutti_layerwise_kv_overlap` | 双盘 striped、32 queues、8 layers、32 chunks、64 tensors、3-stream pipeline | PASS；Phase H 32/32 samples correct |
+
+`layerwise_kv_overlap` 使用缩小但完整的硬件配置（`--layers 8`、
+`--ctx-tokens 8192`、`--requests 1`），保留 K/V 预写、三 stream pipeline、读写、
+instrumentation 和 Phase H byte verification；未运行默认约 40 GiB 数据规模。
+
+### Contract 和 client 结果
+
+| 验证 | 结果 |
+| --- | --- |
+| CUDA 非 hardware CTest | 26/26 PASS |
+| LocalNvmeDataPath hardware contract | 824 passed、0 failed |
+| StorageRuntime local-NVMe contract | 156 passed、0 failed |
+| LocalFileResolver ext4/FIEMAP contract | 22/22 PASS |
+| Public TuttiRuntime hardware E2E | PASS；含重复 shutdown 和 lease reacquire |
+| NVMeService client 32-queue I/O smoke | 8 steps PASS；`max_queues=32`、`granted=32` |
+
+LocalNvmeDataPath 和 StorageRuntime contract 原先把 daemon 目录写死为 `GPU<N>`；
+文件系统重建后只存在 canonical `ACCEL<N>` 目录，导致测试在硬件 I/O 前无法创建
+run directory。测试夹具已改为 `ACCEL<N>` 后完整通过。
+
+Striped contract 的 56 个正确性检查全部通过，包括跨盘 byte-exact、round-robin
+落盘、partial commit、单次 kernel launch 和 restart persistence。唯一失败是既有
+性能 gate：单盘 6.08 GB/s、双盘 6.89 GB/s，speedup 1.13x，低于 1.3x 或
+12 GB/s 条件；与合并前约 1.16x 的已记录基线一致，未通过修改阈值掩盖该结果。

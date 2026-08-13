@@ -25,8 +25,9 @@ The multi-accelerator example consumes two additional Tutti configurations:
 Both configurations explicitly acquire daemon device 0. Each allocation gets
 its own 16-queue group and accelerator-specific filesystem view, so the two
 Runtime instances can drive the same NVMe controller concurrently. These two
-configs use 16 queues and a 16-thread submit block because the current `snvme`
-UAPI limits one queue group to 16 queues.
+configs deliberately use 16 queues and a 16-thread submit block so two Runtime
+instances can share 32 queues on the same controller. The single-Runtime
+configs use the full 32-queue group supported by the current `snvme` UAPI.
 
 The cross-mapping configurations exercise both daemon devices with the
 accelerator-to-device association reversed:

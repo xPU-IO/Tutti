@@ -28,7 +28,7 @@
  *
  *   queue_pool:
  *     default_per_client: 4
- *     max_per_client: 16
+ *     max_per_client: 32
  *
  *   lease:
  *     heartbeat_interval_sec: 10
@@ -96,7 +96,7 @@ struct QueuePoolConfig {
     // Requested zero means default_per_client. The effective grant is further
     // clamped by max_per_client, max_queues_per_group, and available capacity.
     int32_t default_per_client = 4;
-    int32_t max_per_client = 16;
+    int32_t max_per_client = 32;
 };
 
 struct LeaseConfig {

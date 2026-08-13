@@ -77,8 +77,11 @@
  *        reserved field because memset zeroes it).
  *   1  — first consolidated UAPI header (this file).  Fixed-width types,
  *        static_assert layout locks, capability handshake.
+ *   2  — raise the per-fd queue-group capacity from 16 to 32 queue pairs;
+ *        this enlarges struct nvm_ioctl_add_user_queue and changes the
+ *        _IOC_SIZE encoded in NVM_ADD_USER_QUEUE.
  */
-#define TUTTI_SNVME_ABI_VERSION  1u
+#define TUTTI_SNVME_ABI_VERSION  2u
 
 /*
  * Capability bitmask reported by the kernel in nvm_ioctl_dev::capabilities.
@@ -388,7 +391,7 @@ TUTTI_SNVME_STATIC_ASSERT(offsetof(struct nvm_ioctl_raw_admin, nvme_status) == 7
  * struct nvm_ioctl_queue_group — per-fd queue group container.
  * ------------------------------------------------------------------------- */
 #define NVM_MAX_GROUPS_PER_FD       1
-#define NVM_MAX_QUEUES_PER_GROUP   16
+#define NVM_MAX_QUEUES_PER_GROUP   32
 
 struct nvm_ioctl_queue_group {
     uint32_t    group_id;       /* out: kernel-assigned, opaque   */
@@ -445,7 +448,7 @@ struct nvm_ioctl_add_user_queue {
     struct nvm_user_queue_pair_out  out_pairs[NVM_MAX_QUEUES_PER_GROUP];
 };
 
-TUTTI_SNVME_STATIC_ASSERT(sizeof(struct nvm_ioctl_add_user_queue) == 544,
+TUTTI_SNVME_STATIC_ASSERT(sizeof(struct nvm_ioctl_add_user_queue) == 1056,
     "nvm_ioctl_add_user_queue: size mismatch");
 TUTTI_SNVME_STATIC_ASSERT(offsetof(struct nvm_ioctl_add_user_queue, group_id) == 0,
     "nvm_ioctl_add_user_queue: group_id offset");
@@ -453,18 +456,18 @@ TUTTI_SNVME_STATIC_ASSERT(offsetof(struct nvm_ioctl_add_user_queue, nr_pairs) ==
     "nvm_ioctl_add_user_queue: nr_pairs offset");
 TUTTI_SNVME_STATIC_ASSERT(offsetof(struct nvm_ioctl_add_user_queue, pairs) == 32,
     "nvm_ioctl_add_user_queue: pairs offset");
-TUTTI_SNVME_STATIC_ASSERT(offsetof(struct nvm_ioctl_add_user_queue, out_pairs) == 288,
+TUTTI_SNVME_STATIC_ASSERT(offsetof(struct nvm_ioctl_add_user_queue, out_pairs) == 544,
     "nvm_ioctl_add_user_queue: out_pairs offset");
 
 /* ===========================================================================
  * Ioctl command numbers
  * ===========================================================================
  *
- * These are the SAME command numbers as before — no new commands added,
- * no existing commands changed.  The _IOC_SIZE baked into each command
- * is determined by sizeof(struct ...) which is verified by the
- * static_asserts above to be identical to the pre-UAPI-consolidation
- * layout on LP64.
+ * The ioctl type and command-number fields remain stable.  The complete
+ * encoded value of NVM_ADD_USER_QUEUE changed in ABI version 2 because its
+ * fixed arrays grew from 16 to 32 entries and _IOC_SIZE is part of the ioctl
+ * value.  The ABI handshake rejects a stale kernel/userspace pair before
+ * userspace attempts this command.
  */
 
 /* NVM_* ioctls — issued on /dev/ssnvme<N> (fd_dev) */

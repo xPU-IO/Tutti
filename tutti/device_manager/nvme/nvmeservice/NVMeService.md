@@ -112,13 +112,13 @@ Expected lines (excerpt):
 
 ```
 nvmeservice: device=0 pci=0000:08:00.0 snvme=/dev/ssnvme0 ns=1 qdepth=64
-             max_user_qid=135 max_q_per_grp=16 allowed_gpus={0}
+             max_user_qid=135 max_q_per_grp=32 allowed_gpus={0}
 NVMeService daemon listening on 127.0.0.1:50051 (port 50051)
 Registered devices:
-  device_id=0 ... max_user_qid=135 max_q/grp=16
+  device_id=0 ... max_user_qid=135 max_q/grp=32
       allowed: cuda_device=0 mount=/mnt/gpu0/ssnvme0
 lease: heartbeat=10s timeout=30s
-queue_pool: default=4 max=16
+queue_pool: default=4 max=32
 ```
 
 Terminal B (client):
@@ -135,7 +135,7 @@ Expected client output (8-step IO smoke):
 ```
 [ OK ] step=1   cudaSetDevice(0)
 [ OK ] step=2   nvm_ctrl_attach_client /dev/ssnvme0 page=4096
-[ OK ] step=3   nvm_create_group gid=1 max_queues=16 granted=4
+[ OK ] step=3   nvm_create_group gid=1 max_queues=32 granted=4
 [ OK ] step=4   mapped SQ/CQ + wbuf/rbuf
 [ OK ] step=5   nvm_add_user_queue qid=33 sq_db=0x1108 cq_db=0x110c
 [ OK ] step=6   Write+Read+verify x 4 IOs at LBA [2621440..2621443]
@@ -180,7 +180,7 @@ nvmes:
 
 queue_pool:
   default_per_client: 4                  # ConnectRequest.num_queues == 0 -> use this
-  max_per_client: 16                     # daemon clamp; kernel still enforces 16/group
+  max_per_client: 32                     # daemon clamp; kernel also enforces 32/group
 
 lease:
   heartbeat_interval_sec: 10
@@ -315,7 +315,7 @@ Hard invariants you can rely on:
   `granted_queues` is returned it is policy guidance only; the
   authoritative numbers come from `NVM_GET_DEV_INFO`
   (`max_user_qid` / `max_queues_per_group`) plus runtime add/destroy.
-- Kernel hard cap per fd: `NVM_MAX_QUEUES_PER_GROUP = 16`
+- Kernel hard cap per fd: `NVM_MAX_QUEUES_PER_GROUP = 32`
   (`backends/local/kernel_modules/snvme/...`).  The daemon also
   clamps `max_per_client`; the *effective* cap is `min(both)`.
 
@@ -443,7 +443,7 @@ has to come from the client.  Two options:
 | client: `Connect rejected: cuda_device=N not in allowed_gpus` | YAML `allowed_gpus` doesn't list this GPU | edit `sys_config.yaml`, restart daemon. |
 | client: `nvm_ctrl_attach_client … EACCES` | perms on `/dev/ssnvmeN` (default root-only) | run client as root or chmod the chrdev. |
 | client: `nvm_create_group … ENOSPC` | another fd already used all 16 group slots on the controller | check `/proc/<pid>/fd` for stale daemon/clients. |
-| client: `nvm_add_user_queue … EBUSY` | per-fd cap (16) already reached; or `granted_queues` was clamped to 0 | reduce `num_queues`, or check `max_per_client` and `max_queues_per_group`. |
+| client: `nvm_add_user_queue … EBUSY` | per-fd cap (32) already reached; or `granted_queues` was clamped to 0 | reduce `num_queues`, or check `max_per_client` and `max_queues_per_group`. |
 | `cudaSetDevice -> initialization error` in a child after fork | classic CUDA-fork-without-exec | fork **before** any `cuda*` call; see `snvme_smoke_libnvm_role.cu` for the reference handshake-via-pipe pattern. |
 | dmesg: `cascade-released N DATA map(s)` after client exit but daemon still alive | normal: B6 fd-scoped DATA reclaim path | nothing to fix, this is the invariant working. |
 | daemon log: `nvmeservice reaper: dropped lease device=… (pid=…)` | client crashed or lost heartbeat for `lease.timeout_sec` | check the client; the queues/DATA were already reclaimed at fd close. |
@@ -562,7 +562,7 @@ nvmes:
     kernel_ioq_cap: 32
     allowed_accel_ids: [0, 1]
     auto_mount: true
-queue_pool: {default_per_client: 4, max_per_client: 16}
+queue_pool: {default_per_client: 4, max_per_client: 32}
 lease: {heartbeat_interval_sec: 10, timeout_sec: 30}
 ```
 

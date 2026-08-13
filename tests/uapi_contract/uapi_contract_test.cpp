@@ -60,12 +60,12 @@ static int fail_count = 0;
 static int test_abi_version()
 {
     /*
-     * TUTTI_SNVME_ABI_VERSION must be 1 for this header revision.
+     * TUTTI_SNVME_ABI_VERSION must be 2 for this header revision.
      * If this fails, either the header was bumped (update this test)
      * or the constant is wrong (fix the header).
      */
-    CHECK(TUTTI_SNVME_ABI_VERSION == 1,
-          "TUTTI_SNVME_ABI_VERSION=%u, expected 1",
+    CHECK(TUTTI_SNVME_ABI_VERSION == 2,
+          "TUTTI_SNVME_ABI_VERSION=%u, expected 2",
           (unsigned)TUTTI_SNVME_ABI_VERSION);
 
     /*
@@ -170,8 +170,8 @@ static int test_struct_sizes()
           "nvm_user_queue_pair_out size=%zu, expected 16",
           sizeof(struct nvm_user_queue_pair_out));
 
-    CHECK(sizeof(struct nvm_ioctl_add_user_queue) == 544,
-          "nvm_ioctl_add_user_queue size=%zu, expected 544",
+    CHECK(sizeof(struct nvm_ioctl_add_user_queue) == 1056,
+          "nvm_ioctl_add_user_queue size=%zu, expected 1056",
           sizeof(struct nvm_ioctl_add_user_queue));
 
     CHECK(sizeof(struct nvm_queue_group) == 16,
@@ -210,7 +210,7 @@ static int test_field_offsets()
 
     /* nvm_ioctl_add_user_queue */
     CHECK(offsetof(struct nvm_ioctl_add_user_queue, pairs) == 32, "addq.pairs");
-    CHECK(offsetof(struct nvm_ioctl_add_user_queue, out_pairs) == 288, "addq.out_pairs");
+    CHECK(offsetof(struct nvm_ioctl_add_user_queue, out_pairs) == 544, "addq.out_pairs");
 
     return 0;
 }
@@ -307,6 +307,9 @@ static int test_ioctl_numbers()
     CHECK((_IOC_NR(NVM_MAP_DEVICE_MEMORY) == 2), "NVM_MAP_DEVICE_MEMORY nr");
     CHECK((_IOC_NR(NVM_GET_DEV_INFO) == 9), "NVM_GET_DEV_INFO nr");
     CHECK((_IOC_NR(NVM_ADD_USER_QUEUE) == 14), "NVM_ADD_USER_QUEUE nr");
+    CHECK((_IOC_SIZE(NVM_ADD_USER_QUEUE) == 1056),
+          "NVM_ADD_USER_QUEUE size=%u, expected 1056",
+          (unsigned)_IOC_SIZE(NVM_ADD_USER_QUEUE));
 
     /* NVM_GET_DEV_INFO is _IOR (read direction), not _IOW */
     CHECK((_IOC_DIR(NVM_GET_DEV_INFO) == _IOC_READ),
@@ -334,7 +337,7 @@ static int test_constants()
           NVM_MAX_QUEUE_GROUPS);
     CHECK(NVM_MAX_GROUPS_PER_FD == 1, "NVM_MAX_GROUPS_PER_FD=%d, expected 1",
           NVM_MAX_GROUPS_PER_FD);
-    CHECK(NVM_MAX_QUEUES_PER_GROUP == 16, "NVM_MAX_QUEUES_PER_GROUP=%d, expected 16",
+    CHECK(NVM_MAX_QUEUES_PER_GROUP == 32, "NVM_MAX_QUEUES_PER_GROUP=%d, expected 32",
           NVM_MAX_QUEUES_PER_GROUP);
     CHECK(NVM_QUEUE_SETUP_F_ON_HOST == 1, "NVM_QUEUE_SETUP_F_ON_HOST=0x%x, expected 0x1",
           NVM_QUEUE_SETUP_F_ON_HOST);

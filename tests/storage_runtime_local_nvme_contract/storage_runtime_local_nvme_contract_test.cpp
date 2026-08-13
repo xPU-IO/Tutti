@@ -230,7 +230,7 @@ int main(int argc, char** argv) {
     tutti::test_support::UniqueTestDirectory run_dir;
     std::string dir_error;
     if (!tutti::test_support::UniqueTestDirectory::create(
-            g_device.mount_path + "/GPU" + std::to_string(kCudaDev),
+            g_device.mount_path + "/ACCEL" + std::to_string(kCudaDev),
             "tutti_storage_runtime_local_nvme",
             run_dir, dir_error)) {
         std::fprintf(stderr, "ERROR: %s\n", dir_error.c_str());

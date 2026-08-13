@@ -266,7 +266,7 @@ nvmeservice: device=0 pci=0000:31:00.0 snvme=/dev/ssnvme0 ns=1 ...
 mount_manager: mounted /dev/snvme0n1 at /mnt/nvme0 (owned)
 tutti_daemon listening on 127.0.0.1:50051 (port 50051)
 Owned devices:
-  device_id=0 pci=0000:31:00.0 snvme=/dev/ssnvme0 ns=1 block_size=4096 io_qp_limit=64 kernel_io_qps=32 user_io_qps=32 max_user_qid=64 max_q_per_grp=16
+  device_id=0 pci=0000:31:00.0 snvme=/dev/ssnvme0 ns=1 block_size=4096 io_qp_limit=64 kernel_io_qps=32 user_io_qps=32 max_user_qid=64 max_q_per_grp=32
 ```
 
 `tutti_daemon listening` 只说明 gRPC 已启动。完整成功还必须确认 mount 和 GPU view，

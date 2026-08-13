@@ -44,7 +44,7 @@ map.o pci.o` (see §6 for the full build).
 
 Upstream NVMe queues are opaque to userspace. snvme exposes them:
 
-- Each controller has **16 queue pairs per queue group** (hard cap
+- Each controller has **32 queue pairs per queue group** (hard cap
   `NVM_MAX_QUEUES_PER_GROUP`); userspace requests beyond the cap are
   clamped to it.
 - **Queue depth is kernel-authoritative.** The module parameter
@@ -207,7 +207,7 @@ would change lock acquisition order against `nvme_dev_disable()` /
    `IRQ_HANDLED` for that case — `IRQ_NONE` lets the kernel's spurious
    detector storm-disable the IRQ line. Keep this semantic on every
    port.
-4. **Queue geometry:** confirm `NVM_MAX_QUEUES_PER_GROUP` (16) and the
+4. **Queue geometry:** confirm `NVM_MAX_QUEUES_PER_GROUP` (32) and the
    `io_queue_depth` parameter wiring survive the port; verify the
    controller-reported `q_depth` against a production-depth ring
    (e.g. with the `/tmp/probe_qdepth` style ioctl probe).

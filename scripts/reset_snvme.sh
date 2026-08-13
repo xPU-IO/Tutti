@@ -59,7 +59,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BUILD_DIR="$SCRIPT_DIR/../build"
+BUILD_DIR="${SNVME_BUILD_DIR:-$SCRIPT_DIR/../build/cuda-module/module}"
 
 FORCE_CLEANUP=0
 DO_INSMOD=1

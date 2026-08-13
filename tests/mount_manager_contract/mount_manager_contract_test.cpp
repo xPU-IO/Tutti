@@ -116,9 +116,6 @@ static void test_config_defaults() {
         "  - pci_addr: \"0000:08:00.0\"\n"
         "    mount_path: \"/mnt/nvme1\"\n"
         "    namespace_id: 1\n"
-        "queue_pool:\n"
-        "  default_per_client: 4\n"
-        "  max_per_client: 16\n"
         "lease:\n"
         "  heartbeat_interval_sec: 10\n"
         "  timeout_sec: 30\n";
@@ -139,6 +136,10 @@ static void test_config_defaults() {
     // unmount_retry absent → defaults
     CHECK(cfg->unmount_retry.interval_ms == 1000, "default interval_ms=1000");
     CHECK(cfg->unmount_retry.max == 30, "default max=30");
+    CHECK(cfg->queue_pool.default_per_client == 4,
+          "default queue_pool.default_per_client=4");
+    CHECK(cfg->queue_pool.max_per_client == 32,
+          "default queue_pool.max_per_client=32");
 }
 
 // =====================================================================

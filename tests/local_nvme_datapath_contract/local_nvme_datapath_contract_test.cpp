@@ -63,7 +63,7 @@ static const NvmeTestDevice& primary_device() {
 }
 
 static std::string primary_test_parent() {
-    return primary_device().mount_path + "/GPU" + std::to_string(g_test_gpu);
+    return primary_device().mount_path + "/ACCEL" + std::to_string(g_test_gpu);
 }
 
 static RegistrationDomainKey primary_registration_domain() {

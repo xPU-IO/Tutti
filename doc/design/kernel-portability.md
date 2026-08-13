@@ -66,7 +66,7 @@ The ioctl UAPI is versioned (`tutti/include/uapi/tutti_snvme.h`):
   follow the controller-reported depth — there is no userspace override
   (a smaller userspace ring would desynchronize SQ wrap-around and CQ
   phase tracking against the controller's deeper rings).
-- Queue count: up to **16 queue pairs per queue group**
+- Queue count: up to **32 queue pairs per queue group**
   (`NVM_MAX_QUEUES_PER_GROUP`); userspace requests beyond that are
   clamped. Both CPU-side (daemon) and GPU-side queues are allocated
   dynamically after mount via batched ioctl.
