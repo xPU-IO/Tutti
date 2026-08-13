@@ -290,6 +290,14 @@ if(TUTTI_BUILD_HARDWARE_STACK)
         tutti_enable_data_path_factory_local_nvme()
         tutti_enable_nvme_resource_grpc()
 
+        # Public TuttiRuntime + YAML NVMe hardware example. Keep this
+        # outside BUILD_TESTING so applications can build the example without
+        # enabling the test suite.
+        add_subdirectory(
+            "${TUTTI_REPOSITORY_ROOT}/examples/tutti_runtime"
+            "${CMAKE_CURRENT_BINARY_DIR}/examples_tutti_runtime"
+        )
+
     else()
         message(STATUS "Tutti: TUTTI_FEATURE_LOCAL_NVME=OFF -- skipping device_manager, data_paths/local_nvme")
     endif()

@@ -1,0 +1,45 @@
+# Tutti local-NVMe Runtime for accelerator 1. This Runtime shares daemon
+# device 0 with the independent accelerator-0 Runtime.
+accelerator:
+  profile: CUDA
+
+runtime:
+  accel_id: 1
+
+storage:
+  resources:
+    - id: shared-example-nvme
+      type: nvme
+      provider:
+        type: nvme-service
+        endpoint: "127.0.0.1:50051"
+      allocation:
+        selection: explicit
+        device_ids: [0]
+        queues_per_controller: 16
+
+  resolvers:
+    - id: shared-example-file-resolver
+      type: local-file
+      scheme: file
+      config: {}
+
+  datapaths:
+    - id: shared-example-local-nvme-datapath
+      type: local-nvme
+      config:
+        handle_cache_capacity: 0
+        prp_cache_capacity: 0
+        handle_cache_l2_capacity: 0
+        threads_per_block: 16
+        max_in_flight_operations: 0
+        max_batch_entries: 0
+        io_granularity: 0
+
+  backends:
+    - id: shared-example-storage
+      contract: ext4-local-nvme
+      resolver: shared-example-file-resolver
+      datapath: shared-example-local-nvme-datapath
+      resource: shared-example-nvme
+      config: {}

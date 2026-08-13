@@ -1,0 +1,46 @@
+# Tutti striped local-NVMe Runtime for accelerator 1. Both accelerator
+# Runtimes independently acquire daemon devices 0 and 1.
+accelerator:
+  profile: CUDA
+
+runtime:
+  accel_id: 1
+
+storage:
+  resources:
+    - id: multi-accelerator-striped-nvme
+      type: nvme
+      provider:
+        type: nvme-service
+        endpoint: "127.0.0.1:50051"
+      allocation:
+        selection: striped
+        device_ids: [0, 1]
+        queues_per_controller: 16
+
+  resolvers:
+    - id: multi-accelerator-striped-file-resolver
+      type: striped-file
+      scheme: striped
+      config: {}
+
+  datapaths:
+    - id: multi-accelerator-striped-local-nvme-datapath
+      type: striped-local-nvme
+      config:
+        handle_cache_capacity: 0
+        prp_cache_capacity: 0
+        handle_cache_l2_capacity: 0
+        threads_per_block: 16
+        max_in_flight_operations: 0
+        max_batch_entries: 0
+        io_granularity: 0
+
+  backends:
+    - id: multi-accelerator-striped-storage
+      contract: striped-local-nvme
+      resolver: multi-accelerator-striped-file-resolver
+      datapath: multi-accelerator-striped-local-nvme-datapath
+      resource: multi-accelerator-striped-nvme
+      config:
+        stripe_unit: 65536

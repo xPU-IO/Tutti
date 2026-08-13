@@ -1,0 +1,45 @@
+# Tutti local-NVMe configuration consumed by the TuttiRuntime example. Controller
+# paths, mount paths, BAR sizes, and actual queue grants come from the daemon.
+accelerator:
+  profile: CUDA
+
+runtime:
+  accel_id: 0
+
+storage:
+  resources:
+    - id: example-nvme
+      type: nvme
+      provider:
+        type: nvme-service
+        endpoint: "127.0.0.1:50051"
+      allocation:
+        selection: explicit
+        device_ids: [0]
+        queues_per_controller: 32
+
+  resolvers:
+    - id: example-file-resolver
+      type: local-file
+      scheme: file
+      config: {}
+
+  datapaths:
+    - id: example-local-nvme-datapath
+      type: local-nvme
+      config:
+        handle_cache_capacity: 0
+        prp_cache_capacity: 0
+        handle_cache_l2_capacity: 0
+        threads_per_block: 32
+        max_in_flight_operations: 0
+        max_batch_entries: 0
+        io_granularity: 0
+
+  backends:
+    - id: example-storage
+      contract: ext4-local-nvme
+      resolver: example-file-resolver
+      datapath: example-local-nvme-datapath
+      resource: example-nvme
+      config: {}

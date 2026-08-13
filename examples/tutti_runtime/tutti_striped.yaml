@@ -1,0 +1,46 @@
+# Tutti two-device striped configuration consumed by the TuttiRuntime example.
+# Controller paths and all other deployment facts come from daemon allocation.
+accelerator:
+  profile: CUDA
+
+runtime:
+  accel_id: 0
+
+storage:
+  resources:
+    - id: example-striped-nvme
+      type: nvme
+      provider:
+        type: nvme-service
+        endpoint: "127.0.0.1:50051"
+      allocation:
+        selection: striped
+        device_ids: [0, 1]
+        queues_per_controller: 32
+
+  resolvers:
+    - id: example-striped-file-resolver
+      type: striped-file
+      scheme: striped
+      config: {}
+
+  datapaths:
+    - id: example-striped-local-nvme-datapath
+      type: striped-local-nvme
+      config:
+        handle_cache_capacity: 0
+        prp_cache_capacity: 0
+        handle_cache_l2_capacity: 0
+        threads_per_block: 32
+        max_in_flight_operations: 0
+        max_batch_entries: 0
+        io_granularity: 0
+
+  backends:
+    - id: example-striped-storage
+      contract: striped-local-nvme
+      resolver: example-striped-file-resolver
+      datapath: example-striped-local-nvme-datapath
+      resource: example-striped-nvme
+      config:
+        stripe_unit: 65536
