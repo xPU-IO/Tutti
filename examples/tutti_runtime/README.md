@@ -60,9 +60,9 @@ The host-local configuration used on this machine owns devices 0 and 1. The
 example YAML explicitly acquires device 0 for accelerator 0.
 
 ```bash
-sudo -S env TUTTI_VERBOSE=1 \
+sudo  env TUTTI_VERBOSE=1 \
   build/cuda-module/tutti/device_manager/nvme/nvmeservice/examples/tutti_daemon \
-  --config config/local/daemon_2disk.yaml < ~/.passwd/1
+  --config config/local/daemon_2disk.yaml 
 ```
 
 Wait for the `tutti_daemon listening` line. Query the daemon and record the
@@ -85,9 +85,9 @@ Pass the actual accelerator view directory published for device 0. For
 example, if the daemon published `/mnt/snvme/gpu0/ssnvme0`:
 
 ```bash
-sudo -S build/cuda-module/bin/tutti_runtime_example \
+sudo  build/cuda-module/bin/tutti_runtime_example \
   --config examples/tutti_runtime/tutti_local_nvme.yaml \
-  --directory /mnt/snvme/gpu0/ssnvme0 < ~/.passwd/1
+  --directory /mnt/snvme/gpu0/ssnvme0 
 ```
 
 `sudo` is needed with the daemon's default root-owned accelerator view
@@ -107,10 +107,10 @@ Pass both directories in the same order as `device_ids` in
 `tutti_striped.yaml`:
 
 ```bash
-sudo -S build/cuda-module/bin/tutti_runtime_example \
+sudo  build/cuda-module/bin/tutti_runtime_example \
   --config examples/tutti_runtime/tutti_striped.yaml \
   --directory /mnt/snvme/gpu0/ssnvme0 \
-  --directory /mnt/snvme/gpu0/ssnvme1 < ~/.passwd/1
+  --directory /mnt/snvme/gpu0/ssnvme1 
 ```
 
 The example creates one shard below each view's `striped/` directory. The
@@ -135,11 +135,11 @@ daemon allocation. Both YAML files select device 0, while their
 published below each accelerator root:
 
 ```bash
-sudo -S build/cuda-module/bin/tutti_runtime_multi_accelerator_example \
+sudo  build/cuda-module/bin/tutti_runtime_multi_accelerator_example \
   --config-0 examples/tutti_runtime/tutti_multi_accelerator_0.yaml \
   --directory-0 /mnt/snvme/gpu0/ssnvme0 \
   --config-1 examples/tutti_runtime/tutti_multi_accelerator_1.yaml \
-  --directory-1 /mnt/snvme/gpu1/ssnvme0 < ~/.passwd/1
+  --directory-1 /mnt/snvme/gpu1/ssnvme0 
 ```
 
 The two YAML paths are compiled-in defaults, so `--config-0` and `--config-1`
@@ -167,11 +167,11 @@ config must use that accelerator's view and the selected device's `chrdev`
 basename:
 
 ```bash
-sudo -S build/cuda-module/bin/tutti_runtime_multi_accelerator_example \
+sudo  build/cuda-module/bin/tutti_runtime_multi_accelerator_example \
   --config-0 examples/tutti_runtime/tutti_cross_accelerator_0_device_1.yaml \
   --directory-0 /mnt/snvme/gpu0/ssnvme1 \
   --config-1 examples/tutti_runtime/tutti_cross_accelerator_1_device_0.yaml \
-  --directory-1 /mnt/snvme/gpu1/ssnvme0 < ~/.passwd/1
+  --directory-1 /mnt/snvme/gpu1/ssnvme0 
 ```
 
 The expected summary is:
@@ -188,13 +188,13 @@ The two workers use different logical filenames, so each Runtime creates its
 own shard on each disk:
 
 ```bash
-sudo -S build/cuda-module/bin/tutti_runtime_multi_accelerator_example \
+sudo  build/cuda-module/bin/tutti_runtime_multi_accelerator_example \
   --config-0 examples/tutti_runtime/tutti_multi_accelerator_striped_0.yaml \
   --directory-0 /mnt/snvme/gpu0/ssnvme0 \
   --directory-0 /mnt/snvme/gpu0/ssnvme1 \
   --config-1 examples/tutti_runtime/tutti_multi_accelerator_striped_1.yaml \
   --directory-1 /mnt/snvme/gpu1/ssnvme0 \
-  --directory-1 /mnt/snvme/gpu1/ssnvme1 < ~/.passwd/1
+  --directory-1 /mnt/snvme/gpu1/ssnvme1 
 ```
 
 With the default 4 MiB request and 64 KiB stripe unit, each logical file
