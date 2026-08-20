@@ -132,4 +132,52 @@ PrpPageCache::Entry* PrpPageCache::get_or_build(const Key& key,
     return &e;
 }
 
+std::uint32_t PrpPageCache::get_or_build_batch(BatchItem* items,
+                                               std::size_t count) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (!enabled() || items == nullptr) return 0;
+
+    std::uint32_t resolved = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        BatchItem& item = items[i];
+        if (item.data_dma == nullptr) continue;
+
+        auto it = index_.find(item.key);
+        if (it != index_.end()) {
+            std::uint32_t slot = it->second;
+            Entry& hit = entries_[slot];
+            ++hit.checkout_refcount;
+            hit.in_use = true;
+            remove_from_lru_(slot);
+            ++stats_.hits;
+            item.result = &hit;
+            ++resolved;
+            continue;
+        }
+
+        ++stats_.misses;
+        std::uint32_t slot = acquire_slot_();
+        if (slot == UINT32_MAX) continue;  // caller falls back to arena
+
+        Entry& e = entries_[slot];
+        e.key = item.key;
+        e.pin_count = 0;
+        e.checkout_refcount = 1;
+        e.in_use = true;
+        e.vaddr = static_cast<char*>(pool_host_) +
+                  static_cast<std::size_t>(slot) * cfg_.page_size;
+        e.ioaddr = pool_dma_->ioaddrs[slot];
+
+        fill_prp_list_page(static_cast<std::uint64_t*>(e.vaddr),
+                           item.data_dma, item.key.start_page,
+                           item.key.pages_in_io, cfg_.page_size);
+
+        index_[item.key] = slot;
+        ++stats_.entries;
+        item.result = &e;
+        ++resolved;
+    }
+    return resolved;
+}
+
 } // namespace tutti::data_paths::local_nvme

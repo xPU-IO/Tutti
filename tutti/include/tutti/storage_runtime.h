@@ -1032,7 +1032,10 @@ public:
                     std::nullopt};
                 }
             // Wait for either a terminal notification or the deadline.
-            io_cv_.wait_for(lock, std::chrono::milliseconds(1),
+            // 50us granularity: hot-path completion detection — with a 1ms
+            // wait, a batch whose kernel finishes mid-sleep used to be
+            // observed ~0.4ms late.
+            io_cv_.wait_for(lock, std::chrono::microseconds(50),
                             [this, slot]{ return io_entries_[slot].terminal; });
         }
     }

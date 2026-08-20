@@ -287,6 +287,15 @@ private:
         // in-flight ops.  A batch may span multiple memory registrations.
         std::vector<std::uint64_t> memory_tokens;
 
+        // PRP cache entries pinned for this op's lifetime (pin at submit,
+        // unpin at release).  Without this the striped path used to leak
+        // every cache entry it touched (checkout never released).
+        struct PrpCacheRef {
+            tutti::data_paths::local_nvme::PrpPageCache* cache = nullptr;
+            tutti::data_paths::local_nvme::PrpPageCache::Entry* entry = nullptr;
+        };
+        std::vector<PrpCacheRef> prp_cache_refs;
+
         std::uint64_t op_token = 0;
         std::uint64_t op_generation = 0;
     };

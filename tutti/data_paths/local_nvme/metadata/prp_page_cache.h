@@ -117,6 +117,37 @@ public:
     // data path layer.
     Entry* get_or_build(const Key& key, const nvm_dma_t* data_dma);
 
+    // Batch variant: ONE locked pass over `count` items (a 921-target
+    // 256K-context batch used to take this mutex 1842 times per submit).
+    // On hit: result = cached entry (checkout++, not evictable).
+    // On miss: builds the page and result = the new entry.
+    // Items whose result stays nullptr (disabled / out of slots / null
+    // dma) must be handled by the caller via the arena fallback.
+    struct BatchItem {
+        Key key{};
+        const nvm_dma_t* data_dma = nullptr;
+        std::uint32_t user = 0;       // caller payload (e.g. list index)
+        Entry* result = nullptr;      // out
+    };
+    std::uint32_t get_or_build_batch(BatchItem* items, std::size_t count);
+
+    // Release one checkout WITHOUT pinning — for error paths before op
+    // registration (pin() already handles the success path by consuming
+    // the checkout).  When both counts reach zero the entry re-enters LRU.
+    void release_checkout(Entry* e) {
+        if (!e) return;
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (e->checkout_refcount > 0) --e->checkout_refcount;
+        e->in_use = (e->checkout_refcount > 0) || (e->pin_count > 0);
+        if (e->pin_count == 0 && e->checkout_refcount == 0) {
+            std::uint32_t slot = static_cast<std::uint32_t>(e - entries_.data());
+            if (index_.count(e->key) && !lru_pos_.count(slot)) {
+                lru_.push_front(slot);
+                lru_pos_[slot] = lru_.begin();
+            }
+        }
+    }
+
     void pin(Entry* e) {
         if (!e) return;
         std::lock_guard<std::mutex> lock(mtx_);

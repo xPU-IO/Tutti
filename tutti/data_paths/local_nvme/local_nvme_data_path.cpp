@@ -1612,15 +1612,28 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
 
     if (total_list_ios > 0) {
         if (prp_cache_.enabled()) {
-            // Try PRP cache path: get_or_build each LIST page by content key.
+            // Try PRP cache path: ONE locked batch resolves all LIST pages
+            // (was: one cache mutex round-trip per entry).
             bool cache_ok = true;
-            std::uint32_t arena_list_idx = 0;  // fallback arena counter
+            std::vector<PrpPageCache::BatchItem> items;
+            items.reserve(total_list_ios);
+            for (const auto& pr : pending) {
+                if (!pr.accepted) continue;
+                for (const auto& li : pr.list_infos) {
+                    PrpPageCache::BatchItem item;
+                    item.key.memory_token = pr.memory_token;
+                    item.key.start_page = li.start_page;
+                    item.key.pages_in_io = li.pages_in_io;
+                    item.data_dma = pr.mreg->dma;
+                    items.push_back(item);
+                }
+            }
+            prp_cache_.get_or_build_batch(items.data(), items.size());
+            std::size_t item_idx = 0;
             for (auto& pr : pending) {
                 if (!pr.accepted) continue;
                 for (const auto& li : pr.list_infos) {
-                    PrpPageCache::Key pkey{pr.memory_token,
-                                            li.start_page, li.pages_in_io};
-                    auto* pe = prp_cache_.get_or_build(pkey, pr.mreg->dma);
+                    auto* pe = items[item_idx++].result;
                     if (pe == nullptr) {
                         cache_ok = false;
                         break;
@@ -1632,10 +1645,12 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
             }
 
             if (!cache_ok) {
-                // Cache exhausted: unpin acquired entries, fall back to arena.
-                for (const auto& ref : prp_cache_refs) {
-                    // Release the slot back (it was in_use, now release).
-                    prp_cache_.unpin(ref.entry);
+                // Cache exhausted: release ALL checkouts (including items
+                // after the failing one that got entries but no ref) and
+                // fall back to arena.
+                for (const auto& item : items) {
+                    if (item.result != nullptr)
+                        prp_cache_.release_checkout(item.result);
                 }
                 prp_cache_refs.clear();
                 // Reset all prp2 fields to 0 (will be filled by arena path).
@@ -1669,7 +1684,7 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
                         arena_.release(lease.slot_index);
                         // Also release any PRP cache entries acquired.
                         for (const auto& ref : prp_cache_refs) {
-                            prp_cache_.unpin(ref.entry);
+                            prp_cache_.release_checkout(ref.entry);
                         }
                         reject_all(StatusCode::DEVICE_ERROR, "H2D PRP page failed");
                         return outcome;
@@ -1713,7 +1728,7 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
         if (ce != cudaSuccess) {
             arena_.release(lease.slot_index);
             for (const auto& ref : prp_cache_refs) {
-                prp_cache_.unpin(ref.entry);
+                prp_cache_.release_checkout(ref.entry);
             }
             reject_all(StatusCode::DEVICE_ERROR, "H2D dynamic descriptors failed");
             return outcome;
@@ -1777,9 +1792,9 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
         // launch configuration errors, not runtime errors).
         // Safe to return the arena slot.
         arena_.release(lease.slot_index);
-        // Unpin any PRP cache entries acquired (no IO issued).
+        // Release any PRP cache checkouts acquired (no IO issued).
         for (const auto& ref : prp_cache_refs) {
-            prp_cache_.unpin(ref.entry);
+            prp_cache_.release_checkout(ref.entry);
         }
         reject_all(StatusCode::DEVICE_ERROR,
                    std::string("kernel launch failed: ") +
