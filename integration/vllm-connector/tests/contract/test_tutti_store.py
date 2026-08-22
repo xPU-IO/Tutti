@@ -1,28 +1,154 @@
-"""TuttiKVStore 专项测试（私有契约，不进共享契约套件）。
+"""TuttiKVStore 专项测试与契约套件支架（不进共享套件的私有契约）。
 
-覆盖：partial-commit 窗口重发、层段布局（18B 标准 io_key）、容量拒绝、
-整 chunk 回收、持久化重开恢复、崩溃安全时序（先数据后 marker）、
-buffer 恰一次注册、TUTTI_NVME_PRESET 推导。
+FakeRuntime 复刻 tutti_runtime 的 Python API 形态（caps/open_batch/
+register_memory/submit/release_io/wait/shutdown），接受的请求在本地
+文件系统上真搬运数据（os.pwrite/pread + ctypes），可注入按轮次的
+部分拒收计划以驱动 store 的窗口重发逻辑。
+
+专项覆盖：partial-commit 窗口重发、层段布局（18B 标准 io_key）、
+容量拒绝、整 chunk 回收、持久化重开恢复、崩溃安全时序（先数据后
+marker）、buffer 恰一次注册、TUTTI_NVME_PRESET 推导。
 """
 
 from __future__ import annotations
 
 import ctypes
+import os
+import shutil
+import tempfile
+import weakref
+from collections import namedtuple
 from pathlib import Path
 
 import pytest
 
 from stores.tutti_nvme.layout import Layout, decode_io_key
 from stores.tutti_nvme.store import TuttiKVStore, _derive_device_fields
-from tutti_nvme_factory import FakeRuntime
 
 SEG = 4096
 
 
 def io_key(chunk: bytes, layer: int) -> bytes:
-    """构造 18B 标准 io_key：chunk_key 16B + layer 2B 小端（02 §3.1b）。"""
+    """构造 18B 标准 io_key：chunk_key 16B + layer 2B 小端。"""
     assert len(chunk) == 16
     return chunk + layer.to_bytes(2, "little")
+
+
+FakeSubmitResult = namedtuple(
+    "FakeSubmitResult",
+    ["status_ok", "status_msg", "io_handle", "initial_states", "rejected"],
+)
+
+
+def _reject_none(round_idx: int, count: int) -> set[int]:
+    return set()
+
+
+class FakeRuntime:
+    """tutti_runtime 的文件系统级 fake（数据真搬运，提交即完成）。"""
+
+    def __init__(self, reject_plan=None):
+        self._next_ticket = 0
+        self._targets: dict[int, str] = {}
+        self._memories: dict[int, tuple[int, int]] = {}
+        self._io_done: set[int] = set()
+        self._released: set[int] = set()
+        self.register_calls: list[tuple] = []
+        self.submit_rounds = 0
+        self.shutdown_called = False
+        self._reject_plan = reject_plan or _reject_none
+
+    def caps(self):
+        return {
+            "target": ["stub"],
+            "memory": ["host"],
+            "length_alignment_bytes": 1,
+            "max_single_io_bytes": None,
+            "max_batch_requests": None,
+            "max_in_flight_operations": None,
+        }
+
+    def open_batch(self, uris):
+        tickets = []
+        for uri in uris:
+            if not uri.startswith("file://"):
+                raise ValueError(f"FakeRuntime 仅支持 file:// uri：{uri!r}")
+            self._next_ticket += 1
+            self._targets[self._next_ticket] = uri[len("file://"):]
+            tickets.append(self._next_ticket)
+        return tickets
+
+    def register_memory(self, addr, size, kind, accel_id=-1, io_granularity=0):
+        self.register_calls.append((addr, size, kind, accel_id, io_granularity))
+        self._next_ticket += 1
+        self._memories[self._next_ticket] = (addr, size)
+        return self._next_ticket
+
+    def submit(self, requests, accel_id=-1, stream=None, execution="device"):
+        rejected = set(self._reject_plan(self.submit_rounds, len(requests)))
+        self.submit_rounds += 1
+        for idx, req in enumerate(requests):
+            if idx not in rejected:
+                self._execute(req)
+        self._next_ticket += 1
+        handle = self._next_ticket
+        self._io_done.add(handle)
+        return FakeSubmitResult(
+            status_ok=True,
+            status_msg="",
+            io_handle=handle,
+            initial_states=[idx not in rejected for idx in range(len(requests))],
+            rejected=sorted(rejected),
+        )
+
+    def release_io(self, io_handle):
+        self._released.add(io_handle)
+
+    def wait(self, io_handle, timeout_ms=0):
+        if io_handle in self._io_done:
+            return ("OK", "COMPLETED")
+        return ("OK", "")
+
+    def shutdown(self, timeout_ms):
+        self.shutdown_called = True
+
+    # ---------- 内部 ----------
+
+    def _execute(self, req):
+        target, target_offset, memory, memory_offset, length, direction = req
+        path = self._targets[target]
+        addr, _size = self._memories[memory]
+        fd = os.open(path, os.O_RDWR)
+        try:
+            if direction == "write":
+                os.pwrite(fd, ctypes.string_at(addr + memory_offset, length), target_offset)
+            elif direction == "read":
+                data = os.pread(fd, length, target_offset)
+                ctypes.memmove(addr + memory_offset, data, len(data))
+            else:
+                raise ValueError(f"未知 direction：{direction!r}")
+        finally:
+            os.close(fd)
+
+
+def register_factory(register) -> None:
+    """向契约套件注册 tutti_nvme 实现（fake runtime 支架）。"""
+
+    def make_store() -> TuttiKVStore:
+        root = tempfile.mkdtemp(prefix="tutti-nvme-contract-")
+        store = TuttiKVStore(
+            root=root, num_chunks=8, segment_bytes=4096, runtime=FakeRuntime()
+        )
+        weakref.finalize(store, shutil.rmtree, root, True)
+        return store
+
+    register(
+        "tutti_nvme",
+        make_store,
+        segment_bytes=4096,
+        granularity=4096,
+        capacity_chunks=8,
+    )
 
 
 def make_store(tmp_path, num_chunks=8, runtime=None) -> TuttiKVStore:
@@ -48,14 +174,14 @@ def test_partial_commit_retried(tmp_path):
     src_id = store.register_buffer(src, SEG)
     keys = [io_key(bytes([i]) * 16, i % 3) for i in range(4)]
     for i, key in enumerate(keys):
-        src[i * SEG : (i + 1) * SEG] = bytes([0x30 + i]) * SEG
+        src[i * SEG:(i + 1) * SEG] = bytes([0x30 + i]) * SEG
     store.put_batch([(k, src_id, i * SEG) for i, k in enumerate(keys)]).wait()
     assert runtime.submit_rounds == 2  # 一轮部分拒 + 一轮重发
     dst = bytearray(4 * SEG)
     dst_id = store.register_buffer(dst, SEG)
     store.get_batch([(k, dst_id, i * SEG) for i, k in enumerate(keys)]).wait()
     for i in range(4):
-        assert dst[i * SEG : (i + 1) * SEG] == bytes([0x30 + i]) * SEG
+        assert dst[i * SEG:(i + 1) * SEG] == bytes([0x30 + i]) * SEG
 
 
 def test_double_stall_raises(tmp_path):
@@ -90,7 +216,7 @@ def test_layer_segments_share_chunk_file(tmp_path):
     data = data_files[0].read_bytes()
     assert len(data) == 6 * SEG  # 最大层 5 → 实写扩展到 6 段
     for layer in layers:
-        segment = data[layer * SEG : (layer + 1) * SEG]
+        segment = data[layer * SEG:(layer + 1) * SEG]
         assert segment == bytes([0x40 + layer]) * SEG
         assert data_files[0].name == chunk.hex() + ".bin"
 

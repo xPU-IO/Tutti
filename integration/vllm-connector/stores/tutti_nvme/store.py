@@ -1,4 +1,4 @@
-"""TuttiKVStore——tutti IO runtime 之上的层盲 KV 存储（02 §3.1/§3.1b）。
+"""TuttiKVStore——tutti IO runtime 之上的层盲 KV 存储。
 
 store 对 io_key 是纯映射（私有解读见 layout.py），数据面全部经由
 runtime.submit 的 DMA 请求表达：put = memory→target（write），
@@ -120,7 +120,8 @@ class _TuttiCompletion:
 class TuttiKVStore:
     """tutti runtime 之上的 KVStore SPI 实现（层盲，io_key 纯映射）。"""
 
-    def __init__(self, root, num_chunks: int, segment_bytes: int, runtime=None):
+    def __init__(self, root, num_chunks: int, segment_bytes: int,
+                 runtime=None, io_stream=None):
         if num_chunks <= 0:
             raise ValueError(f"num_chunks 必须为正数，得到 {num_chunks}")
         if segment_bytes <= 0:
@@ -139,6 +140,7 @@ class TuttiKVStore:
         self._keepers: list = []  # 持有 ctypes 视图防 GC
         self._next_buffer_id = 0
         self._accel_id = -1
+        self._io_stream = io_stream
         self._execution = "device"
 
     # ---------- 生命周期 ----------
@@ -175,7 +177,11 @@ class TuttiKVStore:
         self._own_runtime = self._runtime is None
 
     def _sync_execution_mode(self) -> None:
-        """由 runtime 能力推导 submit 的执行模式（device 优先，host-only 回退）。"""
+        """推导 submit 执行模式：无 io_stream → host 路径；有则按 runtime
+        能力（device 优先，host-only 回退）。"""
+        if self._io_stream is None:
+            self._execution = "host"
+            return
         try:
             caps = self._runtime.caps()
             memories = caps.get("memory", [])
@@ -326,7 +332,7 @@ class TuttiKVStore:
             result = self._runtime.submit(
                 pending,
                 accel_id=self._accel_id,
-                stream=None,
+                stream=self._io_stream,
                 execution=self._execution,
             )
             if not result.status_ok or result.io_handle is None:

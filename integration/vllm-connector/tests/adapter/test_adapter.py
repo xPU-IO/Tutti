@@ -1,0 +1,348 @@
+"""适配层契约测试：真 vLLM 基类对接、双角色共享引擎、端到端读写往返。"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from adapter.connector import TuttiConnectorMetadata, TuttiConnectorV1
+from engine.core import KVEngine
+from index.chunk_index import derive_io_key
+from stores.memory import MemoryKVStore
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorBase_V1,
+    KVConnectorRole,
+)
+
+SEG = 4096
+NUM_LAYERS = 3
+CHUNK_TOKENS = 8
+MAX_WAVE = 4
+BLOCK_SIZE = 16
+
+
+def _segment(chunk_i: int, layer: int) -> bytes:
+    """每个 (chunk, layer) 的层段内容：首字节标记。"""
+    marker = (chunk_i * 29 + layer * 13) & 0xFF
+    return bytes([marker]) + bytes([marker ^ 0x5A]) * (SEG - 1)
+
+
+class PoolHooks:
+    """两端搬运钩子：paged 侧以 dict 模拟，数据经 staging 缓冲中转。"""
+
+    def __init__(self):
+        self.source: dict[tuple[bytes, int], bytes] = {}
+        self.sink: dict[tuple[bytes, int], bytes] = {}
+        self.view = None
+        self.gather_calls: list[tuple] = []
+        self.scatter_calls: list[tuple] = []
+
+    def bind_window(self, window) -> None:
+        """把 staging 视图接到环窗显存上。"""
+        self.view = memoryview(window.buffer.numpy()) if hasattr(window.buffer, "numpy") \
+            else memoryview(window.buffer)
+
+    def gather(self, keys, layer_idx, first_blocks, slots):
+        self.gather_calls.append((tuple(keys), layer_idx, tuple(slots)))
+        for k, s in zip(keys, slots):
+            self.view[s * SEG:(s + 1) * SEG] = self.source[(k, layer_idx)]
+
+    def scatter(self, keys, layer_idx, first_blocks, slots):
+        self.scatter_calls.append((tuple(keys), layer_idx, tuple(slots)))
+        for k, s in zip(keys, slots):
+            self.sink[(k, layer_idx)] = bytes(self.view[s * SEG:(s + 1) * SEG])
+
+
+@dataclass
+class _Harness:
+    store: MemoryKVStore
+    engine: KVEngine
+    hooks: PoolHooks
+    vllm_config: SimpleNamespace
+    scheduler: TuttiConnectorV1
+    worker: TuttiConnectorV1
+    layer_names: list[str] = field(default_factory=list)
+
+
+def _make_vllm_config(extra: dict | None = None, block_size: int = BLOCK_SIZE):
+    merged = {
+        "chunk_tokens": CHUNK_TOKENS,
+        "chunk_kv_bytes": SEG * NUM_LAYERS,
+        "max_chunks_per_wave": MAX_WAVE,
+        "store": {"type": "memory", "options": {"segment_bytes": SEG, "num_chunks": 16}},
+    }
+    merged.update(extra or {})
+    return SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(kv_connector_extra_config=merged),
+        cache_config=SimpleNamespace(block_size=block_size),
+    )
+
+
+def _make_harness(extra: dict | None = None) -> _Harness:
+    """手工构建 engine（注入搬运钩子），双角色挂载点共享同一实例。"""
+    hooks = PoolHooks()
+    store = MemoryKVStore(SEG, 16)
+    engine = KVEngine(
+        {
+            "chunk_tokens": CHUNK_TOKENS,
+            "chunk_kv_bytes": SEG * NUM_LAYERS,
+            "max_chunks_per_wave": MAX_WAVE,
+            "gather_fn": hooks.gather,
+            "scatter_fn": hooks.scatter,
+        },
+        store,
+    )
+    cfg = _make_vllm_config({**(extra or {}), "tutti_engine_instance": engine})
+    kvcc = object()
+    scheduler = TuttiConnectorV1(cfg, KVConnectorRole.SCHEDULER, kvcc)
+    worker = TuttiConnectorV1(cfg, KVConnectorRole.WORKER, kvcc)
+    layer_names = [f"model.layers.{i}.self_attn.attn" for i in range(NUM_LAYERS)]
+    kv_caches = {
+        name: torch.zeros(8, BLOCK_SIZE, 2, 8, dtype=torch.float16)
+        for name in layer_names
+    }
+    worker.register_kv_caches(kv_caches)
+    return _Harness(
+        store=store, engine=engine, hooks=hooks, vllm_config=cfg,
+        scheduler=scheduler, worker=worker, layer_names=layer_names,
+    )
+
+
+def _fake_request(req_id: str, tokens: list[int]):
+    return SimpleNamespace(
+        request_id=req_id, prompt_token_ids=list(tokens), output_token_ids=[]
+    )
+
+
+def _sched_output(new_reqs=(), cached=None):
+    return SimpleNamespace(
+        scheduled_new_reqs=list(new_reqs),
+        scheduled_cached_reqs=cached,
+    )
+
+
+class TestMounting:
+    def test_isinstance_of_real_vllm_base(self):
+        cfg = _make_vllm_config()
+        conn = TuttiConnectorV1(cfg, KVConnectorRole.SCHEDULER, object())
+        assert isinstance(conn, KVConnectorBase_V1)
+
+    def test_three_positional_args(self):
+        cfg = _make_vllm_config()
+        TuttiConnectorV1(cfg, KVConnectorRole.SCHEDULER, object())
+
+    def test_both_roles_share_engine(self):
+        h = _make_harness()
+        assert h.scheduler._engine is h.engine
+        assert h.worker._engine is h.engine
+        # 同 vllm_config 无注入时也共享（进程内注册表）
+        cfg = _make_vllm_config()
+        a = TuttiConnectorV1(cfg, KVConnectorRole.SCHEDULER, object())._engine
+        b = TuttiConnectorV1(cfg, KVConnectorRole.WORKER, object())._engine
+        assert a is b
+
+    def test_piecewise_overridden_true(self):
+        assert TuttiConnectorV1.requires_piecewise_for_cudagraph({}) is True
+
+    def test_prefer_cross_layer_blocks_true(self):
+        h = _make_harness()
+        assert h.worker.prefer_cross_layer_blocks is True
+
+    def test_missing_engine_key_rejected(self):
+        cfg = _make_vllm_config()
+        del cfg.kv_transfer_config.kv_connector_extra_config["chunk_kv_bytes"]
+        with pytest.raises(ValueError):
+            TuttiConnectorV1(cfg, KVConnectorRole.SCHEDULER, object())
+
+
+class TestSchedulerSide:
+    def test_matched_tokens_empty_store(self):
+        h = _make_harness()
+        req = _fake_request("r1", list(range(3 * CHUNK_TOKENS)))
+        assert h.scheduler.get_num_new_matched_tokens(req, 0) == (0, False)
+
+    def test_min_retrieve_threshold(self):
+        h = _make_harness(extra={"min_retrieve_tokens": 2 * CHUNK_TOKENS})
+        # 预置一个 chunk 驻留（写入并结算）
+        keys, _ = h.engine.hash_keys(list(range(3 * CHUNK_TOKENS)))
+        h.engine.plan_store(keys[:1])
+        h.engine.confirm_store(keys[:1])
+        req = _fake_request("r1", list(range(3 * CHUNK_TOKENS)))
+        # 命中 1 chunk（8 tokens）< 阈值 16 → 0
+        assert h.scheduler.get_num_new_matched_tokens(req, 0) == (0, False)
+        assert h.scheduler.get_num_new_matched_tokens(req, 0)[0] == 0  # 无副作用
+
+    def test_max_tokens_per_load_caps(self):
+        h = _make_harness(extra={"max_tokens_per_load": CHUNK_TOKENS})
+        keys, _ = h.engine.hash_keys(list(range(3 * CHUNK_TOKENS)))
+        h.engine.plan_store(keys)
+        h.engine.confirm_store(keys)
+        req = _fake_request("r1", list(range(3 * CHUNK_TOKENS)))
+        assert h.scheduler.get_num_new_matched_tokens(req, 0) == (CHUNK_TOKENS, False)
+
+    def test_build_meta_records_save_plan(self):
+        h = _make_harness()
+        req = _fake_request("r1", list(range(2 * CHUNK_TOKENS + 3)))
+        h.scheduler.get_num_new_matched_tokens(req, 0)
+        h.scheduler.update_state_after_alloc(req, object(), 0)
+        so = _sched_output(new_reqs=[SimpleNamespace(
+            req_id="r1", prompt_token_ids=req.prompt_token_ids, block_ids=[0, 1]
+        )])
+        meta = h.scheduler.build_connector_meta(so)
+        assert isinstance(meta, TuttiConnectorMetadata)
+        assert len(meta.requests) == 1
+        entry = meta.requests[0]
+        # 尾部 3 token 舍弃：恰好 2 chunk
+        assert entry.save_chunk_start == 0
+        assert entry.save_chunk_count == 2
+        assert entry.load_tokens == 0
+
+    def test_partial_chunk_not_saved(self):
+        h = _make_harness()
+        req = _fake_request("r1", list(range(CHUNK_TOKENS - 1)))  # 不足一个 chunk
+        h.scheduler.update_state_after_alloc(req, object(), 0)
+        so = _sched_output(new_reqs=[SimpleNamespace(
+            req_id="r1", prompt_token_ids=req.prompt_token_ids, block_ids=[0]
+        )])
+        meta = h.scheduler.build_connector_meta(so)
+        assert meta.requests[0].save_chunk_count == 0
+
+    def test_request_finished_cleans_up(self):
+        h = _make_harness()
+        req = _fake_request("r1", list(range(CHUNK_TOKENS)))
+        h.scheduler.update_state_after_alloc(req, object(), CHUNK_TOKENS)
+        assert h.scheduler.request_finished(req, [0]) == (False, None)
+        so = _sched_output(new_reqs=[SimpleNamespace(
+            req_id="r1", prompt_token_ids=req.prompt_token_ids, block_ids=[0]
+        )])
+        meta = h.scheduler.build_connector_meta(so)
+        assert meta.requests[0].load_tokens == 0
+
+
+class TestEndToEnd:
+    def test_store_then_load_roundtrip(self):
+        h = _make_harness()
+        # ---- 步 1：保存请求（16 tokens = 2 chunk）----
+        prompt = list(range(2 * CHUNK_TOKENS))
+        req = _fake_request("r1", prompt)
+        h.scheduler.update_state_after_alloc(req, object(), 0)
+        so = _sched_output(new_reqs=[SimpleNamespace(
+            req_id="r1", prompt_token_ids=prompt, block_ids=[0, 1]
+        )])
+        meta = h.scheduler.build_connector_meta(so)
+        assert meta.requests[0].save_chunk_count == 2
+
+        h.worker.bind_connector_metadata(meta)
+        h.worker.start_load_kv(None)  # 触发惰性绑定（本步无读取）
+        h.hooks.bind_window(h.worker._impl.window)
+        chunk_keys, _ = h.engine.hash_keys(prompt)
+        for layer in range(NUM_LAYERS):
+            for i in range(2):
+                h.hooks.source[(chunk_keys[i], layer)] = _segment(i, layer)
+        for name in h.layer_names:
+            h.worker.save_kv_layer(name)
+        h.worker.wait_for_save()
+        # store 内 2 chunk × 全部层的 io_key
+        assert set(h.store.scan()) == {
+            derive_io_key(chunk_keys[i], layer)
+            for i in range(2) for layer in range(NUM_LAYERS)
+        }
+
+        # ---- 步 2：新请求同前缀，命中并加载 ----
+        req2 = _fake_request("r2", prompt)
+        matched, async_load = h.scheduler.get_num_new_matched_tokens(req2, 0)
+        assert (matched, async_load) == (2 * CHUNK_TOKENS, False)
+        h.scheduler.update_state_after_alloc(req2, object(), matched)
+        so2 = _sched_output(new_reqs=[SimpleNamespace(
+            req_id="r2", prompt_token_ids=prompt, block_ids=[4, 5]
+        )])
+        meta2 = h.scheduler.build_connector_meta(so2)
+        assert meta2.requests[0].load_tokens == 2 * CHUNK_TOKENS
+        assert meta2.requests[0].save_chunk_count == 0  # 已驻留不重写
+
+        h.worker.bind_connector_metadata(meta2)
+        h.worker.start_load_kv(None)
+        for name in h.layer_names:
+            h.worker.wait_for_layer_load(name)
+        for i in range(2):
+            for layer in range(NUM_LAYERS):
+                assert h.hooks.sink[(chunk_keys[i], layer)] == _segment(i, layer)
+        # 每层恰好一次 scatter 调用（一层 × N chunk 一个批）
+        assert len(h.hooks.scatter_calls) == NUM_LAYERS
+
+    def test_stale_view_reports_load_errors(self):
+        """近似视图命中而权威视图未遂：worker 上报重算块。"""
+        h = _make_harness()
+        prompt = list(range(CHUNK_TOKENS))
+        # 调度侧视图命中（数据在），worker 侧另挂一个空引擎（数据不在）
+        keys, _ = h.engine.hash_keys(prompt)
+        h.engine.plan_store(keys)
+        h.engine.confirm_store(keys)
+        matched, _ = h.scheduler.get_num_new_matched_tokens(
+            _fake_request("r1", prompt), 0
+        )
+        assert matched == CHUNK_TOKENS
+
+        stale_store = MemoryKVStore(SEG, 16)
+        stale_engine = KVEngine(
+            {
+                "chunk_tokens": CHUNK_TOKENS,
+                "chunk_kv_bytes": SEG * NUM_LAYERS,
+                "max_chunks_per_wave": MAX_WAVE,
+            },
+            stale_store,
+        )
+        cfg2 = _make_vllm_config({"tutti_engine_instance": stale_engine})
+        worker2 = TuttiConnectorV1(cfg2, KVConnectorRole.WORKER, object())
+        worker2.register_kv_caches({
+            name: torch.zeros(8, BLOCK_SIZE, 2, 8, dtype=torch.float16)
+            for name in h.layer_names
+        })
+
+        from adapter.connector import _ReqMeta
+        meta = TuttiConnectorMetadata(requests=[
+            _ReqMeta(
+                req_id="r1", token_ids=prompt, block_ids=[0],
+                load_tokens=CHUNK_TOKENS,
+            )
+        ])
+        worker2.bind_connector_metadata(meta)
+        worker2.start_load_kv(None)
+        errors = worker2.get_block_ids_with_load_errors()
+        assert errors == {0}
+        assert worker2.get_block_ids_with_load_errors() == set()  # 读取即清
+
+    def test_cross_layer_pool_binding(self):
+        """单块跨层显存对象的登记与绑定路径。"""
+        h = _make_harness()
+        pool = torch.zeros(NUM_LAYERS, 8, BLOCK_SIZE, 2, 8, dtype=torch.float16)
+        h.worker.register_cross_layers_kv_cache(pool, attn_backend=None)
+        h.worker._impl._ensure_bound()
+        assert h.worker._impl.window is not None
+        assert h.worker._impl.window.num_slots == 2 * MAX_WAVE
+
+    def test_max_in_flight_layers_caps(self):
+        h = _make_harness(extra={"max_in_flight_layers": 1})
+        prompt = list(range(CHUNK_TOKENS))
+        req = _fake_request("r1", prompt)
+        h.scheduler.update_state_after_alloc(req, object(), 0)
+        so = _sched_output(new_reqs=[SimpleNamespace(
+            req_id="r1", prompt_token_ids=prompt, block_ids=[0]
+        )])
+        meta = h.scheduler.build_connector_meta(so)
+        h.worker.bind_connector_metadata(meta)
+        h.worker.start_load_kv(None)
+        h.hooks.bind_window(h.worker._impl.window)
+        keys, _ = h.engine.hash_keys(prompt)
+        for layer in range(NUM_LAYERS):
+            h.hooks.source[(keys[0], layer)] = _segment(0, layer)
+        h.worker.save_kv_layer(h.layer_names[0])
+        h.worker.save_kv_layer(h.layer_names[1])  # 超限：最旧句柄被等待
+        h.worker.save_kv_layer(h.layer_names[2])
+        h.worker.wait_for_save()
+        assert set(h.store.scan()) == {
+            derive_io_key(keys[0], l) for l in range(NUM_LAYERS)
+        }

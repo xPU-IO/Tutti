@@ -49,14 +49,10 @@ register_store_factory(
     capacity_chunks=8,
 )
 
-# tutti_nvme 双实现注册（FakeRuntime 支架与本文件同目录）。
-import sys as _sys  # noqa: E402
-from pathlib import Path as _Path  # noqa: E402
+# tutti_nvme 双实现注册（FakeRuntime 支架与工厂定义见同目录 test_tutti_store.py）。
+from test_tutti_store import register_factory as _register_tutti_nvme_factory  # noqa: E402
 
-_sys.path.insert(0, str(_Path(__file__).resolve().parent))
-from tutti_nvme_factory import register_factory as _register_tutti_nvme  # noqa: E402
-
-_register_tutti_nvme(register_store_factory)
+_register_tutti_nvme_factory(register_store_factory)
 
 
 def _store_params():

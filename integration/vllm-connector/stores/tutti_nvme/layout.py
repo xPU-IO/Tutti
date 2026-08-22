@@ -1,4 +1,4 @@
-"""file_per_chunk 布局——TuttiKVStore 的私有实现（02 §3.1a/§3.1b）。
+"""file_per_chunk 布局——TuttiKVStore 的私有实现。
 
 目录结构（root 之下）::
 
@@ -7,15 +7,15 @@
 
 - io_key 私有解读（store 层盲，仅做纯字节映射）：前 16 字节为 chunk
   身份（文件分组键），其余字节按小端解释为层号——18B 标准 io_key 恰为
-  chunk_key 16B + layer 2B（02 §3.1b）；长度不足 16B 的 key 整体即
-  chunk 身份、层号为 0。
+  chunk_key 16B + layer 2B；长度不足 16B 的 key 整体即 chunk 身份、
+  层号为 0。
 - 层段 offset = 层号 × segment_bytes（数据文件内字节偏移，直接作为
   runtime 的 target_offset）。
 - 数据文件按需增长：扩展只做实写（1MiB 零块循环 + fsync），禁
   fallocate 与稀疏空洞——LocalFileResolver 依赖 FIEMAP 解析物理
   extent，稀疏区域无法承载 DMA。
 - 崩溃安全：层标记在数据真正落盘（runtime wait 至 COMPLETED）之后
-  创建；残缺 chunk 由 engine 侧按 io_key 完整性规则判缺（02 §3.1b）。
+  创建；残缺 chunk 由 engine 侧按 io_key 完整性规则判缺。
 - placement 表即目录本身：数据文件名承载 chunk 身份，标记文件名承载
   完整 io_key，scan() 列目录即可无损重组，无需独立 sidecar。
 """
@@ -25,7 +25,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-#: 02 §3.1b：chunk_key 固定 16 字节。
+#: chunk_key 的固定字节长度。
 CHUNK_PREFIX_BYTES = 16
 
 #: 实写预分配的零块粒度。
