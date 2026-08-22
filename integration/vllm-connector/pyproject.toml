@@ -14,7 +14,7 @@ dependencies = []
 
 [tool.setuptools.packages.find]
 # PEP 420 命名空间包：adapter/ 与 engine/ 无 __init__.py（纯目录即包）。
-include = ["adapter*", "engine*"]
+include = ["adapter*", "engine*", "index*", "stores*"]
 namespaces = true
 
 [tool.pytest.ini_options]

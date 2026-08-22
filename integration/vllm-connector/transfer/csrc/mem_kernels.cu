@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Minimal port of the single_layer_kv_transfer path from
-// third_pkgs/LMCache/csrc/cuda/mem_kernels.cu (task T-117, decision D-006).
+// third_pkgs/LMCache/csrc/cuda/mem_kernels.cu.
 // Kept: single_layer_kv_transfer_kernel + its host-side dispatch wrapper,
 // the EngineKVFormat guards (is_hnd / check_block_size / check_head_size)
 // and get_kernel_ptr. Dropped: multi_layer* / _unilateral / _fused_ptr /

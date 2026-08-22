@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """gather/scatter CUDA kernels for the Tutti vLLM connector.
 
-T-117 / D-006: minimal port of LMCache's ``single_layer_kv_transfer``
+Minimal port of LMCache's ``single_layer_kv_transfer``
 (third_pkgs/LMCache/csrc/cuda/mem_kernels.cu, Apache-2.0) as a standalone
 torch cpp_extension. Depends only on torch — no vllm, no tutti_runtime.
 

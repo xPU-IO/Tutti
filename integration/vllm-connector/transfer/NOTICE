@@ -17,9 +17,8 @@ third_pkgs/LMCache (Apache-2.0):
   csrc/mem_kernels.cu
     from third_pkgs/LMCache/csrc/cuda/mem_kernels.cu — minimal port of the
     single_layer_kv_transfer path (kernel template, host-side dispatch
-    wrapper, EngineKVFormat guards and get_kernel_ptr), as decided in
-    ai-orch decision D-006 / task T-117. The multi_layer / _unilateral /
-    _fused_ptr / cachegen / sgl paths were intentionally dropped.
+    wrapper, EngineKVFormat guards and get_kernel_ptr). The multi_layer /
+    _unilateral / _fused_ptr / cachegen / sgl paths were intentionally dropped.
 
 Original SPDX-License-Identifier: Apache-2.0 headers are retained in every
 ported file.

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Ported verbatim from third_pkgs/LMCache/csrc/kv_transfer_types.h
-// (single_layer_kv_transfer subset for tutti_kv_kernels, task T-117,
-// decision D-006). Original license: Apache-2.0; see NOTICE.
+// (single_layer_kv_transfer subset for tutti_kv_transfer).
+// Original license: Apache-2.0; see NOTICE.
 
 #pragma once
 

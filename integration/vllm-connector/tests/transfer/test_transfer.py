@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""T-117 tests: LMCache single_layer_kv_transfer port (tutti_kv_kernels).
+"""Tests: LMCache single_layer_kv_transfer port (tutti_kv_transfer).
 
 Run (GPU required for the kernel tests; they skip visibly without one):
     cd integration/vllm-connector && \
-    /data/home/ryeqiu/tutti-env/bin/python -m pytest tests/kernels -v
+    /data/home/ryeqiu/tutti-env/bin/python -m pytest tests/transfer -v
 """
 
 import sys
@@ -12,13 +12,13 @@ from pathlib import Path
 import pytest
 import torch
 
-from tutti_kv_kernels import (
+from tutti_kv_transfer import (
     EngineKVFormat,
     discover_engine_format,
     single_layer_transfer,
 )
 
-CSRC = Path(__file__).resolve().parents[2] / "kernels" / "csrc"
+CSRC = Path(__file__).resolve().parents[2] / "transfer" / "csrc"
 SENTINEL = 777.0
 
 requires_cuda = pytest.mark.skipif(
@@ -100,11 +100,11 @@ def check_roundtrip(paged, paged2, slot_mapping, slot_view, num_slots):
 # ----------------------------------------------------------------------
 
 def test_import_smoke():
-    """Acceptance: `from tutti_kv_kernels import single_layer_transfer`."""
-    from tutti_kv_kernels import single_layer_transfer as f
+    """Acceptance: `from tutti_kv_transfer import single_layer_transfer`."""
+    from tutti_kv_transfer import single_layer_transfer as f
 
     assert callable(f)
-    import tutti_kv_kernels._native as native
+    import tutti_kv_transfer._native as native
 
     assert hasattr(native, "single_layer_kv_transfer")
 
@@ -121,11 +121,11 @@ def test_apache_headers_and_notice():
 
 
 def test_no_vllm_import():
-    """kernels 自净：子进程隔离验证（同进程 adapter 测试会 import vllm）。"""
+    """transfer 包自净：子进程隔离验证（同进程 adapter 测试会 import vllm）。"""
     import subprocess
 
     code = (
-        "import sys; import tutti_kv_kernels; "
+        "import sys; import tutti_kv_transfer; "
         "bad = [m for m in ('vllm', 'tutti_runtime') if m in sys.modules]; "
         "assert not bad, f'leaked imports: {bad}'"
     )

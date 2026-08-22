@@ -4,7 +4,7 @@
 Minimal port of the LMCache detection idea
 (lmcache/v1/gpu_connector/utils.py:186 normalize_kv_and_discover_format ->
 kv_format/detection.py + kv_format/contiguity.py), covering the four
-commonly used layouts (task T-117, decision D-006):
+commonly used layouts:
 
 - FA NHD  (NL_X_TWO_NB_BS_NH_HS, 1): [2, nb, bs, nh, hs] contiguous
 - FI NHD  (NL_X_NB_TWO_BS_NH_HS, 2): [nb, 2, bs, nh, hs] contiguous
