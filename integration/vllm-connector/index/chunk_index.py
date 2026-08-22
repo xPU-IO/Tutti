@@ -38,6 +38,47 @@ def _chunk_digest(parent: bytes, chunk: Sequence[int]) -> bytes:
     return hashlib.blake2b(parent + payload, digest_size=_KEY_BYTES).digest()
 
 
+# io_key 中层编号的编码宽度（字节，小端）
+_IO_LAYER_BYTES = 2
+
+
+def derive_io_key(chunk_key: bytes, layer_idx: int) -> bytes:
+    """把层编号编入 chunk key，得到存储层使用的 io_key（18 字节）。
+
+    chunk_key 长度须为 16 字节、layer_idx 须落在 2 字节无符号整数
+    范围内，否则 ValueError。
+    """
+    if not isinstance(chunk_key, (bytes, bytearray)) or len(chunk_key) != _KEY_BYTES:
+        raise ValueError(f"chunk_key 须为 16 字节，got {chunk_key!r}")
+    if not isinstance(layer_idx, int) or isinstance(layer_idx, bool):
+        raise ValueError(f"layer_idx 须为整数，got {layer_idx!r}")
+    if not 0 <= layer_idx < (1 << (8 * _IO_LAYER_BYTES)):
+        raise ValueError(f"layer_idx 超出编码范围，got {layer_idx!r}")
+    return bytes(chunk_key) + layer_idx.to_bytes(_IO_LAYER_BYTES, "little")
+
+
+def chunk_key_of(io_key: bytes) -> bytes:
+    """从 io_key 取回 chunk key（前 16 字节）；长度非法 → ValueError。"""
+    _require_io_key(io_key)
+    return bytes(io_key[:_KEY_BYTES])
+
+
+def layer_of(io_key: bytes) -> int:
+    """从 io_key 取回层编号（末 2 字节小端整数）；长度非法 → ValueError。"""
+    _require_io_key(io_key)
+    return int.from_bytes(io_key[_KEY_BYTES:], "little")
+
+
+def _require_io_key(io_key) -> None:
+    """校验 io_key 形态：18 字节的字节串。"""
+    if not isinstance(io_key, (bytes, bytearray)):
+        raise ValueError(f"io_key 须为字节串，got {io_key!r}")
+    if len(io_key) != _KEY_BYTES + _IO_LAYER_BYTES:
+        raise ValueError(
+            f"io_key 须为 {_KEY_BYTES + _IO_LAYER_BYTES} 字节，got {len(io_key)}"
+        )
+
+
 class ChunkIndex:
     """语义索引：key → 驻留 / pin / pending。
 

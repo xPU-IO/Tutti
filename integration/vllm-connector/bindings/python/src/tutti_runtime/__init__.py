@@ -1,6 +1,6 @@
 """tutti_runtime — Python bindings for the Tutti StorageRuntime.
 
-Public surface (see task T-101 / decisions D-001, D-002, D-005):
+Public surface:
     make_stub_runtime(accel_id=-1) -> Runtime
     make_local_nvme_runtime(preset: dict) -> Runtime
     make_striped_nvme_runtime(preset: dict) -> Runtime

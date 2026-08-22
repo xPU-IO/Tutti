@@ -6,6 +6,7 @@
 
 from .base import KVStore
 from .memory import MemoryKVStore
+from .tutti_nvme.store import TuttiKVStore
 
 _STORE_TYPES: dict[str, type[KVStore]] = {}
 
@@ -32,3 +33,4 @@ def create_store(type_name: str, options: dict) -> KVStore:
 
 
 register_store_type("memory", MemoryKVStore)
+register_store_type("tutti_nvme", TuttiKVStore)

@@ -2,7 +2,7 @@
 //
 // pybind11 extension `tutti_runtime._core`: wraps the tutti StorageRuntime
 // public facade (tutti/storage_runtime.h) and the preset assembly factories
-// (tutti/presets/local_nvme.h) per task T-101 (decisions D-001/D-002/D-005).
+// (tutti/presets/local_nvme.h).
 //
 // Handles are passed to Python as opaque std::uint64_t tickets minted here;
 // the bit layout of TargetHandle/MemoryHandle/IoHandle is never exposed.
@@ -355,8 +355,11 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// Strict preset dict parsing: missing key / unknown key / wrong type all
-// raise ValueError naming the offending key (per task card).
+// Preset dict parsing: unknown key / wrong type raise ValueError naming the
+// offending key. Device-selection facts (ssnvme_path / pci_bdf / mount_path)
+// are required; hardware geometry and queue-budget knobs are optional and
+// fall back to the C++ struct defaults (single source of truth in
+// tutti/presets/local_nvme.h).
 // ---------------------------------------------------------------------------
 
 [[noreturn]] void value_error(const std::string& msg) {
@@ -381,6 +384,17 @@ std::int64_t get_int_field(const py::dict& d, const std::string& key) {
     return v.cast<std::int64_t>();
 }
 
+// Optional int: keep the C++ struct default when the key is absent.
+template <typename T>
+void opt_int_field(const py::dict& d, const std::string& key, T& target) {
+    if (!d.contains(key.c_str())) { return; }
+    const py::object v = d[key.c_str()];
+    if (py::isinstance<py::bool_>(v) || !py::isinstance<py::int_>(v)) {
+        value_error("preset key '" + key + "' must be an int");
+    }
+    target = static_cast<T>(v.cast<std::int64_t>());
+}
+
 std::string get_str_field(const py::dict& d, const std::string& key) {
     if (!d.contains(key.c_str())) {
         value_error("missing preset key: '" + key + "'");
@@ -390,6 +404,17 @@ std::string get_str_field(const py::dict& d, const std::string& key) {
         value_error("preset key '" + key + "' must be a str");
     }
     return v.cast<std::string>();
+}
+
+// Optional str: keep the C++ struct default when the key is absent.
+void opt_str_field(const py::dict& d, const std::string& key,
+                   std::string& target) {
+    if (!d.contains(key.c_str())) { return; }
+    const py::object v = d[key.c_str()];
+    if (!py::isinstance<py::str>(v)) {
+        value_error("preset key '" + key + "' must be a str");
+    }
+    target = v.cast<std::string>();
 }
 
 py::dict get_dict_field(const py::dict& d, const std::string& key) {
@@ -423,13 +448,11 @@ tutti::presets::NvmeDeviceConfig parse_device(const py::dict& d) {
     tutti::presets::NvmeDeviceConfig dev;
     dev.ssnvme_path = get_str_field(d, "ssnvme_path");
     dev.pci_bdf = get_str_field(d, "pci_bdf");
-    dev.backing_device = get_str_field(d, "backing_device");
+    opt_str_field(d, "backing_device", dev.backing_device);
     dev.mount_path = get_str_field(d, "mount_path");
-    dev.namespace_id =
-        static_cast<std::uint32_t>(get_int_field(d, "namespace_id"));
-    dev.block_size =
-        static_cast<std::uint32_t>(get_int_field(d, "block_size"));
-    dev.bar0_size = static_cast<std::uint64_t>(get_int_field(d, "bar0_size"));
+    opt_int_field(d, "namespace_id", dev.namespace_id);
+    opt_int_field(d, "block_size", dev.block_size);
+    opt_int_field(d, "bar0_size", dev.bar0_size);
     return dev;
 }
 
@@ -440,20 +463,15 @@ tutti::presets::LocalNvmePreset parse_local_preset(const py::dict& d) {
          "max_in_flight_operations", "threads_per_block",
          "handle_cache_capacity", "prp_cache_capacity"},
         "local nvme preset");
-    tutti::presets::LocalNvmePreset p;
+    tutti::presets::LocalNvmePreset p;  // C++ 默认：预算字段的单一来源
     p.device = parse_device(get_dict_field(d, "device"));
-    p.gpu_id = static_cast<std::int32_t>(get_int_field(d, "gpu_id"));
-    p.num_queues = static_cast<std::uint32_t>(get_int_field(d, "num_queues"));
-    p.max_batch_entries =
-        static_cast<std::uint32_t>(get_int_field(d, "max_batch_entries"));
-    p.max_in_flight_operations = static_cast<std::uint32_t>(
-        get_int_field(d, "max_in_flight_operations"));
-    p.threads_per_block =
-        static_cast<std::uint32_t>(get_int_field(d, "threads_per_block"));
-    p.handle_cache_capacity = static_cast<std::uint32_t>(
-        get_int_field(d, "handle_cache_capacity"));
-    p.prp_cache_capacity =
-        static_cast<std::uint32_t>(get_int_field(d, "prp_cache_capacity"));
+    opt_int_field(d, "gpu_id", p.gpu_id);
+    opt_int_field(d, "num_queues", p.num_queues);
+    opt_int_field(d, "max_batch_entries", p.max_batch_entries);
+    opt_int_field(d, "max_in_flight_operations", p.max_in_flight_operations);
+    opt_int_field(d, "threads_per_block", p.threads_per_block);
+    opt_int_field(d, "handle_cache_capacity", p.handle_cache_capacity);
+    opt_int_field(d, "prp_cache_capacity", p.prp_cache_capacity);
     return p;
 }
 
@@ -472,7 +490,7 @@ tutti::presets::StripedNvmePreset parse_striped_preset(const py::dict& d) {
         py::isinstance<py::str>(devices_obj)) {
         value_error("preset key 'devices' must be a list of device dicts");
     }
-    tutti::presets::StripedNvmePreset p;
+    tutti::presets::StripedNvmePreset p;  // C++ 默认：预算字段的单一来源
     py::sequence devices = py::reinterpret_borrow<py::sequence>(devices_obj);
     for (std::size_t i = 0; i < py::len(devices); ++i) {
         p.devices.push_back(
@@ -480,17 +498,13 @@ tutti::presets::StripedNvmePreset parse_striped_preset(const py::dict& d) {
                 devices.attr("__getitem__")(i),
                 "devices[" + std::to_string(i) + "]")));
     }
-    p.gpu_id = static_cast<std::int32_t>(get_int_field(d, "gpu_id"));
-    p.num_queues = static_cast<std::uint32_t>(get_int_field(d, "num_queues"));
-    p.stripe_unit = static_cast<std::uint64_t>(get_int_field(d, "stripe_unit"));
-    p.max_batch_entries =
-        static_cast<std::uint32_t>(get_int_field(d, "max_batch_entries"));
-    p.max_in_flight_operations = static_cast<std::uint32_t>(
-        get_int_field(d, "max_in_flight_operations"));
-    p.threads_per_block =
-        static_cast<std::uint32_t>(get_int_field(d, "threads_per_block"));
-    p.prp_cache_capacity =
-        static_cast<std::uint32_t>(get_int_field(d, "prp_cache_capacity"));
+    opt_int_field(d, "gpu_id", p.gpu_id);
+    opt_int_field(d, "num_queues", p.num_queues);
+    opt_int_field(d, "stripe_unit", p.stripe_unit);
+    opt_int_field(d, "max_batch_entries", p.max_batch_entries);
+    opt_int_field(d, "max_in_flight_operations", p.max_in_flight_operations);
+    opt_int_field(d, "threads_per_block", p.threads_per_block);
+    opt_int_field(d, "prp_cache_capacity", p.prp_cache_capacity);
     return p;
 }
 

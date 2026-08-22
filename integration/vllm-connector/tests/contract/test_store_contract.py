@@ -49,6 +49,15 @@ register_store_factory(
     capacity_chunks=8,
 )
 
+# tutti_nvme 双实现注册（FakeRuntime 支架与本文件同目录）。
+import sys as _sys  # noqa: E402
+from pathlib import Path as _Path  # noqa: E402
+
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from tutti_nvme_factory import register_factory as _register_tutti_nvme  # noqa: E402
+
+_register_tutti_nvme(register_store_factory)
+
 
 def _store_params():
     return [pytest.param(spec, id=name) for name, spec in sorted(STORE_FACTORIES.items())]

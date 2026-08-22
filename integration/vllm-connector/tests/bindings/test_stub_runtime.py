@@ -1,6 +1,6 @@
-"""Stub-mode contract tests for tutti_runtime (task T-101 acceptance).
+"""Stub-mode contract tests for tutti_runtime.
 
-All tests run hardware-free via make_stub_runtime (decisions D-002):
+All tests run hardware-free via make_stub_runtime:
 assembly -> open_batch -> register_memory(host) -> submit -> force-complete
 -> wait -> release_io -> shutdown.
 """
