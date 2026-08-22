@@ -346,3 +346,119 @@ class TestEndToEnd:
         assert set(h.store.scan()) == {
             derive_io_key(keys[0], l) for l in range(NUM_LAYERS)
         }
+
+
+# ----------------------------------------------------------------------
+# 搬运钩子接线（worker 侧 bind 期构造）
+# ----------------------------------------------------------------------
+
+requires_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA device not available"
+)
+
+# 接线用几何：chunk 对齐块边界（chunk_tokens=32，block_size=16 → 2 块/chunk）
+WIRE_CHUNK_TOKENS = 32
+WIRE_NH = 2
+WIRE_HS = 64
+WIRE_PTPL = 2 * 2 * WIRE_NH * WIRE_HS  # K/V × heads × dim × fp16 字节
+WIRE_SEGMENT = WIRE_CHUNK_TOKENS * WIRE_PTPL
+
+
+class _RecordingStore:
+    """接线验证用 store 替身：接受任意缓冲，只记录注册粒度。"""
+
+    def __init__(self):
+        self.granularities: list[int] = []
+
+    @property
+    def capacity_chunks(self) -> int:
+        return 16
+
+    def open(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+    def register_buffer(self, buffer, granularity: int) -> int:
+        self.granularities.append(granularity)
+        return len(self.granularities)
+
+    def put_batch(self, batch):
+        return _ImmediateDone()
+
+    def get_batch(self, batch):
+        return _ImmediateDone()
+
+    def drop(self, keys) -> None:
+        return None
+
+    def scan(self):
+        return iter([])
+
+
+class _ImmediateDone:
+    def wait(self) -> None:
+        return None
+
+    def query(self) -> bool:
+        return True
+
+
+class TestTransferWiring:
+    """加速侧池 → worker 构造搬运钩子并注入引擎；主存池 → 配置钩子保留。"""
+
+    def _wired_engine(self, cross: bool) -> tuple[KVEngine, _RecordingStore]:
+        store = _RecordingStore()
+        engine = KVEngine(
+            {
+                "chunk_tokens": WIRE_CHUNK_TOKENS,
+                "chunk_kv_bytes": WIRE_SEGMENT * NUM_LAYERS,
+                "max_chunks_per_wave": MAX_WAVE,
+            },
+            store,
+        )
+        cfg = _make_vllm_config({
+            "tutti_engine_instance": engine,
+            "chunk_tokens": WIRE_CHUNK_TOKENS,
+            "chunk_kv_bytes": WIRE_SEGMENT * NUM_LAYERS,
+        })
+        worker = TuttiConnectorV1(cfg, KVConnectorRole.WORKER, object())
+        if cross:
+            pool = torch.zeros(
+                NUM_LAYERS, 2, 8, BLOCK_SIZE, WIRE_NH, WIRE_HS,
+                dtype=torch.float16, device="cuda",
+            )
+            worker.register_cross_layers_kv_cache(pool, attn_backend=None)
+        else:
+            names = [f"model.layers.{i}.self_attn.attn" for i in range(NUM_LAYERS)]
+            worker.register_kv_caches({
+                name: torch.zeros(
+                    2, 8, BLOCK_SIZE, WIRE_NH, WIRE_HS,
+                    dtype=torch.float16, device="cuda",
+                )
+                for name in names
+            })
+        worker._impl._ensure_bound()
+        return engine, store
+
+    @requires_cuda
+    def test_per_layer_pool_wires_hooks(self):
+        engine, store = self._wired_engine(cross=False)
+        assert callable(engine._transfer._gather_fn)
+        assert callable(engine._transfer._scatter_fn)
+        assert store.granularities == [WIRE_SEGMENT]  # 环窗注册恰一次
+
+    @requires_cuda
+    def test_cross_layer_pool_wires_hooks(self):
+        engine, store = self._wired_engine(cross=True)
+        assert callable(engine._transfer._gather_fn)
+        assert callable(engine._transfer._scatter_fn)
+        assert store.granularities == [WIRE_SEGMENT]
+
+    def test_cpu_pools_keep_config_hooks(self):
+        """主存池不接线：引擎配置中的钩子原样生效（无 GPU 环境行为不变）。"""
+        h = _make_harness()
+        h.worker._impl._ensure_bound()
+        assert h.engine._transfer._gather_fn == h.hooks.gather
+        assert h.engine._transfer._scatter_fn == h.hooks.scatter

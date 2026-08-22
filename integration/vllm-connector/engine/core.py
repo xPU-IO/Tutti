@@ -140,11 +140,16 @@ class KVEngine:
         window: RingWindow,
         num_layers: int,
         blocks_per_chunk: int,
+        *,
+        gather_fn=None,
+        scatter_fn=None,
     ) -> None:
         """绑定执行态：层数定案、选定传输路径、staging 环窗接入 store。
 
         kv_caches 为布局侧的层缓存映射（staged 路径不使用）；window 为
         部署层注入的环形窗口；num_layers、blocks_per_chunk 为正整数。
+        gather_fn / scatter_fn 为可选搬运钩子，给出时优先于 config 中
+        的同名项（部署层在绑定期按池几何构造后注入）。
         重复 bind、chunk_kv_bytes 不能按层数整分、窗口几何不匹配、
         staging 环窗被 store 拒收 → RuntimeError / ValueError。
         """
@@ -157,6 +162,9 @@ class KVEngine:
             raise ValueError(f"blocks_per_chunk 须为正整数，got {blocks_per_chunk!r}")
         if not isinstance(window, RingWindow):
             raise ValueError(f"window 须为 RingWindow 实例，got {window!r}")
+        for name, fn in (("gather_fn", gather_fn), ("scatter_fn", scatter_fn)):
+            if fn is not None and not callable(fn):
+                raise ValueError(f"{name} 须为可调用或 None，got {fn!r}")
         if self._chunk_kv_bytes % num_layers != 0:
             raise ValueError(
                 f"chunk_kv_bytes({self._chunk_kv_bytes}) 不能被 "
@@ -175,7 +183,12 @@ class KVEngine:
         self._num_layers = num_layers
         self._segment_bytes = segment_bytes
         self._window = window
-        self._transfer = select_transfer(kv_caches, self._store, self._config)
+        config = dict(self._config)
+        if gather_fn is not None:
+            config["gather_fn"] = gather_fn
+        if scatter_fn is not None:
+            config["scatter_fn"] = scatter_fn
+        self._transfer = select_transfer(kv_caches, self._store, config)
         buffer_id = self._store.register_buffer(window.buffer, segment_bytes)
         if buffer_id is None:
             raise RuntimeError(
