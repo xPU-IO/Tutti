@@ -77,6 +77,17 @@ class Layout:
     def chunk_file(self, chunk_id: bytes) -> Path:
         return self._chunks_dir / (chunk_id.hex() + _DATA_SUFFIX)
 
+    def target_uri(self, chunk_id: bytes) -> str:
+        """Return the runtime target URI for a chunk."""
+        return "file://" + str(self.chunk_file(chunk_id).resolve())
+
+    def target_size(self, chunk_id: bytes) -> int:
+        """Return the logical size currently visible to a runtime target."""
+        try:
+            return self.chunk_file(chunk_id).stat().st_size
+        except OSError:
+            return 0
+
     def marker_file(self, io_key: bytes) -> Path:
         return self._meta_dir / (bytes(io_key).hex() + _MARKER_SUFFIX)
 

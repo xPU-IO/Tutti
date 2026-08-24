@@ -20,6 +20,7 @@ import time
 from pathlib import Path
 
 from .layout import Layout, decode_io_key
+from .striped_layout import StripedLayout
 
 #: KV IO 页基：register_buffer 粒度必须为其正倍数（对齐 NVMe/DMA 路径）。
 _IO_PAGE_BYTES = 4096
@@ -121,11 +122,15 @@ class TuttiKVStore:
     """tutti runtime 之上的 KVStore SPI 实现（层盲，io_key 纯映射）。"""
 
     def __init__(self, root, num_chunks: int, segment_bytes: int,
-                 runtime=None, io_stream=None, preset=None):
+                 runtime=None, io_stream=None, preset=None,
+                 layout="file_per_chunk", mounts=None, stripe_unit=None):
         """preset 为 dict 时优先于 TUTTI_NVME_PRESET 环境变量构造 runtime。
 
         preset 的字符串值恰为纯十进制整数时转为 int（配置占位符替换后
         的数字字符串由此归一，如 device_id / gpu_id）。
+
+        ``layout="striped"`` 选择条带逻辑 target；其 ``mounts`` 与
+        ``stripe_unit`` 仅作用于该布局，默认 file_per_chunk 不变。
         """
         if num_chunks <= 0:
             raise ValueError(f"num_chunks 必须为正数，得到 {num_chunks}")
@@ -136,8 +141,19 @@ class TuttiKVStore:
         self._segment_bytes = segment_bytes
         self._runtime = runtime
         self._own_runtime = runtime is None
-        self._layout = Layout(self._root, segment_bytes)
         self._preset = _normalize_preset(preset) if preset is not None else None
+        if layout in (None, "file_per_chunk", "file"):
+            self._layout = Layout(self._root, segment_bytes)
+        elif layout == "striped":
+            if mounts is None:
+                mounts = _preset_mounts(self._preset)
+            if stripe_unit is None:
+                raise ValueError("striped target 必须提供 stripe_unit")
+            self._layout = StripedLayout(
+                self._root, segment_bytes, mounts, stripe_unit
+            )
+        else:
+            raise ValueError(f"未知 tutti_nvme layout：{layout!r}")
         self._opened = False
         self._live: set[bytes] = set()
         self._buffers: dict[int, tuple[int, int]] = {}
@@ -270,10 +286,10 @@ class TuttiKVStore:
         requests = []
         for io_key, buffer_id, offset in entries:
             chunk_id, layer = decode_io_key(io_key)
-            uri = "file://" + str(self._layout.chunk_file(chunk_id).resolve())
+            uri = self._layout.target_uri(chunk_id)
             requests.append(
                 (
-                    self._target(uri),
+                    self._target(uri, self._layout.target_size(chunk_id)),
                     layer * self._segment_bytes,
                     self._mem_for(buffer_id),
                     offset,
@@ -293,10 +309,10 @@ class TuttiKVStore:
         requests = []
         for io_key, buffer_id, offset in entries:
             chunk_id, layer = decode_io_key(io_key)
-            uri = "file://" + str(self._layout.chunk_file(chunk_id).resolve())
+            uri = self._layout.target_uri(chunk_id)
             requests.append(
                 (
-                    self._target(uri),
+                    self._target(uri, self._layout.target_size(chunk_id)),
                     layer * self._segment_bytes,
                     self._mem_for(buffer_id),
                     offset,
@@ -310,11 +326,20 @@ class TuttiKVStore:
     def drop(self, keys) -> None:
         self._require_open()
         io_keys = []
+        chunk_ids = set()
         for key in keys:
-            decode_io_key(key)  # 类型/非空校验
+            chunk_id, _ = decode_io_key(key)  # 类型/非空校验
             io_keys.append(bytes(key))
+            chunk_ids.add(chunk_id)
         self._layout.drop(io_keys)
         self._live.difference_update(io_keys)
+        # Dropping the last layer unlinks the backing file(s).  Do not reuse
+        # a runtime target ticket that still owns the old unlinked inode when
+        # the same chunk is written again.
+        for chunk_id in chunk_ids:
+            uri = self._layout.target_uri(chunk_id)
+            self._targets.pop(uri, None)
+            self._target_sizes.pop(uri, None)
 
     def scan(self):
         self._require_open()
@@ -353,14 +378,19 @@ class TuttiKVStore:
             entries.append((bytes(io_key), buffer_id, offset))
         return entries
 
-    def _target(self, uri: str) -> int:
+    def _target(self, uri: str, target_size: int | None = None) -> int:
         ticket = self._targets.get(uri)
         if ticket is None:
             ticket = self._runtime.open_batch([uri])[0]
             self._targets[uri] = ticket
-            try:
-                self._target_sizes[uri] = os.stat(uri[len("file://"):]).st_size
-            except OSError:
+            if target_size is not None:
+                self._target_sizes[uri] = target_size
+            elif uri.startswith("file://"):
+                try:
+                    self._target_sizes[uri] = os.stat(uri[len("file://"):]).st_size
+                except OSError:
+                    self._target_sizes[uri] = -1
+            else:
                 self._target_sizes[uri] = -1
         return ticket
 
@@ -374,13 +404,10 @@ class TuttiKVStore:
         """
         for io_key, _, _ in entries:
             chunk_id, _ = decode_io_key(io_key)
-            uri = "file://" + str(self._layout.chunk_file(chunk_id).resolve())
+            uri = self._layout.target_uri(chunk_id)
             if uri not in self._targets:
                 continue
-            try:
-                size_now = self._layout.chunk_file(chunk_id).stat().st_size
-            except OSError:
-                continue
+            size_now = self._layout.target_size(chunk_id)
             if size_now != self._target_sizes.get(uri):
                 self._targets.pop(uri, None)
 
@@ -439,6 +466,21 @@ def _normalize_preset(preset) -> dict:
     if isinstance(preset, str) and preset.strip().isdigit():
         return int(preset)
     return preset
+
+
+def _preset_mounts(preset):
+    """Derive striped layout mounts from a striped preset when available."""
+    if not isinstance(preset, dict):
+        return None
+    devices = preset.get("devices")
+    if not isinstance(devices, (list, tuple)):
+        return None
+    mounts = []
+    for device in devices:
+        if not isinstance(device, dict) or not device.get("mount_path"):
+            return None
+        mounts.append(device["mount_path"])
+    return mounts or None
 
 
 def _build_runtime(preset: dict):
