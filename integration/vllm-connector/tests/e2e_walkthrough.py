@@ -333,6 +333,28 @@ def main():
     show_stripes(store, keys_a, NUM_LAYERS)
 
     # ================================================================
+    # 阶段 1.5：写入即时读回 —— get_batch 直读 store 独立校验写路径
+    # （不经过 pin/load/scatter 的加载链路，专验 gather→put_batch→分片）
+    # ================================================================
+    print()
+    print("=" * 70)
+    print("阶段 1.5：写入即时读回 —— 绕开 load 路径直读，单验写路径")
+    print("=" * 70)
+
+    probe = bytearray(SEGMENT_BYTES)
+    probe_id = store.register_buffer(probe, SEGMENT_BYTES)
+    bad = 0
+    for i, key in enumerate(keys_a):
+        for layer in range(NUM_LAYERS):
+            store.get_batch([(derive_io_key(key, layer), probe_id, 0)]).wait()
+            if bytes(probe) != hooks.src[(key, layer)]:
+                bad += 1
+    total = NUM_LAYERS * len(keys_a)
+    print(f"  直读校验：{total} 段，不一致 {bad} 段"
+          f"{'（PASS：写路径独立成立）' if bad == 0 else '（FAIL）'}")
+    assert bad == 0
+
+    # ================================================================
     # 阶段 2：语义索引 —— scheduler 命中查询
     # ================================================================
     print()
