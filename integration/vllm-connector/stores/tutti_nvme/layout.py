@@ -35,6 +35,7 @@ _ZERO_BLOCK = b"\x00" * _EXTEND_BLOCK_BYTES
 
 _DATA_SUFFIX = ".bin"
 _MARKER_SUFFIX = ".ok"
+_MANIFEST_NAME = "namespace.manifest"
 
 
 def decode_io_key(io_key: bytes) -> tuple[bytes, int]:
@@ -71,6 +72,24 @@ class Layout:
         if num_layers <= 0:
             raise ValueError(f"num_layers 必须为正数，得到 {num_layers}")
         self.layer_span = num_layers
+
+    # ---------- 池归属 ----------
+
+    def check_namespace(self, namespace: bytes) -> bool:
+        """校验池归属：manifest 与给定命名空间一致才可复用。
+
+        首次建池（无 manifest）写入当前命名空间并返回 True；已有
+        manifest 且一致 → True；不一致 → False（调用方按空池语义
+        处理，禁止静默复用）。命名空间为不透明字节串（本层不解读）。
+        """
+        path = self.root / _MANIFEST_NAME
+        try:
+            stored = path.read_bytes()
+        except FileNotFoundError:
+            self.root.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(namespace)
+            return True
+        return stored == namespace
 
     # ---------- 命名 ----------
 

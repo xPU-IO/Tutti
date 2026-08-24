@@ -80,6 +80,29 @@ def _expand_placeholders(value, vllm_config=None):
     return value
 
 
+def _key_namespace(vllm_config, extra: dict) -> str:
+    """组装 chunk key 命名空间（影响字节布局的维度，v2 格式头）。
+
+    字段取舍以"影响 KV 字节布局"为准：模型标识、KV dtype、TP world
+    size、chunk KV 字节数（含 head/dim 几何）、chunk_tokens。字段序
+    固定；worker_id 不入（per-rank 池已物理隔离）。旧池数据不兼容
+    （key 变更），部署升级时清池。
+    """
+    model = getattr(getattr(vllm_config, "model_config", None), "model", "")
+    cache_cfg = getattr(vllm_config, "cache_config", None)
+    dtype = getattr(cache_cfg, "cache_dtype", "") or ""
+    tp = getattr(getattr(vllm_config, "parallel_config", None),
+                 "tensor_parallel_size", 1)
+    return "|".join([
+        "v2",
+        f"model={model}",
+        f"dtype={dtype}",
+        f"tp={tp}",
+        f"chunk_kv_bytes={extra.get('chunk_kv_bytes')}",
+        f"chunk_tokens={extra.get('chunk_tokens')}",
+    ])
+
+
 def _engine_for(vllm_config, extra: dict) -> KVEngine:
     """取同进程共享的引擎实例；extra 可直传实例绕过构造。
 
@@ -102,7 +125,14 @@ def _engine_for(vllm_config, extra: dict) -> KVEngine:
             dict(store_spec.get("options") or {}), vllm_config
         )
         store = create_store(store_spec["type"], options)
-        engine = KVEngine({k: extra[k] for k in _ENGINE_KEYS}, store)
+        # 可选层数预告：查询侧（不做 bind）的驱逐展开与冷启动完整性
+        # 判定依赖层数；与缓存键无关（同配置实例共享同引擎）。
+        config = {k: extra[k] for k in _ENGINE_KEYS}
+        if extra.get("num_layers") is not None:
+            config["num_layers"] = extra["num_layers"]
+        # key 命名空间：同 vllm_config 派生恒定，无需入缓存键
+        config["key_namespace"] = _key_namespace(vllm_config, extra)
+        engine = KVEngine(config, store)
         entry[1][keys] = engine
     return engine
 
@@ -116,10 +146,19 @@ class _RequestTracker:
     block_ids: list[int]
     saved_tokens: int = 0
 
-    def update(self, new_token_ids: list[int], new_block_ids: list[int]) -> None:
-        """增量并入新调度的 token 与块。"""
+    def update(self, new_token_ids: list[int], new_block_ids: list[int],
+               *, replace_blocks: bool = False) -> None:
+        """增量并入新调度的 token 与块。
+
+        replace_blocks=False：new_block_ids 追加到块表尾部（常规
+        decode 增量）；True：整体替换块表（preemption→resume 契约，
+        fork output.py：resumed 请求的 new_block_ids 是替换语义）。
+        """
         self.token_ids.extend(new_token_ids)
-        self.block_ids.extend(_flatten_blocks(new_block_ids))
+        if replace_blocks:
+            self.block_ids = _flatten_blocks(new_block_ids)
+        else:
+            self.block_ids.extend(_flatten_blocks(new_block_ids))
 
     def advance_save(self, chunk_tokens: int) -> tuple[int, int]:
         """推进可保存边界，返回 (起始 chunk 序号, 本次可保存 chunk 数)。
@@ -146,6 +185,7 @@ class _ReqMeta:
     token_ids: list[int]
     block_ids: list[int]
     load_tokens: int = 0
+    load_start_token: int = 0   # 加载区间起点（vLLM 已计 token 数）
     save_chunk_start: int = 0
     save_chunk_count: int = 0
 
@@ -185,6 +225,8 @@ class TuttiConnectorV1(KVConnectorBase_V1):
         # 请求对象切片——scheduled_cached_reqs.new_token_ids 仅 PP 时
         # 非空，常规部署恒为空表）
         self._live_requests: dict[str, object] = {}
+        # 外部加载区间起点（update_state_after_alloc 时的已计 token 数）
+        self._load_starts: dict[str, int] = {}
         # worker 角色实现
         self._impl: WorkerImpl | None = None
         if role is KVConnectorRole.WORKER:
@@ -270,6 +312,10 @@ class TuttiConnectorV1(KVConnectorBase_V1):
         tokens += list(getattr(request, "output_token_ids", None) or [])
         hit = self._engine.lookup_prefix(tokens)
         new = max(0, hit - num_computed_tokens)
+        # 命中上限：为生成首 token 保留至少一个待计算 token
+        # （num_new_tokens ≥ 1，vLLM 调度推进前提；legacy 同语义）。
+        # 先 clamp 后对齐——上限内取最大 chunk 对齐值。
+        new = min(new, max(0, len(tokens) - 1 - num_computed_tokens))
         new = new // self._chunk_tokens * self._chunk_tokens
         if self._min_retrieve_tokens and new < self._min_retrieve_tokens:
             new = 0
@@ -287,10 +333,15 @@ class TuttiConnectorV1(KVConnectorBase_V1):
 
         同时保留活请求引用：请求对象的 token 序列随 decode 持续
         增长，cached 步的增量切片依赖该引用（见 build_connector_meta）。
+        外部加载区间起点 = 请求当前已计 token 数（vLLM 本地前缀
+        命中计入其中，connector 只补其后区间）。
         """
         self._live_requests[request.request_id] = request
         if num_external_tokens > 0:
             self._pending_loads[request.request_id] = num_external_tokens
+            self._load_starts[request.request_id] = int(
+                getattr(request, "num_computed_tokens", 0)
+            )
 
     def build_connector_meta(self, scheduler_output) -> TuttiConnectorMetadata:
         """把本步调度结果折叠为传输计划；调用即重置调度侧记账。"""
@@ -298,6 +349,7 @@ class TuttiConnectorV1(KVConnectorBase_V1):
             self._trackers.pop(req_id, None)
             self._live_requests.pop(req_id, None)
             self._pending_loads.pop(req_id, None)
+            self._load_starts.pop(req_id, None)
         scheduled: list[str] = []
         for new_req in scheduler_output.scheduled_new_reqs:
             block_ids = _flatten_blocks(new_req.block_ids)
@@ -308,6 +360,7 @@ class TuttiConnectorV1(KVConnectorBase_V1):
             )
             scheduled.append(new_req.req_id)
         cached = scheduler_output.scheduled_cached_reqs
+        resumed = getattr(cached, "resumed_req_ids", None) or set()
         if cached is not None:
             for i, req_id in enumerate(cached.req_ids):
                 tracker = self._trackers.get(req_id)
@@ -325,7 +378,10 @@ class TuttiConnectorV1(KVConnectorBase_V1):
                     if i < len(cached.new_block_ids)
                     else None
                 )
-                tracker.update(new_tokens, blocks_i or [])
+                tracker.update(
+                    new_tokens, blocks_i or [],
+                    replace_blocks=req_id in resumed,
+                )
                 scheduled.append(req_id)
 
         requests: list[_ReqMeta] = []
@@ -340,6 +396,7 @@ class TuttiConnectorV1(KVConnectorBase_V1):
                 token_ids=list(tracker.token_ids),
                 block_ids=list(tracker.block_ids),
                 load_tokens=self._pending_loads.pop(req_id, 0),
+                load_start_token=self._load_starts.pop(req_id, 0),
                 save_chunk_start=start,
                 save_chunk_count=count,
             )

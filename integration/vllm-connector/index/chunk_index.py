@@ -83,26 +83,34 @@ class ChunkIndex:
     """语义索引：key → 驻留 / pin / pending。
 
     契约：
-    - key 链：key_i = blake2b(parent_{i-1} + tokens_i)，parent_0 为空
-      bytes，parent_i = key_i；token 以 8 字节小端编码。同一 token
-      序列在任何进程得到相同 key。尾部不足一个 chunk 的 token 舍弃。
+    - key 链：key_i = blake2b(parent_{i-1} + tokens_i)，parent_0 为
+      namespace（缺省空 bytes），parent_i = key_i；token 以 8 字节
+      小端编码。同一 token 序列在同一 namespace 的任何进程得到
+      相同 key；namespace 由部署层按模型/dtype/TP/几何组装为不
+      透明串（本层只哈希、不解读），不同 namespace 的 key 天然
+      隔离。尾部不足一个 chunk 的 token 舍弃。
     - 状态三种：resident（驻留，参与命中与 LRU）、pending（写入已
       受理未结算：不参与命中、不参与驱逐、占用容量）、pin 计数
       （大于 0 即受驱逐保护）。
     - 驱逐只发生在 plan_store；pin 计数大于 0 的 key 永不驱逐。
     """
 
-    def __init__(self, capacity: int, chunk_tokens: int):
+    def __init__(self, capacity: int, chunk_tokens: int,
+                 namespace: bytes = b""):
         """capacity 为可容纳的 chunk 总数，chunk_tokens 为每 chunk 的 token 数。
 
-        参数非正 → ValueError。
+        namespace 为 key 链的不透明前缀（字节串；空 = 无命名空间，
+        兼容无部署上下文的进程内使用）。参数非法 → ValueError。
         """
         if capacity <= 0:
             raise ValueError(f"capacity must be positive, got {capacity!r}")
         if chunk_tokens <= 0:
             raise ValueError(f"chunk_tokens must be positive, got {chunk_tokens!r}")
+        if not isinstance(namespace, (bytes, bytearray)):
+            raise ValueError(f"namespace 须为字节串，got {namespace!r}")
         self._capacity = capacity
         self._chunk_tokens = chunk_tokens
+        self._namespace = bytes(namespace)
         # 驻留表：插入序即 LRU 序（最旧在前）。
         self._resident: OrderedDict[bytes, None] = OrderedDict()
         # 在途集合：plan_store 受理、confirm_store 尚未结算。
@@ -125,40 +133,49 @@ class ChunkIndex:
     def lookup_prefix(self, token_ids: Sequence[int]) -> int:
         """返回 token_ids 前缀中连续命中的 token 数（链式滚动）。
 
-        从空 parent 起逐 chunk 计算 key：驻留则推进并累计 token 数，
+        从 namespace 起逐 chunk 计算 key：驻留则推进并累计 token 数，
         首个未驻留的 chunk 即停止。在途（pending）chunk 不算命中。
+        命中即刷新 LRU（读热者存活，退化插入序）。
         """
         matched = 0
-        parent = b""
+        parent = self._namespace
         step = self._chunk_tokens
         for i in range(0, len(token_ids) - step + 1, step):
             parent = _chunk_digest(parent, token_ids[i:i + step])
             if parent not in self._resident:
                 break
             matched += step
+            self._resident.move_to_end(parent)
         return matched
 
     def hash_keys(
         self,
         token_ids: Sequence[int],
         start: int = 0,
-        parent: bytes = b"",
+        parent: bytes | None = None,
     ) -> tuple[list[bytes], bytes]:
         """把 token_ids 从下标 start 起折叠为 key 序列。
 
         start 之前的 token 视为已折叠进 parent（增量续算入口），
         start 为负 → ValueError。返回 (keys, last_parent)：尾部不足
         一个 chunk 的 token 舍弃；无完整 chunk 时 keys 为空、
-        last_parent 原样返回 parent。
+        last_parent 原样返回 parent（未给 parent 时自 namespace 起）。
         """
         if start < 0:
             raise ValueError(f"start must be non-negative, got {start!r}")
+        if parent is None:
+            parent = self._namespace
         keys: list[bytes] = []
         step = self._chunk_tokens
         for i in range(start, len(token_ids) - step + 1, step):
             parent = _chunk_digest(parent, token_ids[i:i + step])
             keys.append(parent)
         return keys, parent
+
+    @property
+    def namespace(self) -> bytes:
+        """key 链的不透明前缀（部署层组装，本层不解读）。"""
+        return self._namespace
 
     # ---- 写入计划（两阶段）----
 
@@ -257,3 +274,20 @@ class ChunkIndex:
             self._pending.discard(k)
             if k not in self._resident:
                 self._resident[k] = None
+
+    def forget(self, keys: Iterable[bytes]) -> list[bytes]:
+        """按完整性翻转移除一批近似驻留项。
+
+        适用于"曾判完整、现已消失"的组（对账方持有前后两次的完整
+        组差集）；读保护（pin）中的 key 跳过——在途读取由 miss 降级
+        兜底，强制移除会破坏 unpin 配对。非驻留 key 静默忽略。
+        返回因 pin 保护而未能移除的 key（调用方应留存至下次对账
+        重试，避免翻转事实随基准推进丢失）。
+        """
+        kept: list[bytes] = []
+        for k in keys:
+            if self._pins.get(k, 0) > 0:
+                kept.append(k)
+            else:
+                self._resident.pop(k, None)
+        return kept

@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 
 import torch
@@ -22,6 +23,24 @@ _SLOT_CACHE_LIMIT = 1024
 
 #: 层名序号提取（vLLM 层名约定 model.layers.{i}....）。
 _LAYER_NAME_RE = re.compile(r"layers\.(\d+)")
+
+#: 运行日志（准入失败等容量配置问题的非静默说明）。
+_LOG = logging.getLogger(__name__)
+
+
+def _load_chunk_span(start_token: int, token_count: int,
+                     chunk_tokens: int) -> tuple[int, int]:
+    """加载区间 [start, start+count) 覆盖的完整 chunk 区间。
+
+    返回 (首个 chunk 序号, chunk 数)：起点向上取整到 chunk 边界
+    （首个不完整 chunk 让渡给重算），终点向下取整。区间非法或
+    无完整 chunk → (0, 0)。
+    """
+    if start_token < 0 or token_count <= 0:
+        return 0, 0
+    first = (start_token + chunk_tokens - 1) // chunk_tokens
+    last = (start_token + token_count) // chunk_tokens
+    return first, max(0, last - first)
 
 
 class PagedTransferHooks:
@@ -272,7 +291,13 @@ class WorkerImpl:
     # ---- 读取编排 ----
 
     def start_load_kv(self, forward_context=None, **kwargs) -> None:
-        """组读取批并预取第 0 层。"""
+        """组读取批并预取第 0 层。
+
+        加载区间 = [load_start_token, load_start_token + load_tokens)：
+        vLLM 本地前缀命中的 token 已计入请求 computed，connector 只
+        补其后区间——起点非 chunk 边界时首个不完整 chunk 让渡
+        （重算兜底），key 与块表按同一 chunk 区间切片。
+        """
         self._ensure_bound()
         self._load_keys = []
         self._load_block_tables = []
@@ -283,24 +308,25 @@ class WorkerImpl:
         for meta in getattr(self._metadata, "requests", []) or []:
             if meta.load_tokens <= 0:
                 continue
-            count = meta.load_tokens // self._chunk_tokens
+            first_chunk, n_chunks = _load_chunk_span(
+                meta.load_start_token, meta.load_tokens, self._chunk_tokens
+            )
+            if n_chunks <= 0:
+                continue
             req_keys, _ = self._engine.hash_keys(meta.token_ids)
-            req_keys = req_keys[:count]
+            req_keys = req_keys[first_chunk : first_chunk + n_chunks]
             try:
                 self._engine.pin(req_keys)
             except KeyError:
                 # 近似视图未遂：该区间块上报重算
-                for i in range(count):
-                    pos = i * self._chunk_tokens
-                    span = min(self._chunk_tokens, len(meta.block_ids) * self._block_size - pos)
-                    if span <= 0:
-                        break
-                    self._load_error_blocks.update(
-                        meta.block_ids[pos // self._block_size: (pos + span) // self._block_size + 1]
-                    )
+                self._report_load_errors(meta, first_chunk, n_chunks)
                 continue
             keys.extend(req_keys)
-            block_tables.extend(self._chunk_block_tables(meta, count))
+            block_tables.extend(
+                self._chunk_block_tables(meta, first_chunk + n_chunks)[first_chunk:]
+            )
+        if keys:
+            self._load_keys = keys
         if keys:
             self._load_keys = keys
             self._load_block_tables = block_tables
@@ -323,7 +349,16 @@ class WorkerImpl:
     # ---- 写入编排 ----
 
     def save_kv_layer(self, layer_name: str, kv_layer=None, attn_metadata=None, **kwargs) -> None:
-        """发起指定层的写入批（本步首个写入层时组批）。"""
+        """发起指定层的写入批（本步首个写入层时组批）。
+
+        组批时执行写入准入（plan_store）：为腾容量驱逐的 chunk 由
+        engine 展开全层 io_key 实际删除（盘与权威索引）。数据面写
+        全批（不按受理子集切片）——查询侧的乐观受理会把 key 标记
+        为驻留（近似视图），物理判据只能以本进程权威写入为准，
+        重写同 key 数据幂等无害。准入未被受理（容量不足且无可
+        驱逐）时记录运行日志并跳过本批数据面——该路径正常部署
+        不可达，出现即容量配置问题。
+        """
         self._ensure_bound()
         idx = self._resolve_layer(layer_name)
         if self._save_keys is None:
@@ -337,6 +372,15 @@ class WorkerImpl:
                 end = start + meta.save_chunk_count
                 keys.extend(req_keys[start:end])
                 block_tables.extend(self._chunk_block_tables(meta, end)[start:end])
+            if keys and self._engine.plan_store(keys) is None:
+                _LOG.warning(
+                    "写入计划未被受理（容量 %d 不足以容纳本批 %d "
+                    "chunk 且无可驱逐驻留）——容量配置问题，跳过"
+                    "本批数据面写入",
+                    self._engine.capacity_chunks, len(keys),
+                )
+                keys = []
+                block_tables = []
             self._save_keys = keys
             self._save_block_tables = block_tables
             if not keys:
@@ -393,6 +437,15 @@ class WorkerImpl:
             list(blocks[i * per_chunk:(i + 1) * per_chunk])
             for i in range(count)
         ]
+
+    def _report_load_errors(self, meta, first_chunk: int, n_chunks: int) -> None:
+        """把读取未遂区间覆盖的块上报为重算。"""
+        per_chunk = -(-self._chunk_tokens // self._block_size)
+        blocks = meta.block_ids
+        start_blk = first_chunk * per_chunk
+        end_blk = min((first_chunk + n_chunks) * per_chunk, len(blocks))
+        if end_blk > start_blk:
+            self._load_error_blocks.update(blocks[start_blk:end_blk])
 
     def _resolve_layer(self, layer_name: str) -> int:
         """把层名解析为层序号。
