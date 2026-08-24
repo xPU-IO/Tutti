@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -49,6 +50,30 @@ def _extra_config(vllm_config) -> dict:
     return dict(extra) if extra else {}
 
 
+def _expand_placeholders(value, vllm_config=None):
+    """递归替换字符串值中的 {LOCAL_RANK} 占位符（多副本部署的按副本分叉）。
+
+    rank 源优先级：vllm_config.parallel_config.rank（vLLM 各进程构造
+    connector 时在手的权威副本号）→ LOCAL_RANK 环境变量 → 0。
+    vLLM V1 多进程 worker 不设 LOCAL_RANK，仅靠环境变量时 4 个副本
+    会全部展开为 0（真机实测），故配置对象优先。
+    """
+    rank = None
+    parallel = getattr(vllm_config, "parallel_config", None)
+    if parallel is not None:
+        rank = getattr(parallel, "rank", None)
+    if rank is None:
+        rank = os.environ.get("LOCAL_RANK", "0")
+    rank = str(rank)
+    if isinstance(value, str):
+        return value.replace("{LOCAL_RANK}", rank)
+    if isinstance(value, dict):
+        return {k: _expand_placeholders(v, vllm_config) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_expand_placeholders(v, vllm_config) for v in value]
+    return value
+
+
 def _engine_for(vllm_config, extra: dict) -> KVEngine:
     """取同进程共享的引擎实例；extra 可直传实例绕过构造。"""
     injected = extra.get("tutti_engine_instance")
@@ -61,7 +86,10 @@ def _engine_for(vllm_config, extra: dict) -> KVEngine:
     engine = _ENGINES.get(key)
     if engine is None:
         store_spec = extra.get("store") or {"type": "memory", "options": {}}
-        store = create_store(store_spec["type"], dict(store_spec.get("options") or {}))
+        options = _expand_placeholders(
+            dict(store_spec.get("options") or {}), vllm_config
+        )
+        store = create_store(store_spec["type"], options)
         engine = KVEngine({k: extra[k] for k in _ENGINE_KEYS}, store)
         _ENGINES[key] = engine
     return engine
@@ -141,6 +169,10 @@ class TuttiConnectorV1(KVConnectorBase_V1):
         # 调度侧请求记账
         self._trackers: dict[str, _RequestTracker] = {}
         self._pending_loads: dict[str, int] = {}
+        # 调度侧活请求引用（fork 语义：cached 步的 token 增量须从活
+        # 请求对象切片——scheduled_cached_reqs.new_token_ids 仅 PP 时
+        # 非空，常规部署恒为空表）
+        self._live_requests: dict[str, object] = {}
         # worker 角色实现
         self._impl: WorkerImpl | None = None
         if role is KVConnectorRole.WORKER:
@@ -217,7 +249,11 @@ class TuttiConnectorV1(KVConnectorBase_V1):
 
         返回值：超出 num_computed_tokens 的可加载 token 数（chunk 对齐、
         受最小检索量与单步加载上限约束），读取为步内同步完成。
+
+        查询前先对账盘上持久层（多副本部署下命中查询方与落盘方
+        可能分属不同进程，索引以盘上标记为准增量同步）。
         """
+        self._engine.sync_from_store()
         tokens = list(getattr(request, "prompt_token_ids", None) or [])
         tokens += list(getattr(request, "output_token_ids", None) or [])
         hit = self._engine.lookup_prefix(tokens)
@@ -230,12 +266,21 @@ class TuttiConnectorV1(KVConnectorBase_V1):
         return new, False
 
     def update_state_after_alloc(self, request, blocks, num_external_tokens: int) -> None:
-        """登记本步要加载的 token 数（块分配已完成）。"""
+        """登记本步要加载的 token 数（块分配已完成）。
+
+        同时保留活请求引用：请求对象的 token 序列随 decode 持续
+        增长，cached 步的增量切片依赖该引用（见 build_connector_meta）。
+        """
+        self._live_requests[request.request_id] = request
         if num_external_tokens > 0:
             self._pending_loads[request.request_id] = num_external_tokens
 
     def build_connector_meta(self, scheduler_output) -> TuttiConnectorMetadata:
         """把本步调度结果折叠为传输计划；调用即重置调度侧记账。"""
+        for req_id in scheduler_output.finished_req_ids:
+            self._trackers.pop(req_id, None)
+            self._live_requests.pop(req_id, None)
+            self._pending_loads.pop(req_id, None)
         scheduled: list[str] = []
         for new_req in scheduler_output.scheduled_new_reqs:
             block_ids = _flatten_blocks(new_req.block_ids)
@@ -249,12 +294,21 @@ class TuttiConnectorV1(KVConnectorBase_V1):
         if cached is not None:
             for i, req_id in enumerate(cached.req_ids):
                 tracker = self._trackers.get(req_id)
-                if tracker is None:
+                live = self._live_requests.get(req_id)
+                if tracker is None or live is None:
                     continue
-                tracker.update(
-                    list(cached.new_token_ids[i]),
-                    _flatten_blocks(cached.new_block_ids[i]),
+                # token 增量从活请求对象切片（new_token_ids 仅 PP 非空）
+                num_new = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+                have = len(tracker.token_ids)
+                new_tokens = list(
+                    live.all_token_ids[have : have + num_new]
                 )
+                blocks_i = (
+                    cached.new_block_ids[i]
+                    if i < len(cached.new_block_ids)
+                    else None
+                )
+                tracker.update(new_tokens, blocks_i or [])
                 scheduled.append(req_id)
 
         requests: list[_ReqMeta] = []

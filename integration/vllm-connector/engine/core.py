@@ -77,6 +77,10 @@ class KVEngine:
         # 冷启动分组：层数定案前暂存；层集合不完整的 chunk 视为缺失。
         self._scan_groups = _group_scan(store)
         self._restored = False
+        # 恢复层集的连续性：混合注意力模型（部分层无 KV 语义，如
+        # Hy3 偶数层）恢复层集不连续——前缀恢复会跳过无数据层的
+        # 状态建立，输出错误；非连续时命中查询安全降级为 0。
+        self._contiguous_restore = True
         # 执行态（bind 后可用）
         self._num_layers: int | None = None
         self._segment_bytes: int | None = None
@@ -88,8 +92,15 @@ class KVEngine:
     # ---- 计划态 ----
 
     def lookup_prefix(self, token_ids: Sequence[int]) -> int:
-        """查询前缀命中的 token 数（转发语义索引）。"""
+        """查询前缀命中的 token 数（转发语义索引）。
+
+        恢复层集非连续（混合注意力模型）时恒为 0：无数据层的推理
+        状态无法从前缀恢复，命中报告会导致输出错误（安全降级，
+        见 _contiguous_restore）。
+        """
         self._require_open()
+        if not self._contiguous_restore:
+            return 0
         return self._index.lookup_prefix(token_ids)
 
     def hash_keys(
@@ -202,9 +213,17 @@ class KVEngine:
 
         返回完成句柄；wait 返回即源侧搬运（scatter）已执行。批内
         chunk 数超过单波容量、层号越界、未 bind → ValueError /
-        RuntimeError。store 侧未知 key 的异常原样上抛。
+        RuntimeError。store 侧未知 key 的异常原样上抛——混合注意力
+        模型的无 KV 层（如 Hy3 偶数层）经存活探测跳过：store 提供
+        has 查询时整层缺数据的读取降级为即时完成（scatter 无事可做，
+        该层槽内容不被引用）。
         """
         keys = self._prepare_layer_call(keys, layer_idx)
+        has = getattr(self._store, "has", None)
+        if has is not None:
+            keys = [k for k in keys if has(derive_io_key(k, layer_idx))]
+            if not keys:
+                return _ImmediateHandle()
         wave, slots = self._window.acquire(len(keys))
         batch = [
             (derive_io_key(k, layer_idx), self._staging_buffer_id, self._window.slot_offset(s))
@@ -287,22 +306,63 @@ class KVEngine:
         self._inflight.append(handle)
         return handle
 
+    def sync_from_store(self) -> None:
+        """从盘上持久层枚举增量灌入索引（幂等，可重复调用）。
+
+        多副本部署下索引属主与命中查询方可能分属不同进程（worker
+        落盘、调度侧查询），查询方以盘上标记为准对账——仅扫持久层
+        元数据目录，不触碰数据面。完整性基准取扫描结果中的多数
+        层集（混合注意力模型仅部分层槽有数据，见 _deferred_restore）。
+        """
+        self._require_open()
+        groups = _group_scan(self._store)
+        if not groups:
+            return
+        counts: dict[frozenset, int] = {}
+        for layers in groups.values():
+            key = frozenset(layers)
+            counts[key] = counts.get(key, 0) + 1
+        expected = max(counts.items(), key=lambda kv: (kv[1], len(kv[0])))[0]
+        full_keys = [
+            chunk_key for chunk_key, layers in groups.items()
+            if frozenset(layers) == expected
+        ]
+        self._index.restore(full_keys)
+        self._scan_groups = groups
+        self._restored = True
+        # 层集连续性：排序后恰为区间 [min, max] 全体才连续（混合
+        # 注意力模型的恢复层集有洞，如 Hy3 的 {1,3,…,79}）。
+        ordered = sorted(expected)
+        self._contiguous_restore = ordered == list(
+            range(ordered[0], ordered[-1] + 1)
+        )
+
     def _deferred_restore(self) -> None:
-        """层数定案后执行冷启动灌入：层完整的 chunk 才驻留。"""
+        """层数定案后执行冷启动灌入：层完整的 chunk 才驻留。
+
+        完整性基准取扫描结果中的多数层集——混合注意力模型（如
+        Hy3：奇数层全注意力落盘、偶数层线性注意力无 KV）仅部分
+        层槽有数据，按 range(num_layers) 全量判定会整体判缺；
+        多数层集对均匀模型等价于全量，对混合模型取真实层集，
+        孤立的异构/残缺 chunk 被排除。
+        """
         if self._restored:
             return
-        self._restored = True
-        expected = set(range(self._num_layers))
-        full_keys = [
-            chunk_key for chunk_key, layers in self._scan_groups.items()
-            if layers == expected
-        ]
-        if full_keys:
-            self._index.restore(full_keys)
+        self.sync_from_store()
 
     def _require_open(self) -> None:
         if self._closed:
             raise RuntimeError("engine 已 close")
+
+
+class _ImmediateHandle:
+    """即时完成句柄：wait 立即返回，query 恒为真（无数据层的读取）。"""
+
+    def wait(self) -> None:
+        return None
+
+    def query(self) -> bool:
+        return True
 
 
 def _group_scan(store) -> dict[bytes, set[int]]:

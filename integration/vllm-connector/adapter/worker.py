@@ -20,25 +20,37 @@ _SLOT_CACHE_LIMIT = 1024
 
 
 class PagedTransferHooks:
-    """staged 路径的两端搬运：paged 池 ↔ staging 槽（逐 token 块表映射）。
+    """staged 路径的两端搬运：paged 池 ↔ staging 槽。
+
+    支持两类池布局：
+    - 逐层 5-D/3-D 池（[2, nb, bs, nh, hs] 等常见形态）：经布局发现
+      例程定格式，走搬运函数（single_layer_transfer）。
+    - 跨层交织池 [nb, nl, bs, 2, kv]（CROSS_LAYER 模式，K/V 在 token
+      行内交织）：逐层切片 [nb, bs, 2, kv] 与槽段 [tokens, 2, kv]
+      字节同构，按块表索引直接拷贝（搬运函数的格式分支尚未覆盖
+      该布局，见 results/ 的 cpp-gap 记录）。
 
     契约：
     - 构造注入：layer_view 为层序号 → 该层 paged 张量的访问器；staging
       为一维 uint8 字节张量（槽数 × 段长，加速侧或页锁定主存均可）；
       segment_bytes / chunk_tokens / block_size 为几何；fmt 为池布局
-      格式整数（经格式发现例程对池张量推断）。chunk_tokens 须为
+      格式整数（交织布局下忽略，可传 None）。chunk_tokens 须为
       block_size 的正整数倍，否则 ValueError。
     - 钩子签名对齐引擎侧调用约定 (keys, layer_idx, block_tables, slots)：
       block_tables 为逐 chunk 的块号列表（每 chunk 恰 chunk_tokens //
       block_size 个，块号可任意分布）；slots 为 staging 槽号列表。
-      gather 在提交前执行（源侧 → 槽）；scatter 在完成句柄 wait 后
-      执行（槽 → 目的侧）。
+      gather 在写入批发起前执行（源侧 → 槽）；scatter 在完成句柄
+      wait 后执行（槽 → 目的侧）。
     - 层段按 token 主序打包（[tokens, 2, H]；单张量几何为 [tokens, H]）。
-    - gather 返回前同步当前流，保证紧随其后的批次读到的槽内容已就绪。
+    - gather 返回前同步全部设备（staging 落 0 号加速器，池可能异卡，
+      提交批次读槽前须确保跨卡拷贝全部落地）。
     """
 
+    _INTERLEAVED = "interleaved"
+    _KERNEL = "kernel"
+
     def __init__(self, layer_view, staging, segment_bytes: int,
-                 chunk_tokens: int, block_size: int, fmt: int):
+                 chunk_tokens: int, block_size: int, fmt):
         self._layer_view = layer_view
         self._staging = staging
         self._segment_bytes = segment_bytes
@@ -53,16 +65,37 @@ class PagedTransferHooks:
         reference = layer_view(0)
         self._dtype = reference.dtype
         self._device = reference.device
-        row_bytes = segment_bytes // chunk_tokens
-        element = reference.element_size()
-        if segment_bytes % chunk_tokens or row_bytes % element:
-            raise ValueError("层段字节数不能按 token 行整分")
-        if fmt == EngineKVFormat.MLA:
-            self._staging_shape = (chunk_tokens, row_bytes // element)
+        if reference.dim() == 4 and reference.shape[2] == 2:
+            # 跨层交织池的逐层切片 [nb, bs, 2, kv]
+            self._mode = self._INTERLEAVED
+            self._kv_channels = int(reference.shape[3])
+            self._staging_shape = (chunk_tokens, 2, self._kv_channels)
+            if reference.shape[1] != block_size:
+                raise ValueError(
+                    f"交织池块维 {reference.shape[1]} 与 block_size"
+                    f"({block_size}) 不符"
+                )
         else:
-            if row_bytes % (2 * element):
-                raise ValueError("token 行字节不能按 K/V 两份整分")
-            self._staging_shape = (chunk_tokens, 2, row_bytes // (2 * element))
+            self._mode = self._KERNEL
+            if (
+                reference.device.type == "cuda"
+                and staging.device.type == "cuda"
+                and reference.device != staging.device
+            ):
+                raise ValueError(
+                    "搬运函数路径要求 staging 与池同卡（跨卡池当前仅"
+                    "支持交织布局的索引拷贝路径；主存 staging 不受限）"
+                )
+            row_bytes = segment_bytes // chunk_tokens
+            element = reference.element_size()
+            if segment_bytes % chunk_tokens or row_bytes % element:
+                raise ValueError("层段字节数不能按 token 行整分")
+            if fmt == EngineKVFormat.MLA:
+                self._staging_shape = (chunk_tokens, row_bytes // element)
+            else:
+                if row_bytes % (2 * element):
+                    raise ValueError("token 行字节不能按 K/V 两份整分")
+                self._staging_shape = (chunk_tokens, 2, row_bytes // (2 * element))
         self._slot_cache: dict[tuple[int, ...], torch.Tensor] = {}
 
     def gather(self, keys, layer_idx: int, block_tables, slots) -> None:
@@ -77,7 +110,7 @@ class PagedTransferHooks:
 
     def _transfer(self, block_tables, slots, layer_idx: int,
                   direction: str, sync: bool) -> None:
-        """逐 chunk 组 staging 视图与槽号映射并调用搬运函数。"""
+        """逐 chunk 组 staging 视图与槽号映射并执行搬运。"""
         paged = self._layer_view(layer_idx)
         for blocks, slot in zip(block_tables, slots):
             staging_view = (
@@ -87,10 +120,28 @@ class PagedTransferHooks:
                 .view(*self._staging_shape)
             )
             slot_mapping = self._slot_mapping(blocks)
-            single_layer_transfer(staging_view, paged, slot_mapping,
-                                  self._fmt, direction)
+            if self._mode == self._INTERLEAVED:
+                self._transfer_interleaved(staging_view, paged, slot_mapping,
+                                           direction)
+            else:
+                single_layer_transfer(staging_view, paged, slot_mapping,
+                                      self._fmt, direction)
         if sync and self._device.type == "cuda":
-            torch.cuda.current_stream(self._device).synchronize()
+            # staging 与池可能异卡（staging 固定 0 号加速器）：全设备
+            # 同步，确保提交批次发起时跨卡拷贝已落地。
+            torch.cuda.synchronize()
+
+    def _transfer_interleaved(self, staging_view, paged, slot_mapping,
+                              direction: str) -> None:
+        """交织池搬运：块表索引直达（池段与槽段字节同构）。"""
+        block_ids = torch.div(slot_mapping, self._block_size, rounding_mode="floor")
+        offsets = slot_mapping % self._block_size
+        if direction == "to_staging":
+            staging_view.copy_(paged[block_ids, offsets])
+        else:
+            paged.index_put_(
+                (block_ids, offsets), staging_view.to(paged.device)
+            )
 
     def _slot_mapping(self, blocks) -> torch.Tensor:
         """块表 → 逐 token 平铺槽号（块号 × 块大小 + 块内偏移）。"""
@@ -171,15 +222,36 @@ class WorkerImpl:
         self._chunk_kv_bytes = chunk_kv_bytes
         self._max_chunks_per_wave = max_chunks_per_wave
         self._block_size = block_size
+        # 已有登记且尚未绑定 → 立即补绑（见 register_kv_caches 的时序说明）
+        if (self._kv_caches or self._cross_pool is not None) and not self._bound:
+            self._ensure_bound()
 
     def register_kv_caches(self, kv_caches: dict) -> None:
-        """登记逐层显存对象映射（层名顺序即层序）。"""
+        """登记逐层显存对象映射（层名顺序即层序）。
+
+        登记即绑定（幂等）：冷启动恢复（scan → restore）须在首个
+        请求调度查询之前完成——惰性绑定会把恢复推迟到首请求执行期，
+        调度器的命中查询先于执行，重启后的首请求会错过恢复窗口。
+        """
         self._kv_caches = dict(kv_caches)
         self._layer_names = list(kv_caches.keys())
+        if self._config_ready():
+            self._ensure_bound()
 
     def register_cross_layers_kv_cache(self, kv_cache, attn_backend) -> None:
         """登记单块跨层显存对象（第 0 维为层数）。"""
         self._cross_pool = kv_cache
+        if self._config_ready():
+            self._ensure_bound()
+
+    def _config_ready(self) -> bool:
+        """编排几何是否已注入（未注入时保持惰性，configure 后补绑）。"""
+        return (
+            self._chunk_tokens is not None
+            and self._chunk_kv_bytes is not None
+            and self._max_chunks_per_wave is not None
+            and self._block_size is not None
+        )
 
     def set_metadata(self, metadata) -> None:
         """接收本步传输计划。"""
@@ -330,41 +402,77 @@ class WorkerImpl:
     def _ensure_bound(self) -> None:
         """惰性绑定：分配 staging 环窗显存并接入引擎（恰一次）。
 
-        池为加速侧内存时，按池布局格式构造两端搬运钩子并经 bind 注入
-        （bind 参数优先于引擎配置中的同名钩子）；池为主存或布局无法
-        识别时不注入，保持配置钩子或缺省 no-op 行为。
+        池为加速侧内存时构造两端搬运钩子并经 bind 注入（bind 参数
+        优先于引擎配置中的同名钩子；逐层常见布局走布局发现 + 搬运
+        函数，跨层交织布局走块表索引拷贝）；池为主存或布局无法识别
+        时不注入，保持配置钩子或缺省 no-op 行为。
         """
         if self._bound:
             return
         if self._cross_pool is not None:
-            num_layers = int(self._cross_pool.shape[0])
-            device = self._cross_pool.device
+            if self._cross_pool.dim() < 2:
+                raise ValueError(
+                    "跨层池至少 2 维（[块数, 层数, ...]），got shape="
+                    f"{tuple(self._cross_pool.shape)}"
+                )
+            # 跨层池布局为 [块数, 层数, 块大小, K/V, 通道]（CROSS_LAYER
+            # 模式实测；层数在第 1 维，块数在第 0 维）。
+            num_layers = int(self._cross_pool.shape[1])
         elif self._kv_caches:
             num_layers = len(self._kv_caches)
-            first = next(iter(self._kv_caches.values()))
-            device = getattr(first, "device", "cpu")
         else:
             raise RuntimeError("尚未登记任何显存对象，无法绑定")
         if num_layers <= 0:
             raise RuntimeError("登记的层数为空，无法绑定")
         if self._chunk_kv_bytes % num_layers != 0:
-            raise ValueError("chunk_kv_bytes 不能按层数整分")
+            raise ValueError(
+                f"chunk_kv_bytes({self._chunk_kv_bytes}) 不能按层数"
+                f"({num_layers}) 整分"
+            )
         segment_bytes = self._chunk_kv_bytes // num_layers
         slots = 2 * self._max_chunks_per_wave
-        staging = torch.empty(
-            slots * segment_bytes, dtype=torch.uint8, device=device
-        )
-        # 存储侧按缓冲协议登记：本机驻留内存用共享底层存储的数组视图，
-        # 加速侧内存保持原对象（由实现按地址登记）。
-        raw = staging.numpy() if staging.device.type == "cpu" else staging
+        # staging 落 0 号加速器：真机 runtime 组装当前仅支持进程视角
+        # 0 号卡（gpu_id 非 0 组装必败，DataPath 亦不接受主存 staging），
+        # 全副本统一 gpu_id=0 → staging 与 runtime 同卡；池在他卡的副本
+        # 由 gather/scatter 跨卡搬运（torch 自动处理）。池为主存时
+        # （测试替身）用页锁定主存。
+        if self._cross_pool is not None:
+            pool_device = self._cross_pool.device
+        elif self._kv_caches:
+            pool_device = getattr(
+                next(iter(self._kv_caches.values())), "device", torch.device("cpu")
+            )
+        else:
+            pool_device = torch.device("cpu")
+        if pool_device.type == "cuda":
+            # 64 KiB 对齐分配：真机注册 DEVICE 内存要求基址按 snvme
+            # GPU 页粒度（64 KiB）对齐，torch 分配器不保证——超量
+            # 分配后取对齐切片（共享存储，无拷贝）。
+            slack = 65536
+            block = torch.empty(
+                slots * segment_bytes + slack, dtype=torch.uint8,
+                device="cuda:0",
+            )
+            base = block.data_ptr()
+            skip = (slack - base % slack) % slack
+            staging = block[skip : skip + slots * segment_bytes]
+            raw = staging
+        else:
+            staging = torch.empty(
+                slots * segment_bytes, dtype=torch.uint8, pin_memory=True
+            )
+            raw = staging.numpy()
         window = RingWindow(raw, slots, segment_bytes)
         blocks_per_chunk = -(-self._chunk_tokens // self._block_size)
         gather_fn = scatter_fn = None
         layer_view = self._layer_view()
         if layer_view is not None and getattr(layer_view(0), "is_cuda", False):
             reference = layer_view(0)
-            fmt = discover_engine_format(
-                reference, use_mla=reference.dim() == 3
+            interleaved = reference.dim() == 4 and reference.shape[2] == 2
+            fmt = (
+                None if interleaved else discover_engine_format(
+                    reference, use_mla=reference.dim() == 3
+                )
             )
             hooks = PagedTransferHooks(
                 layer_view, staging, segment_bytes,
@@ -380,10 +488,14 @@ class WorkerImpl:
         self._bound = True
 
     def _layer_view(self):
-        """返回层序号 → paged 张量的访问器；未登记任何池时为 None。"""
+        """返回层序号 → paged 张量的访问器；未登记任何池时为 None。
+
+        跨层池布局为 [块数, 层数, ...]（CROSS_LAYER 模式），逐层切片
+        取第 1 维。
+        """
         if self._cross_pool is not None:
             pool = self._cross_pool
-            return lambda idx: pool[idx]
+            return lambda idx: pool[:, idx]
         if self._kv_caches:
             names = self._layer_names
             caches = self._kv_caches

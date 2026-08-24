@@ -121,7 +121,12 @@ class TuttiKVStore:
     """tutti runtime 之上的 KVStore SPI 实现（层盲，io_key 纯映射）。"""
 
     def __init__(self, root, num_chunks: int, segment_bytes: int,
-                 runtime=None, io_stream=None):
+                 runtime=None, io_stream=None, preset=None):
+        """preset 为 dict 时优先于 TUTTI_NVME_PRESET 环境变量构造 runtime。
+
+        preset 的字符串值恰为纯十进制整数时转为 int（配置占位符替换后
+        的数字字符串由此归一，如 device_id / gpu_id）。
+        """
         if num_chunks <= 0:
             raise ValueError(f"num_chunks 必须为正数，得到 {num_chunks}")
         if segment_bytes <= 0:
@@ -132,15 +137,21 @@ class TuttiKVStore:
         self._runtime = runtime
         self._own_runtime = runtime is None
         self._layout = Layout(self._root, segment_bytes)
+        self._preset = _normalize_preset(preset) if preset is not None else None
         self._opened = False
         self._live: set[bytes] = set()
         self._buffers: dict[int, tuple[int, int]] = {}
         self._mem_cache: dict[tuple[int, int], int] = {}
         self._targets: dict[str, int] = {}
+        self._target_sizes: dict[str, int] = {}
         self._keepers: list = []  # 持有 ctypes 视图防 GC
         self._next_buffer_id = 0
         self._accel_id = -1
-        self._io_stream = io_stream
+        # 'auto' 在 open() 惰性解析为专用 IO 流（见 _resolve_auto_stream）；
+        # 其余取值（int 句柄 / None）原样使用。
+        self._io_stream_raw = io_stream
+        self._io_stream = None if io_stream == "auto" else io_stream
+        self._io_stream_obj = None  # 专用流引用，防句柄悬空
         self._execution = "device"
 
     # ---------- 生命周期 ----------
@@ -153,11 +164,38 @@ class TuttiKVStore:
         if self._opened:
             raise RuntimeError("tutti store 已 open")
         if self._runtime is None:
-            self._runtime = _build_runtime_from_env()
+            if self._preset is not None:
+                self._runtime = _build_runtime(self._preset)
+            else:
+                self._runtime = _build_runtime_from_env()
         self._layout.ensure_dirs()
         self._live = self._layout.scan()
+        if self._io_stream_raw == "auto":
+            self._resolve_auto_stream()
         self._sync_execution_mode()
         self._opened = True
+
+    def _resolve_auto_stream(self) -> None:
+        """在 runtime 加速器上建专用 IO 流并取其句柄。
+
+        默认流句柄为 0，与绑定的空指针语义冲突（submit 会当作未给流
+        拒绝），故 'auto' 一律建专用流；落在 preset 的 gpu_id 设备上
+        （runtime 校验流须属于自身加速器）。open 仅发生在 worker 进程，
+        此处 CUDA 必已初始化。
+        """
+        import torch
+
+        if not torch.cuda.is_available():
+            raise RuntimeError("io_stream='auto' 需要 CUDA 可用")
+        accel = 0
+        if isinstance(self._preset, dict):
+            raw = self._preset.get("gpu_id", 0)
+            try:
+                accel = int(raw)
+            except (TypeError, ValueError):
+                accel = 0
+        self._io_stream_obj = torch.cuda.Stream(device=f"cuda:{accel}")
+        self._io_stream = int(self._io_stream_obj.cuda_stream)
 
     def close(self) -> None:
         if not self._opened:
@@ -167,6 +205,7 @@ class TuttiKVStore:
         self._buffers = {}
         self._mem_cache = {}
         self._targets = {}
+        self._target_sizes = {}
         self._keepers = []
         if self._own_runtime and self._runtime is not None:
             try:
@@ -227,6 +266,7 @@ class TuttiKVStore:
         entries = self._normalize(batch, require_live=False)
         io_keys = [io_key for io_key, _, _ in entries]
         self._layout.prepare_put(io_keys, self._num_chunks)  # 容量不足 → ValueError
+        self._invalidate_stale_targets(entries)
         requests = []
         for io_key, buffer_id, offset in entries:
             chunk_id, layer = decode_io_key(io_key)
@@ -249,6 +289,7 @@ class TuttiKVStore:
     def get_batch(self, batch) -> _TuttiCompletion:
         self._require_open()
         entries = self._normalize(batch, require_live=True)
+        self._invalidate_stale_targets(entries)
         requests = []
         for io_key, buffer_id, offset in entries:
             chunk_id, layer = decode_io_key(io_key)
@@ -279,6 +320,11 @@ class TuttiKVStore:
         self._require_open()
         return sorted(self._live)
 
+    def has(self, io_key) -> bool:
+        """存活查询（O(1)）：读取侧跳过无数据层（混合注意力模型的
+        线性注意力层从未落盘，属正常状态而非错误）。"""
+        return io_key in self._live
+
     # ---------- 内部 ----------
 
     def _normalize(self, batch, require_live: bool):
@@ -308,7 +354,31 @@ class TuttiKVStore:
         if ticket is None:
             ticket = self._runtime.open_batch([uri])[0]
             self._targets[uri] = ticket
+            try:
+                self._target_sizes[uri] = os.stat(uri[len("file://"):]).st_size
+            except OSError:
+                self._target_sizes[uri] = -1
         return ticket
+
+    def _invalidate_stale_targets(self, entries) -> None:
+        """按当前文件尺寸失效过期的 target 票据。
+
+        数据文件随写入逐层增长，runtime 票据在开票时解析文件尺寸——
+        文件增长后旧票据的 target 尺寸过期，写更高层段会被
+        OUT_OF_RANGE 拒绝。组批前按 stat 对账，尺寸变化即弃票重开
+        （旧票据由 runtime 在 shutdown 统一回收，无逐票释放接口）。
+        """
+        for io_key, _, _ in entries:
+            chunk_id, _ = decode_io_key(io_key)
+            uri = "file://" + str(self._layout.chunk_file(chunk_id).resolve())
+            if uri not in self._targets:
+                continue
+            try:
+                size_now = self._layout.chunk_file(chunk_id).stat().st_size
+            except OSError:
+                continue
+            if size_now != self._target_sizes.get(uri):
+                self._targets.pop(uri, None)
 
     def _mem_for(self, buffer_id: int) -> int:
         addr, size = self._buffers[buffer_id]
@@ -356,6 +426,45 @@ class TuttiKVStore:
 # ---------- 真机 runtime 构造（TUTTI_NVME_PRESET） ----------
 
 
+def _normalize_preset(preset) -> dict:
+    """递归归一 preset：字符串值恰为纯十进制整数时转 int。"""
+    if isinstance(preset, dict):
+        return {k: _normalize_preset(v) for k, v in preset.items()}
+    if isinstance(preset, list):
+        return [_normalize_preset(v) for v in preset]
+    if isinstance(preset, str) and preset.strip().isdigit():
+        return int(preset)
+    return preset
+
+
+def _build_runtime(preset: dict):
+    """按 preset dict 构造真机 runtime（daemon_config 推导与归一同环境变量路径）。"""
+    import yaml
+
+    if not isinstance(preset, dict):
+        raise RuntimeError("preset 必须是映射")
+    if "daemon_config" in preset:
+        preset = _derive_device_fields(preset, yaml)
+
+    try:
+        import tutti_runtime  # bindings 构建产物（需在 sys.path/PYTHONPATH）
+    except ImportError as exc:
+        raise RuntimeError(
+            "tutti_runtime 绑定不可用：先构建 integration/vllm-connector/"
+            "bindings/python 并将其加入 PYTHONPATH"
+        ) from exc
+
+    preset = dict(preset)
+    preset_type = preset.pop("type", "local")
+    preset.pop("daemon_config", None)  # 推导元键不进 runtime preset
+    preset.pop("device_id", None)
+    if preset_type == "striped":
+        return tutti_runtime.make_striped_nvme_runtime(preset)
+    if preset_type == "local":
+        return tutti_runtime.make_local_nvme_runtime(preset)
+    raise RuntimeError(f"未知 preset type：{preset_type}")
+
+
 def _build_runtime_from_env():
     """按 TUTTI_NVME_PRESET 构造真机 runtime（本包私有推导）。"""
     import yaml
@@ -369,26 +478,7 @@ def _build_runtime_from_env():
     preset = yaml.safe_load(text)
     if not isinstance(preset, dict):
         raise RuntimeError("TUTTI_NVME_PRESET 解析结果必须是映射")
-
-    if "daemon_config" in preset:
-        preset = _derive_device_fields(preset, yaml)
-
-    try:
-        import tutti_runtime  # bindings 构建产物（需在 sys.path/PYTHONPATH）
-    except ImportError as exc:
-        raise RuntimeError(
-            "tutti_runtime 绑定不可用：先构建 integration/vllm-connector/"
-            "bindings/python 并将其加入 PYTHONPATH"
-        ) from exc
-
-    preset_type = preset.pop("type", "local")
-    preset.pop("daemon_config", None)  # 推导元键不进 runtime preset
-    preset.pop("device_id", None)
-    if preset_type == "striped":
-        return tutti_runtime.make_striped_nvme_runtime(preset)
-    if preset_type == "local":
-        return tutti_runtime.make_local_nvme_runtime(preset)
-    raise RuntimeError(f"未知 preset type：{preset_type}")
+    return _build_runtime(_normalize_preset(preset))
 
 
 def _derive_device_fields(preset: dict, yaml) -> dict:

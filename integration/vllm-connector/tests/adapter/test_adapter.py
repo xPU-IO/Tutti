@@ -81,10 +81,49 @@ def _make_vllm_config(extra: dict | None = None, block_size: int = BLOCK_SIZE):
     )
 
 
+class _TensorAdaptingStore:
+    """MemoryKVStore 的张量适配层。
+
+    真机 store 走 data_ptr 协议直收张量；MemoryKVStore 走缓冲协议
+    只收 numpy 视图。本层在注册时把 CPU 张量转成共享存储的 numpy
+    视图，令测试替身与真机的注册接受面对齐。
+    """
+
+    def __init__(self, inner: MemoryKVStore):
+        self._inner = inner
+
+    @property
+    def capacity_chunks(self) -> int:
+        return self._inner.capacity_chunks
+
+    def open(self) -> None:
+        self._inner.open()
+
+    def close(self) -> None:
+        self._inner.close()
+
+    def register_buffer(self, buffer, granularity: int):
+        if torch.is_tensor(buffer) and not buffer.is_cuda:
+            buffer = buffer.numpy()
+        return self._inner.register_buffer(buffer, granularity)
+
+    def put_batch(self, batch):
+        return self._inner.put_batch(batch)
+
+    def get_batch(self, batch):
+        return self._inner.get_batch(batch)
+
+    def drop(self, keys) -> None:
+        self._inner.drop(keys)
+
+    def scan(self):
+        return self._inner.scan()
+
+
 def _make_harness(extra: dict | None = None) -> _Harness:
     """手工构建 engine（注入搬运钩子），双角色挂载点共享同一实例。"""
     hooks = PoolHooks()
-    store = MemoryKVStore(SEG, 16)
+    store = _TensorAdaptingStore(MemoryKVStore(SEG, 16))
     engine = KVEngine(
         {
             "chunk_tokens": CHUNK_TOKENS,
@@ -113,14 +152,19 @@ def _make_harness(extra: dict | None = None) -> _Harness:
 
 def _fake_request(req_id: str, tokens: list[int]):
     return SimpleNamespace(
-        request_id=req_id, prompt_token_ids=list(tokens), output_token_ids=[]
+        request_id=req_id,
+        prompt_token_ids=list(tokens),
+        output_token_ids=[],
+        all_token_ids=list(tokens),  # 活请求序列：decode 步持续追加
     )
 
 
-def _sched_output(new_reqs=(), cached=None):
+def _sched_output(new_reqs=(), cached=None, finished=(), scheduled_tokens=None):
     return SimpleNamespace(
         scheduled_new_reqs=list(new_reqs),
         scheduled_cached_reqs=cached,
+        finished_req_ids=set(finished),
+        num_scheduled_tokens=dict(scheduled_tokens or {}),
     )
 
 
@@ -222,6 +266,82 @@ class TestSchedulerSide:
         assert meta.requests[0].load_tokens == 0
 
 
+class TestCachedStepForkSemantics:
+    """fork 的 CachedRequestData 消费语义（PP 关闭时 new_token_ids 恒空）。
+
+    回归背景：真机 IndexError——cached 步的 token 增量须从活请求对象
+    切片（num_scheduled_tokens 对齐），块取 new_block_ids[i]（可 None）。
+    """
+
+    def test_decode_step_advances_tracker(self):
+        h = _make_harness()
+        prompt = list(range(3 * CHUNK_TOKENS))
+        req = _fake_request("r1", prompt)
+        h.scheduler.update_state_after_alloc(req, object(), 0)
+        so = _sched_output(new_reqs=[SimpleNamespace(
+            req_id="r1", prompt_token_ids=prompt, block_ids=[0, 1, 2]
+        )])
+        meta = h.scheduler.build_connector_meta(so)
+        assert meta.requests[0].save_chunk_count == 3
+
+        # ---- decode 步：fork 形态（new_token_ids 空、new_block_ids 嵌套）----
+        req.all_token_ids.extend(range(1000, 1000 + CHUNK_TOKENS))  # 活序列增长
+        cached = SimpleNamespace(
+            req_ids=["r1"],
+            new_token_ids=[],                       # PP 关闭：恒空
+            new_block_ids=[([3],)],                 # tuple-of-lists，可 None
+            all_token_ids={},
+        )
+        so2 = _sched_output(
+            cached=cached, scheduled_tokens={"r1": CHUNK_TOKENS},
+        )
+        meta2 = h.scheduler.build_connector_meta(so2)
+        assert len(meta2.requests) == 1
+        # 记账推进：token 序列含 decode 增量、块表含新块
+        assert meta2.requests[0].token_ids == prompt + list(
+            range(1000, 1000 + CHUNK_TOKENS)
+        )
+        assert meta2.requests[0].block_ids == [0, 1, 2, 3]
+        # 第 4 个 chunk 的保存计划在 decode 步成整后浮现
+        assert meta2.requests[0].save_chunk_start == 3
+        assert meta2.requests[0].save_chunk_count == 1
+
+    def test_none_blocks_and_unscheduled_cached_req_tolerated(self):
+        h = _make_harness()
+        prompt = list(range(CHUNK_TOKENS))
+        req = _fake_request("r1", prompt)
+        h.scheduler.update_state_after_alloc(req, object(), 0)
+        so = _sched_output(new_reqs=[SimpleNamespace(
+            req_id="r1", prompt_token_ids=prompt, block_ids=[0]
+        )])
+        h.scheduler.build_connector_meta(so)
+
+        cached = SimpleNamespace(
+            req_ids=["r1", "ghost"],   # ghost：无 tracker（防御）
+            new_token_ids=[],
+            new_block_ids=[None, None],
+            all_token_ids={},
+        )
+        meta = h.scheduler.build_connector_meta(_sched_output(
+            cached=cached, scheduled_tokens={"r1": 1},
+        ))
+        assert [m.req_id for m in meta.requests] == ["r1"]
+        assert meta.requests[0].block_ids == [0]
+
+    def test_finished_req_state_released(self):
+        h = _make_harness()
+        prompt = list(range(CHUNK_TOKENS))
+        req = _fake_request("r1", prompt)
+        h.scheduler.update_state_after_alloc(req, object(), 0)
+        h.scheduler.build_connector_meta(_sched_output(new_reqs=[
+            SimpleNamespace(req_id="r1", prompt_token_ids=prompt, block_ids=[0])
+        ]))
+        assert "r1" in h.scheduler._trackers
+        h.scheduler.build_connector_meta(_sched_output(finished=["r1"]))
+        assert "r1" not in h.scheduler._trackers
+        assert "r1" not in h.scheduler._live_requests
+
+
 class TestEndToEnd:
     def test_store_then_load_roundtrip(self):
         h = _make_harness()
@@ -286,7 +406,7 @@ class TestEndToEnd:
         )
         assert matched == CHUNK_TOKENS
 
-        stale_store = MemoryKVStore(SEG, 16)
+        stale_store = _TensorAdaptingStore(MemoryKVStore(SEG, 16))
         stale_engine = KVEngine(
             {
                 "chunk_tokens": CHUNK_TOKENS,
@@ -316,9 +436,9 @@ class TestEndToEnd:
         assert worker2.get_block_ids_with_load_errors() == set()  # 读取即清
 
     def test_cross_layer_pool_binding(self):
-        """单块跨层显存对象的登记与绑定路径。"""
+        """单块跨层显存对象的登记与绑定路径（[块数, 层数, 块, K/V, 通道]）。"""
         h = _make_harness()
-        pool = torch.zeros(NUM_LAYERS, 8, BLOCK_SIZE, 2, 8, dtype=torch.float16)
+        pool = torch.zeros(8, NUM_LAYERS, BLOCK_SIZE, 2, 8, dtype=torch.float16)
         h.worker.register_cross_layers_kv_cache(pool, attn_backend=None)
         h.worker._impl._ensure_bound()
         assert h.worker._impl.window is not None
@@ -425,8 +545,10 @@ class TestTransferWiring:
         })
         worker = TuttiConnectorV1(cfg, KVConnectorRole.WORKER, object())
         if cross:
+            # 跨层交织池：[块数, 层数, 块大小, K/V, 通道]（fork 的
+            # CROSS_LAYER 模式；逐层切片为 4-D [nb, bs, 2, kv]）
             pool = torch.zeros(
-                NUM_LAYERS, 2, 8, BLOCK_SIZE, WIRE_NH, WIRE_HS,
+                8, NUM_LAYERS, BLOCK_SIZE, 2, WIRE_NH * WIRE_HS,
                 dtype=torch.float16, device="cuda",
             )
             worker.register_cross_layers_kv_cache(pool, attn_backend=None)

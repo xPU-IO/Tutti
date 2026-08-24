@@ -135,3 +135,68 @@ def test_full_chain_mla():
     assert fmt == EngineKVFormat.MLA
     per_token = 576 * 2  # hs × bf16
     _run_full_chain(pool, use_mla=True, per_token_bytes=per_token)
+
+
+@requires_cuda
+def test_full_chain_cross_interleaved():
+    """跨层交织池 [nb, nl, bs, 2, kv] 全链路逐字节一致（CROSS_LAYER 模式）。
+
+    布局与 fork 的跨层池一致（块主序、K/V 在 token 行内交织、
+    heads×dim 合并为一维通道）；块号取非连续分布。
+    """
+    kv_channels = 2 * 64  # heads × dim（合并维）
+    pool = torch.zeros(
+        NUM_BLOCKS, NUM_LAYERS, BLOCK_SIZE, 2, kv_channels,
+        dtype=torch.float16, device="cuda",
+    )
+    _fill_deterministic(pool)
+
+    def layer_view(idx):
+        return pool[:, idx]
+
+    per_token = 2 * kv_channels * 2  # K/V × 通道 × fp16
+    segment_bytes = per_token * CHUNK_TOKENS
+    assert segment_bytes % 4096 == 0
+
+    keys = [bytes([0xB0 + i]) * 16 for i in range(NUM_CHUNKS)]
+    staging = torch.empty(2 * MAX_WAVE * segment_bytes, dtype=torch.uint8,
+                          pin_memory=True)
+    window = RingWindow(staging.numpy(), 2 * MAX_WAVE, segment_bytes)
+    store = MemoryKVStore(segment_bytes, num_chunks=16)
+    engine = KVEngine(
+        {
+            "chunk_tokens": CHUNK_TOKENS,
+            "chunk_kv_bytes": segment_bytes * NUM_LAYERS,
+            "max_chunks_per_wave": MAX_WAVE,
+        },
+        store,
+    )
+    hooks = PagedTransferHooks(
+        layer_view, staging, segment_bytes,
+        CHUNK_TOKENS, BLOCK_SIZE, None,  # 交织布局：fmt 忽略
+    )
+    engine.bind({}, window, NUM_LAYERS, BPC,
+                gather_fn=hooks.gather, scatter_fn=hooks.scatter)
+
+    original = pool.clone()
+    for layer in range(NUM_LAYERS):
+        engine.store_layer(keys, layer, BLOCK_TABLES).wait()
+    assert set(store.scan()) == {
+        derive_io_key(k, layer)
+        for k in keys for layer in range(NUM_LAYERS)
+    }
+
+    pool.fill_(SENTINEL)
+    for layer in range(NUM_LAYERS):
+        engine.load_layer(keys, layer, BLOCK_TABLES).wait()
+
+    # 受保护块逐字节还原（切片取 [块, 层] → 交换回原视角比对）
+    for block in range(NUM_BLOCKS):
+        got = pool[block].reshape(-1)
+        want = original[block].reshape(-1)
+        if block not in PROTECTED_BLOCKS:
+            want = torch.full_like(want, SENTINEL)
+        assert torch.equal(
+            got.view(torch.uint8).cpu(), want.view(torch.uint8).cpu()
+        ), f"block {block} 内容不符"
+    engine.close()
