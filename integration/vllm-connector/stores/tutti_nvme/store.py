@@ -238,6 +238,25 @@ class TuttiKVStore:
     # ---------- SPI ----------
 
     def register_buffer(self, buffer, granularity: int) -> int | None:
+        """注册批量 IO 的内存缓冲，返回 store 内部 buffer_id。
+
+        具体注册的是哪块内存：engine.bind 传入的 staging 环窗缓冲——
+        一段连续 device 显存（或 host 内存），按"槽"等分，布局为
+        slots × segment_bytes，槽 i 占据
+        [i×segment_bytes, (i+1)×segment_bytes)。本方法的 buffer 即
+        该段内存的起始视图；size 取自对象属性（numel×element_size）。
+
+        granularity：单条批量 IO 的字节粒度 = 层段宽（segment_bytes）。
+        DMA 以此为对齐与切分单位；必须是 _IO_PAGE_BYTES 的正倍数。
+
+        返回 buffer_id：store 局部编号，映射到底层 (addr, size)。
+        之后 put_batch/get_batch 的每条 IO 以
+        (io_key, buffer_id, offset) 寻址，offset 即槽内字节偏移。
+
+        语义：同一 (addr, size) 只向 runtime 注册一次（ticket 复用）；
+        注册期间持有 buffer 引用防止回收；注册失败 → None（调用方
+        视为该缓冲不可用于 DMA）。
+        """
         self._require_open()
         if granularity is None or granularity <= 0:
             return None
