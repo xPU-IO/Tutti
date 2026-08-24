@@ -106,11 +106,12 @@ class KVEngine:
             raise ValueError(
                 f"config['key_namespace'] 须为 str/bytes/None，got {raw_ns!r}"
             )
-        store.open()
-        # 命名空间注入持久层（可选实现）：manifest 校验池归属
+        # 命名空间注入持久层（可选实现）：manifest 校验池归属。
+        # 注入须在 open 之前（持久层契约），open 时按 manifest 校验归属。
         setter = getattr(store, "set_key_namespace", None)
         if setter is not None and namespace:
             setter(namespace)
+        store.open()
         self._index = ChunkIndex(store.capacity_chunks, self._chunk_tokens,
                                  namespace=namespace)
         # 冷启动分组：层数定案前暂存；层集合不完整的 chunk 视为缺失。

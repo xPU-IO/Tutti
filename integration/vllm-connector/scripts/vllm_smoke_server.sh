@@ -37,6 +37,7 @@ exec python -m vllm.entrypoints.openai.api_server \
         "chunk_tokens": 256,
         "chunk_kv_bytes": 20971520,
         "max_chunks_per_wave": 512,
+        "num_layers": 80,
         "store": {
           "type": "tutti_nvme",
           "options": {
