@@ -1,0 +1,45 @@
+# 验收复测用 runtime spec（cpp-large-request 验收）：生产形态
+# prp_cache_capacity=4096（修复前必败配置），nvme0，daemon 在环。
+accelerator:
+  profile: CUDA
+
+runtime:
+  accel_id: 0
+
+storage:
+  resources:
+    - id: verify-nvme
+      type: nvme
+      provider:
+        type: nvme-service
+        endpoint: "127.0.0.1:50051"
+      allocation:
+        selection: explicit
+        device_ids: [0]
+        queues_per_controller: 32
+
+  resolvers:
+    - id: verify-file-resolver
+      type: local-file
+      scheme: file
+      config: {}
+
+  datapaths:
+    - id: verify-local-nvme-datapath
+      type: local-nvme
+      config:
+        handle_cache_capacity: 4096
+        prp_cache_capacity: 4096
+        handle_cache_l2_capacity: 0
+        threads_per_block: 16
+        max_in_flight_operations: 4
+        max_batch_entries: 4096
+        io_granularity: 0
+
+  backends:
+    - id: verify-storage
+      contract: ext4-local-nvme
+      resolver: verify-file-resolver
+      datapath: verify-local-nvme-datapath
+      resource: verify-nvme
+      config: {}
