@@ -25,8 +25,9 @@ _ENGINE_KEYS = ("chunk_tokens", "chunk_kv_bytes", "max_chunks_per_wave")
 # 策略键（调度取舍，引擎不消费）
 _STRATEGY_KEYS = ("min_retrieve_tokens", "max_tokens_per_load")
 
-# 同进程同配置的引擎实例表：键 = (vllm_config 对象身份, 规范化配置)。
-_ENGINES: dict[tuple, KVEngine] = {}
+# 同进程同配置的引擎实例表：键 = vllm_config 对象身份（值持有配置
+# 强引用防 id 回收复用），二级键 = 规范化配置三元组。
+_ENGINE_CACHE: dict[int, tuple[Any, dict[tuple, KVEngine]]] = {}
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -75,15 +76,21 @@ def _expand_placeholders(value, vllm_config=None):
 
 
 def _engine_for(vllm_config, extra: dict) -> KVEngine:
-    """取同进程共享的引擎实例；extra 可直传实例绕过构造。"""
+    """取同进程共享的引擎实例；extra 可直传实例绕过构造。
+
+    实例表按配置对象身份索引并持有其强引用（配置存活期内 id 不
+    复用；配置回收后条目随之失活——查询以 is 校验双保险，避免
+    回收地址复用导致的假命中）。
+    """
     injected = extra.get("tutti_engine_instance")
     if injected is not None:
         return injected
-    key = (
-        id(vllm_config),
-        tuple(sorted((k, extra.get(k)) for k in _ENGINE_KEYS)),
-    )
-    engine = _ENGINES.get(key)
+    keys = tuple(sorted((k, extra.get(k)) for k in _ENGINE_KEYS))
+    entry = _ENGINE_CACHE.get(id(vllm_config))
+    if entry is None or entry[0] is not vllm_config:
+        entry = (vllm_config, {})
+        _ENGINE_CACHE[id(vllm_config)] = entry
+    engine = entry[1].get(keys)
     if engine is None:
         store_spec = extra.get("store") or {"type": "memory", "options": {}}
         options = _expand_placeholders(
@@ -91,7 +98,7 @@ def _engine_for(vllm_config, extra: dict) -> KVEngine:
         )
         store = create_store(store_spec["type"], options)
         engine = KVEngine({k: extra[k] for k in _ENGINE_KEYS}, store)
-        _ENGINES[key] = engine
+        entry[1][keys] = engine
     return engine
 
 
@@ -250,8 +257,8 @@ class TuttiConnectorV1(KVConnectorBase_V1):
         返回值：超出 num_computed_tokens 的可加载 token 数（chunk 对齐、
         受最小检索量与单步加载上限约束），读取为步内同步完成。
 
-        查询前先对账盘上持久层（多副本部署下命中查询方与落盘方
-        可能分属不同进程，索引以盘上标记为准增量同步）。
+        查询前先对账持久层（多副本部署下命中查询方与落盘方
+        可能分属不同进程，索引以持久层标记为准增量同步）。
         """
         self._engine.sync_from_store()
         tokens = list(getattr(request, "prompt_token_ids", None) or [])

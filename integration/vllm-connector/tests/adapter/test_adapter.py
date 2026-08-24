@@ -11,6 +11,7 @@ import torch
 from adapter.connector import TuttiConnectorMetadata, TuttiConnectorV1
 from engine.core import KVEngine
 from index.chunk_index import derive_io_key
+from stores.tutti_nvme.layout import decode_io_key
 from stores.memory import MemoryKVStore
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
@@ -120,30 +121,40 @@ class _TensorAdaptingStore:
         return self._inner.scan()
 
 
-def _make_harness(extra: dict | None = None) -> _Harness:
-    """手工构建 engine（注入搬运钩子），双角色挂载点共享同一实例。"""
+def _make_harness(extra: dict | None = None, num_layers: int | None = None,
+                  register_per_layer: bool = True) -> _Harness:
+    """手工构建 engine（注入搬运钩子），双角色挂载点共享同一实例。
+
+    num_layers 覆盖层数几何（engine 的 chunk_kv_bytes 与逐层登记数）；
+    register_per_layer=False 时不做逐层登记（cross 池模式由调用方
+    自行 register_cross_layers_kv_cache）。
+    """
+    nl = num_layers or NUM_LAYERS
+    extra = dict(extra or {})
+    extra.setdefault("chunk_kv_bytes", SEG * nl)
     hooks = PoolHooks()
     store = _TensorAdaptingStore(MemoryKVStore(SEG, 16))
     engine = KVEngine(
         {
             "chunk_tokens": CHUNK_TOKENS,
-            "chunk_kv_bytes": SEG * NUM_LAYERS,
+            "chunk_kv_bytes": SEG * nl,
             "max_chunks_per_wave": MAX_WAVE,
             "gather_fn": hooks.gather,
             "scatter_fn": hooks.scatter,
         },
         store,
     )
-    cfg = _make_vllm_config({**(extra or {}), "tutti_engine_instance": engine})
+    cfg = _make_vllm_config({**extra, "tutti_engine_instance": engine})
     kvcc = object()
     scheduler = TuttiConnectorV1(cfg, KVConnectorRole.SCHEDULER, kvcc)
     worker = TuttiConnectorV1(cfg, KVConnectorRole.WORKER, kvcc)
-    layer_names = [f"model.layers.{i}.self_attn.attn" for i in range(NUM_LAYERS)]
-    kv_caches = {
-        name: torch.zeros(8, BLOCK_SIZE, 2, 8, dtype=torch.float16)
-        for name in layer_names
-    }
-    worker.register_kv_caches(kv_caches)
+    layer_names = [f"model.layers.{i}.self_attn.attn" for i in range(nl)]
+    if register_per_layer:
+        kv_caches = {
+            name: torch.zeros(8, BLOCK_SIZE, 2, 8, dtype=torch.float16)
+            for name in layer_names
+        }
+        worker.register_kv_caches(kv_caches)
     return _Harness(
         store=store, engine=engine, hooks=hooks, vllm_config=cfg,
         scheduler=scheduler, worker=worker, layer_names=layer_names,
@@ -340,6 +351,94 @@ class TestCachedStepForkSemantics:
         h.scheduler.build_connector_meta(_sched_output(finished=["r1"]))
         assert "r1" not in h.scheduler._trackers
         assert "r1" not in h.scheduler._live_requests
+
+
+class TestLayerResolution:
+    """层名 → 层号解析（cross 池按名；禁止静默轮转）。
+
+    回归背景：cross 池模式曾按调用序轮转（wait/save 共享计数），
+    第 i 层 save 落 2i+1 (mod N)——盘上层号只余奇数、每槽双写覆盖。
+    """
+
+    NL = 80  # 仿真 Hy3 层数（几何独立于文件头常量）
+
+    def _cross_harness(self):
+        h = _make_harness(num_layers=self.NL, register_per_layer=False)
+        pool = torch.zeros(4, self.NL, BLOCK_SIZE, 2, 8, dtype=torch.float16)
+        h.worker.register_cross_layers_kv_cache(pool, attn_backend=None)
+        return h
+
+    def _run_prefill_step(self, h, prompt):
+        """走一遍 prefill 编排（绑定 + 元数据 + 逐层 wait/save 交织）。"""
+        req = _fake_request("r1", prompt)
+        h.scheduler.update_state_after_alloc(req, object(), 0)
+        meta = h.scheduler.build_connector_meta(_sched_output(new_reqs=[
+            SimpleNamespace(
+                req_id="r1", prompt_token_ids=prompt, block_ids=list(
+                    range(len(prompt) // BLOCK_SIZE)
+                )
+            )
+        ]))
+        h.worker.bind_connector_metadata(meta)
+        h.worker.start_load_kv(None)  # 触发绑定
+        h.hooks.bind_window(h.worker._impl.window)
+        names = [f"model.layers.{i}.self_attn.attn" for i in range(self.NL)]
+        keys, _ = h.engine.hash_keys(prompt)
+        for name in names:
+            # 真实钩子序：层前 wait、层后 save——同名两次解析
+            h.worker.wait_for_layer_load(name)
+            for i in range(len(keys)):
+                h.hooks.source[(keys[i], int(name.split(".")[2]))] = _segment(i, 0)
+            h.worker.save_kv_layer(name)
+        h.worker.wait_for_save()
+        return keys
+
+    def test_cross_pool_layer_indices_complete(self):
+        """80 层 wait/save 交织：io_key 层号全集恰 0..79 各一次。"""
+        h = self._cross_harness()
+        keys = self._run_prefill_step(h, list(range(2 * CHUNK_TOKENS)))
+        scanned = list(h.store.scan())
+        # 每 chunk 每层恰一条（同名覆盖会令条目数减少）
+        assert len(scanned) == 2 * self.NL
+        layer_numbers = sorted(decode_io_key(k)[1] for k in scanned)
+        assert layer_numbers == sorted(
+            [layer for _ in range(2) for layer in range(self.NL)]
+        )
+
+    def test_same_name_resolves_consistently(self):
+        """同名两次调用（wait 与 save）解析一致。"""
+        h = self._cross_harness()
+        h.worker.start_load_kv  # noqa: B018 - 不触发，仅示意
+        impl = h.worker._impl
+        impl._ensure_bound()
+        name = "model.layers.17.self_attn.attn"
+        assert impl._resolve_layer(name) == impl._resolve_layer(name) == 17
+
+    def test_unnumbered_name_learns_stable_mapping(self):
+        """无序号层名：首次出现序学习映射，同名恒定。"""
+        h = self._cross_harness()
+        impl = h.worker._impl
+        impl._ensure_bound()
+        assert impl._resolve_layer("attn_pool") == 0
+        assert impl._resolve_layer("attn_pool") == 0  # 稳定
+        assert impl._resolve_layer("other_block") == 1
+        assert impl._resolve_layer("model.layers.3.self_attn.attn") == 3  # 正则优先
+
+    def test_out_of_range_layer_name_raises(self):
+        """越界层号直接抛错（禁止静默轮转/截断）。"""
+        h = self._cross_harness()
+        impl = h.worker._impl
+        impl._ensure_bound()
+        with pytest.raises(ValueError, match="越界"):
+            impl._resolve_layer("model.layers.80.self_attn.attn")
+
+    def test_per_layer_unknown_name_raises(self):
+        """逐层登记模式：未收录层名抛错（原静默返回 0 已收紧）。"""
+        h = _make_harness()
+        impl = h.worker._impl
+        impl._ensure_bound()
+        with pytest.raises(ValueError, match="未在逐层登记"):
+            impl._resolve_layer("model.layers.99.self_attn.attn")
 
 
 class TestEndToEnd:

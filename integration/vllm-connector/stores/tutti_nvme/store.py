@@ -325,6 +325,10 @@ class TuttiKVStore:
         线性注意力层从未落盘，属正常状态而非错误）。"""
         return io_key in self._live
 
+    def set_layer_span(self, num_layers: int) -> None:
+        """声明层宽（bind 后由引擎注入）：数据文件按层宽全尺寸预分配。"""
+        self._layout.set_layer_span(num_layers)
+
     # ---------- 内部 ----------
 
     def _normalize(self, batch, require_live: bool):

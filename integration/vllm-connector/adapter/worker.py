@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import re
+
 import torch
 from tutti_kv_transfer import (
     EngineKVFormat,
@@ -17,6 +19,9 @@ from engine.staging import RingWindow
 
 #: 单步内块表缓存上限（超出即整体重建，防无界增长）。
 _SLOT_CACHE_LIMIT = 1024
+
+#: 层名序号提取（vLLM 层名约定 model.layers.{i}....）。
+_LAYER_NAME_RE = re.compile(r"layers\.(\d+)")
 
 
 class PagedTransferHooks:
@@ -203,7 +208,9 @@ class WorkerImpl:
         self._load_handles: dict[int, object] = {}
         self._pinned = False
         self._load_error_blocks: set[int] = set()
-        self._call_seq = 0
+        # 无序号层名的学习映射（层名 → 层号，首次出现序；同一步内
+        # wait/save 两次调用凭此解析一致）
+        self._name_to_idx: dict[str, int] = {}
         self._save_keys: list[bytes] | None = None
         self._save_block_tables: list[list[int]] = []
         self._save_inflight: list = []
@@ -265,7 +272,6 @@ class WorkerImpl:
         self._load_keys = []
         self._load_block_tables = []
         self._load_handles = {}
-        self._call_seq = 0
         self._pinned = False
         keys: list[bytes] = []
         block_tables: list[list[int]] = []
@@ -348,7 +354,6 @@ class WorkerImpl:
             self._engine.confirm_store(self._save_keys, ok=True)
         self._save_keys = None
         self._save_block_tables = []
-        self._call_seq = 0
 
     # ---- 状态与收尾 ----
 
@@ -387,17 +392,34 @@ class WorkerImpl:
     def _resolve_layer(self, layer_name: str) -> int:
         """把层名解析为层序号。
 
-        逐层登记模式用登记序；单块跨层模式（无层名登记）按本步内
-        的调用序号轮转。
+        两种登记模式统一按名解析：优先提取层名中的序号
+        （layers.{i} 约定）；无序号时查学习映射（首次出现序），
+        未见过则按已学习层数顺延登记。解析结果校验层号范围；
+        登记模式下列表未收录的层名、任何越界结果均抛错——
+        层号错位会静默写错层，宁可失败。
         """
         if self._kv_caches:
             try:
                 return self._layer_names.index(layer_name)
             except ValueError:
-                return 0
-        idx = self._call_seq
-        self._call_seq += 1
-        return idx % max(self._num_layers, 1)
+                raise ValueError(
+                    f"层名未在逐层登记中：{layer_name!r}"
+                    f"（已登记 {len(self._layer_names)} 层）"
+                )
+        match = _LAYER_NAME_RE.search(layer_name)
+        if match:
+            idx = int(match.group(1))
+        else:
+            idx = self._name_to_idx.get(layer_name)
+            if idx is None:
+                idx = len(self._name_to_idx)
+                self._name_to_idx[layer_name] = idx
+        if not 0 <= idx < self._num_layers:
+            raise ValueError(
+                f"层名 {layer_name!r} 解析层号 {idx} 越界"
+                f"（层数 {self._num_layers}）"
+            )
+        return idx
 
     def _ensure_bound(self) -> None:
         """惰性绑定：分配 staging 环窗显存并接入引擎（恰一次）。

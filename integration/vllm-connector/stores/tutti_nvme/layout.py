@@ -57,8 +57,20 @@ class Layout:
             raise ValueError(f"segment_bytes 必须为正数，得到 {segment_bytes}")
         self.root = Path(root)
         self.segment_bytes = segment_bytes
+        #: 已知层宽时数据文件首写即全尺寸（层宽未定则按需增长）。
+        self.layer_span: int | None = None
         self._chunks_dir = self.root / "chunks"
         self._meta_dir = self.root / "meta"
+
+    def set_layer_span(self, num_layers: int) -> None:
+        """声明层宽（bind 后由引擎注入）：数据文件按层宽全尺寸预分配。
+
+        文件逐层增长会使传输层票据随文件尺寸失效重开，层多时
+        票据池被耗尽；首写即全尺寸令每文件恰一张稳定票据。
+        """
+        if num_layers <= 0:
+            raise ValueError(f"num_layers 必须为正数，得到 {num_layers}")
+        self.layer_span = num_layers
 
     # ---------- 命名 ----------
 
@@ -122,6 +134,9 @@ class Layout:
         for chunk_id, layer_count in grouped.items():
             path = self.chunk_file(chunk_id)
             need = layer_count * self.segment_bytes
+            if self.layer_span is not None:
+                # 层宽已知：首写即全尺寸（票据稳定，见 set_layer_span）
+                need = max(need, self.layer_span * self.segment_bytes)
             current = path.stat().st_size if path.exists() else 0
             if current < need:
                 _append_real_zeros(path, current, need)
