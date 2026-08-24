@@ -107,9 +107,14 @@ class PagedTransferHooks:
         """源侧搬运：paged 池一层段 → staging 槽（写入批发起前调用）。"""
         self._transfer(block_tables, slots, layer_idx, "to_staging", sync=True)
 
-    def scatter(self, keys, layer_idx: int, block_tables, slots) -> None:
-        """目的侧搬运：staging 槽 → paged 池一层段（完成句柄 wait 后调用）。"""
+    def scatter(self, keys, layer_idx: int, block_tables, slots):
+        """目的侧搬运并返回消费完成事件（无需事件时返回 None）。"""
         self._transfer(block_tables, slots, layer_idx, "to_paged", sync=False)
+        if self._device.type != "cuda":
+            return None
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream(device=self._device))
+        return event
 
     # ---- 内部 ----
 

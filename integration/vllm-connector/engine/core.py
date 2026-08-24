@@ -19,30 +19,42 @@ _IO_KEY_BYTES = 18
 
 
 class _PostCompletion:
-    """底层完成句柄 wait 返回后执行收尾动作的完成句柄。
+    """底层完成句柄与消费侧事件组成的完成句柄。
 
-    契约：wait 先等底层完成再执行收尾动作（恰一次）；query 只反映
-    底层完成状态，收尾动作由 wait 触发。
+    契约：wait 先等底层完成，再执行收尾动作并等待其返回的事件（恰一
+    次）；query 在收尾尚未启动时反映底层状态，事件已产生后反映事件状态。
     """
 
-    __slots__ = ("_inner", "_after", "_done")
+    __slots__ = ("_inner", "_after", "_event", "_done")
 
     def __init__(self, inner, after):
         """inner 为底层完成句柄，after 为无参收尾可调用。"""
         self._inner = inner
         self._after = after
+        self._event = None
         self._done = False
 
     def wait(self) -> None:
         """阻塞至底层完成并执行收尾动作（恰一次）。"""
         self._inner.wait()
         if not self._done:
+            self._event = self._after()
+            if self._event is not None:
+                synchronize = getattr(self._event, "synchronize", None)
+                if callable(synchronize):
+                    synchronize()
+                else:
+                    self._event.wait()
             self._done = True
-            self._after()
 
     def query(self) -> bool:
         """非阻塞查询底层是否完成。"""
-        return self._inner.query()
+        if not self._inner.query():
+            return False
+        if self._event is None:
+            return True
+        query = getattr(self._event, "query", None)
+        return bool(query()) if callable(query) else self._done
 
 
 class KVEngine:
@@ -82,6 +94,7 @@ class KVEngine:
         self._segment_bytes: int | None = None
         self._window: RingWindow | None = None
         self._transfer: StagedTransfer | None = None
+        self._scatter_hook = None
         self._staging_buffer_id: int | None = None
         self._inflight: list = []
 
@@ -188,6 +201,7 @@ class KVEngine:
             config["gather_fn"] = gather_fn
         if scatter_fn is not None:
             config["scatter_fn"] = scatter_fn
+        self._scatter_hook = config.get("scatter_fn")
         self._transfer = select_transfer(kv_caches, self._store, config)
         # 层宽注入布局（可选实现）：数据文件首写即全尺寸，避免
         # 逐层增长令传输层票据失效重开、票据池耗尽。
@@ -284,9 +298,16 @@ class KVEngine:
         """登记波次完成事件与在途句柄；load 方向追加目的侧搬运。"""
         handle = completion
         if is_load:
+            def scatter_and_capture():
+                if self._scatter_hook is None:
+                    return None
+                return self._scatter_hook(
+                    list(keys), layer_idx, first_blocks, list(slots)
+                )
+
             handle = _PostCompletion(
                 completion,
-                lambda: self._transfer.scatter(keys, layer_idx, first_blocks, slots),
+                scatter_and_capture,
             )
         self._window.complete(wave, handle)
         self._inflight.append(handle)

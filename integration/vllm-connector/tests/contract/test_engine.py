@@ -57,7 +57,38 @@ class MovingHooks:
         """load 方向：把 staging 槽内容读出到目的侧。"""
         self.log.append(("scatter", tuple(keys), layer_idx, tuple(slots), first_blocks))
         for k, s in zip(keys, slots):
-            self.sink[(k, layer_idx)] = bytes(self._view[s * self._seg:(s + 1) * self._seg])
+            self.sink[(k, layer_idx)] = bytes(
+                self._view[s * self._seg:(s + 1) * self._seg]
+            )
+
+
+class TailEvent:
+    """模拟异步消费完成事件。"""
+
+    def __init__(self):
+        self.synchronize_count = 0
+        self._done = False
+
+    def synchronize(self):
+        self.synchronize_count += 1
+        self._done = True
+
+    def query(self):
+        return self._done
+
+
+class EventHooks(MovingHooks):
+    """搬运钩子：目的侧返回一个消费完成事件。"""
+
+    def __init__(self, buffer=None, seg: int = SEG):
+        super().__init__(buffer, seg)
+        self.events: list[TailEvent] = []
+
+    def scatter(self, keys, layer_idx, first_blocks, slots):
+        super().scatter(keys, layer_idx, first_blocks, slots)
+        event = TailEvent()
+        self.events.append(event)
+        return event
 
 
 class StoreSpy:
@@ -191,6 +222,26 @@ class TestRoundtrip:
         assert (keys[0], 0) not in hooks.sink
         engine.wait_idle()
         assert hooks.sink[(keys[0], 0)] == _segment_bytes(1, 0)
+
+    def test_wave_reuse_waits_for_scatter_event(self):
+        store = MemoryKVStore(SEG, NUM_CHUNKS)
+        hooks = EventHooks(None, SEG)
+        engine, _, _ = _make_engine(store, hooks)
+        keys = _chunk_keys(engine, 1, 3)
+        engine.plan_store(keys)
+        engine.confirm_store(keys)
+        for i, key in enumerate(keys):
+            hooks.source[(key, 0)] = _segment_bytes(i + 1, 0)
+        for key in keys:
+            engine.store_layer([key], 0, 0).wait()
+
+        first = engine.load_layer([keys[0]], 0, 0)
+        engine.load_layer([keys[1]], 0, 0)
+        # 第三波复用第一波槽位；acquire 必须等待底层搬运与 scatter 事件。
+        engine.load_layer([keys[2]], 0, 0)
+        assert len(hooks.events) == 1
+        assert hooks.events[0].synchronize_count == 1
+        assert first.query() is True
 
     def test_load_unknown_key_raises(self):
         store = MemoryKVStore(SEG, NUM_CHUNKS)

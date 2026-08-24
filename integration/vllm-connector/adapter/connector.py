@@ -15,8 +15,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorRole,
 )
+from vllm.logger import init_logger
 
 from adapter.worker import WorkerImpl
+
+# 模块以 adapter.* 顶层包导入，logger 名须落在 vllm 命名空间下
+# 才能继承 vllm 根 logger 的 handler（否则输出被静默吞掉）。
+logger = init_logger("vllm.tutti.connector")
 from engine.core import KVEngine
 from stores.registry import create_store
 
@@ -270,6 +275,11 @@ class TuttiConnectorV1(KVConnectorBase_V1):
             new = 0
         if self._max_tokens_per_load:
             new = min(new, self._max_tokens_per_load)
+        if new > 0:
+            logger.info(
+                "[tutti] external hit: req=%s tokens=%d computed=%d",
+                request.request_id, new, num_computed_tokens,
+            )
         return new, False
 
     def update_state_after_alloc(self, request, blocks, num_external_tokens: int) -> None:
