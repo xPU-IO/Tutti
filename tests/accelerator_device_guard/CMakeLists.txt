@@ -4,7 +4,10 @@ add_executable(tutti_accelerator_device_guard_test
     accelerator_device_guard_test.cpp
 )
 
-target_link_libraries(tutti_accelerator_device_guard_test PRIVATE tutti_api)
+target_link_libraries(tutti_accelerator_device_guard_test PRIVATE
+    tutti_api
+    Threads::Threads
+)
 target_include_directories(tutti_accelerator_device_guard_test PRIVATE
     ${TUTTI_REPOSITORY_ROOT}
 )
