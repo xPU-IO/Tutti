@@ -15,11 +15,15 @@ daemon_config + device_id，设备事实（pci_bdf/mount_path/namespace_id）
 from __future__ import annotations
 
 import ctypes
+import logging
 import os
 import time
 from pathlib import Path
 
 from .layout import Layout, decode_io_key
+
+#: 运行日志（池归属校验等部署问题的非静默说明）。
+_LOG = logging.getLogger(__name__)
 
 #: KV IO 页基：register_buffer 粒度必须为其正倍数（对齐 NVMe/DMA 路径）。
 _IO_PAGE_BYTES = 4096
@@ -138,6 +142,7 @@ class TuttiKVStore:
         self._own_runtime = runtime is None
         self._layout = Layout(self._root, segment_bytes)
         self._preset = _normalize_preset(preset) if preset is not None else None
+        self._key_namespace: bytes | None = None
         self._opened = False
         self._live: set[bytes] = set()
         self._buffers: dict[int, tuple[int, int]] = {}
@@ -170,6 +175,16 @@ class TuttiKVStore:
                 self._runtime = _build_runtime_from_env()
         self._layout.ensure_dirs()
         self._live = self._layout.scan()
+        # 池归属校验：manifest 与命名空间不一致 → 空池语义（miss），
+        # 禁止静默复用异构数据（不同模型/几何的旧池）。
+        if self._key_namespace is not None:
+            if not self._layout.check_namespace(self._key_namespace):
+                _LOG.warning(
+                    "池 %s 的命名空间 manifest 与当前配置不一致——按空池"
+                    "处理（不读旧数据）；如需腾挪请人工清理",
+                    self._root,
+                )
+                self._live = set()
         if self._io_stream_raw == "auto":
             self._resolve_auto_stream()
         self._sync_execution_mode()
@@ -324,6 +339,15 @@ class TuttiKVStore:
         """存活查询（O(1)）：读取侧跳过无数据层（混合注意力模型的
         线性注意力层从未落盘，属正常状态而非错误）。"""
         return io_key in self._live
+
+    def set_key_namespace(self, namespace: bytes) -> None:
+        """声明 key 命名空间（engine 构造期注入，open 前生效）。
+
+        用于池归属 manifest 校验：不透明字节串，本层不解读字段。
+        """
+        if self._opened:
+            raise RuntimeError("命名空间须在 open 之前注入")
+        self._key_namespace = bytes(namespace)
 
     def set_layer_span(self, num_layers: int) -> None:
         """声明层宽（bind 后由引擎注入）：数据文件按层宽全尺寸预分配。"""

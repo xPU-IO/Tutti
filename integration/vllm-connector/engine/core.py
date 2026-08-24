@@ -64,6 +64,14 @@ class KVEngine:
     - chunk_tokens：每 chunk 的 token 数（正整数）。
     - chunk_kv_bytes：单 chunk 的 KV 字节数（正整数）。
     - max_chunks_per_wave：单波最大 chunk 数（正整数）。
+    - num_layers：可选层数预告（正整数）。查询侧（不做 bind）注入后，
+      驱逐展开与冷启动完整性判定即可在 bind 之前正确工作；bind 时
+      以实测定案并与预告校验一致（不一致 → ValueError）。缺省 None。
+    - key_namespace：可选 key 命名空间（str 或 bytes，部署层按模型/
+      dtype/TP/几何组装的不透明串，含格式版本号）。注入后 chunk key
+      链以其为前缀派生——不同命名空间（不同模型/几何复用同一池）
+      的 key 天然隔离；支持持久层 manifest 的 store（可选实现）以之
+      校验池归属。缺省无命名空间。
     - gather_fn / scatter_fn：可选搬运钩子（缺省 None，搬运为 no-op），
       语义见传输路径。
 
@@ -84,13 +92,36 @@ class KVEngine:
         self._config = dict(config)
         self._store = store
         self._closed = False
+        layers_hint = config.get("num_layers")
+        if layers_hint is not None and (not _is_int(layers_hint) or layers_hint <= 0):
+            raise ValueError(f"config['num_layers'] 须为正整数或 None，got {layers_hint!r}")
+        raw_ns = config.get("key_namespace")
+        if raw_ns is None:
+            namespace = b""
+        elif isinstance(raw_ns, str):
+            namespace = raw_ns.encode("utf-8")
+        elif isinstance(raw_ns, (bytes, bytearray)):
+            namespace = bytes(raw_ns)
+        else:
+            raise ValueError(
+                f"config['key_namespace'] 须为 str/bytes/None，got {raw_ns!r}"
+            )
         store.open()
-        self._index = ChunkIndex(store.capacity_chunks, self._chunk_tokens)
+        # 命名空间注入持久层（可选实现）：manifest 校验池归属
+        setter = getattr(store, "set_key_namespace", None)
+        if setter is not None and namespace:
+            setter(namespace)
+        self._index = ChunkIndex(store.capacity_chunks, self._chunk_tokens,
+                                 namespace=namespace)
         # 冷启动分组：层数定案前暂存；层集合不完整的 chunk 视为缺失。
         self._scan_groups = _group_scan(store)
         self._restored = False
-        # 执行态（bind 后可用）
-        self._num_layers: int | None = None
+        # 上次对账判完整的组（完整性翻转修正的基准）与因 pin 保护
+        # 未遂的移除项（下次对账重试）。
+        self._synced_full: set[bytes] = set()
+        self._pending_forget: set[bytes] = set()
+        # 执行态（bind 后可用；num_layers 预告可先行）
+        self._num_layers: int | None = layers_hint
         self._segment_bytes: int | None = None
         self._window: RingWindow | None = None
         self._transfer: StagedTransfer | None = None
@@ -109,9 +140,12 @@ class KVEngine:
         self,
         token_ids: Sequence[int],
         start: int = 0,
-        parent: bytes = b"",
+        parent: bytes | None = None,
     ) -> tuple[list[bytes], bytes]:
-        """把 token 序列折叠为 chunk key 链（转发语义索引）。"""
+        """把 token 序列折叠为 chunk key 链（转发语义索引）。
+
+        parent 未给时自命名空间起（见 ChunkIndex.hash_keys）。
+        """
         self._require_open()
         return self._index.hash_keys(token_ids, start, parent)
 
@@ -145,6 +179,11 @@ class KVEngine:
         self._require_open()
         self._index.unpin(keys)
 
+    @property
+    def capacity_chunks(self) -> int:
+        """可容纳的 chunk 总数（转发 store 容量）。"""
+        return self._store.capacity_chunks
+
     # ---- 执行态 ----
 
     def bind(
@@ -171,6 +210,11 @@ class KVEngine:
             raise RuntimeError("bind 恰允许一次")
         if not _is_int(num_layers) or num_layers <= 0:
             raise ValueError(f"num_layers 须为正整数，got {num_layers!r}")
+        if self._num_layers is not None and self._num_layers != num_layers:
+            raise ValueError(
+                f"bind 层数 {num_layers} 与构造预告 num_layers"
+                f"({self._num_layers}) 不一致"
+            )
         if not _is_int(blocks_per_chunk) or blocks_per_chunk <= 0:
             raise ValueError(f"blocks_per_chunk 须为正整数，got {blocks_per_chunk!r}")
         if not isinstance(window, RingWindow):
@@ -203,7 +247,7 @@ class KVEngine:
             config["scatter_fn"] = scatter_fn
         self._scatter_hook = config.get("scatter_fn")
         self._transfer = select_transfer(kv_caches, self._store, config)
-        # 层宽注入布局（可选实现）：数据文件首写即全尺寸，避免
+        # 层宽注入布局（可选实现）：段数据首写即全尺寸，避免
         # 逐层增长令传输层票据失效重开、票据池耗尽。
         setter = getattr(self._store, "set_layer_span", None)
         if setter is not None:
@@ -314,23 +358,31 @@ class KVEngine:
         return handle
 
     def sync_from_store(self) -> None:
-        """从盘上持久层枚举增量灌入索引（幂等，可重复调用）。
+        """从盘上持久层枚举对账近似索引（幂等，可重复调用）。
 
         多副本部署下索引属主与命中查询方可能分属不同进程（worker
         落盘、调度侧查询），查询方以盘上标记为准对账——仅扫持久层
         元数据目录，不触碰数据面。层集合不完整的 chunk 视为缺失
-        （miss 语义，不驻留）。
+        （miss 语义，不驻留）；盘上完整层组消失时移除近似项
+        （完整性翻转修正，见 ChunkIndex.reconcile）。
         """
         self._require_open()
         groups = _group_scan(self._store)
-        if not groups:
-            return
         expected = set(range(self._num_layers or 0))
+        # 灌入序 = 枚举序（确定；restore 的首次灌入序即 LRU 初始序）
         full_keys = [
             chunk_key for chunk_key, layers in groups.items()
             if layers >= expected
         ]
+        full = set(full_keys)
+        # 完整性翻转修正：上次对账时完整、现已不完整/消失的组移除
+        # 近似项；乐观受理项（从未在盘上判完整）不受影响——worker
+        # 落盘前它们只在近似视图，miss 降级兜底。pin 保护而未移除
+        # 的项留存至下次对账重试（防翻转事实随基准推进丢失）。
+        stale = (self._synced_full - full) | self._pending_forget
+        self._pending_forget = set(self._index.forget(stale))
         self._index.restore(full_keys)
+        self._synced_full = full
         self._scan_groups = groups
         self._restored = True
 

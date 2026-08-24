@@ -161,12 +161,13 @@ def _make_harness(extra: dict | None = None, num_layers: int | None = None,
     )
 
 
-def _fake_request(req_id: str, tokens: list[int]):
+def _fake_request(req_id: str, tokens: list[int], num_computed_tokens: int = 0):
     return SimpleNamespace(
         request_id=req_id,
         prompt_token_ids=list(tokens),
         output_token_ids=[],
         all_token_ids=list(tokens),  # 活请求序列：decode 步持续追加
+        num_computed_tokens=num_computed_tokens,
     )
 
 
@@ -441,42 +442,142 @@ class TestLayerResolution:
             impl._resolve_layer("model.layers.99.self_attn.attn")
 
 
+class TestLoadSemantics:
+    """加载区间 / resume 块表 / full-hit 契约（fork V1 语义对齐）。"""
+
+    def _prefill_save(self, h, prompt, block_ids):
+        """走一遍 prefill 保存（全 chunk 落盘驻留）。"""
+        req = _fake_request("r1", prompt)
+        h.scheduler.update_state_after_alloc(req, object(), 0)
+        meta = h.scheduler.build_connector_meta(_sched_output(new_reqs=[
+            SimpleNamespace(
+                req_id="r1", prompt_token_ids=prompt, block_ids=block_ids
+            )
+        ]))
+        h.worker.bind_connector_metadata(meta)
+        h.worker.start_load_kv(None)
+        h.hooks.bind_window(h.worker._impl.window)
+        keys, _ = h.engine.hash_keys(prompt)
+        for layer in range(NUM_LAYERS):
+            for i, k in enumerate(keys):
+                h.hooks.source[(k, layer)] = _segment(i, layer)
+        for name in h.layer_names:
+            h.worker.save_kv_layer(name)
+        h.worker.wait_for_save()
+        return keys
+
+    def test_mixed_prefix_loads_offset_window(self):
+        """B3：本地命中 N 时只加载 [N, hit) 区间，不重写前 N 段。"""
+        h = _make_harness()
+        prompt = list(range(4 * CHUNK_TOKENS))
+        blocks = list(range(4 * CHUNK_TOKENS // BLOCK_SIZE))
+        keys = self._prefill_save(h, prompt, blocks)
+
+        # 本地已有 2 chunk（computed=2CT）：外部补其后区间；上限
+        # prompt-1（computed+new ≤ 4CT-1）→ new 对齐后 1 chunk
+        req2 = _fake_request("r2", prompt, num_computed_tokens=2 * CHUNK_TOKENS)
+        matched, _ = h.scheduler.get_num_new_matched_tokens(req2, 2 * CHUNK_TOKENS)
+        assert matched == CHUNK_TOKENS
+        h.scheduler.update_state_after_alloc(req2, object(), matched)
+        meta2 = h.scheduler.build_connector_meta(_sched_output(new_reqs=[
+            SimpleNamespace(req_id="r2", prompt_token_ids=prompt,
+                            block_ids=list(range(10, 14)))  # 4 块覆盖全 prompt
+        ]))
+        m = meta2.requests[0]
+        assert m.load_start_token == 2 * CHUNK_TOKENS
+        assert m.load_tokens == CHUNK_TOKENS
+
+        # worker 组批：恰为 chunk [2,3) 的 key 与块表（前 2 段不重写）
+        h.worker.bind_connector_metadata(meta2)
+        h.worker.start_load_kv(None)
+        impl = h.worker._impl
+        assert impl._load_keys == keys[2:3]
+        assert impl._load_block_tables == [[12]]
+
+    def test_resumed_request_replaces_block_table(self):
+        """M2：preemption→resume 的 new_block_ids 为替换语义。"""
+        h = _make_harness()
+        prompt = list(range(CHUNK_TOKENS))
+        h.scheduler.update_state_after_alloc(
+            _fake_request("r1", prompt), object(), 0
+        )
+        h.scheduler.build_connector_meta(_sched_output(new_reqs=[
+            SimpleNamespace(req_id="r1", prompt_token_ids=prompt,
+                            block_ids=[0, 1])
+        ]))
+        # decode 增量：append 语义
+        req = _fake_request("r1", prompt + [77])
+        req.all_token_ids = prompt + [77]
+        h.scheduler._live_requests["r1"] = req
+        h.scheduler._trackers["r1"].token_ids = prompt  # 对齐切片基准
+        h.scheduler.build_connector_meta(_sched_output(
+            cached=SimpleNamespace(
+                req_ids=["r1"], new_token_ids=[], new_block_ids=[[2]],
+                all_token_ids={},
+            ),
+            scheduled_tokens={"r1": 1},
+        ))
+        assert h.scheduler._trackers["r1"].block_ids == [0, 1, 2]
+        # resume：替换语义（旧块零残留）
+        h.scheduler.build_connector_meta(_sched_output(
+            cached=SimpleNamespace(
+                req_ids=["r1"], new_token_ids=[], new_block_ids=[[20, 21, 22]],
+                all_token_ids={},
+                resumed_req_ids={"r1"},
+            ),
+            scheduled_tokens={"r1": 0},
+        ))
+        assert h.scheduler._trackers["r1"].block_ids == [20, 21, 22]
+
+    def test_full_prompt_hit_capped(self):
+        """M3：full-prompt 命中上限 prompt-1（对齐后）→ 调度可推进。"""
+        h = _make_harness()
+        prompt = list(range(4 * CHUNK_TOKENS))
+        blocks = list(range(4 * CHUNK_TOKENS // BLOCK_SIZE))
+        self._prefill_save(h, prompt, blocks)
+        matched, _ = h.scheduler.get_num_new_matched_tokens(
+            _fake_request("r2", prompt), 0
+        )
+        # 4 chunk 全驻留：上限 4CT-1 → 对齐 3CT（保留 ≥1 待算 token）
+        assert matched == 3 * CHUNK_TOKENS
+
+
 class TestEndToEnd:
     def test_store_then_load_roundtrip(self):
         h = _make_harness()
-        # ---- 步 1：保存请求（16 tokens = 2 chunk）----
-        prompt = list(range(2 * CHUNK_TOKENS))
+        # ---- 步 1：保存请求（24 tokens = 3 chunk）----
+        prompt = list(range(3 * CHUNK_TOKENS))
         req = _fake_request("r1", prompt)
         h.scheduler.update_state_after_alloc(req, object(), 0)
         so = _sched_output(new_reqs=[SimpleNamespace(
-            req_id="r1", prompt_token_ids=prompt, block_ids=[0, 1]
+            req_id="r1", prompt_token_ids=prompt, block_ids=[0, 1, 2]
         )])
         meta = h.scheduler.build_connector_meta(so)
-        assert meta.requests[0].save_chunk_count == 2
+        assert meta.requests[0].save_chunk_count == 3
 
         h.worker.bind_connector_metadata(meta)
         h.worker.start_load_kv(None)  # 触发惰性绑定（本步无读取）
         h.hooks.bind_window(h.worker._impl.window)
         chunk_keys, _ = h.engine.hash_keys(prompt)
         for layer in range(NUM_LAYERS):
-            for i in range(2):
+            for i in range(3):
                 h.hooks.source[(chunk_keys[i], layer)] = _segment(i, layer)
         for name in h.layer_names:
             h.worker.save_kv_layer(name)
         h.worker.wait_for_save()
-        # store 内 2 chunk × 全部层的 io_key
+        # store 内 3 chunk × 全部层的 io_key
         assert set(h.store.scan()) == {
             derive_io_key(chunk_keys[i], layer)
-            for i in range(2) for layer in range(NUM_LAYERS)
+            for i in range(3) for layer in range(NUM_LAYERS)
         }
 
-        # ---- 步 2：新请求同前缀，命中并加载 ----
+        # ---- 步 2：新请求同前缀，命中并加载（上限 prompt-1 → 2 chunk）----
         req2 = _fake_request("r2", prompt)
         matched, async_load = h.scheduler.get_num_new_matched_tokens(req2, 0)
         assert (matched, async_load) == (2 * CHUNK_TOKENS, False)
         h.scheduler.update_state_after_alloc(req2, object(), matched)
         so2 = _sched_output(new_reqs=[SimpleNamespace(
-            req_id="r2", prompt_token_ids=prompt, block_ids=[4, 5]
+            req_id="r2", prompt_token_ids=prompt, block_ids=[4, 5, 6]
         )])
         meta2 = h.scheduler.build_connector_meta(so2)
         assert meta2.requests[0].load_tokens == 2 * CHUNK_TOKENS
@@ -495,7 +596,8 @@ class TestEndToEnd:
     def test_stale_view_reports_load_errors(self):
         """近似视图命中而权威视图未遂：worker 上报重算块。"""
         h = _make_harness()
-        prompt = list(range(CHUNK_TOKENS))
+        # 2 chunk prompt：命中上限 prompt-1 → 对齐后 1 chunk（新契约）
+        prompt = list(range(2 * CHUNK_TOKENS))
         # 调度侧视图命中（数据在），worker 侧另挂一个空引擎（数据不在）
         keys, _ = h.engine.hash_keys(prompt)
         h.engine.plan_store(keys)
@@ -524,7 +626,7 @@ class TestEndToEnd:
         from adapter.connector import _ReqMeta
         meta = TuttiConnectorMetadata(requests=[
             _ReqMeta(
-                req_id="r1", token_ids=prompt, block_ids=[0],
+                req_id="r1", token_ids=prompt, block_ids=[0, 1],
                 load_tokens=CHUNK_TOKENS,
             )
         ])

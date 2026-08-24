@@ -40,13 +40,14 @@ def test_cross_pool_80_layer_roundtrip():
     h.worker.register_cross_layers_kv_cache(pool, attn_backend=None)
 
     # ---- prefill：80 层 wait/save 交织写入 ----
-    prompt = list(range(2 * CHUNK_TOKENS))
+    prompt = list(range(3 * CHUNK_TOKENS))
     req = _fake_request("r1", prompt)
     h.scheduler.update_state_after_alloc(req, object(), 0)
+    n_blocks = -(-len(prompt) // BLOCK_SIZE)  # cdiv：块覆盖全部 token
     meta = h.scheduler.build_connector_meta(_sched_output(new_reqs=[
         SimpleNamespace(
             req_id="r1", prompt_token_ids=prompt,
-            block_ids=list(range(len(prompt) // BLOCK_SIZE)),
+            block_ids=list(range(n_blocks)),
         )
     ]))
     h.worker.bind_connector_metadata(meta)
@@ -57,7 +58,7 @@ def test_cross_pool_80_layer_roundtrip():
     patterns = {}
     for idx, name in enumerate(names):
         h.worker.wait_for_layer_load(name)
-        for chunk in range(2):
+        for chunk in range(3):
             # 每层不同内容：层号与 chunk 共同编码
             seg = _segment_bytes(chunk, idx)
             h.hooks.source[(keys[chunk], idx)] = seg
@@ -65,22 +66,22 @@ def test_cross_pool_80_layer_roundtrip():
         h.worker.save_kv_layer(name)
     h.worker.wait_for_save()
 
-    # 层号全集恰 0..79（每 chunk 各一次 → 每层恰 2 条）
+    # 层号全集恰 0..79（每 chunk 各一次 → 每层恰 3 条）
     scanned = list(h.store.scan())
-    assert len(scanned) == 2 * NL
+    assert len(scanned) == 3 * NL
     layers = sorted(decode_io_key(k)[1] for k in scanned)
     assert layers == sorted(
-        [layer for _ in range(2) for layer in range(NL)]
+        [layer for _ in range(3) for layer in range(NL)]
     )
 
-    # ---- 命中加载：同前缀新请求，逐层读回 ----
+    # ---- 命中加载：同前缀新请求（上限 prompt-1 → 2 chunk），逐层读回 ----
     req2 = _fake_request("r2", prompt)
     matched, _ = h.scheduler.get_num_new_matched_tokens(req2, 0)
     assert matched == 2 * CHUNK_TOKENS
     h.scheduler.update_state_after_alloc(req2, object(), matched)
     meta2 = h.scheduler.build_connector_meta(_sched_output(new_reqs=[
         SimpleNamespace(
-            req_id="r2", prompt_token_ids=prompt, block_ids=[8, 9]
+            req_id="r2", prompt_token_ids=prompt, block_ids=[8, 9, 10]
         )
     ]))
     h.worker.bind_connector_metadata(meta2)
