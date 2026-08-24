@@ -1757,10 +1757,10 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
         return outcome;
     }
 
-    // ASYNC zero-init on caller stream: cudaMemsetAsync on device memory
-    // is fully async (no host block).  Ordered with kernel launch on
-    // ctx.stream — kernel sees zeroed status array.
-    ce = cudaMemsetAsync(d_status, 0,
+    // Initialize every status as pending.  Success is written explicitly by
+    // the device path, so a skipped or unexecuted entry cannot aggregate as
+    // a false success.  0xFF maps to kEntryCompletionPending in result.
+    ce = cudaMemsetAsync(d_status, 0xFF,
                      total_entries * sizeof(EntryCompletionStatus),
                      ctx.stream);
     if (ce != cudaSuccess) {
@@ -2475,6 +2475,10 @@ void LocalNvmeDataPath::aggregate_completion_status_(OpEntry& op) {
                                                          "%x", s.nvme_status_dword3);
                                           return std::string(buf);
                                       }() + ")";
+                        break;
+                    case kEntryCompletionPending:
+                        first_error = "entry " + std::to_string(i) +
+                                      ": device submit was not executed";
                         break;
                     default:
                         first_error = "entry " + std::to_string(i) +

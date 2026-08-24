@@ -7,10 +7,10 @@
 
 #include "tutti/data_paths/local_nvme/io/prp_builder.h"
 
-#include <tutti/cuda_like.h>
 #include <nvm_dma.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 
@@ -24,31 +24,26 @@ bool PrpPageCache::init(const Config& cfg, nvm_ctrl_t* ctrl) {
     cfg_ = cfg;
     ctrl_ = ctrl;
 
-    // Host-pinned pool: cudaHostAlloc + one nvm_dma_map_data_host for the
-    // whole pool.  The NVMe controller DMAs PRP lists from host DRAM;
-    // fills are plain host memcpy.
+    // Allocate page-aligned host memory, then let nvm_dma_map_data_host pin
+    // and DMA-map it.  CUDA host allocations are not valid backing for this
+    // kernel get_user_pages path on every deployment: the mapping can succeed
+    // while the controller observes stale/zero PRP-list entries.
     const std::size_t bytes =
         static_cast<std::size_t>(cfg_.capacity) * cfg_.page_size;
-
-#if defined(TUTTI_USE_HOST)
-    std::fprintf(stderr, "[prp_cache] init: HOST profile has no pinned-host allocator\n");
-    return false;
-#else
-    cudaError_t ce = cudaHostAlloc(&pool_host_, bytes, cudaHostAllocDefault);
-    if (ce != cudaSuccess || pool_host_ == nullptr) {
+    const int alloc_rc = posix_memalign(&pool_host_, cfg_.page_size, bytes);
+    if (alloc_rc != 0 || pool_host_ == nullptr) {
         std::fprintf(stderr,
-                     "[prp_cache] init: cudaHostAlloc(%zu bytes) failed: %s\n",
-                     bytes, cudaGetErrorString(ce));
+                     "[prp_cache] init: posix_memalign(%zu bytes) failed: rc=%d\n",
+                     bytes, alloc_rc);
         return false;
     }
-#endif
 
     int rc = nvm_dma_map_data_host(&pool_dma_, ctrl, pool_host_, bytes);
     if (rc != 0 || pool_dma_ == nullptr) {
         std::fprintf(stderr,
                      "[prp_cache] init: nvm_dma_map_data_host failed: rc=%d\n",
                      rc);
-        cudaFreeHost(pool_host_);
+        std::free(pool_host_);
         pool_host_ = nullptr;
         return false;
     }
@@ -77,7 +72,7 @@ void PrpPageCache::shutdown() {
         pool_dma_ = nullptr;
     }
     if (pool_host_) {
-        cudaFreeHost(pool_host_);
+        std::free(pool_host_);
         pool_host_ = nullptr;
     }
 

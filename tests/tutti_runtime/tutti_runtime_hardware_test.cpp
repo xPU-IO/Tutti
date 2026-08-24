@@ -21,22 +21,29 @@ namespace {
 constexpr int kSkip = 77;
 constexpr std::uint64_t kDefaultIoSize = 4 * 1024 * 1024;
 constexpr std::uint64_t kDeviceBufferAlignment = 64 * 1024;
-constexpr std::uint64_t kRequestSize = 4 * 1024;
-constexpr std::size_t kRequestsPerBatch = 1024;
+constexpr std::uint64_t kDefaultRequestSize = 4 * 1024;
+constexpr std::size_t kDefaultRequestsPerBatch = 1024;
 constexpr std::uint64_t kIoTimeoutMs = 30000;
-constexpr unsigned char kExpectedPattern = 0x5A;
 constexpr unsigned char kPoisonPattern = 0xFF;
 
 extern "C" void launch_dma_visible_fill(void* buffer, unsigned char value,
                                          std::uint64_t size,
                                          cudaStream_t stream);
+extern "C" void launch_dma_visible_pattern(void* buffer, std::uint64_t size,
+                                            cudaStream_t stream);
 
 struct Options {
     std::string config_path;
     std::string uri;
     std::uint64_t io_size = kDefaultIoSize;
+    std::uint64_t request_size = kDefaultRequestSize;
+    std::size_t requests_per_batch = kDefaultRequestsPerBatch;
     std::int32_t expected_accel_id = -1;
 };
+
+unsigned char expected_pattern(std::uint64_t index) {
+    return static_cast<unsigned char>((index * 17 + 29) % 251);
+}
 
 bool parse_u64(const char* text, std::uint64_t& value) {
     if (text == nullptr || *text == '\0' || *text == '-') return false;
@@ -72,6 +79,15 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.uri = value;
         } else if (argument == "--size") {
             if (!parse_u64(value, options.io_size)) return false;
+        } else if (argument == "--request-size") {
+            if (!parse_u64(value, options.request_size)) return false;
+        } else if (argument == "--batch-requests") {
+            std::uint64_t parsed = 0;
+            if (!parse_u64(value, parsed) ||
+                parsed > std::numeric_limits<std::size_t>::max()) {
+                return false;
+            }
+            options.requests_per_batch = static_cast<std::size_t>(parsed);
         } else if (argument == "--accel-id") {
             if (!parse_i32(value, options.expected_accel_id)) return false;
         } else {
@@ -79,8 +95,10 @@ bool parse_options(int argc, char** argv, Options& options) {
         }
     }
     return !options.config_path.empty() && !options.uri.empty() &&
-           options.io_size > 0 &&
-           options.io_size % kRequestSize == 0 &&
+           options.io_size > 0 && options.request_size > 0 &&
+           options.requests_per_batch > 0 &&
+           options.request_size % 4096 == 0 &&
+           options.io_size % options.request_size == 0 &&
            options.io_size <= std::numeric_limits<std::size_t>::max();
 }
 
@@ -179,15 +197,17 @@ bool submit_range(tutti::StorageRuntime& runtime,
                   const tutti::MemoryHandle& memory,
                   const tutti::TargetHandle& target,
                   tutti::IoDirection direction, std::uint64_t size,
+                  std::uint64_t request_size,
+                  std::size_t requests_per_batch,
                   const tutti::HostSubmitContext& context) {
     std::vector<tutti::IoRequest> requests;
-    requests.reserve(kRequestsPerBatch);
+    requests.reserve(requests_per_batch);
     for (std::uint64_t offset = 0; offset < size;) {
         requests.clear();
-        while (offset < size && requests.size() < kRequestsPerBatch) {
+        while (offset < size && requests.size() < requests_per_batch) {
             requests.push_back(tutti::IoRequest{
-                direction, memory, offset, target, offset, kRequestSize});
-            offset += kRequestSize;
+                direction, memory, offset, target, offset, request_size});
+            offset += request_size;
         }
         if (!submit_and_wait(runtime, requests.data(), requests.size(),
                              context)) {
@@ -211,20 +231,18 @@ bool verify_pattern(void* buffer, std::uint64_t size, cudaStream_t stream) {
             cudaStreamSynchronize(stream) != cudaSuccess) {
             return false;
         }
-        const auto mismatch =
-            std::find_if(observed.begin(), observed.begin() + chunk,
-                         [](unsigned char value) {
-                             return value != kExpectedPattern;
-                         });
-        if (mismatch != observed.begin() + chunk) {
-            const std::uint64_t mismatch_offset =
-                offset + static_cast<std::uint64_t>(mismatch - observed.begin());
-            std::fprintf(stderr,
-                         "data mismatch at byte %llu: observed=%u expected=%u\n",
-                         static_cast<unsigned long long>(mismatch_offset),
-                         static_cast<unsigned>(*mismatch),
-                         static_cast<unsigned>(kExpectedPattern));
-            return false;
+        for (std::size_t index = 0; index < chunk; ++index) {
+            const std::uint64_t absolute_index = offset + index;
+            const unsigned char expected = expected_pattern(absolute_index);
+            if (observed[index] != expected) {
+                std::fprintf(
+                    stderr,
+                    "data mismatch at byte %llu: observed=%u expected=%u\n",
+                    static_cast<unsigned long long>(absolute_index),
+                    static_cast<unsigned>(observed[index]),
+                    static_cast<unsigned>(expected));
+                return false;
+            }
         }
     }
     return true;
@@ -244,8 +262,7 @@ bool run_io(tutti::TuttiRuntime& owner, const Options& options) {
 
     DeviceBuffer buffer;
     if (!allocate_device_buffer(options.io_size, buffer)) return false;
-    launch_dma_visible_fill(buffer.aligned, kExpectedPattern, options.io_size,
-                            buffer.stream);
+    launch_dma_visible_pattern(buffer.aligned, options.io_size, buffer.stream);
     if (cudaGetLastError() != cudaSuccess ||
         cudaStreamSynchronize(buffer.stream) != cudaSuccess) {
         return false;
@@ -273,6 +290,7 @@ bool run_io(tutti::TuttiRuntime& owner, const Options& options) {
     const auto write_started = std::chrono::steady_clock::now();
     bool ok = submit_range(*runtime, memory, target,
                            tutti::IoDirection::WRITE, options.io_size,
+                           options.request_size, options.requests_per_batch,
                            context);
     const auto write_elapsed = std::chrono::steady_clock::now() - write_started;
     launch_dma_visible_fill(buffer.aligned, kPoisonPattern, options.io_size,
@@ -281,7 +299,8 @@ bool run_io(tutti::TuttiRuntime& owner, const Options& options) {
          cudaStreamSynchronize(buffer.stream) == cudaSuccess && ok;
     const auto read_started = std::chrono::steady_clock::now();
     ok = submit_range(*runtime, memory, target, tutti::IoDirection::READ,
-                      options.io_size, context) && ok;
+                      options.io_size, options.request_size,
+                      options.requests_per_batch, context) && ok;
     const auto read_elapsed = std::chrono::steady_clock::now() - read_started;
     ok = verify_pattern(buffer.aligned, options.io_size, buffer.stream) && ok;
 
@@ -293,7 +312,8 @@ bool run_io(tutti::TuttiRuntime& owner, const Options& options) {
         "DMA accel_id=%d size=%llu bytes request=%llu bytes batch=%zu "
         "write=%.3f GiB/s read=%.3f GiB/s\n",
         accel_id, static_cast<unsigned long long>(options.io_size),
-        static_cast<unsigned long long>(kRequestSize), kRequestsPerBatch,
+        static_cast<unsigned long long>(options.request_size),
+        options.requests_per_batch,
         gib_per_second(options.io_size, write_elapsed),
         gib_per_second(options.io_size, read_elapsed));
     return ok && closed.ok() && unregistered.ok();
@@ -306,7 +326,8 @@ int main(int argc, char** argv) {
     if (!parse_options(argc, argv, options)) {
         std::printf(
             "SKIP: --config PATH and --uri URI are required; "
-            "--accel-id ID is optional\n");
+            "--size, --request-size, --batch-requests, and --accel-id "
+            "are optional\n");
         return kSkip;
     }
     int device_count = 0;

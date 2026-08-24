@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.18)
 
+find_package(Threads REQUIRED)
+
 add_executable(tutti_accelerator_device_guard_test
     accelerator_device_guard_test.cpp
 )

@@ -5,7 +5,7 @@
 // Single-tier content-addressed LRU cache for PRP-list pages.
 //
 // Design (2026-08-20 rework, replaces the GPU-resident pool):
-//   The pool is host-pinned memory (cudaHostAlloc), DMA-mapped with
+//   The pool is page-aligned host memory, pinned and DMA-mapped with
 //   nvm_dma_map_data_host once at init().  This makes the miss path a plain
 //   host memcpy — no cudaMemcpy, no stream, no event fencing:
 //     - fill_prp_list_page() writes the page content directly into the pool
@@ -99,7 +99,7 @@ public:
     PrpPageCache(const PrpPageCache&) = delete;
     PrpPageCache& operator=(const PrpPageCache&) = delete;
 
-    // Pre-allocate the pool: one cudaHostAlloc + one nvm_dma_map_data_host.
+    // Pre-allocate the pool: one aligned allocation + one DMA map/pin.
     bool init(const Config& cfg, nvm_ctrl_t* ctrl);
     void shutdown();
 
