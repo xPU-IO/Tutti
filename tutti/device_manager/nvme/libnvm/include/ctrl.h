@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <vector>
 #include <cuda/atomic>
+#include <tutti/accelerator_device_guard.h>
 #include "file.h"
 #include "queue.h"
 
@@ -168,6 +169,13 @@ inline Controller::Controller(const char* snvme_control_path,
                         "(host-only queue pools are not yet supported)", ENOTSUP);
     }
 
+    tutti::DeviceGuard device_guard(static_cast<std::int32_t>(deviceId));
+    if (!device_guard.ok()) {
+        throw error(string("Controller: failed to select accelerator ") +
+                    std::to_string(deviceId) + ": " +
+                    device_guard.status().message());
+    }
+
     int status;
 
     /* GPU-capable bring-up: chrdev_create -> SET_KERNEL_IOQ_CAP -> BIND ->
@@ -207,6 +215,7 @@ inline Controller::Controller(const char* snvme_control_path,
     cuda_err_chk(cudaMemcpy(d_ctrl_ptr, this, sizeof(Controller), cudaMemcpyHostToDevice));
 
     Host_file_system_int(dev_path, dev_mount_path.c_str());
+    (void) device_guard.restore();
 }
 
 
@@ -255,6 +264,13 @@ inline int Controller::init_queues(uint32_t ns_id,
      * cudaHostGetDevicePointer on the BAR0 host mapping (with cudaSetDevice
      * to the per-queue device first), preserving multi-GPU semantics.
      */
+
+    tutti::DeviceGuard device_guard(static_cast<std::int32_t>(deviceId));
+    if (!device_guard.ok()) {
+        printf("init_queues: failed to select accelerator %u: %s\n",
+               deviceId, device_guard.status().message().c_str());
+        return EIO;
+    }
 
     void* devicePtr = nullptr;
     int status;
@@ -431,7 +447,8 @@ inline int Controller::init_queues(uint32_t ns_id,
         cuda_err_chk(cudaMemcpy(d_qps + i, qp, sizeof(QueuePair),
                                 cudaMemcpyHostToDevice));
     }
-    return 0;
+    tutti::Status restored = device_guard.restore();
+    return restored.ok() ? 0 : EIO;
 }
 
 inline Controller::~Controller()
@@ -463,16 +480,24 @@ inline Controller::~Controller()
         this->group_id = 0;
     }
 
-    if (d_qps != nullptr) {
-        cudaFree(d_qps);
-        d_qps = nullptr;
+    tutti::DeviceGuard device_guard(static_cast<std::int32_t>(deviceId));
+    if (!device_guard.ok()) {
+        printf("Controller dtor: failed to select accelerator %u: %s\n",
+               deviceId, device_guard.status().message().c_str());
     }
-    if (h_qps != nullptr) {
-        for (size_t i = 0; i < n_qps; i++) {
-            delete h_qps[i];
+
+    if (device_guard.ok()) {
+        if (d_qps != nullptr) {
+            cudaFree(d_qps);
+            d_qps = nullptr;
         }
-        free(h_qps);
-        h_qps = nullptr;
+        if (h_qps != nullptr) {
+            for (size_t i = 0; i < n_qps; i++) {
+                delete h_qps[i];
+            }
+            free(h_qps);
+            h_qps = nullptr;
+        }
     }
 
     int ret = Host_file_system_exit(dev_path);
@@ -480,6 +505,10 @@ inline Controller::~Controller()
         exit(-1);
     printf("Controller release\n");
     nvm_ctrl_free(ctrl);
+
+    if (device_guard.ok()) {
+        (void) device_guard.restore();
+    }
 }
 
 

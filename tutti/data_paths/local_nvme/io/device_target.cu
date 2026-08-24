@@ -6,6 +6,7 @@
 #include "tutti/data_paths/local_nvme/io/device_target.h"
 
 #include <tutti/cuda_like.h>
+#include <tutti/accelerator_device_guard.h>
 
 #include <cstdio>
 #include <cstring>
@@ -23,19 +24,15 @@ bool build_device_target(
     *out_handle = nullptr;
     *out_overflow_dev = nullptr;
 
+    DeviceGuard device_guard(static_cast<std::int32_t>(cuda_device));
+    if (!device_guard.ok()) return false;
+
     cudaError_t cerr;
 
     // 1. Allocate overflow buffer (if needed) — done first so we can
     //    clean up on failure before allocating the main handle.
     void* overflow_dev = nullptr;
     if (n_overflow > 0 && overflow_extents != nullptr) {
-        cerr = cudaSetDevice(cuda_device);
-        if (cerr != cudaSuccess) {
-            std::fprintf(stderr,
-                "[device_target] cudaSetDevice(%u): %s\n",
-                cuda_device, cudaGetErrorString(cerr));
-            return false;
-        }
         cerr = cudaMalloc(&overflow_dev,
             (std::size_t)n_overflow * sizeof(DeviceLbaExtent));
         if (cerr != cudaSuccess) {
@@ -61,15 +58,6 @@ bool build_device_target(
     tmpl.extents_overflow = (DeviceLbaExtent*)overflow_dev;
 
     // 3. Allocate device handle and H2D copy.
-    cerr = cudaSetDevice(cuda_device);
-    if (cerr != cudaSuccess) {
-        std::fprintf(stderr,
-            "[device_target] cudaSetDevice(%u): %s\n",
-            cuda_device, cudaGetErrorString(cerr));
-        if (overflow_dev) cudaFree(overflow_dev);
-        return false;
-    }
-
     DeviceTargetHandle* dev_handle = nullptr;
     cerr = cudaMalloc(&dev_handle, sizeof(DeviceTargetHandle));
     if (cerr != cudaSuccess) {
@@ -99,8 +87,10 @@ bool build_device_target(
 void free_device_target(
     DeviceTargetHandle* handle,
     void* overflow_dev,
-    uint32_t /*cuda_device*/)
+    uint32_t cuda_device)
 {
+    DeviceGuard device_guard(static_cast<std::int32_t>(cuda_device));
+    if (!device_guard.ok()) return;
     if (overflow_dev != nullptr) {
         cudaFree(overflow_dev);
     }
@@ -122,8 +112,9 @@ bool snapshot_device_target(
         (gpu_overflow == nullptr || out_overflow_image == nullptr)) {
         return false;
     }
-    cudaError_t cerr = cudaSetDevice(cuda_device);
-    if (cerr != cudaSuccess) return false;
+    DeviceGuard device_guard(static_cast<std::int32_t>(cuda_device));
+    if (!device_guard.ok()) return false;
+    cudaError_t cerr;
 
     cerr = cudaMemcpy(out_handle_image, gpu_handle,
                       sizeof(DeviceTargetHandle), cudaMemcpyDeviceToHost);
@@ -151,8 +142,9 @@ bool restore_device_target(
     if (overflow_bytes > 0 && overflow_image == nullptr) return false;
     if (overflow_bytes % sizeof(DeviceLbaExtent) != 0) return false;
 
-    cudaError_t cerr = cudaSetDevice(cuda_device);
-    if (cerr != cudaSuccess) return false;
+    DeviceGuard device_guard(static_cast<std::int32_t>(cuda_device));
+    if (!device_guard.ok()) return false;
+    cudaError_t cerr;
 
     // 1. Overflow buffer + content restore.
     void* overflow_dev = nullptr;
