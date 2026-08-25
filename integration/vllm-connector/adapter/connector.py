@@ -27,6 +27,7 @@ from stores.registry import create_store
 
 # 引擎构造所需的配置键（全部与硬件无关）
 _ENGINE_KEYS = ("chunk_tokens", "chunk_kv_bytes", "max_chunks_per_wave")
+_ENGINE_OPTIONAL_KEYS = ("direct_transfer", "direct_transfer_strict")
 # 策略键（调度取舍，引擎不消费）
 _STRATEGY_KEYS = ("min_retrieve_tokens", "max_tokens_per_load")
 
@@ -113,7 +114,10 @@ def _engine_for(vllm_config, extra: dict) -> KVEngine:
     injected = extra.get("tutti_engine_instance")
     if injected is not None:
         return injected
-    keys = tuple(sorted((k, extra.get(k)) for k in _ENGINE_KEYS))
+    keys = tuple(sorted(
+        (k, extra.get(k))
+        for k in (*_ENGINE_KEYS, *_ENGINE_OPTIONAL_KEYS)
+    ))
     entry = _ENGINE_CACHE.get(id(vllm_config))
     if entry is None or entry[0] is not vllm_config:
         entry = (vllm_config, {})
@@ -128,6 +132,9 @@ def _engine_for(vllm_config, extra: dict) -> KVEngine:
         # 可选层数预告：查询侧（不做 bind）的驱逐展开与冷启动完整性
         # 判定依赖层数；与缓存键无关（同配置实例共享同引擎）。
         config = {k: extra[k] for k in _ENGINE_KEYS}
+        for key in _ENGINE_OPTIONAL_KEYS:
+            if key in extra:
+                config[key] = extra[key]
         if extra.get("num_layers") is not None:
             config["num_layers"] = extra["num_layers"]
         # key 命名空间：同 vllm_config 派生恒定，无需入缓存键
@@ -233,12 +240,18 @@ class TuttiConnectorV1(KVConnectorBase_V1):
             self._impl = WorkerImpl(
                 self._engine,
                 max_in_flight_layers=extra.get("max_in_flight_layers", 0),
+                lookahead_k=extra.get(
+                    "lookahead_k", extra.get("prefetch_k", 1)
+                ),
             )
             self._impl.configure(
                 chunk_tokens=self._chunk_tokens,
                 chunk_kv_bytes=extra["chunk_kv_bytes"],
                 max_chunks_per_wave=extra["max_chunks_per_wave"],
                 block_size=self._block_size,
+                lookahead_k=extra.get(
+                    "lookahead_k", extra.get("prefetch_k", 1)
+                ),
             )
 
     @property

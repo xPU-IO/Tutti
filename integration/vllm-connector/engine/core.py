@@ -5,7 +5,8 @@ from __future__ import annotations
 from typing import Sequence
 
 from engine.staging import RingWindow
-from engine.transfer import StagedTransfer, select_transfer
+from engine.transfer import DirectTransfer, StagedTransfer, select_transfer
+from engine.nvtx import range as nvtx_range
 from index.chunk_index import (
     ChunkIndex,
     StorePlan,
@@ -36,16 +37,17 @@ class _PostCompletion:
 
     def wait(self) -> None:
         """阻塞至底层完成并执行收尾动作（恰一次）。"""
+        if self._done:
+            return
         self._inner.wait()
-        if not self._done:
-            self._event = self._after()
-            if self._event is not None:
-                synchronize = getattr(self._event, "synchronize", None)
-                if callable(synchronize):
-                    synchronize()
-                else:
-                    self._event.wait()
-            self._done = True
+        self._event = self._after()
+        if self._event is not None:
+            synchronize = getattr(self._event, "synchronize", None)
+            if callable(synchronize):
+                synchronize()
+            else:
+                self._event.wait()
+        self._done = True
 
     def query(self) -> bool:
         """非阻塞查询底层是否完成。"""
@@ -55,6 +57,35 @@ class _PostCompletion:
             return True
         query = getattr(self._event, "query", None)
         return bool(query()) if callable(query) else self._done
+
+
+class _AggregateCompletion:
+    """按提交顺序组合多个波次完成句柄。
+
+    每个子句柄已经登记到环窗，因此这里只负责对外提供一个句柄：
+    ``wait`` 顺序等待全部波次，``query`` 只有在全部波次完成时才返回
+    true。顺序等待也保证同一批的 scatter/gather 收尾契约不被重排。
+    """
+
+    __slots__ = ("_handles", "_done")
+
+    def __init__(self, handles):
+        self._handles = tuple(handles)
+        self._done = False
+
+    def wait(self) -> None:
+        if self._done:
+            return
+        for handle in self._handles:
+            handle.wait()
+        self._done = True
+
+    def query(self) -> bool:
+        if self._done:
+            return True
+        # 子句柄的 query 可能在其 after/scatter 尚未执行时已为真；不要
+        # 在这里标记聚合句柄完成，否则后续 wait 会跳过必要收尾。
+        return all(handle.query() for handle in self._handles)
 
 
 class KVEngine:
@@ -72,6 +103,11 @@ class KVEngine:
       链以其为前缀派生——不同命名空间（不同模型/几何复用同一池）
       的 key 天然隔离；支持持久层 manifest 的 store（可选实现）以之
       校验池归属。缺省无命名空间。
+    - direct_transfer：可选 bool。请求 store-native 的 paged KV DMA
+      后端（legacy GeminiFS 风格）；当前 contiguous tutti runtime 不具备
+      该能力时自动回退 staged。
+    - direct_transfer_strict：可选 bool。direct_transfer 能力缺失时失败，
+      用于硬件部署验收，避免误把 staged 当成 direct。
     - gather_fn / scatter_fn：可选搬运钩子（缺省 None，搬运为 no-op），
       语义见传输路径。
 
@@ -89,6 +125,10 @@ class KVEngine:
             fn = config.get(name)
             if fn is not None and not callable(fn):
                 raise ValueError(f"config[{name!r}] 须为可调用或 None，got {fn!r}")
+        for name in ("direct_transfer", "direct_transfer_strict"):
+            value = config.get(name, False)
+            if not isinstance(value, bool):
+                raise ValueError(f"config[{name!r}] 须为 bool，got {value!r}")
         self._config = dict(config)
         self._store = store
         self._closed = False
@@ -247,7 +287,23 @@ class KVEngine:
         if scatter_fn is not None:
             config["scatter_fn"] = scatter_fn
         self._scatter_hook = config.get("scatter_fn")
-        self._transfer = select_transfer(kv_caches, self._store, config)
+        self._transfer = select_transfer(
+            kv_caches,
+            self._store,
+            config,
+            num_layers=num_layers,
+            blocks_per_chunk=blocks_per_chunk,
+            chunk_tokens=self._chunk_tokens,
+            segment_bytes=segment_bytes,
+        )
+        if isinstance(self._transfer, DirectTransfer):
+            # Direct backends register the vLLM paged tensors themselves and
+            # submit block-table aware IO.  No staging buffer id is valid for
+            # this path; load/store delegate below and retain the same engine
+            # completion contract.
+            self._staging_buffer_id = None
+            self._deferred_restore()
+            return
         # 层宽注入布局（可选实现）：段数据首写即全尺寸，避免
         # 逐层增长令传输层票据失效重开、票据池耗尽。
         setter = getattr(self._store, "set_layer_span", None)
@@ -264,34 +320,104 @@ class KVEngine:
     def load_layer(self, keys, layer_idx: int, dst_first_blocks):
         """发起一批读取：一层 × N chunk，持久化 → staging 槽 → 目的侧。
 
-        返回完成句柄；wait 返回即源侧搬运（scatter）已执行。批内
-        chunk 数超过单波容量、层号越界、未 bind → ValueError /
-        RuntimeError。store 侧未知 key 的异常原样上抛。
+        返回聚合完成句柄；wait 返回即全部波次的源侧搬运（scatter）
+        已执行。层号越界、未 bind → ValueError / RuntimeError。store
+        侧未知 key 的异常原样上抛。
         """
         keys = self._prepare_layer_call(keys, layer_idx)
-        wave, slots = self._window.acquire(len(keys))
-        batch = [
-            (derive_io_key(k, layer_idx), self._staging_buffer_id, self._window.slot_offset(s))
-            for k, s in zip(keys, slots)
-        ]
-        completion = self._store.get_batch(batch)
-        return self._settle(wave, keys, layer_idx, dst_first_blocks, slots, completion, is_load=True)
+        if isinstance(self._transfer, DirectTransfer):
+            completion = self._transfer.load_layer(
+                keys, layer_idx, dst_first_blocks
+            )
+            self._inflight.append(completion)
+            return completion
+        handles = []
+        for start in range(0, len(keys), self._max_chunks_per_wave):
+            end = min(start + self._max_chunks_per_wave, len(keys))
+            wave_keys = keys[start:end]
+            wave_blocks = _slice_first_blocks(
+                dst_first_blocks, start, end, len(keys)
+            )
+            wave, slots = self._window.acquire(len(wave_keys))
+            batch = [
+                (derive_io_key(k, layer_idx), self._staging_buffer_id,
+                 self._window.slot_offset(s))
+                for k, s in zip(wave_keys, slots)
+            ]
+            with nvtx_range(
+                f"tutti.load.submit|layer={layer_idx}|wave={wave}"
+                f"|chunks={len(wave_keys)}"
+            ):
+                completion = self._store.get_batch(batch)
+            handles.append(
+                self._settle(
+                    wave, wave_keys, layer_idx, wave_blocks, slots,
+                    completion, is_load=True
+                )
+            )
+        aggregate = _AggregateCompletion(handles)
+        del self._inflight[-len(handles):]
+        self._inflight.append(aggregate)
+        return aggregate
 
     def store_layer(self, keys, layer_idx: int, src_first_blocks):
         """发起一批写入：一层 × N chunk，源侧 → staging 槽 → 持久化。
 
-        返回完成句柄；源侧搬运（gather）在提交前已执行。其余契约同
-        load_layer。
+        返回聚合完成句柄；源侧搬运（gather）在各波提交前已执行。其余
+        契约同 load_layer。
         """
         keys = self._prepare_layer_call(keys, layer_idx)
-        wave, slots = self._window.acquire(len(keys))
-        self._transfer.gather(keys, layer_idx, src_first_blocks, slots)
-        batch = [
-            (derive_io_key(k, layer_idx), self._staging_buffer_id, self._window.slot_offset(s))
-            for k, s in zip(keys, slots)
-        ]
-        completion = self._store.put_batch(batch)
-        return self._settle(wave, keys, layer_idx, src_first_blocks, slots, completion, is_load=False)
+        if isinstance(self._transfer, DirectTransfer):
+            completion = self._transfer.store_layer(
+                keys, layer_idx, src_first_blocks
+            )
+            self._inflight.append(completion)
+            return completion
+        handles = []
+        for start in range(0, len(keys), self._max_chunks_per_wave):
+            end = min(start + self._max_chunks_per_wave, len(keys))
+            wave_keys = keys[start:end]
+            wave_blocks = _slice_first_blocks(
+                src_first_blocks, start, end, len(keys)
+            )
+            wave, slots = self._window.acquire(len(wave_keys))
+            with nvtx_range(
+                f"tutti.store.submit|layer={layer_idx}|wave={wave}"
+                f"|chunks={len(wave_keys)}"
+            ):
+                gather_event = self._transfer.gather(
+                    wave_keys, layer_idx, wave_blocks, slots
+                )
+            if gather_event is not None:
+                wait_event = getattr(self._store, "wait_event", None)
+                if callable(wait_event):
+                    wait_event(gather_event)
+                else:
+                    # Test/fallback stores have no IO stream to fence. Keep
+                    # correctness with a stream-local event wait only.
+                    synchronize = getattr(gather_event, "synchronize", None)
+                    if callable(synchronize):
+                        synchronize()
+            batch = [
+                (derive_io_key(k, layer_idx), self._staging_buffer_id,
+                 self._window.slot_offset(s))
+                for k, s in zip(wave_keys, slots)
+            ]
+            with nvtx_range(
+                f"tutti.store.io|layer={layer_idx}|wave={wave}"
+                f"|chunks={len(wave_keys)}"
+            ):
+                completion = self._store.put_batch(batch)
+            handles.append(
+                self._settle(
+                    wave, wave_keys, layer_idx, wave_blocks, slots,
+                    completion, is_load=False
+                )
+            )
+        aggregate = _AggregateCompletion(handles)
+        del self._inflight[-len(handles):]
+        self._inflight.append(aggregate)
+        return aggregate
 
     def wait_idle(self) -> None:
         """等待全部在途批次完成。"""
@@ -308,12 +434,14 @@ class KVEngine:
         try:
             self.wait_idle()
         finally:
+            if isinstance(self._transfer, DirectTransfer):
+                self._transfer.close()
             self._store.close()
 
     # ---- 内部 ----
 
     def _prepare_layer_call(self, keys, layer_idx: int) -> list[bytes]:
-        """校验执行态前置条件，返回 key 列表。"""
+        """校验执行态前置条件，返回保持原序的 key 列表。"""
         self._require_open()
         if self._window is None:
             raise RuntimeError("执行态方法须在 bind 之后调用")
@@ -324,10 +452,6 @@ class KVEngine:
         keys = list(keys)
         if not keys:
             raise ValueError("keys 不能为空")
-        if len(keys) > self._max_chunks_per_wave:
-            raise ValueError(
-                f"批内 chunk 数 {len(keys)} 超过单波容量 {self._max_chunks_per_wave}"
-            )
         return keys
 
     def _settle(
@@ -346,9 +470,13 @@ class KVEngine:
             def scatter_and_capture():
                 if self._scatter_hook is None:
                     return None
-                return self._scatter_hook(
-                    list(keys), layer_idx, first_blocks, list(slots)
-                )
+                with nvtx_range(
+                    f"tutti.load.scatter|layer={layer_idx}|wave={wave}"
+                    f"|chunks={len(keys)}"
+                ):
+                    return self._scatter_hook(
+                        list(keys), layer_idx, first_blocks, list(slots)
+                    )
 
             handle = _PostCompletion(
                 completion,
@@ -428,6 +556,22 @@ def _positive_int(config: dict, key: str) -> int:
     if not _is_int(value) or value <= 0:
         raise ValueError(f"config[{key!r}] 须为正整数，got {value!r}")
     return value
+
+
+def _slice_first_blocks(first_blocks, start: int, end: int, total: int):
+    """按 chunk 位置切片块表；标量/None 参数在各波保持原样。"""
+    if first_blocks is None:
+        return None
+    try:
+        size = len(first_blocks)
+    except TypeError:
+        return first_blocks
+    if size != total or isinstance(first_blocks, (bytes, bytearray, str)):
+        return first_blocks
+    try:
+        return first_blocks[start:end]
+    except TypeError:
+        return first_blocks
 
 
 def _is_int(value) -> bool:

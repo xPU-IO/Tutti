@@ -914,7 +914,6 @@ int main(int argc, char** argv) {
         std::printf("RESULT: FAIL (test directory)\n");
         return 1;
     }
-    const std::uint32_t kBar0Size = primary_device().bar0_size;
     const std::size_t kBufSize = 1 * 1024 * 1024;  // 1 MiB
 
     // Phase 2 direct-DataPath probe: initialize/shutdown must select the
@@ -923,7 +922,7 @@ int main(int argc, char** argv) {
         const int caller_gpu = test_gpu == 0 ? 1 : 0;
         CHECK(cudaSetDevice(caller_gpu) == cudaSuccess,
               "direct DataPath probe selects non-target caller device");
-        LocalNvmeDataPath direct_dp(kSnvmeDevPath, kBar0Size);
+        LocalNvmeDataPath direct_dp(kSnvmeDevPath);
         DataPathConfig direct_config{"local_nvme"};
         ResourceProvider* direct_resources = nullptr;
         const Status direct_init = direct_dp.initialize(
@@ -947,7 +946,7 @@ int main(int argc, char** argv) {
 
     // Helper lambda for DP with real device.
     auto make_real_dp = [&]() {
-        return LocalNvmeDataPath(kSnvmeDevPath, kBar0Size);
+        return LocalNvmeDataPath(kSnvmeDevPath);
     };
 
     // Helper to initialize.
@@ -1221,7 +1220,7 @@ int main(int argc, char** argv) {
     const std::uint32_t kBlockSize = 4096;
 
     auto make_qg_dp = [&]() {
-        return LocalNvmeDataPath(kSnvmeDevPath, kBar0Size,
+        return LocalNvmeDataPath(kSnvmeDevPath,
                                   kCudaDevice, kNumQueues,
                                   kNamespaceId, kDeviceBlockSize);
     };
@@ -1562,7 +1561,7 @@ int main(int argc, char** argv) {
                    rt.value().valid() ? 1u : 0u);
 
             // Create DataPath with queue group.
-            LocalNvmeDataPath dp(kSnvmeDevPath, kBar0Size,
+            LocalNvmeDataPath dp(kSnvmeDevPath,
                                  kCudaDevice, kNumQueues,
                                  kNamespaceId, kDeviceBlockSize);
             Status init_status = init_dp(dp);
@@ -4559,7 +4558,7 @@ int main(int argc, char** argv) {
 
         // Verify custom budget.
         LocalNvmeDataPath dp_custom(
-            kSnvmeDevPath, kBar0Size,
+            kSnvmeDevPath,
             kCudaDevice, kNumQueues,
             kNamespaceId, kDeviceBlockSize,
             0, 0,  // mdts=0, max_batch_entries=0
@@ -5174,7 +5173,7 @@ int main(int argc, char** argv) {
 
         // ---- Timeout path: budget=1 forces CQ timeout on real LIST IO ----
         LocalNvmeDataPath dp(
-            kSnvmeDevPath, kBar0Size,
+            kSnvmeDevPath,
             kCudaDevice, kNumQueues,
             kNamespaceId, kDeviceBlockSize,
             0, 0,   // mdts=0, max_batch_entries=0
@@ -5736,7 +5735,7 @@ int main(int argc, char** argv) {
     // =====================================================================
     TEST_CASE("63. handle cache: repeated open hit");
     {
-        LocalNvmeDataPath dp(kSnvmeDevPath, kBar0Size,
+        LocalNvmeDataPath dp(kSnvmeDevPath,
                              kCudaDevice, kNumQueues,
                              kNamespaceId, kDeviceBlockSize,
                              0, 0, 0, /*handle_cache_cap=*/8, /*prp_cache_cap=*/0);
@@ -5783,7 +5782,7 @@ int main(int argc, char** argv) {
     {
         // Capacity 2: open 3 files, submit to 1st (in-flight), open 3rd
         // (evicts LRU), verify 1st's handle is NOT evicted (pinned).
-        LocalNvmeDataPath dp(kSnvmeDevPath, kBar0Size,
+        LocalNvmeDataPath dp(kSnvmeDevPath,
                              kCudaDevice, kNumQueues,
                              kNamespaceId, kDeviceBlockSize,
                              0, 0, 0, /*handle_cache_cap=*/2, /*prp_cache_cap=*/0);
@@ -5862,7 +5861,7 @@ int main(int argc, char** argv) {
     // =====================================================================
     TEST_CASE("65. handle cache: eviction after close");
     {
-        LocalNvmeDataPath dp(kSnvmeDevPath, kBar0Size,
+        LocalNvmeDataPath dp(kSnvmeDevPath,
                              kCudaDevice, kNumQueues,
                              kNamespaceId, kDeviceBlockSize,
                              0, 0, 0, /*handle_cache_cap=*/1, /*prp_cache_cap=*/0);
@@ -5909,7 +5908,7 @@ int main(int argc, char** argv) {
     // =====================================================================
     TEST_CASE("66. PRP cache: repeated LIST hit");
     {
-        LocalNvmeDataPath dp(kSnvmeDevPath, kBar0Size,
+        LocalNvmeDataPath dp(kSnvmeDevPath,
                              kCudaDevice, kNumQueues,
                              kNamespaceId, kDeviceBlockSize,
                              0, 0, 0, /*handle_cache_cap=*/0, /*prp_cache_cap=*/32);
@@ -6605,7 +6604,7 @@ int main(int argc, char** argv) {
         // dp_big: every optional knob set to a distinct, non-default value
         // to prove the four caps vary independently of each other.
         LocalNvmeDataPath dp_big(
-            kSnvmeDevPath, kBar0Size,
+            kSnvmeDevPath,
             kCudaDevice, kNumQueues,
             kNamespaceId, kDeviceBlockSize,
             /*mdts_bytes=*/0, /*max_batch_entries=*/512,
@@ -6634,7 +6633,7 @@ int main(int argc, char** argv) {
         // dp_def: all new optional params left at 0 -> must reproduce the
         // exact pre-S4 constructor behavior (16 / 256 / follow-entries /
         // entries*effective_mdts).
-        LocalNvmeDataPath dp_def(kSnvmeDevPath, kBar0Size,
+        LocalNvmeDataPath dp_def(kSnvmeDevPath,
                                  kCudaDevice, kNumQueues,
                                  kNamespaceId, kDeviceBlockSize);
         CHECK(init_dp(dp_def).ok(), "initialize dp_def (all-default capacity)");
@@ -6738,21 +6737,21 @@ int main(int argc, char** argv) {
         // resolver/components lists only include what's mounted.
         const auto& dev0 = g_devices.at(0);
         const auto& dev1 = g_devices.at(1);
-        LocalNvmeDataPath dp0(dev0.ssnvme_path, dev0.bar0_size, kCudaDev,
+        LocalNvmeDataPath dp0(dev0.ssnvme_path, kCudaDev,
                               kNumQueues, dev0.namespace_id, dev0.block_size);
-        LocalNvmeDataPath dp1(dev1.ssnvme_path, dev1.bar0_size, kCudaDev,
+        LocalNvmeDataPath dp1(dev1.ssnvme_path, kCudaDev,
                               kNumQueues, dev1.namespace_id, dev1.block_size);
         std::unique_ptr<LocalNvmeDataPath> dp2, dp3;
         if (num_avail >= 3) {
             const auto& dev2 = g_devices.at(2);
             dp2 = std::make_unique<LocalNvmeDataPath>(
-                dev2.ssnvme_path, dev2.bar0_size, kCudaDev, kNumQueues,
+                dev2.ssnvme_path, kCudaDev, kNumQueues,
                 dev2.namespace_id, dev2.block_size);
         }
         if (num_avail >= 4) {
             const auto& dev3 = g_devices.at(3);
             dp3 = std::make_unique<LocalNvmeDataPath>(
-                dev3.ssnvme_path, dev3.bar0_size, kCudaDev, kNumQueues,
+                dev3.ssnvme_path, kCudaDev, kNumQueues,
                 dev3.namespace_id, dev3.block_size);
         }
 
@@ -7380,7 +7379,7 @@ int main(int argc, char** argv) {
         const std::uint64_t io_size = kBlockSize * 4;
 
         // Enable handle cache with capacity=1 to force eviction path.
-        LocalNvmeDataPath dp_hc(kSnvmeDevPath, kBar0Size, kCudaDev, kNumQueues,
+        LocalNvmeDataPath dp_hc(kSnvmeDevPath, kCudaDev, kNumQueues,
                                 primary_device().namespace_id,
                                 primary_device().block_size,
                                 /*mdts*/0, /*max_batch_entries*/256,

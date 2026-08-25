@@ -99,7 +99,6 @@ public:
             slice.view_path = source.view_path;
             slice.namespace_id = source.namespace_id;
             slice.logical_block_size = source.logical_block_size;
-            slice.bar0_size = source.bar0_size;
             slice.max_data_size = source.max_data_size;
             slice.granted_queues = source.granted_queues;
             slice.allowed_accel_ids = source.allowed_accel_ids;

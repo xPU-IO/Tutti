@@ -89,7 +89,6 @@ using tutti::Result;
 // -------------------------------------------------------------------------
 struct DeviceDescriptor {
     std::string snvme_dev_path;  // e.g. "/dev/ssnvme0"
-    std::uint64_t bar0_size = 0;
     std::uint32_t namespace_id = 1;
     std::uint32_t cuda_device = 0;
     std::uint32_t num_user_queues = 1;

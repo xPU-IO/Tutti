@@ -1,8 +1,75 @@
-"""传输路径：staged 兜底路径与 bind 期的路径定案。"""
+"""传输路径：direct paged backend 与 staged 兜底路径。"""
 
 from __future__ import annotations
 
 from typing import Sequence
+
+
+class DirectTransferUnavailable(RuntimeError):
+    """Raised when a store cannot expose a direct paged-memory backend."""
+
+
+class DirectTransfer:
+    """Adapter for a store-native paged KV DMA implementation.
+
+    The legacy GeminiFS path registers the vLLM paged tensors once and submits
+    block-table aware IO directly against those tensors.  The generic KVStore
+    SPI cannot express that addressing with ``(buffer, offset)`` entries, so
+    stores opt into this path by returning a backend from
+    ``create_direct_transfer``.  The backend must implement
+    ``register_paged_caches``, ``get_paged_batch`` and ``put_paged_batch``.
+    """
+
+    direct = True
+
+    def __init__(
+        self,
+        backend,
+        kv_caches,
+        *,
+        num_layers: int,
+        blocks_per_chunk: int,
+        chunk_tokens: int,
+        segment_bytes: int,
+    ):
+        self._backend = backend
+        register = getattr(backend, "register_paged_caches", None)
+        if not callable(register):
+            raise DirectTransferUnavailable(
+                "direct backend lacks register_paged_caches"
+            )
+        accepted = register(
+            kv_caches,
+            num_layers=num_layers,
+            blocks_per_chunk=blocks_per_chunk,
+            chunk_tokens=chunk_tokens,
+            segment_bytes=segment_bytes,
+        )
+        if accepted is False:
+            raise DirectTransferUnavailable(
+                "direct backend rejected paged cache registration"
+            )
+
+    def load_layer(self, keys, layer_idx: int, block_tables):
+        method = getattr(self._backend, "get_paged_batch", None)
+        if not callable(method):
+            raise DirectTransferUnavailable(
+                "direct backend lacks get_paged_batch"
+            )
+        return method(list(keys), layer_idx, list(block_tables))
+
+    def store_layer(self, keys, layer_idx: int, block_tables):
+        method = getattr(self._backend, "put_paged_batch", None)
+        if not callable(method):
+            raise DirectTransferUnavailable(
+                "direct backend lacks put_paged_batch"
+            )
+        return method(list(keys), layer_idx, list(block_tables))
+
+    def close(self) -> None:
+        close = getattr(self._backend, "close", None)
+        if callable(close):
+            close()
 
 
 class StagedTransfer:
@@ -29,10 +96,13 @@ class StagedTransfer:
         layer_idx: int,
         first_blocks,
         slots: Sequence[int],
-    ) -> None:
+    ):
         """执行 store 方向的源侧搬运（钩子缺省为 no-op）。"""
         if self._gather_fn is not None:
-            self._gather_fn(list(keys), layer_idx, first_blocks, list(slots))
+            return self._gather_fn(
+                list(keys), layer_idx, first_blocks, list(slots)
+            )
+        return None
 
     def scatter(
         self,
@@ -46,11 +116,56 @@ class StagedTransfer:
             self._scatter_fn(list(keys), layer_idx, first_blocks, list(slots))
 
 
-def select_transfer(kv_caches, store, config: dict) -> StagedTransfer:
+def select_transfer(
+    kv_caches,
+    store,
+    config: dict,
+    *,
+    num_layers: int | None = None,
+    blocks_per_chunk: int | None = None,
+    chunk_tokens: int | None = None,
+    segment_bytes: int | None = None,
+):
     """bind 期一次性定案传输路径。
 
     契约：接受布局对象、store 实例与引擎配置，返回选定路径且此后
-    固定不变。当前恒返回 staged 兜底路径；config 中的 gather_fn /
-    scatter_fn 原样注入为搬运钩子。
+    固定不变。direct_transfer=true 时仅在 store 显式提供
+    ``create_direct_transfer`` 且完成 paged cache 注册后启用；否则
+    自动回退 staged。设置 direct_transfer_strict=true 可把能力缺失
+    升级为 RuntimeError，避免部署误以为走了零拷贝路径。
     """
+    if config.get("direct_transfer"):
+        factory = getattr(store, "create_direct_transfer", None)
+        if callable(factory):
+            backend = factory(
+                kv_caches,
+                num_layers=num_layers,
+                blocks_per_chunk=blocks_per_chunk,
+                chunk_tokens=chunk_tokens,
+                segment_bytes=segment_bytes,
+            )
+            if backend is not None:
+                try:
+                    return DirectTransfer(
+                        backend,
+                        kv_caches,
+                        num_layers=num_layers,
+                        blocks_per_chunk=blocks_per_chunk,
+                        chunk_tokens=chunk_tokens,
+                        segment_bytes=segment_bytes,
+                    )
+                except DirectTransferUnavailable:
+                    close = getattr(backend, "close", None)
+                    if callable(close):
+                        close()
+                    if config.get("direct_transfer_strict"):
+                        raise
+        elif config.get("direct_transfer_strict"):
+            raise DirectTransferUnavailable(
+                "store lacks create_direct_transfer"
+            )
+        if config.get("direct_transfer_strict"):
+            raise DirectTransferUnavailable(
+                "store did not accept direct paged cache registration"
+            )
     return StagedTransfer(config.get("gather_fn"), config.get("scatter_fn"))

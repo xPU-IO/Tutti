@@ -23,7 +23,11 @@ from pathlib import Path
 import pytest
 
 from stores.tutti_nvme.layout import Layout, decode_io_key
-from stores.tutti_nvme.store import TuttiKVStore, _derive_device_fields
+from stores.tutti_nvme.store import (
+    TuttiKVStore,
+    _TuttiCompletion,
+    _derive_device_fields,
+)
 
 SEG = 4096
 
@@ -158,6 +162,29 @@ def make_store(tmp_path, num_chunks=8, runtime=None) -> TuttiKVStore:
         segment_bytes=SEG,
         runtime=runtime or FakeRuntime(),
     )
+
+
+def test_scan_refreshes_markers_from_sibling_store(tmp_path):
+    """A scheduler-side store observes a worker's newly committed marker."""
+    root = tmp_path / "pool"
+    worker = TuttiKVStore(
+        root=root, num_chunks=8, segment_bytes=SEG, runtime=FakeRuntime()
+    )
+    scheduler = TuttiKVStore(
+        root=root, num_chunks=8, segment_bytes=SEG, runtime=FakeRuntime()
+    )
+    worker.open()
+    scheduler.open()
+    assert scheduler.scan() == []
+
+    src = bytearray(b"x" * SEG)
+    buffer_id = worker.register_buffer(src, SEG)
+    key = io_key(b"sibling".ljust(16, b"_"), 0)
+    worker.put_batch([(key, buffer_id, 0)]).wait()
+
+    assert scheduler.scan() == [key]
+    worker.close()
+    scheduler.close()
 
 
 # ---------- partial-commit 窗口重发 ----------
@@ -327,6 +354,39 @@ def test_marker_only_after_completion(tmp_path):
     assert store.scan() == [key]
 
 
+def test_completion_wait_uses_runtime_notification_without_polling():
+    """Completion waiting blocks in the runtime watcher, not 100ms polling."""
+    import threading
+
+    class BlockingRuntime:
+        def __init__(self):
+            self.done = threading.Event()
+            self.timeouts = []
+            self.released = []
+
+        def wait(self, handle, timeout_ms=0):
+            self.timeouts.append(timeout_ms)
+            if timeout_ms == 0:
+                return ("TIMEOUT", "")
+            self.done.wait(timeout_ms / 1000)
+            return ("OK", "COMPLETED") if self.done.is_set() else ("TIMEOUT", "")
+
+        def release_io(self, handle):
+            self.released.append(handle)
+
+    runtime = BlockingRuntime()
+    settled = []
+    completion = _TuttiCompletion(runtime, [7], settled.append)
+    assert completion.query() is False
+    runtime.done.set()
+    completion.wait(timeout=1.0)
+    assert settled == [True]
+    assert runtime.released == [7]
+    # The first blocking observation is one long runtime wait, rather than
+    # repeated 100ms probes from the model thread.
+    assert 1000 in runtime.timeouts
+
+
 # ---------- register_buffer ----------
 
 
@@ -437,11 +497,10 @@ def test_preset_optional_fields_parse(tmp_path):
     tutti_runtime = _load_bindings_runtime()
     preset = {
         "device": {
-            "ssnvme_path": "/dev/definitely-not-exist",
             "pci_bdf": "0000:00:00.0",
             "mount_path": str(tmp_path),
         }
-        # backing_device/namespace_id/block_size/bar0_size 与全部预算字段均省略
+        # backing_device/namespace_id/block_size 与全部预算字段均省略
     }
     with pytest.raises(Exception) as excinfo:
         tutti_runtime.make_local_nvme_runtime(preset)
@@ -473,7 +532,6 @@ def test_derive_device_fields_from_daemon(tmp_path):
     assert device["pci_bdf"] == "0000:4b:00.0"       # daemon 推导
     assert device["mount_path"] == "/mnt/nvme1"      # daemon 推导
     assert device["namespace_id"] == 2               # daemon 推导
-    assert device["ssnvme_path"] == "/dev/ssnvme1"   # 命名约定回退
     assert device["backing_device"] == "/dev/snvme1n2"
     assert "type" not in derived                      # 元键不注入 runtime preset
 

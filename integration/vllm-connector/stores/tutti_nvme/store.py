@@ -17,11 +17,12 @@ from __future__ import annotations
 import ctypes
 import logging
 import os
-import time
+import threading
 from pathlib import Path
 
 from .layout import Layout, decode_io_key
 from .striped_layout import StripedLayout
+from engine.nvtx import range as nvtx_range
 
 #: 运行日志（池归属校验等部署问题的非静默说明）。
 _LOG = logging.getLogger(__name__)
@@ -29,8 +30,9 @@ _LOG = logging.getLogger(__name__)
 #: KV IO 页基：register_buffer 粒度必须为其正倍数（对齐 NVMe/DMA 路径）。
 _IO_PAGE_BYTES = 4096
 
-#: Completion.wait 的轮询间隔（毫秒）。
-_POLL_INTERVAL_MS = 100
+#: 后台完成观察者每次等待的上限。runtime 本身以条件变量唤醒；
+#: 有上限是为了在 runtime shutdown/异常实现下也能及时退出。
+_COMPLETION_WAIT_MS = 1000
 
 
 def _buffer_info(buffer) -> tuple[int, int, str, int] | None:
@@ -69,7 +71,13 @@ def _buffer_info(buffer) -> tuple[int, int, str, int] | None:
 
 
 class _TuttiCompletion:
-    """一批 runtime IO 的完成句柄；settle 时统一 release_io 并回调。"""
+    """一批 runtime IO 的完成句柄。
+
+    runtime.wait 在 C++ 层已经是条件变量等待，但旧实现由调用线程以
+    100ms 轮询它。这里把阻塞观察移到 daemon watcher，调用线程只等待
+    一个 Python Event；settle/release 和 store 回调仍由 query/wait 执行，
+    避免后台线程并发修改 store 的布局与 live 集合。
+    """
 
     def __init__(self, runtime, handles, on_settled):
         self._runtime = runtime
@@ -77,49 +85,111 @@ class _TuttiCompletion:
         self._on_settled = on_settled
         self._settled = False
         self._failed = False
+        self._failure_message = "tutti IO 批失败"
+        self._terminal: bool | None = None
+        self._terminal_lock = threading.Lock()
+        self._ready = threading.Event()
+        self._watcher = threading.Thread(
+            target=self._watch_runtime,
+            name="tutti-io-completion",
+            daemon=True,
+        )
+        self._watcher.start()
 
     def query(self) -> bool:
         if self._settled:
             return not self._failed
-        for handle in self._handles:
-            _, state = self._runtime.wait(handle, 0)
-            if state == "FAILED":
-                self._settle(ok=False)
-                return False
-            if state != "COMPLETED":
-                return False
-        self._settle(ok=True)
-        return True
+        # Preserve the old eager-query behavior for already-completed fake
+        # runtimes; this probe is nonblocking and does not reintroduce polling.
+        if not self._ready.is_set():
+            self._probe_runtime()
+        if not self._ready.is_set():
+            return False
+        return self._finish()
 
     def wait(self, timeout: float | None = None) -> None:
         if self._settled:
             if self._failed:
-                raise RuntimeError("该 tutti IO 批已失败（FAILED）")
+                raise RuntimeError(self._failure_message)
             return
-        deadline = None if timeout is None else time.monotonic() + timeout
-        for handle in self._handles:
-            while True:
-                _, state = self._runtime.wait(handle, _POLL_INTERVAL_MS)
-                if state == "COMPLETED":
-                    break
-                if state == "FAILED":
-                    self._settle(ok=False)
-                    raise RuntimeError(f"tutti IO 失败（io handle={handle}）")
-                if deadline is not None and time.monotonic() >= deadline:
-                    raise TimeoutError("等待 tutti IO 批超时")
-        self._settle(ok=True)
+        with nvtx_range("tutti.runtime.wait"):
+            if not self._ready.wait(timeout):
+                raise TimeoutError("等待 tutti IO 批超时")
+        self._finish()
+        if self._failed:
+            raise RuntimeError(self._failure_message)
 
-    def _settle(self, ok: bool) -> None:
-        if self._settled:
-            return
-        self._settled = True
-        self._failed = not ok
+    def _probe_runtime(self) -> None:
+        """做一次非阻塞观察，避免 query 对 watcher 启动存在竞态。"""
+        try:
+            for handle in self._handles:
+                observation, state = self._runtime.wait(handle, 0)
+                if observation == "TIMEOUT" or state not in ("COMPLETED", "FAILED"):
+                    return
+                if observation != "OK" or state == "FAILED":
+                    self._mark_terminal(False, f"tutti IO 失败（io handle={handle}）")
+                    return
+            self._mark_terminal(True, None)
+        except Exception as exc:
+            self._mark_terminal(False, f"tutti IO 等待异常：{exc}")
+
+    def _watch_runtime(self) -> None:
+        """在后台阻塞等待整批 terminal；不触碰 store 回调。"""
+        try:
+            for handle in self._handles:
+                while True:
+                    observation, state = self._runtime.wait(
+                        handle, _COMPLETION_WAIT_MS
+                    )
+                    if observation == "TIMEOUT":
+                        continue
+                    if observation != "OK":
+                        self._mark_terminal(
+                            False, f"tutti IO 等待异常（io handle={handle}）"
+                        )
+                        return
+                    if state == "COMPLETED":
+                        break
+                    if state == "FAILED":
+                        self._mark_terminal(
+                            False, f"tutti IO 失败（io handle={handle}）"
+                        )
+                        return
+            self._mark_terminal(True, None)
+        except Exception as exc:
+            self._mark_terminal(False, f"tutti IO 等待异常：{exc}")
+
+    def _mark_terminal(self, ok: bool, message: str | None) -> None:
+        with self._terminal_lock:
+            if self._terminal is not None:
+                return
+            self._terminal = ok
+            if message:
+                self._failure_message = message
+            self._ready.set()
+
+    def _finish(self) -> bool:
+        with self._terminal_lock:
+            terminal = self._terminal
+            if terminal is None:
+                return False
+            if self._settled:
+                return not self._failed
+            self._settled = True
+            self._failed = not terminal
         for handle in self._handles:
             try:
                 self._runtime.release_io(handle)
             except Exception:
                 pass  # release 尽力而为：shutdown 路径可能先行回收
-        self._on_settled(ok)
+        self._on_settled(terminal)
+        return terminal
+
+    def _settle(self, ok: bool) -> None:
+        # Kept as a small compatibility hook for callers/tests that used the
+        # former implementation's private method.
+        self._mark_terminal(ok, None)
+        self._finish()
 
 
 class TuttiKVStore:
@@ -311,6 +381,53 @@ class TuttiKVStore:
         self._buffers[self._next_buffer_id] = (addr, size)
         return self._next_buffer_id
 
+    def create_direct_transfer(
+        self,
+        kv_caches,
+        *,
+        num_layers: int,
+        blocks_per_chunk: int,
+        chunk_tokens: int,
+        segment_bytes: int,
+    ):
+        """Return a runtime-native paged backend when one is available.
+
+        The current generic ``tutti`` runtime exposes only contiguous
+        ``register_memory`` buffers, so this returns ``None`` on existing
+        deployments and the engine keeps the staged path.  A runtime that
+        implements legacy-style paged registration can expose
+        ``create_direct_transfer``; no store-side copy or staging buffer is
+        then required.  Keeping the capability probe here makes the direct
+        path explicit and prevents silently treating contiguous IO as paged.
+        """
+        factory = getattr(self._runtime, "create_direct_transfer", None)
+        if not callable(factory):
+            return None
+        return factory(
+            kv_caches,
+            num_layers=num_layers,
+            blocks_per_chunk=blocks_per_chunk,
+            chunk_tokens=chunk_tokens,
+            segment_bytes=segment_bytes,
+        )
+
+    def wait_event(self, event) -> None:
+        """Fence the IO stream behind a producer CUDA event.
+
+        The worker records this event after gathering paged KV into staging;
+        waiting on the dedicated IO stream preserves overlap without a
+        device-wide synchronize. Stores using a raw stream handle fall back
+        to a stream-local host wait.
+        """
+        if event is None:
+            return
+        if self._io_stream_obj is not None:
+            self._io_stream_obj.wait_event(event)
+            return
+        synchronize = getattr(event, "synchronize", None)
+        if callable(synchronize):
+            synchronize()
+
     def put_batch(self, batch) -> _TuttiCompletion:
         self._require_open()
         entries = self._normalize(batch, require_live=False)
@@ -331,7 +448,8 @@ class TuttiKVStore:
                     "write",
                 )
             )
-        handles = self._submit_retry(requests)
+        with nvtx_range(f"tutti.runtime.submit|op=write|requests={len(requests)}"):
+            handles = self._submit_retry(requests)
         return _TuttiCompletion(
             self._runtime, handles, lambda ok: self._on_put_settled(ok, io_keys)
         )
@@ -354,7 +472,8 @@ class TuttiKVStore:
                     "read",
                 )
             )
-        handles = self._submit_retry(requests)
+        with nvtx_range(f"tutti.runtime.submit|op=read|requests={len(requests)}"):
+            handles = self._submit_retry(requests)
         return _TuttiCompletion(self._runtime, handles, lambda ok: None)
 
     def drop(self, keys) -> None:
@@ -377,6 +496,10 @@ class TuttiKVStore:
 
     def scan(self):
         self._require_open()
+        # Refresh the local view from the marker directory. Layout.scan uses
+        # a directory-generation cache, so this observes commits from a
+        # sibling scheduler/worker process without rescanning unchanged pools.
+        self._live = self._layout.scan()
         return sorted(self._live)
 
     def has(self, io_key) -> bool:
@@ -575,7 +698,8 @@ def _derive_device_fields(preset: dict, yaml) -> dict:
 
     daemon 配置（yaml）的 nvmes 列表按 device_id 给出权威事实：
     pci_addr、backing_mount_path、namespace_id；preset 可显式覆盖。
-    设备节点名（ssnvme/backing）按 tutti 命名约定回退，可显式给出。
+    SNVMe 字符设备由 C++ preset 组装器按 BDF 查询 sysfs，Python 不拼接
+    `/dev/ssnvme<N>`；backing block device 仍可按 namespace 约定回退。
     """
     daemon_path = preset.get("daemon_config")
     device_id = preset.get("device_id")
@@ -592,7 +716,6 @@ def _derive_device_fields(preset: dict, yaml) -> dict:
     device.setdefault("pci_bdf", entry["pci_addr"])
     device.setdefault("mount_path", entry["backing_mount_path"])
     device.setdefault("namespace_id", namespace_id)
-    device.setdefault("ssnvme_path", f"/dev/ssnvme{device_id}")
     device.setdefault(
         "backing_device", f"/dev/snvme{device_id}n{device.get('namespace_id', 1)}"
     )

@@ -54,6 +54,8 @@ class StripedLayout:
         self.mounts = tuple(normalized_mounts)
         self.stripe_unit = stripe_unit
         self._meta_dir = self.root / "meta"
+        self._scan_signature: tuple[int, int] | None = None
+        self._scan_cache: set[bytes] = set()
 
     @property
     def num_shards(self) -> int:
@@ -112,7 +114,18 @@ class StripedLayout:
     def scan(self) -> set[bytes]:
         live: set[bytes] = set()
         if not self._meta_dir.is_dir():
+            self._scan_signature = None
+            self._scan_cache = set()
             return live
+        try:
+            stat = self._meta_dir.stat()
+            signature = (stat.st_mtime_ns, stat.st_ctime_ns)
+        except OSError:
+            self._scan_signature = None
+            self._scan_cache = set()
+            return live
+        if signature == self._scan_signature:
+            return set(self._scan_cache)
         for entry in self._meta_dir.iterdir():
             if not entry.name.endswith(_MARKER_SUFFIX):
                 continue
@@ -120,7 +133,9 @@ class StripedLayout:
                 live.add(bytes.fromhex(entry.name[:-len(_MARKER_SUFFIX)]))
             except ValueError:
                 continue
-        return live
+        self._scan_signature = signature
+        self._scan_cache = live
+        return set(live)
 
     def chunk_file_count(self) -> int:
         """Count logical chunks, not the N physical shard files."""
@@ -181,6 +196,7 @@ class StripedLayout:
     def commit_layers(self, io_keys) -> None:
         for io_key in io_keys:
             self.marker_file(io_key).touch(exist_ok=True)
+        self._scan_signature = None
 
     def drop(self, io_keys) -> None:
         touched_chunks: set[bytes] = set()
@@ -193,3 +209,4 @@ class StripedLayout:
                 continue
             for shard in range(self.num_shards):
                 self.shard_file(chunk_id, shard).unlink(missing_ok=True)
+        self._scan_signature = None

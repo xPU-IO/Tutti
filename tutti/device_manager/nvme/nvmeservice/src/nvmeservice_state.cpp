@@ -243,7 +243,6 @@ void ServiceState::add_hardware_resource(const NvmeEntry& entry) {
     resource.chrdev_path = bringup.chrdev_path;
     resource.disk_name = bringup.disk_name;
     resource.block_path = bringup.block_path;
-    resource.bar0_size = device.ctrl->bar0_size;
     resource.dstrd = device.ctrl->dstrd;
     resource.max_user_qid = device.ctrl->max_user_qid;
     // QID 0 is the admin queue. Kernel I/O QPs occupy [1, start_cq_idx),
@@ -512,7 +511,6 @@ NvmeSliceGrant ServiceState::make_slice_locked(const DeviceState& device,
     slice.logical_block_size_log = resource.logical_block_size_log;
     slice.queue_depth = resource.queue_depth;
     slice.dstrd = resource.dstrd;
-    slice.bar0_size = resource.bar0_size;
     slice.max_data_size = resource.max_data_size;
     slice.controller_queue_capacity = resource.controller_queue_capacity;
     slice.granted_queues = grant;
@@ -701,7 +699,6 @@ ServiceState::ConnectResult ServiceState::connect(int32_t device_id,
     result.grant.device_id = slice.device_id;
     result.grant.pci_addr = slice.pci_bdf;
     result.grant.snvme_dev_path = slice.chrdev_path;
-    result.grant.bar0_size = slice.bar0_size;
     result.grant.dstrd = slice.dstrd;
     result.grant.granted_queues = static_cast<int32_t>(slice.granted_queues);
     result.grant.namespace_id = slice.namespace_id;

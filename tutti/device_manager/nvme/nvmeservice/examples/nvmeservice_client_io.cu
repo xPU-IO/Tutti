@@ -174,9 +174,7 @@ int run_nvmeservice_client_io(const struct nvmeservice_client_io_args* a) {
     step_ok("cudaSetDevice(%d)", a->cuda_dev);
 
     nvm_ctrl_t* ctrl = nullptr;
-    rc = nvm_ctrl_attach_client(&ctrl,
-                                 a->snvme_dev_path,
-                                 (uint32_t)a->bar0_size);
+    rc = nvm_ctrl_attach_client(&ctrl, a->snvme_dev_path);
     if (rc != 0) return step_fail(rc, "nvm_ctrl_attach_client(%s)",
                                   a->snvme_dev_path);
     step_ok("nvm_ctrl_attach_client %s page=%u",

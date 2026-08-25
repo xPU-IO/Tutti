@@ -62,6 +62,8 @@ class Layout:
         self.layer_span: int | None = None
         self._chunks_dir = self.root / "chunks"
         self._meta_dir = self.root / "meta"
+        self._scan_signature: tuple[int, int] | None = None
+        self._scan_cache: set[bytes] = set()
 
     def set_layer_span(self, num_layers: int) -> None:
         """声明层宽（bind 后由引擎注入）：数据文件按层宽全尺寸预分配。
@@ -117,10 +119,25 @@ class Layout:
         self._meta_dir.mkdir(parents=True, exist_ok=True)
 
     def scan(self) -> set[bytes]:
-        """列 meta/ 目录重组在场 io_key（标记文件名即完整 io_key 的 hex）。"""
+        """列 meta/ 目录重组在场 io_key。
+
+        The directory signature makes repeated scheduler-side refreshes cheap
+        while still observing markers committed by a different process.
+        """
         live: set[bytes] = set()
         if not self._meta_dir.is_dir():
+            self._scan_signature = None
+            self._scan_cache = set()
             return live
+        try:
+            stat = self._meta_dir.stat()
+            signature = (stat.st_mtime_ns, stat.st_ctime_ns)
+        except OSError:
+            self._scan_signature = None
+            self._scan_cache = set()
+            return live
+        if signature == self._scan_signature:
+            return set(self._scan_cache)
         for entry in self._meta_dir.iterdir():
             name = entry.name
             if not name.endswith(_MARKER_SUFFIX):
@@ -129,7 +146,9 @@ class Layout:
                 live.add(bytes.fromhex(name[: -len(_MARKER_SUFFIX)]))
             except ValueError:
                 continue  # 非 marker 命名的杂散文件忽略
-        return live
+        self._scan_signature = signature
+        self._scan_cache = live
+        return set(live)
 
     def chunk_file_count(self) -> int:
         if not self._chunks_dir.is_dir():
@@ -176,6 +195,7 @@ class Layout:
         """数据落盘后建层标记（崩溃安全窗口：先数据后标记）。"""
         for io_key in io_keys:
             self.marker_file(io_key).touch(exist_ok=True)
+        self._scan_signature = None
 
     def drop(self, io_keys) -> None:
         """逐 io_key 删层标记；某 chunk 的标记删光后回收其数据文件。"""
@@ -188,6 +208,7 @@ class Layout:
             if any(self._meta_dir.glob(chunk_id.hex() + "*" + _MARKER_SUFFIX)):
                 continue  # 该 chunk 仍有存活层段
             self.chunk_file(chunk_id).unlink(missing_ok=True)
+        self._scan_signature = None
 
 
 def _append_real_zeros(path: Path, start: int, end: int) -> None:

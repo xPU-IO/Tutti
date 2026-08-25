@@ -99,12 +99,10 @@ struct LocalNvmeTargetState {
 class LocalNvmeDataPath : public DataPath {
 public:
     // Skeleton constructor (Round 7): no controller, no queue group.
-    LocalNvmeDataPath(std::string snvme_dev_path = "",
-                      std::uint32_t bar0_size = 0);
+    LocalNvmeDataPath(std::string snvme_dev_path = "");
 
     // Production constructor: includes queue group parameters.
     // snvme_dev_path: e.g. "/dev/ssnvme0"
-    // bar0_size: BAR0 size in bytes
     // cuda_device: primary GPU for d_qps + per-queue rings
     // num_user_queues: count of user QPs to create
     // (SQ/CQ ring depth is NOT a parameter: it is fixed by the kernel
@@ -143,7 +141,6 @@ public:
     //   ~= 259.5 MiB. Callers requesting large batch_entries must budget
     //   GPU memory accordingly.
     LocalNvmeDataPath(std::string snvme_dev_path,
-                      std::uint32_t bar0_size,
                       std::uint32_t cuda_device,
                       std::uint32_t num_user_queues,
                       std::uint32_t namespace_id,
@@ -495,7 +492,6 @@ private:
 
     // Controller connection (client-only attach).
     std::string snvme_dev_path_;
-    std::uint32_t bar0_size_ = 0;
     nvm_ctrl_t* ctrl_ = nullptr;
 
     // Queue group parameters (production mode).

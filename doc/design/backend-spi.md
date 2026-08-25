@@ -117,3 +117,27 @@ public API, `open_batch` parallelism, submit grouping, per-request
 fail-closed status, opaque identity handling, and the contract test
 kit (`tutti/testing/mock_data_path.h` is a complete reference
 implementation used by the hardware-independent suites).
+
+## 6. Optional paged-memory path
+
+`DataPath::register_paged_memory()` and `submit_paged()` are an explicit
+optional extension for a backend that can resolve a block table in the
+device-facing IO path. They are deliberately separate from
+`register_memory()` / `submit()` and from `supports_direct`: direct
+contiguous device IO does not imply paged-cache support.
+
+A backend must set `DataPathCapabilities::supports_paged_memory` and override
+all paged hooks before the extension is selectable. The base `DataPath`
+implementation returns `UNSUPPORTED`, rejects every paged request, and mints
+no operation. Existing staged and contiguous backends therefore retain their
+current behavior.
+
+`DataPathPagedMemoryView` describes per-layer physical block pools without
+exposing an NVMe descriptor or file-format field. `DataPathPagedRequest`
+contains a copied logical block-id vector, layer index, token interval, and
+ordinary target byte range. Implementations must copy the block-id metadata
+before returning from an asynchronous submit; callers are not required to
+keep that vector alive until completion. No implementation may advertise
+paged support while internally flattening the cache through a staging buffer:
+that remains a valid staged fallback, but it must leave the capability false
+and return `UNSUPPORTED` from the paged hooks.

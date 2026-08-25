@@ -36,14 +36,11 @@ struct RuntimeTelemetry {
 
 // Configuration for a single NVMe device.
 struct NvmeDeviceConfig {
-    std::string ssnvme_path;     // e.g. "/dev/ssnvme0"
     std::string pci_bdf;         // e.g. "0000:08:00.0"
     std::string backing_device;  // e.g. "/dev/snvme0n1"
     std::string mount_path;      // e.g. "/mnt/nvme0"
     std::uint32_t namespace_id = 1;
     std::uint32_t block_size = 4096;
-    static constexpr std::uint64_t kDefaultBar0 = 16384;
-    std::uint64_t bar0_size = kDefaultBar0;
 };
 
 // Configuration for single-disk LocalNvmeDataPath.

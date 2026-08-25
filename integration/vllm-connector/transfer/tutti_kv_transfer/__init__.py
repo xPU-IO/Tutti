@@ -21,6 +21,7 @@ __all__ = [
     "EngineKVFormat",
     "discover_engine_format",
     "single_layer_transfer",
+    "batched_layer_transfer",
 ]
 
 # TransferDirection (csrc/kv_transfer_types.h)
@@ -119,4 +120,23 @@ def single_layer_transfer(
         _DIRECTIONS[direction],
         int(engine_kv_format),
         _infer_token_major(staging_view, engine_kv_format),
+    )
+
+
+def batched_layer_transfer(
+    staging_view: torch.Tensor,
+    paged_view: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    engine_kv_format: int,
+    direction: str,
+) -> None:
+    """Copy multiple chunks for one layer with one CUDA kernel launch.
+
+    ``staging_view`` and ``slot_mapping`` contain the concatenated token rows
+    of all chunks in the batch.  The native kernel is already token-count
+    agnostic, so this entry point makes the batching contract explicit while
+    retaining all validation and layout handling of :func:`single_layer_transfer`.
+    """
+    single_layer_transfer(
+        staging_view, paged_view, slot_mapping, engine_kv_format, direction
     )

@@ -26,6 +26,7 @@ Run:
     /data/home/ryeqiu/tutti-env/bin/python tests/e2e_walkthrough.py
 """
 
+import os
 import sys
 import threading
 import time
@@ -34,6 +35,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from engine.core import KVEngine
+from engine.nvtx import range as nvtx_range
 from engine.staging import RingWindow
 from index.chunk_index import derive_io_key  # noqa: F401  (教学展示用)
 from stores.base import KVStore  # noqa: F401  (SPI 契约参照)
@@ -240,7 +242,8 @@ class VLLMForwardSim:
         """逐层 save：make_layer_kv(layer) 模拟该层 forward 产出的 KV。"""
         self._engine.plan_store(keys)
         for layer in range(self._num_layers):
-            make_layer_kv(layer)  # "forward 计算"（写出源侧层段）
+            with nvtx_range(f"tutti.sim.compute|phase=prefill|layer={layer}"):
+                make_layer_kv(layer)  # "forward 计算"（写出源侧层段）
             self._engine.store_layer(keys, layer, src_first_blocks=None)
             self.timeline.append(f"save L{layer} 已发起（不等待，下层继续）")
         self._engine.wait_idle()
@@ -259,7 +262,8 @@ class VLLMForwardSim:
             if nxt < self._num_layers:
                 inflight = self._engine.load_layer(keys, nxt, dst_first_blocks=None)
                 self.timeline.append(f"load L{nxt} 发起（与 L{layer} 计算重叠）")
-            compute(layer)                          # "attention 计算" L
+            with nvtx_range(f"tutti.sim.compute|phase=decode|layer={layer}"):
+                compute(layer)                      # "attention 计算" L
         self._engine.unpin(keys)
 
 
@@ -389,6 +393,13 @@ def main():
         for layer in range(NUM_LAYERS)
     )
     print(f"  数据一致性：{'PASS（盘→staging→目的侧，逐段一致）' if ok else 'FAIL'}")
+
+    # Optional replay loop for Nsight: keep the same request resident and
+    # immediately issue it again so cache reuse and layer overlap are visible.
+    replay_rounds = max(1, int(os.environ.get("TUTTI_NVTX_REPLAY_ROUNDS", "1")))
+    for replay in range(1, replay_rounds):
+        with nvtx_range(f"tutti.replay.request|id=A|round={replay}"):
+            sim.hit_forward(keys_a, lambda _layer: None)
 
     # ================================================================
     # 阶段 4：容量淘汰（LRU 驱逐 + 断链截断）

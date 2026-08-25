@@ -32,11 +32,11 @@ sudo env TUTTI_VERBOSE=1 \
 测试不会读取 YAML；通过 `--nvme` 显式传入设备表，格式为：
 
 ```text
-ssnvme_path,pci_bdf,backing_device,mount_path[,block_size[,bar0_size[,namespace_id]]]
+ssnvme_path,pci_bdf,backing_device,mount_path[,block_size[,namespace_id]]
 ```
 
 字段依次为 daemon RPC 报告的 `snvme`、`pci_addr`、对应 namespace 块设备、真实
-`mount_path`、`blk`、`bar0` 和 `namespace_id`。先运行 client 的 `--list-only`，
+`mount_path`、`blk` 和 `namespace_id`。先运行 client 的 `--list-only`，
 以 RPC metadata 为准生成参数；不要根据 YAML 数组顺序或设备名模板推导路径。
 GPU view（例如 `/mnt/snvme/gpu0/ssnvme0`）不是 backing `mount_path`。
 legacy `allowed_gpus` 必须包含测试命令的 `--gpu`。
@@ -45,8 +45,8 @@ legacy `allowed_gpus` 必须包含测试命令的 `--gpu`。
 4 KiB）；daemon 每次 bring-up 后仍须重新核对这些 metadata：
 
 ```bash
-NVME0='/dev/ssnvme0,0000:41:00.0,/dev/snvme0n1,/mnt/snvme/nvme1,4096,32768,1'
-NVME1='/dev/ssnvme1,0000:44:00.0,/dev/snvme1n1,/mnt/snvme/nvme2,4096,32768,1'
+NVME0='/dev/ssnvme0,0000:41:00.0,/dev/snvme0n1,/mnt/snvme/nvme1,4096,1'
+NVME1='/dev/ssnvme1,0000:44:00.0,/dev/snvme1n1,/mnt/snvme/nvme2,4096,1'
 ```
 
 如果 daemon 使用其他 YAML，必须同步修改这些字段。`block_size` 是 namespace
@@ -116,7 +116,7 @@ build/cuda/bin/tutti_striped_local_nvme_contract_test \
 
 硬件测试或 client 应先通过 `ListNvmeResources` 读取本次 owner bring-up 返回的
 `device_id`、`pci_bdf`、实际 `chrdev_path`/minor、`block_path`、namespace、page/
-logical-block、BAR0 和 queue metadata，再生成 `--nvme` 参数。不得按 YAML 数组顺序、
+logical-block 和 queue metadata，再生成 `--nvme` 参数。不得按 YAML 数组顺序、
 accelerator ordinal 或设备 ID 拼接 `/dev` 路径；allocation 返回的 `view_path` 才是
 accelerator 可见路径。
 

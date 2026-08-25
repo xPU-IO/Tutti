@@ -11,6 +11,7 @@
 #include <tutti/cuda_like.h>
 #include <tutti/accelerator_device_guard.h>
 #include <nvm_types.h>
+#include <nvtx3/nvToolsExt.h>
 
 #include <algorithm>
 #include <chrono>
@@ -28,8 +29,8 @@ namespace tutti::data_paths::local_nvme {
 // -------------------------------------------------------------------------
 
 LocalNvmeDataPath::LocalNvmeDataPath(
-    std::string snvme_dev_path, std::uint32_t bar0_size)
-    : snvme_dev_path_(std::move(snvme_dev_path)), bar0_size_(bar0_size) {
+    std::string snvme_dev_path)
+    : snvme_dev_path_(std::move(snvme_dev_path)) {
     caps_.name = "local_nvme";
     caps_.source_api_version = 1;
     caps_.supports_host_execution = false;
@@ -64,8 +65,8 @@ LocalNvmeDataPath::LocalNvmeDataPath(
 }
 
 LocalNvmeDataPath::LocalNvmeDataPath(
-    std::string snvme_dev_path, std::uint32_t bar0_size,
-    std::uint32_t cuda_device, std::uint32_t num_user_queues,
+    std::string snvme_dev_path, std::uint32_t cuda_device,
+    std::uint32_t num_user_queues,
     std::uint32_t namespace_id,
     std::uint32_t block_size,
     std::uint64_t mdts_bytes,
@@ -79,7 +80,7 @@ LocalNvmeDataPath::LocalNvmeDataPath(
     std::uint32_t handle_cache_l2_capacity,
     std::string controller_pci_addr,
     std::uint32_t threads_per_block)
-    : snvme_dev_path_(std::move(snvme_dev_path)), bar0_size_(bar0_size),
+    : snvme_dev_path_(std::move(snvme_dev_path)),
       cuda_device_(cuda_device), num_user_queues_(num_user_queues),
       namespace_id_(namespace_id),
       block_size_(block_size),
@@ -392,13 +393,7 @@ Status LocalNvmeDataPath::initialize_impl_(const DataPathConfig& config,
     }
 
     if (!snvme_dev_path_.empty()) {
-        if (bar0_size_ == 0) {
-            return Status(StatusCode::INVALID_ARGUMENT,
-                          "bar0_size is 0");
-        }
-
-        int rc = nvm_ctrl_attach_client(&ctrl_, snvme_dev_path_.c_str(),
-                                        bar0_size_);
+        int rc = nvm_ctrl_attach_client(&ctrl_, snvme_dev_path_.c_str());
         if (rc != 0 || ctrl_ == nullptr) {
             return Status(StatusCode::NOT_READY,
                           "nvm_ctrl_attach_client(" + snvme_dev_path_ +
@@ -1782,10 +1777,12 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
         if (test_inject_resolve_lba_failure_) inject_flag |= 0x1u;
         if (test_inject_nvme_error_)          inject_flag |= 0x2u;
 
+        nvtxRangePushA("tutti.local_nvme.io_kernel");
         launch_err = launch_submit_one(d_entries, d_status, total_entries,
-                                        cq_poll_budget_, threads_per_block_,
-                                        inject_flag,
-                                        ctx.stream);
+                                       cq_poll_budget_, threads_per_block_,
+                                       inject_flag,
+                                       ctx.stream);
+        nvtxRangePop();
     }
     if (launch_err != cudaSuccess) {
         // Launch failed: kernel was NOT issued (cudaGetLastError returns

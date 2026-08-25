@@ -10,6 +10,7 @@ import pytest
 
 from engine.core import KVEngine
 from engine.staging import RingWindow
+from engine.transfer import DirectTransferUnavailable
 from index.chunk_index import chunk_key_of, derive_io_key, layer_of
 from stores.memory import MemoryKVStore
 
@@ -125,6 +126,49 @@ class StoreSpy:
 
     def scan(self):
         return self._inner.scan()
+
+
+class DirectCompletion:
+    def __init__(self):
+        self.wait_count = 0
+
+    def wait(self):
+        self.wait_count += 1
+
+    def query(self):
+        return True
+
+
+class DirectBackend:
+    def __init__(self):
+        self.registered = None
+        self.calls = []
+
+    def register_paged_caches(self, caches, **kwargs):
+        self.registered = (caches, kwargs)
+        return True
+
+    def get_paged_batch(self, keys, layer, blocks):
+        self.calls.append(("get", keys, layer, blocks))
+        return DirectCompletion()
+
+    def put_paged_batch(self, keys, layer, blocks):
+        self.calls.append(("put", keys, layer, blocks))
+        return DirectCompletion()
+
+
+class DirectStore(MemoryKVStore):
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.backend = DirectBackend()
+        self.register_calls = 0
+
+    def register_buffer(self, buffer, granularity):
+        self.register_calls += 1
+        return super().register_buffer(buffer, granularity)
+
+    def create_direct_transfer(self, caches, **kwargs):
+        return self.backend
 
 
 class FakeEvent:
@@ -252,6 +296,47 @@ class TestRoundtrip:
 
 
 class TestWindowWaves:
+    def test_oversized_batch_splits_keys_and_block_tables(self):
+        store = MemoryKVStore(SEG, NUM_CHUNKS)
+        hooks = MovingHooks(None, SEG)
+        engine, _, _ = _make_engine(store, hooks)
+        keys = _chunk_keys(engine, 10, 2 * MAX_WAVE + 3)
+        blocks = [[100 + i, 200 + i] for i in range(len(keys))]
+        engine.plan_store(keys)
+        engine.confirm_store(keys)
+        for i, key in enumerate(keys):
+            hooks.source[(key, 0)] = _segment_bytes(i + 1, 0)
+
+        store_handle = engine.store_layer(keys, 0, blocks)
+        store_handle.wait()
+        gather = [entry for entry in hooks.log if entry[0] == "gather"]
+        assert [entry[1] for entry in gather] == [
+            tuple(keys[0:2]), tuple(keys[2:4]), tuple(keys[4:6]),
+            tuple(keys[6:7]),
+        ]
+        assert [entry[4] for entry in gather] == [
+            blocks[0:2], blocks[2:4], blocks[4:6], blocks[6:7],
+        ]
+
+        load_handle = engine.load_layer(keys, 0, blocks)
+        assert load_handle.query() is True
+        # 提交到第 3 波时，环窗回绕已按 wave-2 规则等待前两波，
+        # 因而前两波的 scatter 可能已经发生；后两波仍由 wait 收尾。
+        assert set(hooks.sink) == {(key, 0) for key in keys[:4]}
+        load_handle.wait()
+        assert hooks.sink == {
+            (key, 0): _segment_bytes(i + 1, 0)
+            for i, key in enumerate(keys)
+        }
+        scatter = [entry for entry in hooks.log if entry[0] == "scatter"]
+        assert [entry[1] for entry in scatter] == [
+            tuple(keys[0:2]), tuple(keys[2:4]), tuple(keys[4:6]),
+            tuple(keys[6:7]),
+        ]
+        assert [entry[4] for entry in scatter] == [
+            blocks[0:2], blocks[2:4], blocks[4:6], blocks[6:7],
+        ]
+
     def test_wave_and_slot_rotation_at_engine_level(self):
         store = MemoryKVStore(SEG, NUM_CHUNKS)
         hooks = MovingHooks(None, SEG)
@@ -355,6 +440,52 @@ class TestBind:
         _make_engine(spy)
         assert spy.register_calls == [SEG]
 
+    def test_direct_backend_skips_staging_registration_and_delegates(self):
+        store = DirectStore(SEG, NUM_CHUNKS)
+        config = {
+            "chunk_tokens": CHUNK_TOKENS,
+            "chunk_kv_bytes": SEG * NUM_LAYERS,
+            "max_chunks_per_wave": MAX_WAVE,
+            "direct_transfer": True,
+        }
+        engine = KVEngine(config, store)
+        window = RingWindow(bytearray(NUM_SLOTS * SEG), NUM_SLOTS, SEG)
+        engine.bind({"layer.0": object()}, window, NUM_LAYERS, 2)
+        assert store.register_calls == 0
+        keys = _chunk_keys(engine, 3, 1)
+        load = engine.load_layer(keys, 1, [[9, 10]])
+        save = engine.store_layer(keys, 2, [[9, 10]])
+        load.wait()
+        save.wait()
+        assert [entry[0] for entry in store.backend.calls] == ["get", "put"]
+        assert store.backend.registered[1]["num_layers"] == NUM_LAYERS
+
+    def test_direct_strict_rejects_store_without_capability(self):
+        config = {
+            "chunk_tokens": CHUNK_TOKENS,
+            "chunk_kv_bytes": SEG * NUM_LAYERS,
+            "max_chunks_per_wave": MAX_WAVE,
+            "direct_transfer": True,
+            "direct_transfer_strict": True,
+        }
+        engine = KVEngine(config, MemoryKVStore(SEG, NUM_CHUNKS))
+        window = RingWindow(bytearray(NUM_SLOTS * SEG), NUM_SLOTS, SEG)
+        with pytest.raises(DirectTransferUnavailable):
+            engine.bind({}, window, NUM_LAYERS, 2)
+
+    def test_direct_request_falls_back_to_staged_without_capability(self):
+        store = StoreSpy(MemoryKVStore(SEG, NUM_CHUNKS))
+        config = {
+            "chunk_tokens": CHUNK_TOKENS,
+            "chunk_kv_bytes": SEG * NUM_LAYERS,
+            "max_chunks_per_wave": MAX_WAVE,
+            "direct_transfer": True,
+        }
+        engine = KVEngine(config, store)
+        engine.bind({}, RingWindow(bytearray(NUM_SLOTS * SEG), NUM_SLOTS, SEG),
+                    NUM_LAYERS, 2)
+        assert store.register_calls == [SEG]
+
     def test_double_bind_rejected(self):
         engine, window, _ = _make_engine(MemoryKVStore(SEG, NUM_CHUNKS))
         with pytest.raises(RuntimeError):
@@ -408,8 +539,10 @@ class TestBind:
     def test_layer_call_validation(self):
         engine, _, _ = _make_engine(MemoryKVStore(SEG, NUM_CHUNKS))
         keys = _chunk_keys(engine, 1, MAX_WAVE + 1)
-        with pytest.raises(ValueError):
-            engine.store_layer(keys, 0, 0)      # 超单波容量
+        # 超单波容量的请求自动拆成多个波次，仍保持单一完成句柄。
+        handle = engine.store_layer(keys, 0, 0)
+        handle.wait()
+        assert handle.query() is True
         with pytest.raises(ValueError):
             engine.store_layer([], 0, 0)        # 空批
         with pytest.raises(ValueError):

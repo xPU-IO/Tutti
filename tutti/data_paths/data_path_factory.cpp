@@ -133,8 +133,6 @@ Result<CreatedDataPath> create_local_nvme(
     // QueueAcquireHelper::acquire_queue), and nvm_parallel_queue supports
     // multiple concurrent submitters per queue.  The data path itself
     // emits a warning in that case.
-    auto bar0_size = checked_u32(slice.bar0_size, "bar0_size");
-    if (!bar0_size.ok()) return failure<CreatedDataPath>(bar0_size.status());
     auto max_batch_entries = checked_u32(
         tuning(spec).max_batch_entries, "max_batch_entries");
     if (!max_batch_entries.ok()) {
@@ -144,7 +142,6 @@ Result<CreatedDataPath> create_local_nvme(
     CreatedDataPath result;
     result.instance = std::make_unique<local_nvme::LocalNvmeDataPath>(
         slice.chrdev_path,
-        bar0_size.value(),
         static_cast<std::uint32_t>(slice.accel_id),
         slice.granted_queues,
         slice.namespace_id,
@@ -208,7 +205,6 @@ Result<CreatedDataPath> create_striped_local_nvme(
         // sharing; the data path warns) — see the local-nvme branch above.
         striped_local_nvme::DeviceDescriptor descriptor;
         descriptor.snvme_dev_path = slice.chrdev_path;
-        descriptor.bar0_size = slice.bar0_size;
         descriptor.namespace_id = slice.namespace_id;
         descriptor.cuda_device = static_cast<std::uint32_t>(slice.accel_id);
         descriptor.num_user_queues = slice.granted_queues;

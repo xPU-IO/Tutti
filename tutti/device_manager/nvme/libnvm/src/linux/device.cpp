@@ -910,10 +910,9 @@ int nvm_controller_init_gpu(nvm_ctrl_t** ctrl,
  * =================================================================== */
 
 int nvm_ctrl_attach_client(nvm_ctrl_t** ctrl,
-                           const char* snvme_dev_path,
-                           uint32_t bar0_size)
+                           const char* snvme_dev_path)
 {
-    if (ctrl == NULL || snvme_dev_path == NULL || bar0_size == 0) {
+    if (ctrl == NULL || snvme_dev_path == NULL) {
         return EINVAL;
     }
     *ctrl = NULL;
@@ -964,14 +963,10 @@ int nvm_ctrl_attach_client(nvm_ctrl_t** ctrl,
     }
     (*ctrl)->bar0_cuda_registered = true;
 
-    /* Note: bar0_size is currently not stored on nvm_ctrl_t (mm_size
-     * was set to NVM_CTRL_MEM_MINSIZE inside nvm_ctrl_init).  The
-     * passed-in size is reserved for future use (e.g. extended
-     * doorbell windows) and validated only as non-zero above.
-     * Callers that need to mmap MORE than NVM_CTRL_MEM_MINSIZE
-     * should issue a separate mmap on a fresh fd; that's outside
-     * libnvm's scope. */
-    (void) bar0_size;
+    /* BAR size/address are intentionally not a client input.  nvm_ctrl_init
+     * maps the controller's BAR through the kernel-owned
+     * NVM_CTRL_MEM_MINSIZE window, and the kernel is the sole authority for
+     * any future extended doorbell metadata. */
     return 0;
 }
 

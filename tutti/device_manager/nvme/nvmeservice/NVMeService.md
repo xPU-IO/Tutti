@@ -341,12 +341,10 @@ auto sess = client.connect(/*device_id=*/0,
                            /*num_queues=*/4);
 if (!sess) { /* see stderr */ return -1; }
 
-// sess->{snvme_dev_path, bar0_size, granted_queues, …}
+// sess->{snvme_dev_path, granted_queues, …}
 // drive libnvm yourself:
 nvm_ctrl_t* ctrl = nullptr;
-int rc = nvm_ctrl_attach_client(&ctrl,
-                                sess->snvme_dev_path.c_str(),
-                                (uint32_t)sess->bar0_size);
+int rc = nvm_ctrl_attach_client(&ctrl, sess->snvme_dev_path.c_str());
 
 uint32_t group_id = 0, max_q = 0;
 nvm_create_group(ctrl, &group_id, &max_q);

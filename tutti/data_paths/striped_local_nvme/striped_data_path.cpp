@@ -15,6 +15,7 @@
 
 #include <nvm_ctrl.h>
 #include <nvm_dma.h>
+#include <nvtx3/nvToolsExt.h>
 
 #include <tutti/cuda_like.h>
 #include <tutti/accelerator_device_guard.h>
@@ -266,9 +267,9 @@ Status StripedDataPath::initialize_impl_(const DataPathConfig& config,
             return Status(StatusCode::INVALID_ARGUMENT,
                          "all devices must share the same block_size");
         }
-        if (d.block_size == 0 || d.bar0_size == 0) {
+        if (d.block_size == 0) {
             return Status(StatusCode::INVALID_ARGUMENT,
-                         "device descriptor missing required fields");
+                         "device descriptor missing block_size");
         }
     }
 
@@ -287,8 +288,7 @@ Status StripedDataPath::initialize_impl_(const DataPathConfig& config,
         DeviceSlot slot;
         slot.desc = desc;
 
-        int rc = nvm_ctrl_attach_client(&slot.ctrl, desc.snvme_dev_path.c_str(),
-                                        desc.bar0_size);
+        int rc = nvm_ctrl_attach_client(&slot.ctrl, desc.snvme_dev_path.c_str());
         if (rc != 0 || slot.ctrl == nullptr) {
             rollback_devices();
             return Status(StatusCode::NOT_READY,
@@ -1442,11 +1442,13 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
         return outcome;
     }
 
+    nvtxRangePushA("tutti.striped_nvme.io_kernel");
     cudaError_t launch_err = launch_fused_submit(
         d_entries, d_status,
         reinterpret_cast<const DeviceTargetHandle* const*>(lease.d_dev_table),
         total_entries, total_dev_table, cq_poll_budget_, threads_per_block_,
         0, ctx.stream);
+    nvtxRangePop();
     if (launch_err != cudaSuccess) {
         release_cache_refs();
         arena_.release(lease.slot_index);

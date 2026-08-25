@@ -18,7 +18,6 @@ extern "C" {
 struct nvmeservice_client_io_args {
     int          cuda_dev;
     const char*  snvme_dev_path;
-    uint64_t     bar0_size;
     uint32_t     namespace_id;
     uint32_t     blk_size;
     uint32_t     queue_depth;

@@ -9,6 +9,12 @@
 #include <tutti/storage_runtime.h>
 #include <tutti/cuda_like.h>
 
+#include <cctype>
+#include <cstdlib>
+#include <filesystem>
+#include <stdexcept>
+#include <system_error>
+
 // Private headers — included here ONLY, never by consumer code.
 #include "tutti/data_paths/local_nvme/local_nvme_data_path.h"
 #include "tutti/data_paths/striped_local_nvme/striped_data_path.h"
@@ -18,6 +24,68 @@
 
 namespace tutti::presets {
 
+namespace {
+
+std::string normalize_bdf(std::string bdf) {
+    while (!bdf.empty() && std::isspace(static_cast<unsigned char>(bdf.back()))) {
+        bdf.pop_back();
+    }
+    std::size_t first = 0;
+    while (first < bdf.size() &&
+           std::isspace(static_cast<unsigned char>(bdf[first]))) {
+        ++first;
+    }
+    bdf.erase(0, first);
+    for (char& c : bdf) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    if (bdf.size() == 7 && bdf[2] == ':' && bdf[5] == '.') {
+        bdf = "0000:" + bdf;
+    }
+    return bdf;
+}
+
+std::string chrdev_for_bdf(const std::string& pci_bdf) {
+    if (pci_bdf.empty()) {
+        throw std::invalid_argument("NVMe device pci_bdf must not be empty");
+    }
+    const std::string wanted = normalize_bdf(pci_bdf);
+    const char* configured_root = std::getenv("TUTTI_SNVME_SYSFS_ROOT");
+    const std::filesystem::path root = configured_root && *configured_root
+        ? configured_root : "/sys/class/snvme";
+    std::error_code ec;
+    if (!std::filesystem::is_directory(root, ec)) {
+        throw std::runtime_error("SNVMe sysfs class is unavailable: " +
+                                 root.string());
+    }
+
+    for (const auto& entry : std::filesystem::directory_iterator(root, ec)) {
+        if (ec) break;
+        const std::string name = entry.path().filename().string();
+        if (name.rfind("snvme", 0) != 0 || name.size() == 5) continue;
+        bool numeric = true;
+        for (std::size_t i = 5; i < name.size(); ++i) {
+            numeric = numeric && std::isdigit(static_cast<unsigned char>(name[i]));
+        }
+        if (!numeric) continue;
+        const std::filesystem::path target =
+            std::filesystem::weakly_canonical(entry.path(), ec);
+        if (ec) {
+            ec.clear();
+            continue;
+        }
+        for (const auto& component : target) {
+            if (normalize_bdf(component.string()) == wanted) {
+                return "/dev/ssnvme" + name.substr(5);
+            }
+        }
+    }
+    throw std::runtime_error("no /dev/ssnvme device maps to PCI BDF " +
+                             pci_bdf + " under " + root.string());
+}
+
+} // namespace
+
 RuntimeWithTelemetry make_local_nvme_runtime(const LocalNvmePreset& p) {
     namespace lnvme = tutti::data_paths::local_nvme;
     using tutti::resolvers::local_file::LocalFileResolver;
@@ -26,8 +94,7 @@ RuntimeWithTelemetry make_local_nvme_runtime(const LocalNvmePreset& p) {
     // Heap-allocate the DataPath + resolver — injected as raw pointers
     // into RuntimeComponents, lifetime tied to the runtime.
     auto* dp = new lnvme::LocalNvmeDataPath(
-        p.device.ssnvme_path,
-        p.device.bar0_size,
+        chrdev_for_bdf(p.device.pci_bdf),
         p.gpu_id,
         p.num_queues,
         p.device.namespace_id,
@@ -75,7 +142,7 @@ RuntimeWithTelemetry make_striped_nvme_runtime(const StripedNvmePreset& p) {
 
     std::vector<snvme::DeviceDescriptor> sdevs;
     for (const auto& d : p.devices) {
-        sdevs.push_back({d.ssnvme_path, d.bar0_size, d.namespace_id,
+        sdevs.push_back({chrdev_for_bdf(d.pci_bdf), d.namespace_id,
                          (std::uint32_t)p.gpu_id, p.num_queues, d.block_size,
                          d.pci_bdf});
     }

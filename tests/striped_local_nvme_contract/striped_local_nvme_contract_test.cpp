@@ -30,7 +30,7 @@
 //
 // Usage:
 //   tutti_striped_local_nvme_contract_test [--devices 2|4] [--gpu ID]
-//       [--nvme ssnvme,bdf,backing,mount[,block_size[,bar0_size[,nsid]]]] ...
+//       [--nvme ssnvme,bdf,backing,mount[,block_size[,nsid]]] ...
 // With no argument, the test selects the largest supported power-of-two
 // device count that is available: 4 when all four devices are ready,
 // otherwise 2 when at least the first two devices are ready.
@@ -386,7 +386,7 @@ struct StripedEnv {
         std::vector<DeviceDescriptor> v;
         for (std::uint32_t i = 0; i < n; ++i) {
             const auto& device = g_devices.at(i);
-            v.push_back({device.ssnvme_path, device.bar0_size,
+            v.push_back({device.ssnvme_path,
                          device.namespace_id, (std::uint32_t)g_gpu_id,
                          /*num_user_queues=*/16, device.block_size,
                          device.pci_bdf});

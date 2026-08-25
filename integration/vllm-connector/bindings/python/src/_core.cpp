@@ -356,8 +356,9 @@ private:
 
 // ---------------------------------------------------------------------------
 // Preset dict parsing: unknown key / wrong type raise ValueError naming the
-// offending key. Device-selection facts (ssnvme_path / pci_bdf / mount_path)
-// are required; hardware geometry and queue-budget knobs are optional and
+// offending key. Device-selection facts (pci_bdf / mount_path) are required;
+// the character-device path is resolved from the BDF by the C++ preset
+// assembler. Hardware geometry and queue-budget knobs are optional and
 // fall back to the C++ struct defaults (single source of truth in
 // tutti/presets/local_nvme.h).
 // ---------------------------------------------------------------------------
@@ -442,17 +443,15 @@ void check_unknown_keys(const py::dict& d,
 tutti::presets::NvmeDeviceConfig parse_device(const py::dict& d) {
     check_unknown_keys(
         d,
-        {"ssnvme_path", "pci_bdf", "backing_device", "mount_path",
-         "namespace_id", "block_size", "bar0_size"},
+        {"pci_bdf", "backing_device", "mount_path", "namespace_id",
+         "block_size"},
         "device dict");
     tutti::presets::NvmeDeviceConfig dev;
-    dev.ssnvme_path = get_str_field(d, "ssnvme_path");
     dev.pci_bdf = get_str_field(d, "pci_bdf");
     opt_str_field(d, "backing_device", dev.backing_device);
     dev.mount_path = get_str_field(d, "mount_path");
     opt_int_field(d, "namespace_id", dev.namespace_id);
     opt_int_field(d, "block_size", dev.block_size);
-    opt_int_field(d, "bar0_size", dev.bar0_size);
     return dev;
 }
 

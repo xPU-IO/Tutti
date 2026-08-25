@@ -244,7 +244,7 @@ int main(int argc, char** argv) {
     // =====================================================================
     printf("--- 1. assembly/open ---\n");
     {
-        LocalNvmeDataPath dp(g_device.ssnvme_path, g_device.bar0_size, kCudaDev,
+        LocalNvmeDataPath dp(g_device.ssnvme_path, kCudaDev,
                              kNumQueues, g_device.namespace_id, g_device.block_size);
         auto resolver = make_resolver();
         auto rt = make_runtime(dp, resolver);
@@ -268,7 +268,7 @@ int main(int argc, char** argv) {
         // DataPath key mismatch: resolver sets key "local-nvme-ext4"; inject a
         // runtime whose only DataPath has a different key → no route.
         {
-            LocalNvmeDataPath dp2(g_device.ssnvme_path, g_device.bar0_size, kCudaDev,
+            LocalNvmeDataPath dp2(g_device.ssnvme_path, kCudaDev,
                                   kNumQueues, g_device.namespace_id,
                                   g_device.block_size);
             auto resolver2 = make_resolver();
@@ -295,7 +295,7 @@ int main(int argc, char** argv) {
     // =====================================================================
     printf("--- 2. memory / lazy registration ---\n");
     {
-        LocalNvmeDataPath dp(g_device.ssnvme_path, g_device.bar0_size, kCudaDev,
+        LocalNvmeDataPath dp(g_device.ssnvme_path, kCudaDev,
                              kNumQueues, g_device.namespace_id, g_device.block_size);
         auto resolver = make_resolver();
         auto rt = make_runtime(dp, resolver);
@@ -343,7 +343,7 @@ int main(int argc, char** argv) {
     // =====================================================================
     printf("--- 3. real data SINGLE/DUAL/LIST/cross-segment ---\n");
     {
-        LocalNvmeDataPath dp(g_device.ssnvme_path, g_device.bar0_size, kCudaDev,
+        LocalNvmeDataPath dp(g_device.ssnvme_path, kCudaDev,
                              kNumQueues, g_device.namespace_id, g_device.block_size);
         auto resolver = make_resolver();
         auto rt = make_runtime(dp, resolver);
@@ -451,7 +451,7 @@ int main(int argc, char** argv) {
     // =====================================================================
     printf("--- 4. batch / mixed / partial commit ---\n");
     {
-        LocalNvmeDataPath dp(g_device.ssnvme_path, g_device.bar0_size, kCudaDev,
+        LocalNvmeDataPath dp(g_device.ssnvme_path, kCudaDev,
                              kNumQueues, g_device.namespace_id, g_device.block_size);
         auto resolver = make_resolver();
         auto rt = make_runtime(dp, resolver);
@@ -537,7 +537,7 @@ int main(int argc, char** argv) {
     // =====================================================================
     printf("--- 5. order/concurrency ---\n");
     {
-        LocalNvmeDataPath dp(g_device.ssnvme_path, g_device.bar0_size, kCudaDev,
+        LocalNvmeDataPath dp(g_device.ssnvme_path, kCudaDev,
                              kNumQueues, g_device.namespace_id, g_device.block_size);
         auto resolver = make_resolver();
         auto rt = make_runtime(dp, resolver);
@@ -657,7 +657,7 @@ int main(int argc, char** argv) {
     // =====================================================================
     printf("--- 6. failure/timeout ---\n");
     {
-        LocalNvmeDataPath dp(g_device.ssnvme_path, g_device.bar0_size, kCudaDev,
+        LocalNvmeDataPath dp(g_device.ssnvme_path, kCudaDev,
                              kNumQueues, g_device.namespace_id, g_device.block_size);
         auto resolver = make_resolver();
         auto rt = make_runtime(dp, resolver);
@@ -727,7 +727,7 @@ int main(int argc, char** argv) {
     printf("--- 7. teardown / repeat lifecycle ---\n");
     {
         for (int round = 0; round < 2; ++round) {
-            LocalNvmeDataPath dp(g_device.ssnvme_path, g_device.bar0_size, kCudaDev,
+            LocalNvmeDataPath dp(g_device.ssnvme_path, kCudaDev,
                                  kNumQueues, g_device.namespace_id,
                                  g_device.block_size);
             auto resolver = make_resolver();
@@ -777,7 +777,7 @@ int main(int argc, char** argv) {
         // in-flight=8, batch_entries=4096 (both >= task minimums); the
         // other two new knobs (max_batch_requests, max_request_bytes_override)
         // are left at 0 (follow entries / entries*MDTS).
-        LocalNvmeDataPath dp_big(g_device.ssnvme_path, g_device.bar0_size,
+        LocalNvmeDataPath dp_big(g_device.ssnvme_path,
                                  kCudaDev, kNumQueues, g_device.namespace_id,
                                  g_device.block_size,
                                  /*mdts_bytes=*/0, /*max_batch_entries=*/4096,
@@ -939,7 +939,7 @@ int main(int argc, char** argv) {
     // =====================================================================
     printf("--- 9. default capacity regression: oversized batch fail-closed ---\n");
     {
-        LocalNvmeDataPath dp(g_device.ssnvme_path, g_device.bar0_size, kCudaDev,
+        LocalNvmeDataPath dp(g_device.ssnvme_path, kCudaDev,
                              kNumQueues, g_device.namespace_id, g_device.block_size);
         auto resolver = make_resolver();
         auto rt = make_runtime(dp, resolver);
@@ -986,7 +986,7 @@ int main(int argc, char** argv) {
     // =====================================================================
     printf("--- 10. batch open: mixed scenarios + byte verify ---\n");
     {
-        LocalNvmeDataPath dp(g_device.ssnvme_path, g_device.bar0_size, kCudaDev,
+        LocalNvmeDataPath dp(g_device.ssnvme_path, kCudaDev,
                              kNumQueues, g_device.namespace_id, g_device.block_size);
         auto resolver = make_resolver();
         auto rt = make_runtime(dp, resolver);

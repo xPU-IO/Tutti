@@ -14,7 +14,7 @@
 //      (NVM_SET_KERNEL_IOQ_CAP + SNVM_DEVICE_BIND + NVM_GET_DEV_INFO).
 //   2. Enforce a per-NVMe ACL (allowed_gpus -- NUMA / PCIe-switch
 //      affinity) on Connect requests.
-//   3. Hand out per-allocation metadata: snvme_dev_path, bar0_size,
+//   3. Hand out per-allocation metadata: snvme_dev_path,
 //      ns_id, queue_depth, mount_path symlink, lease parameters.
 //   4. Heartbeat-based lease cleanup: PID + /proc starttime check
 //      with grace timeout.  The kernel's snvm_dev_release fd-cascade
@@ -79,7 +79,6 @@ message DeviceInfo {
     uint32  blk_size_log         = 7;   // log2(blk_size), i.e. LBA shift
     uint32  queue_depth          = 8;   // entries per queue (NVMe MQES+1)
     uint32  dstrd                = 9;   // doorbell stride (encoded)
-    uint64  bar0_size            = 10;  // BAR0 region length (for client mmap)
     uint32  max_user_qid         = 11;  // upper bound of kernel user-QID pool
     uint32  max_queues_per_group = 12;  // kernel hard cap per fd
 
@@ -87,6 +86,7 @@ message DeviceInfo {
     // device, plus the GPU-view symlink path daemon installed for
     // each.  Empty mount_path means symlink installation failed.
     repeated AllowedGpu allowed_gpus = 13;
+    reserved 10;
 }
 
 message AllowedGpu {
@@ -112,7 +112,7 @@ message ConnectResponse {
     // --- Device metadata for nvm_ctrl_attach_client ---
     string  pci_addr        = 2;
     string  snvme_dev_path  = 3;
-    uint64  bar0_size       = 4;
+    reserved 4;
 
     // --- Daemon's recommended queue count ---
     // Client must not exceed this when calling nvm_add_user_queue.
@@ -212,12 +212,12 @@ message NvmeResource {
     uint32 logical_block_size_log = 10;
     uint32 queue_depth = 11;
     uint32 dstrd = 12;
-    uint64 bar0_size = 13;
     uint64 max_data_size = 14;
     uint32 max_user_qid = 15;
     uint32 kernel_io_qps = 16;
     uint32 controller_queue_capacity = 17;
     uint32 max_queues_per_group = 18;
+    reserved 13;
     uint32 reserved_queues = 19;
     uint32 available_queues = 20;
     repeated int32 allowed_accel_ids = 21;
@@ -256,10 +256,10 @@ message NvmeSlice {
     uint32 logical_block_size_log = 12;
     uint32 queue_depth = 13;
     uint32 dstrd = 14;
-    uint64 bar0_size = 15;
     uint64 max_data_size = 16;
     uint32 controller_queue_capacity = 17;
     uint32 granted_queues = 18;
+    reserved 15;
     uint32 max_queues_per_group = 19;
     repeated int32 allowed_accel_ids = 20;
     uint32 heartbeat_interval_sec = 21;

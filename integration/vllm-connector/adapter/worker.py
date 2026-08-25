@@ -11,12 +11,14 @@ import re
 
 import torch
 from tutti_kv_transfer import (
+    batched_layer_transfer,
     EngineKVFormat,
     discover_engine_format,
     single_layer_transfer,
 )
 
 from engine.staging import RingWindow
+from engine.nvtx import range as nvtx_range
 
 #: 单步内块表缓存上限（超出即整体重建，防无界增长）。
 _SLOT_CACHE_LIMIT = 1024
@@ -122,13 +124,18 @@ class PagedTransferHooks:
                 self._staging_shape = (chunk_tokens, 2, row_bytes // (2 * element))
         self._slot_cache: dict[tuple[int, ...], torch.Tensor] = {}
 
-    def gather(self, keys, layer_idx: int, block_tables, slots) -> None:
+    def gather(self, keys, layer_idx: int, block_tables, slots):
         """源侧搬运：paged 池一层段 → staging 槽（写入批发起前调用）。"""
-        self._transfer(block_tables, slots, layer_idx, "to_staging", sync=True)
+        self._transfer(block_tables, slots, layer_idx, "to_staging")
+        if self._device.type != "cuda":
+            return None
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream(device=self._device))
+        return event
 
     def scatter(self, keys, layer_idx: int, block_tables, slots):
         """目的侧搬运并返回消费完成事件（无需事件时返回 None）。"""
-        self._transfer(block_tables, slots, layer_idx, "to_paged", sync=False)
+        self._transfer(block_tables, slots, layer_idx, "to_paged")
         if self._device.type != "cuda":
             return None
         event = torch.cuda.Event()
@@ -138,9 +145,28 @@ class PagedTransferHooks:
     # ---- 内部 ----
 
     def _transfer(self, block_tables, slots, layer_idx: int,
-                  direction: str, sync: bool) -> None:
-        """逐 chunk 组 staging 视图与槽号映射并执行搬运。"""
+                  direction: str) -> None:
+        """搬运一层；连续槽位的多个 chunk 合并为一次 kernel。"""
         paged = self._layer_view(layer_idx)
+        if (self._mode == self._KERNEL
+                and len(block_tables) == len(slots)
+                and self._can_batch_slots(slots)):
+            mappings = [self._slot_mapping(blocks) for blocks in block_tables]
+            if mappings:
+                slot_mapping = torch.cat(mappings, dim=0)
+                first = slots[0]
+                staging_view = (
+                    self._staging.narrow(
+                        0, first * self._segment_bytes,
+                        len(slots) * self._segment_bytes,
+                    )
+                    .view(self._dtype)
+                    .view(len(slots) * self._chunk_tokens, *self._staging_shape[1:])
+                )
+                batched_layer_transfer(
+                    staging_view, paged, slot_mapping, self._fmt, direction
+                )
+                return
         for blocks, slot in zip(block_tables, slots):
             staging_view = (
                 self._staging
@@ -155,11 +181,13 @@ class PagedTransferHooks:
             else:
                 single_layer_transfer(staging_view, paged, slot_mapping,
                                       self._fmt, direction)
-        if sync and self._device.type == "cuda":
-            # staging 与池可能异卡（staging 固定 0 号加速器）：全设备
-            # 同步，确保提交批次发起时跨卡拷贝已落地。
-            torch.cuda.synchronize()
 
+    def _can_batch_slots(self, slots) -> bool:
+        """Return true when slot segments form one contiguous staging view."""
+        if not slots:
+            return False
+        return all(next_slot == slot + 1
+                   for slot, next_slot in zip(slots, slots[1:]))
     def _transfer_interleaved(self, staging_view, paged, slot_mapping,
                               direction: str) -> None:
         """交织池搬运：块表索引直达（池段与槽段字节同构）。"""
@@ -196,22 +224,35 @@ class WorkerImpl:
     - 构造注入引擎与在途句柄上限（max_in_flight_layers，0 = 不限）。
     - 显存对象经两个登记回调进入（单块跨层池或逐层映射，二选一）；
       首个执行回调触发惰性绑定（分配 staging 环窗显存并接入引擎）。
-    - 读取流程：start_load_kv 组批并预取第 0 层；wait_for_layer_load
-      等待当前层后预取下一层；末层等待返回即释放读保护。
+    - 读取流程：start_load_kv 组批并预取前 K 层；wait_for_layer_load
+      等待当前层后补交第 K 层；末层等待返回即释放读保护。K=1
+      时退化为原有逐层流水。
     - 写入流程：save_kv_layer 逐层发起一批；wait_for_save 等待全部
       完成并结算写入（在途句柄超限时先行等待最旧一批）。
     - 近似视图未遂（读取保护失败）的块经 get_block_ids_with_load_errors
       上报，由上层重算兜底。
     """
 
-    def __init__(self, engine, max_in_flight_layers: int = 0):
-        """engine 为编排核心实例；max_in_flight_layers 为负 → ValueError。"""
+    def __init__(self, engine, max_in_flight_layers: int = 0,
+                 lookahead_k: int | None = None):
+        """构造 worker；lookahead_k 为有界读取预取层数。"""
         if not isinstance(max_in_flight_layers, int) or max_in_flight_layers < 0:
             raise ValueError(
                 f"max_in_flight_layers 须为非负整数，got {max_in_flight_layers!r}"
             )
         self._engine = engine
         self._max_in_flight = max_in_flight_layers
+        if lookahead_k is None:
+            engine_config = getattr(engine, "_config", {})
+            lookahead_k = engine_config.get(
+                "lookahead_k", engine_config.get("prefetch_k", 1)
+            )
+        if not isinstance(lookahead_k, int) or isinstance(lookahead_k, bool) \
+                or lookahead_k <= 0:
+            raise ValueError(
+                f"lookahead_k 须为正整数，got {lookahead_k!r}"
+            )
+        self._lookahead_k = lookahead_k
         # configure 注入
         self._chunk_tokens = 0
         self._chunk_kv_bytes = 0
@@ -247,11 +288,23 @@ class WorkerImpl:
         chunk_kv_bytes: int,
         max_chunks_per_wave: int,
         block_size: int,
+        lookahead_k: int | None = None,
     ) -> None:
-        """注入编排所需的几何参数（由挂载点从配置读出）。"""
+        """注入编排所需的几何参数（由挂载点从配置读出）。
+
+        ``lookahead_k`` 可在配置阶段覆盖构造默认值，便于 connector
+        统一透传策略参数；缺省保持构造时的值。
+        """
         self._chunk_tokens = chunk_tokens
         self._chunk_kv_bytes = chunk_kv_bytes
         self._max_chunks_per_wave = max_chunks_per_wave
+        if lookahead_k is not None:
+            if (not isinstance(lookahead_k, int)
+                    or isinstance(lookahead_k, bool) or lookahead_k <= 0):
+                raise ValueError(
+                    f"lookahead_k 须为正整数，got {lookahead_k!r}"
+                )
+            self._lookahead_k = lookahead_k
         self._block_size = block_size
         # 已有登记且尚未绑定 → 立即补绑（见 register_kv_caches 的时序说明）
         if (self._kv_caches or self._cross_pool is not None) and not self._bound:
@@ -331,17 +384,28 @@ class WorkerImpl:
             self._load_keys = keys
             self._load_block_tables = block_tables
             self._pinned = True
-            self._start_load_layer(0)
+            with nvtx_range(
+                f"tutti.request.load|requests="
+                f"{len(getattr(self._metadata, 'requests', []) or [])}"
+                f"|chunks={len(keys)}|K={self._lookahead_k}"
+            ):
+                self._prefetch_load_layers(0)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """等待指定层读取完成，并预取下一层。"""
         idx = self._resolve_layer(layer_name)
         handle = self._load_handles.pop(idx, None)
         if handle is not None:
-            handle.wait()
-        nxt = idx + 1
-        if nxt < self._num_layers and self._load_keys and nxt not in self._load_handles:
-            self._start_load_layer(nxt)
+            with nvtx_range(f"tutti.request.wait_load|layer={idx}"):
+                handle.wait()
+        # 维持固定的 K 层在途窗口：首次调用已提交 [0, K)，每次
+        # 消费一层后只补交尾部一层。按 idx+K 定位可避免重复提交，
+        # 也让乱序/重复回调保持幂等。
+        nxt = idx + self._lookahead_k
+        if (nxt < self._num_layers and self._load_keys
+                and nxt not in self._load_handles):
+            with nvtx_range(f"tutti.request.prefetch_load|layer={nxt}"):
+                self._start_load_layer(nxt)
         if idx == self._num_layers - 1 and self._pinned:
             self._engine.unpin(self._load_keys)
             self._pinned = False
@@ -387,9 +451,12 @@ class WorkerImpl:
                 return
         if not self._save_keys:
             return
-        handle = self._engine.store_layer(
-            self._save_keys, idx, self._save_block_tables
-        )
+        with nvtx_range(
+            f"tutti.request.save|layer={idx}|chunks={len(self._save_keys)}"
+        ):
+            handle = self._engine.store_layer(
+                self._save_keys, idx, self._save_block_tables
+            )
         self._save_inflight.append(handle)
         if self._max_in_flight and len(self._save_inflight) > self._max_in_flight:
             self._save_inflight.pop(0).wait()
@@ -428,6 +495,18 @@ class WorkerImpl:
         self._load_handles[layer_idx] = self._engine.load_layer(
             self._load_keys, layer_idx, self._load_block_tables
         )
+
+    def _prefetch_load_layers(self, first_idx: int) -> None:
+        """提交从 ``first_idx`` 起的有限层窗口。
+
+        staging 环窗本身对波次覆盖负责背压；这里仅限制层级在途数，
+        因而不会创建无界 async bulk 队列。若环窗容量不足，底层
+        ``acquire`` 会在复用前驱槽位时等待其完成，保持既有安全契约。
+        """
+        end = min(self._num_layers, first_idx + self._lookahead_k)
+        for layer_idx in range(first_idx, end):
+            if layer_idx not in self._load_handles:
+                self._start_load_layer(layer_idx)
 
     def _chunk_block_tables(self, meta, count: int) -> list[list[int]]:
         """计算前 count 个 chunk 各自的块号表（块号可任意分布）。"""
@@ -510,7 +589,10 @@ class WorkerImpl:
                 f"({num_layers}) 整分"
             )
         segment_bytes = self._chunk_kv_bytes // num_layers
-        slots = 2 * self._max_chunks_per_wave
+        # 两个完整环窗半区各容纳 K 个波次；K=1 保持旧的双半窗
+        # 几何，K>1 才能让初始层预取不在第三个波次立即回绕阻塞。
+        window_layers = min(self._lookahead_k, num_layers)
+        slots = 2 * self._max_chunks_per_wave * window_layers
         # staging 落 0 号加速器：真机 runtime 组装当前仅支持进程视角
         # 0 号卡（gpu_id 非 0 组装必败，DataPath 亦不接受主存 staging），
         # 全副本统一 gpu_id=0 → staging 与 runtime 同卡；池在他卡的副本
@@ -542,7 +624,10 @@ class WorkerImpl:
                 slots * segment_bytes, dtype=torch.uint8, pin_memory=True
             )
             raw = staging.numpy()
-        window = RingWindow(raw, slots, segment_bytes)
+        window = RingWindow(
+            raw, slots, segment_bytes,
+            capacity_per_wave=self._max_chunks_per_wave,
+        )
         blocks_per_chunk = -(-self._chunk_tokens // self._block_size)
         gather_fn = scatter_fn = None
         layer_view = self._layer_view()
@@ -559,8 +644,12 @@ class WorkerImpl:
                 self._chunk_tokens, self._block_size, fmt,
             )
             gather_fn, scatter_fn = hooks.gather, hooks.scatter
+        bind_caches = self._kv_caches if self._kv_caches else (
+            self._cross_pool if self._cross_pool is not None else {}
+        )
         self._engine.bind(
-            self._kv_caches or {}, window, num_layers, blocks_per_chunk,
+            bind_caches,
+            window, num_layers, blocks_per_chunk,
             gather_fn=gather_fn, scatter_fn=scatter_fn,
         )
         self._num_layers = num_layers

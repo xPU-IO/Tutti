@@ -17,7 +17,6 @@ void fill_resource(const NvmeResourceSnapshot& source, NvmeResource* target) {
     target->set_logical_block_size_log(source.logical_block_size_log);
     target->set_queue_depth(source.queue_depth);
     target->set_dstrd(source.dstrd);
-    target->set_bar0_size(source.bar0_size);
     target->set_max_data_size(source.max_data_size);
     target->set_max_user_qid(source.max_user_qid);
     target->set_kernel_io_qps(source.kernel_io_qps);
@@ -51,7 +50,6 @@ void fill_slice_proto(const NvmeSliceGrant& source, NvmeSlice* target) {
     target->set_logical_block_size_log(source.logical_block_size_log);
     target->set_queue_depth(source.queue_depth);
     target->set_dstrd(source.dstrd);
-    target->set_bar0_size(source.bar0_size);
     target->set_max_data_size(source.max_data_size);
     target->set_controller_queue_capacity(source.controller_queue_capacity);
     target->set_granted_queues(source.granted_queues);
@@ -152,7 +150,6 @@ grpc::Status NvmeServiceImpl::ListDevices(grpc::ServerContext*, const Empty*,
         device->set_blk_size_log(resource.logical_block_size_log);
         device->set_queue_depth(resource.queue_depth);
         device->set_dstrd(resource.dstrd);
-        device->set_bar0_size(resource.bar0_size);
         device->set_max_user_qid(resource.max_user_qid);
         device->set_max_queues_per_group(resource.max_queues_per_group);
         for (int32_t accel_id : resource.allowed_accel_ids) {
@@ -181,7 +178,6 @@ grpc::Status NvmeServiceImpl::Connect(grpc::ServerContext*,
     response->set_allocation_id(grant.allocation_id);
     response->set_pci_addr(grant.pci_addr);
     response->set_snvme_dev_path(grant.snvme_dev_path);
-    response->set_bar0_size(grant.bar0_size);
     response->set_granted_queues(grant.granted_queues);
     response->set_namespace_id(grant.namespace_id);
     response->set_page_size(grant.page_size);

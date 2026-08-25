@@ -112,7 +112,6 @@ nvmeservice::NvmeResourceSnapshot resource(int32_t device_id,
     result.logical_block_size_log = 12;
     result.queue_depth = 1024;
     result.dstrd = 0;
-    result.bar0_size = 32768;
     result.max_data_size = 524288;
     result.max_user_qid = 96;
     result.kernel_io_qps = 32;
@@ -457,7 +456,7 @@ void test_rpc_contract() {
               !item.chrdev_path().empty() && !item.block_path().empty() &&
               !item.backing_mount_path().empty() && item.namespace_id() == 1 &&
               item.page_size() == 4096 && item.logical_block_size() == 4096 &&
-              item.queue_depth() == 1024 && item.bar0_size() == 32768 &&
+              item.queue_depth() == 1024 &&
               item.controller_queue_capacity() == 8 &&
               item.allowed_accel_ids_size() == 2,
               "new resource metadata is complete");

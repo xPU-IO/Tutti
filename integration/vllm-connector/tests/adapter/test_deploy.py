@@ -24,7 +24,7 @@ class TestLocalRankPlaceholder:
             "preset": {
                 "device_id": "{LOCAL_RANK}",
                 "gpu_id": "{LOCAL_RANK}",
-                "ssnvme_path": "/dev/ssnvme{LOCAL_RANK}",
+                "pci_bdf": "0000:4b:00.0",
             },
         }
         os.environ["LOCAL_RANK"] = "3"
@@ -35,7 +35,7 @@ class TestLocalRankPlaceholder:
         assert got["root"] == "/mnt/nvme3/pool"
         assert got["num_chunks"] == 128  # 数值不动
         assert got["preset"]["device_id"] == "3"
-        assert got["preset"]["ssnvme_path"] == "/dev/ssnvme3"
+        assert got["preset"]["pci_bdf"] == "0000:4b:00.0"
 
     def test_defaults_to_zero(self):
         os.environ.pop("LOCAL_RANK", None)
@@ -103,7 +103,7 @@ class TestPresetNormalization:
             "device_id": "2",
             "gpu_id": "2",
             "num_queues": "8",
-            "ssnvme_path": "/dev/ssnvme2",
+            "pci_bdf": "0000:4b:00.0",
             "device": {"namespace_id": "1", "block_size": "4096",
                        "mount_path": "/mnt/nvme2"},
         }
@@ -111,7 +111,7 @@ class TestPresetNormalization:
         assert got["device_id"] == 2
         assert got["gpu_id"] == 2
         assert got["num_queues"] == 8
-        assert got["ssnvme_path"] == "/dev/ssnvme2"  # 非纯数字不动
+        assert got["pci_bdf"] == "0000:4b:00.0"  # 非纯数字不动
         assert got["device"]["namespace_id"] == 1
         assert got["device"]["block_size"] == 4096
         assert got["device"]["mount_path"] == "/mnt/nvme2"

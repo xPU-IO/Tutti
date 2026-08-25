@@ -40,7 +40,6 @@ int run_io(int32_t accel_id, const nvmeservice::ClientNvmeSlice& slice,
     nvmeservice_client_io_args arguments {};
     arguments.cuda_dev = accel_id;
     arguments.snvme_dev_path = slice.chrdev_path.c_str();
-    arguments.bar0_size = slice.bar0_size;
     arguments.namespace_id = slice.namespace_id;
     arguments.blk_size = slice.logical_block_size;
     arguments.queue_depth = slice.queue_depth;
@@ -127,7 +126,6 @@ int main(int argc, char** argv) {
                   << " block_size=" << resource.logical_block_size
                   << " page_size=" << resource.page_size
                   << " queue_depth=" << resource.queue_depth
-                  << " bar0=" << resource.bar0_size
                   << " capacity=" << resource.controller_queue_capacity
                   << " reserved=" << resource.reserved_queues
                   << " available_queues=" << resource.available_queues
@@ -142,7 +140,6 @@ int main(int argc, char** argv) {
         if (!session) return 1;
         nvmeservice::ClientNvmeSlice slice;
         slice.chrdev_path = session->snvme_dev_path;
-        slice.bar0_size = session->bar0_size;
         slice.namespace_id = session->namespace_id;
         slice.logical_block_size = session->blk_size;
         slice.queue_depth = session->queue_depth;

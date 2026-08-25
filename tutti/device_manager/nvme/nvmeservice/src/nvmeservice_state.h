@@ -66,7 +66,6 @@ struct NvmeResourceSnapshot {
     uint32_t logical_block_size_log = 0;
     uint32_t queue_depth = 0;
     uint32_t dstrd = 0;
-    uint64_t bar0_size = 0;
     uint64_t max_data_size = 0;
     uint32_t max_user_qid = 0;
     // Actual kernel I/O QPs, excluding QID 0's admin queue.
@@ -142,7 +141,6 @@ struct NvmeSliceGrant {
     uint32_t logical_block_size_log = 0;
     uint32_t queue_depth = 0;
     uint32_t dstrd = 0;
-    uint64_t bar0_size = 0;
     uint64_t max_data_size = 0;
     uint32_t controller_queue_capacity = 0;
     uint32_t granted_queues = 0;
@@ -176,7 +174,6 @@ struct ConnectGrant {
     int32_t device_id = -1;
     std::string pci_addr;
     std::string snvme_dev_path;
-    uint64_t bar0_size = 0;
     uint32_t dstrd = 0;
     int32_t granted_queues = 0;
     uint32_t namespace_id = 0;
