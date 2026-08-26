@@ -22,10 +22,11 @@
 //   - free is a no-op (segments are freed on pool shutdown).
 //   - shutdown nvm_dma_unmap's all segments.
 //
-// Thread safety: none — caller must hold registry_mutex_ (same as
-// DescPool, storage_runtime.h:374/401).
+// Thread safety: internal mutex covers init/growth/shutdown because dynamic
+// submit misses may arrive from multiple host threads.
 
 #include <cstdint>
+#include <mutex>
 #include <vector>
 
 // nvm_dma.h pulls in nvm_types.h which defines nvm_dma_t and nvm_ctrl_t
@@ -45,9 +46,10 @@ struct PrpBufRef {
 
 class PrpBufPool {
 public:
-    // Default segment size: 256 MiB = 65536 pages (4KiB) = ~1.05M slices
-    // (at 16 slices/page). 180GB KV / 128KiB = 1.47M slices → ~2 segments.
-    static constexpr std::uint64_t DEFAULT_SEGMENT_PAGES = 65536ULL;
+    // Default segment size: 16 MiB = 4096 pages. The pool grows by adding
+    // segments; a small dynamic LIST miss must not require pinning 256 MiB.
+    // Requests larger than one segment are rounded up to a segment multiple.
+    static constexpr std::uint64_t DEFAULT_SEGMENT_PAGES = 4096ULL;
 
     PrpBufPool() = default;
     ~PrpBufPool();
@@ -63,15 +65,27 @@ public:
     // segment->vaddr + (base_page + i) * page_size for IOVA/virtual access.
     PrpBufRef alloc_pages(std::uint64_t n_pages);
 
+    // Unmap all host-pinned segments.  retain=true intentionally leaks the
+    // mappings/backing after a controller timeout; the controller may still
+    // fetch a PRP list.  Idempotent.
+    void shutdown(bool retain = false);
+
     // Total pages allocated across all segments.
-    std::uint64_t total_pages() const { return total_pages_; }
+    std::uint64_t total_pages() const {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return total_pages_;
+    }
 
     // Number of segments allocated (for diagnostics / dma_map count).
-    std::size_t num_segments() const { return segments_.size(); }
+    std::size_t num_segments() const {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return segments_.size();
+    }
 
 private:
     struct Segment {
         nvm_dma_t* dma = nullptr;      // nvm_dma_map_data_host'd
+        void* backing = nullptr;       // page-aligned caller-owned host memory
         std::uint64_t capacity_pages = 0;  // total pages in this segment
         std::uint64_t used_pages = 0;     // pages already sub-allocated
     };
@@ -81,6 +95,7 @@ private:
     std::uint64_t page_size_ = 4096;
     std::uint64_t total_pages_ = 0;
     std::uint64_t segment_pages_ = DEFAULT_SEGMENT_PAGES;
+    mutable std::mutex mtx_;
 };
 
 } // namespace tutti::data_paths::local_nvme

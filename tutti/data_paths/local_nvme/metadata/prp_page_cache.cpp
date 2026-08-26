@@ -62,19 +62,18 @@ bool PrpPageCache::init(const Config& cfg, nvm_ctrl_t* ctrl) {
     return true;
 }
 
-void PrpPageCache::shutdown() {
+void PrpPageCache::shutdown(bool retain) {
     std::lock_guard<std::mutex> lock(mtx_);
     if (!initialized_) return;
 
-    // DMA unmap FIRST, then free host memory (lives/dies together).
-    if (pool_dma_) {
-        nvm_dma_unmap(pool_dma_);
-        pool_dma_ = nullptr;
+    // A timed-out controller command may still fetch the PRP list. Retain
+    // both DMA mapping and host backing together in that case.
+    if (!retain) {
+        if (pool_dma_) nvm_dma_unmap(pool_dma_);
+        if (pool_host_) std::free(pool_host_);
     }
-    if (pool_host_) {
-        std::free(pool_host_);
-        pool_host_ = nullptr;
-    }
+    pool_dma_ = nullptr;
+    pool_host_ = nullptr;
 
     entries_.clear();
     free_list_.clear();

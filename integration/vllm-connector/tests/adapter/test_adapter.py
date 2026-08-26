@@ -8,7 +8,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from adapter.connector import TuttiConnectorMetadata, TuttiConnectorV1
+from adapter.connector import (
+    TuttiConnectorMetadata,
+    TuttiConnectorV1,
+    _resolve_geometry,
+)
 from engine.core import KVEngine
 from index.chunk_index import derive_io_key
 from stores.tutti_nvme.layout import decode_io_key
@@ -73,12 +77,17 @@ def _make_vllm_config(extra: dict | None = None, block_size: int = BLOCK_SIZE):
         "chunk_tokens": CHUNK_TOKENS,
         "chunk_kv_bytes": SEG * NUM_LAYERS,
         "max_chunks_per_wave": MAX_WAVE,
+        "num_layers": NUM_LAYERS,
         "store": {"type": "memory", "options": {"segment_bytes": SEG, "num_chunks": 16}},
     }
     merged.update(extra or {})
     return SimpleNamespace(
         kv_transfer_config=SimpleNamespace(kv_connector_extra_config=merged),
         cache_config=SimpleNamespace(block_size=block_size),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1,
+            decode_context_parallel_size=1,
+        ),
     )
 
 
@@ -132,6 +141,7 @@ def _make_harness(extra: dict | None = None, num_layers: int | None = None,
     nl = num_layers or NUM_LAYERS
     extra = dict(extra or {})
     extra.setdefault("chunk_kv_bytes", SEG * nl)
+    extra.setdefault("num_layers", nl)
     hooks = PoolHooks()
     store = _TensorAdaptingStore(MemoryKVStore(SEG, 16))
     engine = KVEngine(
@@ -190,15 +200,20 @@ class TestMounting:
         cfg = _make_vllm_config()
         TuttiConnectorV1(cfg, KVConnectorRole.SCHEDULER, object())
 
-    def test_both_roles_share_engine(self):
+    def test_roles_are_isolated_without_test_injection(self):
         h = _make_harness()
+        # Explicit object injection remains available to the pure-Python test
+        # harness, but production role construction is split.
         assert h.scheduler._engine is h.engine
         assert h.worker._engine is h.engine
-        # 同 vllm_config 无注入时也共享（进程内注册表）
         cfg = _make_vllm_config()
         a = TuttiConnectorV1(cfg, KVConnectorRole.SCHEDULER, object())._engine
         b = TuttiConnectorV1(cfg, KVConnectorRole.WORKER, object())._engine
-        assert a is b
+        assert a is not b
+        assert type(a).__name__ == "SchedulerMetadataIndex"
+        assert type(b).__name__ == "KVEngine"
+        a.close()
+        b.close()
 
     def test_piecewise_overridden_true(self):
         assert TuttiConnectorV1.requires_piecewise_for_cudagraph({}) is True
@@ -207,11 +222,114 @@ class TestMounting:
         h = _make_harness()
         assert h.worker.prefer_cross_layer_blocks is True
 
+    def test_requires_nhd_layout(self):
+        assert TuttiConnectorV1.get_required_kvcache_layout(
+            _make_vllm_config()
+        ) == "NHD"
+
+    def test_dcp_rejected_before_engine_open(self):
+        cfg = _make_vllm_config()
+        cfg.parallel_config.decode_context_parallel_size = 2
+        with pytest.raises(ValueError, match="decode_context_parallel_size=2"):
+            TuttiConnectorV1(cfg, KVConnectorRole.SCHEDULER, object())
+
     def test_missing_engine_key_rejected(self):
         cfg = _make_vllm_config()
         del cfg.kv_transfer_config.kv_connector_extra_config["chunk_kv_bytes"]
         with pytest.raises(ValueError):
             TuttiConnectorV1(cfg, KVConnectorRole.SCHEDULER, object())
+
+
+class TestGeometryResolution:
+    @staticmethod
+    def _kv_cache_config(page_size=SEG, block_size=BLOCK_SIZE, layers=NUM_LAYERS):
+        spec = SimpleNamespace(
+            block_size=block_size,
+            page_size_bytes=page_size,
+        )
+        group = SimpleNamespace(
+            layer_names=[f"model.layers.{i}.attn" for i in range(layers)],
+            kv_cache_spec=spec,
+        )
+        return SimpleNamespace(kv_cache_groups=[group])
+
+    def test_derives_model_geometry(self):
+        extra = {
+            "chunk_tokens": 2 * BLOCK_SIZE,
+            "max_chunks_per_wave": MAX_WAVE,
+        }
+        got = _resolve_geometry(extra, self._kv_cache_config())
+        assert got["num_layers"] == NUM_LAYERS
+        assert got["chunk_kv_bytes"] == 2 * SEG * NUM_LAYERS
+
+    def test_connector_injects_derived_geometry_into_store(self):
+        extra = {
+            "chunk_tokens": 2 * BLOCK_SIZE,
+            "max_chunks_per_wave": MAX_WAVE,
+            "store": {"type": "memory", "options": {"num_chunks": 16}},
+        }
+        cfg = SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(kv_connector_extra_config=extra),
+            cache_config=SimpleNamespace(block_size=BLOCK_SIZE, cache_dtype="auto"),
+            model_config=SimpleNamespace(model="fake-model"),
+            parallel_config=SimpleNamespace(tensor_parallel_size=1),
+        )
+        connector = TuttiConnectorV1(
+            cfg,
+            KVConnectorRole.SCHEDULER,
+            self._kv_cache_config(),
+        )
+        assert connector._engine._num_layers == NUM_LAYERS
+        assert connector._engine._chunk_kv_bytes == 2 * SEG * NUM_LAYERS
+        assert connector._engine._store._segment_bytes == 2 * SEG
+
+    def test_matching_explicit_geometry_is_accepted(self):
+        extra = {
+            "chunk_tokens": 2 * BLOCK_SIZE,
+            "max_chunks_per_wave": MAX_WAVE,
+            "num_layers": NUM_LAYERS,
+            "chunk_kv_bytes": 2 * SEG * NUM_LAYERS,
+        }
+        assert _resolve_geometry(extra, self._kv_cache_config()) == extra
+
+    def test_mismatched_explicit_geometry_is_rejected(self):
+        extra = {
+            "chunk_tokens": 2 * BLOCK_SIZE,
+            "max_chunks_per_wave": MAX_WAVE,
+            "num_layers": NUM_LAYERS + 1,
+        }
+        with pytest.raises(ValueError, match="推导值"):
+            _resolve_geometry(extra, self._kv_cache_config())
+
+    def test_multiple_cache_groups_are_rejected(self):
+        config = self._kv_cache_config()
+        config.kv_cache_groups.append(config.kv_cache_groups[0])
+        extra = {
+            "chunk_tokens": 2 * BLOCK_SIZE,
+            "max_chunks_per_wave": MAX_WAVE,
+        }
+        with pytest.raises(ValueError, match="multi-group"):
+            _resolve_geometry(extra, config)
+
+    def test_nonuniform_layer_pages_are_rejected(self):
+        names = ["layer.0", "layer.1"]
+        spec = SimpleNamespace(
+            block_size=BLOCK_SIZE,
+            kv_cache_specs={
+                names[0]: SimpleNamespace(page_size_bytes=SEG),
+                names[1]: SimpleNamespace(page_size_bytes=2 * SEG),
+            },
+        )
+        config = SimpleNamespace(kv_cache_groups=[SimpleNamespace(
+            layer_names=names,
+            kv_cache_spec=spec,
+        )])
+        extra = {
+            "chunk_tokens": 2 * BLOCK_SIZE,
+            "max_chunks_per_wave": MAX_WAVE,
+        }
+        with pytest.raises(ValueError, match="每层 KV page"):
+            _resolve_geometry(extra, config)
 
 
 class TestSchedulerSide:
@@ -255,6 +373,9 @@ class TestSchedulerSide:
         assert entry.save_chunk_start == 0
         assert entry.save_chunk_count == 2
         assert entry.load_tokens == 0
+        # Planning reserves capacity only. Resident publication is gated by
+        # the worker's successful save completion.
+        assert h.engine.lookup_prefix(req.prompt_token_ids) == 0
 
     def test_partial_chunk_not_saved(self):
         h = _make_harness()
@@ -466,6 +587,110 @@ class TestLoadSemantics:
         h.worker.wait_for_save()
         return keys
 
+    def test_failed_layer_marks_invalid_and_stops_later_scatter(self):
+        class Handle:
+            def __init__(self, layer, fail=False):
+                self.layer = layer
+                self.fail = fail
+                self.wait_count = 0
+                self.abort_count = 0
+
+            def wait(self):
+                self.wait_count += 1
+                if self.fail:
+                    from engine.core import LoadGateError
+                    raise LoadGateError("cq failed", whole_operation=True)
+
+            def abort(self):
+                self.abort_count += 1
+
+        class Engine:
+            def __init__(self):
+                self.handles = {}
+                self.calls = []
+                self.unpinned = []
+
+            def load_layer(self, keys, layer, blocks):
+                self.calls.append(layer)
+                handle = Handle(layer, fail=layer == 0)
+                self.handles[layer] = handle
+                return handle
+
+            def abort(self):
+                for handle in self.handles.values():
+                    if not handle.fail:
+                        handle.abort()
+
+            def unpin(self, keys):
+                self.unpinned.append(tuple(keys))
+
+        from adapter.worker import WorkerImpl
+
+        engine = Engine()
+        worker = WorkerImpl(engine, lookahead_k=3)
+        worker._num_layers = 4
+        worker._load_keys = [b"k0", b"k1"]
+        worker._load_block_tables = [[10], [11]]
+        worker._pinned = True
+        worker._prefetch_load_layers(0)
+        assert engine.calls == [0, 1, 2]
+        worker.wait_for_layer_load("model.layers.0.self_attn")
+        assert worker.get_block_ids_with_load_errors() == {10, 11}
+        assert engine.handles[1].abort_count == 1
+        assert engine.handles[2].abort_count == 1
+        worker.wait_for_layer_load("model.layers.1.self_attn")
+        assert engine.calls == [0, 1, 2]
+        assert engine.unpinned == [(b"k0", b"k1")]
+
+    def test_abort_is_idempotent(self):
+        class Engine:
+            def __init__(self):
+                self.abort_count = 0
+
+            def abort(self):
+                self.abort_count += 1
+
+            def close(self):
+                return None
+
+        from adapter.worker import WorkerImpl
+
+        engine = Engine()
+        worker = WorkerImpl(engine)
+        worker.abort()
+        worker.abort()
+        assert worker._save_inflight == []
+        assert worker._load_handles == {}
+
+    def test_save_failure_drains_and_never_publishes_resident(self):
+        class FailedHandle:
+            def wait(self):
+                raise RuntimeError("write cq failed")
+
+        class Engine:
+            def __init__(self):
+                self.wait_idle_count = 0
+                self.confirm_calls = []
+
+            def wait_idle(self):
+                self.wait_idle_count += 1
+
+            def confirm_store(self, keys, ok=True):
+                self.confirm_calls.append((tuple(keys), ok))
+
+        from adapter.worker import WorkerImpl
+
+        engine = Engine()
+        worker = WorkerImpl(engine)
+        worker._save_keys = [b"k"]
+        worker._save_inflight = [FailedHandle()]
+        with pytest.raises(RuntimeError, match="write cq failed"):
+            worker.wait_for_save()
+        assert engine.wait_idle_count == 1
+        assert engine.confirm_calls == [((b"k",), False)]
+        assert worker._save_keys is None
+        assert worker._save_inflight == []
+
     def test_mixed_prefix_loads_offset_window(self):
         """B3：本地命中 N 时只加载 [N, hit) 区间，不重写前 N 段。"""
         h = _make_harness()
@@ -643,7 +868,13 @@ class TestEndToEnd:
         h.worker.register_cross_layers_kv_cache(pool, attn_backend=None)
         h.worker._impl._ensure_bound()
         assert h.worker._impl.window is not None
-        assert h.worker._impl.window.num_slots == 2 * MAX_WAVE
+        read = h.worker._impl.read_window
+        write = h.worker._impl.write_window
+        assert read.num_slots == write.num_slots == MAX_WAVE
+        assert read.slot_base == 0
+        assert write.slot_base == MAX_WAVE
+        assert read.buffer is write.buffer
+        assert len(read.buffer) == 2 * MAX_WAVE * (SEG * NUM_LAYERS // NUM_LAYERS)
 
     def test_max_in_flight_layers_caps(self):
         h = _make_harness(extra={"max_in_flight_layers": 1})

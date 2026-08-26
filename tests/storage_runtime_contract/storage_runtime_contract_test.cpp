@@ -933,6 +933,45 @@ static int test_component_backed_runtime_route() {
     return 0;
 }
 
+// io_granularity belongs to the public MemoryView and must survive the lazy
+// Runtime -> DataPath registration performed on first submit.
+static int test_component_registration_preserves_io_granularity() {
+    RuntimeFakeResolver resolver;
+    RuntimeFakeDataPath data_path;
+    tutti::RuntimeComponents components;
+    components.resolvers.push_back({"fake", &resolver});
+    components.data_paths.push_back(
+        {"runtime-fake-datapath", &data_path, tutti::DataPathConfig{"fake"}});
+
+    auto created = tutti::StorageRuntime::create({}, std::move(components));
+    if (!created.ok()) return 1;
+    auto runtime = std::move(created).value();
+
+    char buffer[8192]{};
+    auto view = make_host_view(buffer, sizeof(buffer));
+    view.io_granularity = 4096;
+    auto memory = runtime->register_memory(view);
+    auto target = runtime->open("fake://granularity", tutti::OpenOptions{});
+    if (!memory.ok() || !target.ok()) return 1;
+
+    const tutti::IoRequest request{
+        tutti::IoDirection::WRITE, memory.value(), 0,
+        target.value(), 0, 4096};
+    const tutti::HostSubmitContext context{
+        tutti::ExecutionDomain::HOST_EXECUTION, -1, nullptr};
+    auto submitted = runtime->submit(&request, 1, context);
+    if (!submitted.status.ok() || !submitted.io.has_value()) return 1;
+    if (data_path.register_calls != 1 ||
+        data_path.last_registered_memory_view.io_granularity != 4096) return 1;
+
+    auto snapshot = runtime->query(*submitted.io);
+    if (!snapshot.ok() || snapshot.value().state != tutti::IoState::COMPLETED ||
+        !runtime->release_io(*submitted.io).ok()) return 1;
+    if (!runtime->close(target.value()).ok() ||
+        !runtime->unregister_memory(memory.value()).ok()) return 1;
+    return runtime->shutdown(1).ok() ? 0 : 1;
+}
+
 // 24. Component assembly refuses an unregistered URI scheme without opening a
 // private target or registering memory.
 static int test_component_runtime_unknown_scheme() {
@@ -1034,6 +1073,54 @@ static int test_component_runtime_partial_commit() {
     auto snapshot = runtime->query(*submitted.io);
     if (!snapshot.ok() || snapshot.value().state != tutti::IoState::COMPLETED ||
         !runtime->release_io(*submitted.io).ok()) return 1;
+    if (!runtime->close(target.value()).ok() ||
+        !runtime->unregister_memory(memory.value()).ok()) return 1;
+    return runtime->shutdown(1).ok() ? 0 : 1;
+}
+
+// Structured terminal detail survives Runtime release and remains conservative
+// about request attribution when the DataPath does not provide a bitmap.
+static int test_structured_terminal_detail_survives_release() {
+    RuntimeFakeResolver resolver;
+    RuntimeFakeDataPath data_path;
+    data_path.terminal_state = tutti::OpState::FAILED;
+    data_path.terminal_status =
+        tutti::Status(tutti::StatusCode::DEVICE_ERROR, "injected cq error");
+    data_path.terminal_detail.failure_kind = tutti::IoFailureKind::NVME_CQ_ERROR;
+    data_path.terminal_detail.failure_scope = tutti::IoFailureScope::WHOLE_OPERATION;
+    data_path.terminal_detail.first_failed_entry = 1;
+    data_path.terminal_detail.raw_cq_status = 0xdeadbeefu;
+    data_path.terminal_detail.confirmed_bytes = 32;
+
+    tutti::RuntimeComponents components;
+    components.resolvers.push_back({"fake", &resolver});
+    components.data_paths.push_back(
+        {"runtime-fake-datapath", &data_path, tutti::DataPathConfig{"fake"}});
+    auto created = tutti::StorageRuntime::create({}, std::move(components));
+    if (!created.ok()) return 1;
+    auto runtime = std::move(created).value();
+    char buffer[128]{};
+    auto memory = runtime->register_memory(make_host_view(buffer, sizeof(buffer)));
+    auto target = runtime->open("fake://detail", tutti::OpenOptions{});
+    if (!memory.ok() || !target.ok()) return 1;
+    const tutti::IoRequest request{
+        tutti::IoDirection::READ, memory.value(), 0, target.value(), 0, 32};
+    const tutti::HostSubmitContext context{
+        tutti::ExecutionDomain::HOST_EXECUTION, -1, nullptr};
+    auto submitted = runtime->submit(&request, 1, context);
+    if (!submitted.io.has_value()) return 1;
+    auto detail = runtime->wait_detail(*submitted.io, 1000);
+    if (!detail.ok() || detail.value().state != tutti::IoState::FAILED ||
+        detail.value().detail.failure_kind != tutti::IoFailureKind::NVME_CQ_ERROR ||
+        detail.value().detail.first_failed_entry != 1 ||
+        detail.value().detail.raw_cq_status != 0xdeadbeefu ||
+        detail.value().detail.confirmed_bytes != 32 ||
+        detail.value().detail.failure_scope != tutti::IoFailureScope::WHOLE_OPERATION) {
+        return 1;
+    }
+    if (!runtime->release_io(*submitted.io).ok()) return 1;
+    auto retained = runtime->wait_detail(*submitted.io, 0);
+    if (!retained.ok() || retained.value().detail.raw_cq_status != 0xdeadbeefu) return 1;
     if (!runtime->close(target.value()).ok() ||
         !runtime->unregister_memory(memory.value()).ok()) return 1;
     return runtime->shutdown(1).ok() ? 0 : 1;
@@ -1570,9 +1657,11 @@ int main() {
         test_overflow_safety,                   // 22
         test_nonconst_and_test_access,          // 23
         test_component_backed_runtime_route,    // 24
+        test_component_registration_preserves_io_granularity,
         test_component_runtime_unknown_scheme,  // 25
         test_component_runtime_groups_by_datapath,// 26
         test_component_runtime_partial_commit,  // 27
+        test_structured_terminal_detail_survives_release,
         test_concurrent_submit_query_release,   // 28
         test_close_unregister_vs_submit_race,   // 29
         test_progress_serialization,            // 30

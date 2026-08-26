@@ -16,7 +16,12 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from .layout import _append_real_zeros, decode_io_key
+from .layout import (
+    _append_real_zeros,
+    _bump_scan_generation,
+    _read_scan_generation,
+    decode_io_key,
+)
 
 _IO_PAGE_BYTES = 4096
 _MARKER_SUFFIX = ".ok"
@@ -54,7 +59,7 @@ class StripedLayout:
         self.mounts = tuple(normalized_mounts)
         self.stripe_unit = stripe_unit
         self._meta_dir = self.root / "meta"
-        self._scan_signature: tuple[int, int] | None = None
+        self._scan_signature: tuple[int, int, bytes] | None = None
         self._scan_cache: set[bytes] = set()
 
     @property
@@ -119,7 +124,11 @@ class StripedLayout:
             return live
         try:
             stat = self._meta_dir.stat()
-            signature = (stat.st_mtime_ns, stat.st_ctime_ns)
+            signature = (
+                stat.st_mtime_ns,
+                stat.st_ctime_ns,
+                _read_scan_generation(self._meta_dir),
+            )
         except OSError:
             self._scan_signature = None
             self._scan_cache = set()
@@ -196,6 +205,7 @@ class StripedLayout:
     def commit_layers(self, io_keys) -> None:
         for io_key in io_keys:
             self.marker_file(io_key).touch(exist_ok=True)
+        _bump_scan_generation(self._meta_dir)
         self._scan_signature = None
 
     def drop(self, io_keys) -> None:
@@ -209,4 +219,5 @@ class StripedLayout:
                 continue
             for shard in range(self.num_shards):
                 self.shard_file(chunk_id, shard).unlink(missing_ok=True)
+        _bump_scan_generation(self._meta_dir)
         self._scan_signature = None

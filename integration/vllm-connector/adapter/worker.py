@@ -18,6 +18,7 @@ from tutti_kv_transfer import (
 )
 
 from engine.staging import RingWindow
+from engine.core import LoadGateError
 from engine.nvtx import range as nvtx_range
 
 #: 单步内块表缓存上限（超出即整体重建，防无界增长）。
@@ -233,9 +234,13 @@ class WorkerImpl:
       上报，由上层重算兜底。
     """
 
-    def __init__(self, engine, max_in_flight_layers: int = 0,
+    def __init__(self, engine, max_in_flight_layers: int | None = None,
                  lookahead_k: int | None = None):
         """构造 worker；lookahead_k 为有界读取预取层数。"""
+        if max_in_flight_layers is None:
+            max_in_flight_layers = int(
+                getattr(engine, "max_in_flight_operations", 0) or 0
+            )
         if not isinstance(max_in_flight_layers, int) or max_in_flight_layers < 0:
             raise ValueError(
                 f"max_in_flight_layers 须为非负整数，got {max_in_flight_layers!r}"
@@ -265,13 +270,16 @@ class WorkerImpl:
         # 绑定态
         self._num_layers = 0
         self._bound = False
-        self._window: RingWindow | None = None
+        self._window: RingWindow | None = None  # read-window compatibility alias
+        self._read_window: RingWindow | None = None
+        self._write_window: RingWindow | None = None
         # 本步计划与编排状态
         self._metadata = None
         self._load_keys: list[bytes] = []
         self._load_block_tables: list[list[int]] = []
         self._load_handles: dict[int, object] = {}
         self._pinned = False
+        self._load_failed = False
         self._load_error_blocks: set[int] = set()
         # 无序号层名的学习映射（层名 → 层号，首次出现序；同一步内
         # wait/save 两次调用凭此解析一致）
@@ -352,6 +360,8 @@ class WorkerImpl:
         （重算兜底），key 与块表按同一 chunk 区间切片。
         """
         self._ensure_bound()
+        self._finalize_load_state()
+        self._load_failed = False
         self._load_keys = []
         self._load_block_tables = []
         self._load_handles = {}
@@ -389,15 +399,33 @@ class WorkerImpl:
                 f"{len(getattr(self._metadata, 'requests', []) or [])}"
                 f"|chunks={len(keys)}|K={self._lookahead_k}"
             ):
-                self._prefetch_load_layers(0)
+                try:
+                    self._prefetch_load_layers(0)
+                except Exception:
+                    self._mark_load_failure()
+                    self._abort_step()
+                    raise
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """等待指定层读取完成，并预取下一层。"""
         idx = self._resolve_layer(layer_name)
         handle = self._load_handles.pop(idx, None)
         if handle is not None:
-            with nvtx_range(f"tutti.request.wait_load|layer={idx}"):
-                handle.wait()
+            try:
+                with nvtx_range(f"tutti.request.wait_load|layer={idx}"):
+                    handle.wait()
+            except LoadGateError as exc:
+                self._mark_load_failure(exc)
+                self._abort_step()
+                # vLLM's KV load recovery contract is invalid_block_ids, not a
+                # connector exception. The current forward output is discarded
+                # by the scheduler and either failed or recomputed per policy.
+                return
+            except Exception:
+                self._abort_step()
+                raise
+        if self._load_failed:
+            return
         # 维持固定的 K 层在途窗口：首次调用已提交 [0, K)，每次
         # 消费一层后只补交尾部一层。按 idx+K 定位可避免重复提交，
         # 也让乱序/重复回调保持幂等。
@@ -417,12 +445,13 @@ class WorkerImpl:
 
         组批时执行写入准入（plan_store）：为腾容量驱逐的 chunk 由
         engine 展开全层 io_key 实际删除（盘与权威索引）。数据面写
-        全批（不按受理子集切片）——查询侧的乐观受理会把 key 标记
-        为驻留（近似视图），物理判据只能以本进程权威写入为准，
-        重写同 key 数据幂等无害。准入未被受理（容量不足且无可
+        全批（不按受理子集切片）；resident 只在所有层 save completion
+        成功后发布，失败则回收 pending 预留。准入未被受理（容量不足且无可
         驱逐）时记录运行日志并跳过本批数据面——该路径正常部署
         不可达，出现即容量配置问题。
         """
+        if self._load_failed:
+            return
         self._ensure_bound()
         idx = self._resolve_layer(layer_name)
         if self._save_keys is None:
@@ -436,47 +465,85 @@ class WorkerImpl:
                 end = start + meta.save_chunk_count
                 keys.extend(req_keys[start:end])
                 block_tables.extend(self._chunk_block_tables(meta, end)[start:end])
-            if keys and self._engine.plan_store(keys) is None:
-                _LOG.warning(
-                    "写入计划未被受理（容量 %d 不足以容纳本批 %d "
-                    "chunk 且无可驱逐驻留）——容量配置问题，跳过"
-                    "本批数据面写入",
-                    self._engine.capacity_chunks, len(keys),
-                )
-                keys = []
-                block_tables = []
+            if keys:
+                plan = self._engine.plan_store(keys)
+                if plan is None:
+                    pending = getattr(self._engine, "store_plan_pending", None)
+                    if not callable(pending) or not pending(keys):
+                        _LOG.warning(
+                            "写入计划未被受理（容量 %d 不足以容纳本批 %d "
+                            "chunk 且无可驱逐驻留）——容量配置问题，跳过"
+                            "本批数据面写入",
+                            self._engine.capacity_chunks, len(keys),
+                        )
+                        keys = []
+                        block_tables = []
             self._save_keys = keys
             self._save_block_tables = block_tables
             if not keys:
                 return
         if not self._save_keys:
             return
-        with nvtx_range(
-            f"tutti.request.save|layer={idx}|chunks={len(self._save_keys)}"
-        ):
-            handle = self._engine.store_layer(
-                self._save_keys, idx, self._save_block_tables
-            )
+        try:
+            # The DataPath counts an operation as in-flight until progress/wait
+            # observes its terminal event. Reap the oldest write before the
+            # next submit reaches the runtime admission boundary. The write
+            # stream itself preserves FIFO execution.
+            if (self._max_in_flight and
+                    len(self._save_inflight) >= self._max_in_flight):
+                self._save_inflight.pop(0).wait()
+            with nvtx_range(
+                f"tutti.request.save|layer={idx}|chunks={len(self._save_keys)}"
+            ):
+                handle = self._engine.store_layer(
+                    self._save_keys, idx, self._save_block_tables
+                )
+        except Exception:
+            self._abort_step()
+            raise
         self._save_inflight.append(handle)
-        if self._max_in_flight and len(self._save_inflight) > self._max_in_flight:
-            self._save_inflight.pop(0).wait()
 
     def wait_for_save(self) -> None:
         """等待全部写入完成并结算。"""
+        first_error = None
         for handle in self._save_inflight:
-            handle.wait()
-        self._save_inflight = []
+            try:
+                handle.wait()
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+        try:
+            self._engine.wait_idle()
+        except Exception as exc:
+            if first_error is None:
+                first_error = exc
+        try:
+            self._finalize_load_state()
+        except Exception as exc:
+            if first_error is None:
+                first_error = exc
         if self._save_keys:
-            self._engine.confirm_store(self._save_keys, ok=True)
+            self._engine.confirm_store(self._save_keys, ok=first_error is None)
+        self._save_inflight = []
         self._save_keys = None
         self._save_block_tables = []
+        if first_error is not None:
+            raise first_error
 
     # ---- 状态与收尾 ----
 
     @property
     def window(self) -> RingWindow | None:
-        """绑定的 staging 环窗（未绑定为 None）。"""
+        """兼容属性：返回 read bank（其 buffer 仍是完整共享 staging）。"""
         return self._window
+
+    @property
+    def read_window(self) -> RingWindow | None:
+        return self._read_window
+
+    @property
+    def write_window(self) -> RingWindow | None:
+        return self._write_window
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         """上报读取未遂的块集合（读取后清空）。"""
@@ -486,12 +553,21 @@ class WorkerImpl:
 
     def shutdown(self) -> None:
         """等待在途并关闭引擎（幂等由引擎保证）。"""
-        self._engine.close()
+        try:
+            self._abort_step()
+        finally:
+            self._engine.close()
+
+    def abort(self) -> None:
+        """请求失败收尾：drain 双 bank、回滚写计划并释放读 pin。"""
+        self._abort_step()
 
     # ---- 内部 ----
 
     def _start_load_layer(self, layer_idx: int) -> None:
         """发起一层的读取批。"""
+        if self._load_failed:
+            return
         self._load_handles[layer_idx] = self._engine.load_layer(
             self._load_keys, layer_idx, self._load_block_tables
         )
@@ -507,6 +583,65 @@ class WorkerImpl:
         for layer_idx in range(first_idx, end):
             if layer_idx not in self._load_handles:
                 self._start_load_layer(layer_idx)
+
+    def _finalize_load_state(self, suppress_errors: bool = False) -> None:
+        """Drain remaining read callbacks and release any outstanding pin."""
+        first_error = None
+        handles = list(self._load_handles.values())
+        self._load_handles = {}
+        for handle in handles:
+            try:
+                handle.wait()
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+        if self._pinned:
+            try:
+                self._engine.unpin(self._load_keys)
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+            self._pinned = False
+        self._load_keys = []
+        self._load_block_tables = []
+        if first_error is not None and not suppress_errors:
+            raise first_error
+
+    def _abort_step(self) -> None:
+        """Best-effort full-direction drain while preserving the first error."""
+        try:
+            self._engine.abort()
+        except Exception:
+            pass
+        self._finalize_load_state(suppress_errors=True)
+        if self._save_keys:
+            try:
+                self._engine.confirm_store(self._save_keys, ok=False)
+            except Exception:
+                pass
+        self._save_inflight = []
+        self._save_keys = None
+        self._save_block_tables = []
+
+    def _mark_load_failure(self, error=None) -> None:
+        """Fail closed: all blocks in the gated load become invalid."""
+        self._load_failed = True
+        if isinstance(error, LoadGateError) and error.invalid_block_ids:
+            self._load_error_blocks.update(error.invalid_block_ids)
+            return
+        selected = self._load_block_tables
+        if (isinstance(error, LoadGateError) and not error.whole_operation
+                and error.failed_batch_indices):
+            selected = [
+                self._load_block_tables[index]
+                for index in error.failed_batch_indices
+                if 0 <= index < len(self._load_block_tables)
+            ]
+        for blocks in selected:
+            if isinstance(blocks, (list, tuple, set)):
+                self._load_error_blocks.update(blocks)
+            elif blocks is not None:
+                self._load_error_blocks.add(blocks)
 
     def _chunk_block_tables(self, meta, count: int) -> list[list[int]]:
         """计算前 count 个 chunk 各自的块号表（块号可任意分布）。"""
@@ -589,15 +724,16 @@ class WorkerImpl:
                 f"({num_layers}) 整分"
             )
         segment_bytes = self._chunk_kv_bytes // num_layers
-        # 两个完整环窗半区各容纳 K 个波次；K=1 保持旧的双半窗
-        # 几何，K>1 才能让初始层预取不在第三个波次立即回绕阻塞。
+        # 原 staging 总槽数不变，但静态拆为 read/write 两个 bank。
+        # 每个 bank 各容纳 K 个满波；K=1 时同方向下一波在复用前
+        # 等待，K>1 保留有界 lookahead，不扩展为全层预排。
         window_layers = min(self._lookahead_k, num_layers)
-        slots = 2 * self._max_chunks_per_wave * window_layers
-        # staging 落 0 号加速器：真机 runtime 组装当前仅支持进程视角
-        # 0 号卡（gpu_id 非 0 组装必败，DataPath 亦不接受主存 staging），
-        # 全副本统一 gpu_id=0 → staging 与 runtime 同卡；池在他卡的副本
-        # 由 gather/scatter 跨卡搬运（torch 自动处理）。池为主存时
-        # （测试替身）用页锁定主存。
+        bank_slots = self._max_chunks_per_wave * window_layers
+        slots = 2 * bank_slots
+        # Staging must be local to the registered KV pool. The deployment
+        # preset binds the matching rank-local DataPath/IO streams to this
+        # accelerator; cross-device staging would add P2P traffic and can
+        # exhaust one GPU's queue group during TP initialization.
         if self._cross_pool is not None:
             pool_device = self._cross_pool.device
         elif self._kv_caches:
@@ -613,7 +749,7 @@ class WorkerImpl:
             slack = 65536
             block = torch.empty(
                 slots * segment_bytes + slack, dtype=torch.uint8,
-                device="cuda:0",
+                device=pool_device,
             )
             base = block.data_ptr()
             skip = (slack - base % slack) % slack
@@ -624,9 +760,15 @@ class WorkerImpl:
                 slots * segment_bytes, dtype=torch.uint8, pin_memory=True
             )
             raw = staging.numpy()
-        window = RingWindow(
-            raw, slots, segment_bytes,
+        read_window = RingWindow(
+            raw, bank_slots, segment_bytes,
             capacity_per_wave=self._max_chunks_per_wave,
+            slot_base=0,
+        )
+        write_window = RingWindow(
+            raw, bank_slots, segment_bytes,
+            capacity_per_wave=self._max_chunks_per_wave,
+            slot_base=bank_slots,
         )
         blocks_per_chunk = -(-self._chunk_tokens // self._block_size)
         gather_fn = scatter_fn = None
@@ -649,11 +791,14 @@ class WorkerImpl:
         )
         self._engine.bind(
             bind_caches,
-            window, num_layers, blocks_per_chunk,
+            read_window, num_layers, blocks_per_chunk,
+            write_window=write_window,
             gather_fn=gather_fn, scatter_fn=scatter_fn,
         )
         self._num_layers = num_layers
-        self._window = window
+        self._window = read_window
+        self._read_window = read_window
+        self._write_window = write_window
         self._bound = True
 
     def _layer_view(self):

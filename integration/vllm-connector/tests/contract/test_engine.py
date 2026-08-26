@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
-from engine.core import KVEngine
+from engine.core import KVEngine, LoadGateError, _PostCompletion
 from engine.staging import RingWindow
 from engine.transfer import DirectTransferUnavailable
 from index.chunk_index import chunk_key_of, derive_io_key, layer_of
@@ -228,6 +229,71 @@ class TestIoKeyHelpers:
 
 
 class TestRoundtrip:
+    def test_failed_load_never_runs_scatter(self):
+        class FailedCompletion:
+            def wait_result(self):
+                return type("Result", (), {"ok": False})()
+
+            def wait(self):
+                raise AssertionError("legacy wait must not be used")
+
+            def query(self):
+                return False
+
+        scattered = []
+        completion = _PostCompletion(
+            FailedCompletion(), lambda: scattered.append("scatter")
+        )
+        with pytest.raises(LoadGateError, match="禁止 scatter"):
+            completion.wait()
+        assert scattered == []
+
+    def test_structured_failed_index_maps_to_wave_block_ids(self):
+        failure = type("Failure", (), {"failure_scope": "REQUEST_INDICES"})()
+        result = type("Result", (), {
+            "ok": False,
+            "failed_batch_indices": (1,),
+            "failures": (failure,),
+        })()
+
+        class FailedCompletion:
+            def wait_result(self):
+                return result
+
+            def query(self):
+                return False
+
+        completion = _PostCompletion(
+            FailedCompletion(), lambda: None,
+            block_tables=[[10, 20], [11, 21]],
+        )
+        with pytest.raises(LoadGateError) as excinfo:
+            completion.wait()
+        assert excinfo.value.whole_operation is False
+        assert excinfo.value.failed_batch_indices == (1,)
+        assert excinfo.value.invalid_block_ids == (11, 21)
+
+    def test_abort_suppresses_scatter_for_prefetched_success(self):
+        class Completion:
+            def __init__(self):
+                self.wait_count = 0
+
+            def wait(self):
+                self.wait_count += 1
+
+            def query(self):
+                return True
+
+        scattered = []
+        inner = Completion()
+        completion = _PostCompletion(
+            inner, lambda: scattered.append("must-not-run")
+        )
+        completion.abort()
+        completion.abort()
+        assert inner.wait_count == 1
+        assert scattered == []
+
     def test_multilayer_store_load_no_cross_talk(self):
         store = MemoryKVStore(SEG, NUM_CHUNKS)
         hooks = MovingHooks(None, SEG)
@@ -398,8 +464,113 @@ class TestWindowWaves:
         with pytest.raises(ValueError):
             RingWindow(bytearray(4 * SEG), 4, 0)            # 非法段宽
 
+    def test_split_banks_share_buffer_without_slot_overlap(self):
+        total_slots = 2 * MAX_WAVE * 3
+        buffer = bytearray(total_slots * SEG)
+        bank_slots = total_slots // 2
+        read = RingWindow(buffer, bank_slots, SEG,
+                          capacity_per_wave=MAX_WAVE, slot_base=0)
+        write = RingWindow(buffer, bank_slots, SEG,
+                           capacity_per_wave=MAX_WAVE, slot_base=bank_slots)
+        read_slots = set()
+        write_slots = set()
+        for _ in range(3):
+            read_slots.update(read.acquire(MAX_WAVE)[1])
+            write_slots.update(write.acquire(MAX_WAVE)[1])
+        assert read.buffer is write.buffer is buffer
+        assert read_slots == set(range(0, bank_slots))
+        assert write_slots == set(range(bank_slots, total_slots))
+        assert read_slots.isdisjoint(write_slots)
+
+    def test_drain_continues_other_bank_after_first_failure(self):
+        class FailingEvent(FakeEvent):
+            def wait(self):
+                self.wait_count += 1
+                raise RuntimeError("read failed")
+
+        buffer = bytearray(2 * SEG)
+        read = RingWindow(buffer, 1, SEG, capacity_per_wave=1, slot_base=0)
+        write = RingWindow(buffer, 1, SEG, capacity_per_wave=1, slot_base=1)
+        read_wave, _ = read.acquire(1)
+        write_wave, _ = write.acquire(1)
+        read_event = FailingEvent()
+        write_event = FakeEvent()
+        read.complete(read_wave, read_event)
+        write.complete(write_wave, write_event)
+        # A minimal engine with both banks exercises the real drain path.
+        store = MemoryKVStore(SEG, NUM_CHUNKS)
+        engine = KVEngine({"chunk_tokens": CHUNK_TOKENS,
+                           "chunk_kv_bytes": SEG * NUM_LAYERS,
+                           "max_chunks_per_wave": 1}, store)
+        engine.bind({}, read, NUM_LAYERS, 2, write_window=write)
+        with pytest.raises(RuntimeError, match="read failed"):
+            engine.abort()
+        assert read_event.wait_count == 1
+        assert write_event.wait_count == 1
+        assert read._allocations == write._allocations == {}
+
+
+class TestSplitBankRouting:
+    def test_gather_and_scatter_use_directional_store_contexts(self):
+        class DirectionalMemoryStore(MemoryKVStore):
+            def __init__(self):
+                super().__init__(SEG, NUM_CHUNKS)
+                self.active_direction = None
+                self.context_log = []
+
+            @contextmanager
+            def stream_context(self, direction):
+                assert self.active_direction is None
+                self.active_direction = direction
+                self.context_log.append(("enter", direction))
+                try:
+                    yield
+                finally:
+                    self.context_log.append(("exit", direction))
+                    self.active_direction = None
+
+        store = DirectionalMemoryStore()
+        total_slots = 2 * MAX_WAVE
+        buffer = bytearray(total_slots * SEG)
+        read = RingWindow(buffer, MAX_WAVE, SEG,
+                          capacity_per_wave=MAX_WAVE, slot_base=0)
+        write = RingWindow(buffer, MAX_WAVE, SEG,
+                           capacity_per_wave=MAX_WAVE, slot_base=MAX_WAVE)
+        hook_slots = {}
+
+        def gather(keys, layer, blocks, slots):
+            assert store.active_direction is None
+            hook_slots["write"] = tuple(slots)
+
+        def scatter(keys, layer, blocks, slots):
+            assert store.active_direction == "read"
+            hook_slots["read"] = tuple(slots)
+
+        engine = KVEngine({"chunk_tokens": CHUNK_TOKENS,
+                           "chunk_kv_bytes": SEG * NUM_LAYERS,
+                           "max_chunks_per_wave": MAX_WAVE}, store)
+        engine.bind({}, read, NUM_LAYERS, 2, write_window=write,
+                    gather_fn=gather, scatter_fn=scatter)
+        key = _chunk_keys(engine, 9, 1)[0]
+        engine.store_layer([key], 0, [[0, 1]]).wait()
+        engine.load_layer([key], 0, [[0, 1]]).wait()
+        assert set(hook_slots["read"]).issubset(range(0, MAX_WAVE))
+        assert set(hook_slots["write"]).issubset(range(MAX_WAVE, 2 * MAX_WAVE))
+        assert store.context_log == [("enter", "read"), ("exit", "read")]
+
 
 class TestEvictionWiring:
+    def test_sync_releases_failed_planned_store_without_marker(self):
+        store = MemoryKVStore(SEG, num_chunks=1)
+        engine, _, _ = _make_engine(store, num_chunks=1)
+        key = _chunk_keys(engine, 1, 1)[0]
+        assert engine.plan_store([key]) is not None
+        assert engine.lookup_prefix([1000] * CHUNK_TOKENS) == 0
+        engine.sync_from_store()
+        # No durable layer markers: the reservation is released and can be
+        # planned again rather than leaking scheduler capacity forever.
+        assert engine.plan_store([key]) is not None
+
     def test_plan_store_drops_all_layers_of_evicted(self):
         spy = StoreSpy(MemoryKVStore(SEG, num_chunks=2))
         engine, _, _ = _make_engine(spy, MovingHooks(None, SEG), num_chunks=2)

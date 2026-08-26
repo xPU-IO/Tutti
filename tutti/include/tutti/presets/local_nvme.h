@@ -74,6 +74,7 @@ struct StripedNvmePreset {
 struct RuntimeWithTelemetry {
     std::unique_ptr<StorageRuntime> runtime;
     RuntimeTelemetry telemetry;
+    Status creation_status = Status::Ok();
 };
 
 RuntimeWithTelemetry make_local_nvme_runtime(const LocalNvmePreset& preset);

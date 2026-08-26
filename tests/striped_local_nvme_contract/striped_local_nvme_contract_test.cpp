@@ -364,7 +364,8 @@ struct StripedEnv {
     StripedDataPath dp;
     std::unique_ptr<StorageRuntime> rt;
 
-    explicit StripedEnv(std::uint32_t num_devices)
+    explicit StripedEnv(std::uint32_t num_devices,
+                        std::uint64_t stripe_unit = kStripeUnit)
         : dp(build_devs(num_devices),
              /*cuda_device=*/(std::uint32_t)g_gpu_id,
              /*mdts_override=*/0, /*cq_poll_budget=*/2000000,
@@ -376,7 +377,7 @@ struct StripedEnv {
                 BackingDeviceConfig{device.backing_device, 0}));
         }
         striped_resolver = std::make_unique<StripedResolver>(
-            std::move(sub_resolvers), kStripeUnit);
+            std::move(sub_resolvers), stripe_unit);
     }
 
     // Round 16 S3: build DeviceDescriptor list for N=1..4 devices.
@@ -395,8 +396,10 @@ struct StripedEnv {
     }
 };
 
-static std::unique_ptr<StripedEnv> make_env(std::uint32_t num_devices = 2) {
-    auto env = std::make_unique<StripedEnv>(num_devices);
+static std::unique_ptr<StripedEnv> make_env(
+    std::uint32_t num_devices = 2,
+    std::uint64_t stripe_unit = kStripeUnit) {
+    auto env = std::make_unique<StripedEnv>(num_devices, stripe_unit);
     RuntimeComponents comps;
     comps.resolvers.push_back({"striped", env->striped_resolver.get()});
     comps.data_paths.push_back({kDPKey, &env->dp, DataPathConfig{"striped-local-nvme"}});
@@ -870,6 +873,7 @@ static int test_86_lifecycle(StripedEnv* env) {
 
 static int test_87_full_public_path(StripedEnv* env) {
     TEST_CASE("87. full public path (zero striped-awareness at the call site)");
+    env->dp.test_arena_reset_alloc_counts();
 
     const std::uint64_t shard_size = kStripeUnit * 4;
     std::string p0 = shard_path(0, "t87", 0);
@@ -923,6 +927,11 @@ static int test_87_full_public_path(StripedEnv* env) {
         cudaStreamDestroy(stream);
     }
     CHECK(ok, "submit(WRITE) -> wait -> submit(READ) -> wait -> release -> byte-exact");
+    const auto alloc_counts = env->dp.test_arena_alloc_counts();
+    CHECK(alloc_counts.cuda_malloc == 0,
+          "striped submit performs zero cudaMalloc");
+    CHECK(alloc_counts.gpu_prp_cuda_malloc == 0,
+          "striped submit performs zero GPU PRP allocation");
     // ---- end zero-striped-awareness block ----
 
     if (raw) cudaFree(raw);
@@ -1388,6 +1397,169 @@ static int test_92_n4_roundtrip_single_launch(StripedEnv* env4) {
     env4->rt->unregister_memory(mem_r.value());
     cudaFree(raw); env4->rt->close(target); cudaStreamDestroy(stream);
     for (auto& p : paths) ::unlink(p.c_str());
+    return g_fail > 0 ? 1 : 0;
+}
+
+// -------------------------------------------------------------------------
+// Test 98: registration-time prebuilt descriptors preserve logical blocks,
+// split by each controller's driver MDTS, and still use one fused launch.
+// -------------------------------------------------------------------------
+
+static int test_98_prebuilt_logical_block_mdts(StripedEnv* env,
+                                                std::uint32_t n) {
+    TEST_CASE(n == 2
+        ? "98. N=2 prebuilt 256KiB and block>driver-MDTS"
+        : "98. N=4 prebuilt 256KiB and block>driver-MDTS");
+
+    std::uint64_t max_mdts = 0;
+    for (std::uint32_t d = 0; d < n; ++d) {
+        const std::uint64_t hardware = env->dp.test_device_hardware_mdts(d);
+        const std::uint64_t effective = env->dp.test_device_effective_mdts(d);
+        CHECK(hardware > 0, "controller reports hardware MDTS");
+        CHECK(effective > 0 && effective <= hardware,
+              "effective MDTS is derived from controller hardware");
+        max_mdts = std::max(max_mdts, effective);
+    }
+    if (max_mdts == 0) return 1;
+
+    auto run_case = [&](std::uint64_t logical_block,
+                        const char* suffix,
+                        std::uint64_t pattern_seed) -> bool {
+        auto case_env = make_env(n, logical_block);
+        if (!case_env) return false;
+        const std::string name = "t98_n" + std::to_string(n) + "_" + suffix;
+        std::vector<std::string> paths(n);
+        for (std::uint32_t d = 0; d < n; ++d) {
+            paths[d] = shard_path(d, name, d);
+            if (!create_backing_file(paths[d], logical_block)) {
+                std::fprintf(stderr, "  t98 create backing failed: %s\n",
+                             paths[d].c_str());
+                for (const auto& path : paths) ::unlink(path.c_str());
+                return false;
+            }
+        }
+
+        const std::uint64_t io_size = logical_block * n;
+        const std::string uri = "striped://" + name + "?devs=" +
+            devs_param(n) + "&unit=" + std::to_string(logical_block);
+        auto opened = case_env->rt->open(uri, OpenOptions{"striped"});
+        if (!opened.ok()) {
+            std::fprintf(stderr, "  t98 open failed: %s\n",
+                         opened.status().message().c_str());
+            for (const auto& path : paths) ::unlink(path.c_str());
+            return false;
+        }
+
+        void* raw = nullptr;
+        void* buffer = cuda_malloc_aligned_64k(io_size, &raw);
+        if (!buffer) {
+            std::fprintf(stderr, "  t98 cuda buffer allocation failed\n");
+            case_env->rt->close(opened.value());
+            for (const auto& path : paths) ::unlink(path.c_str());
+            return false;
+        }
+        MemoryView view{buffer, io_size, MemoryKind::DEVICE,
+                        MemoryOwnership::CALLER_OWNED, 0, "",
+                        logical_block};
+        auto memory = case_env->rt->register_memory(view);
+        if (!memory.ok()) {
+            std::fprintf(stderr, "  t98 register_memory failed: %s\n",
+                         memory.status().message().c_str());
+            cudaFree(raw);
+            case_env->rt->close(opened.value());
+            for (const auto& path : paths) ::unlink(path.c_str());
+            return false;
+        }
+
+        cudaStream_t stream = nullptr;
+        cudaStreamCreate(&stream);
+        HostSubmitContext ctx{ExecutionDomain::DEVICE_EXECUTION, 0, stream};
+        launch_fill_position_pattern_gpu(buffer, pattern_seed, io_size, stream);
+        cudaStreamSynchronize(stream);
+
+        std::uint64_t expected_entries = 0;
+        for (std::uint32_t d = 0; d < n; ++d) {
+            const std::uint64_t mdts =
+                case_env->dp.test_device_effective_mdts(d);
+            expected_entries += (logical_block + mdts - 1) / mdts;
+        }
+
+        case_env->dp.test_reset_submit_counters();
+        IoRequest write{IoDirection::WRITE, memory.value(), 0,
+                        opened.value(), 0, io_size};
+        const bool write_ok = submit_wait_all(case_env->rt.get(), &write, 1, ctx);
+        const std::uint64_t write_prebuilt =
+            case_env->dp.test_last_prebuilt_entry_count();
+        const std::uint64_t write_dynamic =
+            case_env->dp.test_last_dynamic_entry_count();
+        const bool allow_shape_fallback = logical_block > max_mdts;
+        const bool write_shape =
+            case_env->dp.test_submit_call_count() == 1 &&
+            case_env->dp.test_kernel_launch_count() == 1 &&
+            write_prebuilt > 0 &&
+            write_prebuilt + write_dynamic >= expected_entries &&
+            (allow_shape_fallback || write_dynamic == 0);
+
+        launch_fill_pattern_gpu(buffer, 0xFF, io_size, stream);
+        cudaStreamSynchronize(stream);
+        case_env->dp.test_reset_submit_counters();
+        IoRequest read{IoDirection::READ, memory.value(), 0,
+                       opened.value(), 0, io_size};
+        const bool read_ok = submit_wait_all(case_env->rt.get(), &read, 1, ctx);
+        const std::uint64_t read_prebuilt =
+            case_env->dp.test_last_prebuilt_entry_count();
+        const std::uint64_t read_dynamic =
+            case_env->dp.test_last_dynamic_entry_count();
+        const bool read_shape =
+            case_env->dp.test_submit_call_count() == 1 &&
+            case_env->dp.test_kernel_launch_count() == 1 &&
+            read_prebuilt > 0 &&
+            read_prebuilt + read_dynamic >= expected_entries &&
+            (allow_shape_fallback || read_dynamic == 0);
+
+        std::vector<unsigned char> host(io_size);
+        cudaMemcpy(host.data(), buffer, io_size, cudaMemcpyDeviceToHost);
+        bool bytes_ok = true;
+        for (std::uint64_t i = 0; i < io_size; ++i) {
+            const auto expected = static_cast<unsigned char>(
+                (pattern_seed + i) % 251u);
+            if (host[i] != expected) {
+                bytes_ok = false;
+                break;
+            }
+        }
+
+        std::printf(
+            "  N=%u block=%llu mdts_max=%llu entries=%llu "
+            "write[p=%llu,d=%llu] read[p=%llu,d=%llu] launch=1 "
+            "shape=%s bytes=%s\n",
+            n, (unsigned long long)logical_block,
+            (unsigned long long)max_mdts,
+            (unsigned long long)expected_entries,
+            (unsigned long long)write_prebuilt,
+            (unsigned long long)write_dynamic,
+            (unsigned long long)read_prebuilt,
+            (unsigned long long)read_dynamic,
+            (write_shape && read_shape) ? "yes" : "no",
+            bytes_ok ? "ok" : "bad");
+
+        case_env->rt->unregister_memory(memory.value());
+        cudaFree(raw);
+        case_env->rt->close(opened.value());
+        cudaStreamDestroy(stream);
+        case_env->rt->shutdown(5000);
+        for (const auto& path : paths) ::unlink(path.c_str());
+        return write_ok && read_ok && write_shape && read_shape && bytes_ok;
+    };
+
+    const std::uint64_t block_256k = 256ull * 1024;
+    const std::uint64_t large_block =
+        ((max_mdts * 2 + block_256k - 1) / block_256k) * block_256k;
+    CHECK(run_case(block_256k, "256k", 9800 + n),
+          "256KiB logical block prebuilt write/read byte-exact, one launch");
+    CHECK(large_block > max_mdts, "large logical block is greater than every MDTS");
+    CHECK(run_case(large_block, "gt_mdts", 9900 + n),
+          "block>MDTS prebuilt fan-out write/read byte-exact, one launch");
     return g_fail > 0 ? 1 : 0;
 }
 
@@ -1905,6 +2077,8 @@ int main(int argc, char** argv) {
             direct_config, *direct_resources);
         CHECK(direct_init.ok(),
               "direct StripedDataPath initialize works from wrong caller device");
+        CHECK(direct_dp.test_arena_alloc_counts().gpu_prp_cuda_malloc == 0,
+              "striped initialization performs zero GPU PRP allocation");
         int after_init = -1;
         CHECK(cudaGetDevice(&after_init) == cudaSuccess &&
               after_init == caller_gpu,
@@ -1940,6 +2114,7 @@ int main(int argc, char** argv) {
     rc |= test_87_full_public_path(env2.get());
     rc |= test_88_block_addressing(env2.get());
     rc |= test_90_fault_partial_commit(env2.get());
+    rc |= test_98_prebuilt_logical_block_mdts(env2.get(), 2);
 
     env2->rt->shutdown(5000);
 
@@ -1954,6 +2129,7 @@ int main(int argc, char** argv) {
         } else {
             std::printf("Quad-device StorageRuntime created (StripedResolver + StripedDataPath, N=4)\n");
             rc |= test_92_n4_roundtrip_single_launch(env4.get());
+            rc |= test_98_prebuilt_logical_block_mdts(env4.get(), 4);
             rc |= test_93_n4_distribution(env4.get());
             rc |= test_95_multi_target_batch(env4.get());
             rc |= test_96_many_targets_batch(env4.get());

@@ -28,6 +28,66 @@
 
 namespace tutti::data_paths::striped_local_nvme {
 
+namespace {
+
+struct NvtxIoStyle {
+    const char* label;
+    std::uint32_t argb;
+};
+
+NvtxIoStyle nvtx_io_style(const DataPathRequest* requests, std::size_t count) {
+    bool has_read = false;
+    bool has_write = false;
+    for (std::size_t i = 0; i < count; ++i) {
+        has_read |= requests[i].intent.direction == IoDirection::READ;
+        has_write |= requests[i].intent.direction == IoDirection::WRITE;
+    }
+    if (has_read && !has_write) {
+        return {"tutti.striped_nvme.io_kernel|op=read", 0xFF00B8D9u};
+    }
+    if (has_write && !has_read) {
+        return {"tutti.striped_nvme.io_kernel|op=write", 0xFFFF8C00u};
+    }
+    return {"tutti.striped_nvme.io_kernel|op=mixed", 0xFF8D99A6u};
+}
+
+void nvtx_push_io(const NvtxIoStyle& style) {
+    nvtxEventAttributes_t attrs{};
+    attrs.version = NVTX_VERSION;
+    attrs.size = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
+    attrs.colorType = NVTX_COLOR_ARGB;
+    attrs.color = style.argb;
+    attrs.messageType = NVTX_MESSAGE_TYPE_ASCII;
+    attrs.message.ascii = style.label;
+    nvtxRangePushEx(&attrs);
+}
+
+IoFailureKind completion_failure_kind(std::uint32_t result) {
+    switch (result) {
+        case 1: return IoFailureKind::RESOLVE_LBA;
+        case 2: return IoFailureKind::CQ_TIMEOUT;
+        case 3: return IoFailureKind::NVME_CQ_ERROR;
+        default: return IoFailureKind::UNKNOWN;
+    }
+}
+
+void set_completion_failure(IoCompletionDetail& detail,
+                            IoFailureKind kind,
+                            std::uint64_t confirmed_bytes,
+                            bool timeout_seen = false,
+                            std::uint32_t first_failed_entry = UINT32_MAX,
+                            std::uint32_t raw_cq_status = 0) {
+    detail.confirmed_bytes = confirmed_bytes;
+    detail.timeout_seen = timeout_seen;
+    detail.first_failed_entry = first_failed_entry;
+    detail.failure_kind = kind;
+    detail.raw_cq_status = raw_cq_status;
+    detail.failure_scope = IoFailureScope::WHOLE_OPERATION;
+    detail.failed_request_indices.clear();
+}
+
+} // namespace
+
 using namespace tutti::binding::ext4_local_nvme;
 using namespace tutti::binding::striped_local_nvme;
 using tutti::data_paths::local_nvme::DeviceTargetHandle;
@@ -100,7 +160,20 @@ StripedDataPath::StripedDataPath(std::vector<DeviceDescriptor> devices,
 
 StripedDataPath::~StripedDataPath() {
     if (initialized_) {
-        shutdown(0);
+        const Status stopped = shutdown(0);
+        if (!stopped.ok()) {
+            // Destruction cannot report TIMEOUT to a caller. Detach all host
+            // PRP mappings/backing so member destructors cannot unmap memory
+            // a controller may still fetch after an unresolved command.
+            for (auto& cache : prp_caches_) {
+                if (cache) cache->shutdown(/*retain=*/true);
+            }
+            for (auto& pool : prp_buf_pools_) {
+                if (pool) pool->shutdown(/*retain=*/true);
+            }
+            prp_caches_.clear();
+            prp_buf_pools_.clear();
+        }
     }
 }
 
@@ -358,21 +431,20 @@ Status StripedDataPath::initialize_impl_(const DataPathConfig& config,
         devices_.push_back(std::move(slot));
     }
 
-    // effective_mdts = min(all devices' hardware MDTS), further clamped by
-    // an optional override.
+    // The public capability is the conservative minimum. Submission and
+    // prebuild use each selected controller's own driver-reported MDTS.
     std::uint64_t min_mdts = UINT64_MAX;
-    for (const auto& d : devices_) {
-        if (d.hardware_mdts > 0 && d.hardware_mdts < min_mdts) {
-            min_mdts = d.hardware_mdts;
+    for (std::uint32_t i = 0; i < devices_.size(); ++i) {
+        const std::uint64_t mdts = device_effective_mdts_(i);
+        if (mdts > 0 && mdts < min_mdts) {
+            min_mdts = mdts;
         }
     }
     if (min_mdts == UINT64_MAX || min_mdts == 0) {
         rollback_devices();
         return Status(StatusCode::NOT_READY, "no device reported a usable MDTS");
     }
-    effective_mdts_bytes_ = (mdts_override_ > 0)
-        ? std::min(mdts_override_, min_mdts)
-        : min_mdts;
+    effective_mdts_bytes_ = min_mdts;
     if (effective_mdts_bytes_ % block_size_ != 0) {
         rollback_devices();
         return Status(StatusCode::INVALID_ARGUMENT,
@@ -389,11 +461,18 @@ Status StripedDataPath::initialize_impl_(const DataPathConfig& config,
         }
     }
     std::uint64_t prp_list_page_capacity = page_size / sizeof(std::uint64_t) + 1;
-    std::uint64_t mdts_pages = effective_mdts_bytes_ / page_size;
-    if (mdts_pages > prp_list_page_capacity) {
-        rollback_devices();
-        return Status(StatusCode::INVALID_ARGUMENT,
-                      "effective MDTS exceeds PRP-list page capacity");
+    for (std::uint32_t i = 0; i < devices_.size(); ++i) {
+        const std::uint64_t mdts = device_effective_mdts_(i);
+        if (mdts == 0 || mdts % block_size_ != 0 || mdts % page_size != 0) {
+            rollback_devices();
+            return Status(StatusCode::INVALID_ARGUMENT,
+                          "controller MDTS is not block/page aligned");
+        }
+        if (mdts / page_size > prp_list_page_capacity) {
+            rollback_devices();
+            return Status(StatusCode::INVALID_ARGUMENT,
+                          "controller MDTS exceeds one PRP-list page capacity");
+        }
     }
 
     max_request_bytes_ = static_cast<std::uint64_t>(max_batch_entries_) *
@@ -430,6 +509,16 @@ Status StripedDataPath::initialize_impl_(const DataPathConfig& config,
     if (!arena_.init(arena_cfg, ctrls)) {
         rollback_devices();
         return Status(StatusCode::NOT_READY, "StripedArena init failed");
+    }
+
+    // Host-pinned PRP miss pools are per controller because each IOVA belongs
+    // to that controller/IOMMU domain. They grow on demand and never allocate
+    // GPU PRP backing.
+    prp_buf_pools_.resize(devices_.size());
+    for (std::size_t i = 0; i < devices_.size(); ++i) {
+        prp_buf_pools_[i] =
+            std::make_unique<tutti::data_paths::local_nvme::PrpBufPool>();
+        prp_buf_pools_[i]->init(devices_[i].ctrl, page_size);
     }
 
     // Round 16 S5: initialize per-device PRP cache if enabled.
@@ -489,12 +578,15 @@ Status StripedDataPath::shutdown_impl_(std::uint64_t timeout_ns) {
         }
     }
 
-    bool any_timeout = false;
+    bool any_timeout = timeout_prp_retained_;
     for (const auto& [tok, op] : ops_) {
         if (op.has_timeout) { any_timeout = true; break; }
     }
-    arena_.shutdown(any_timeout);
-    for (auto& pc : prp_caches_) if (pc) pc->shutdown();
+    arena_.shutdown();
+    for (auto& pc : prp_caches_) if (pc) pc->shutdown(any_timeout);
+    for (auto& pool : prp_buf_pools_) if (pool) pool->shutdown(any_timeout);
+    prp_caches_.clear();
+    prp_buf_pools_.clear();
     ops_.clear();
 
     for (auto& [tok, tgt] : targets_) {
@@ -524,6 +616,7 @@ Status StripedDataPath::shutdown_impl_(std::uint64_t timeout_ns) {
     devices_.clear();
 
     initialized_ = false;
+    timeout_prp_retained_ = false;
     return Status::Ok();
 }
 
@@ -852,73 +945,117 @@ Status StripedDataPath::unregister_memory_impl_(DataPathMemory memory) {
 bool StripedDataPath::build_striped_prebuilt_(
     StripedMemory& mem, std::uint64_t io_granularity, std::string& status_msg) {
 
-    const std::uint64_t page_size = static_cast<std::uint64_t>(devices_[0].ctrl->page_size);
-    const std::uint64_t mdts = effective_mdts_bytes_;
-    const std::uint64_t granularity = std::min(io_granularity, mdts);
-    const std::uint64_t bytes_per_slice = granularity;
-    const std::uint64_t pages_per_io = bytes_per_slice / page_size;
-    const std::uint64_t num_slices = mem.size / bytes_per_slice;
-
+    const std::uint64_t page_size = devices_[0].page_size;
+    const std::uint64_t bytes_per_slice = io_granularity;
+    if (bytes_per_slice == 0 || bytes_per_slice % page_size != 0) {
+        status_msg = "io_granularity must be a positive controller-page multiple";
+        return false;
+    }
     if (mem.size % bytes_per_slice != 0) {
         status_msg = "io_granularity does not evenly divide memory size";
         return false;
     }
+    const std::uint64_t num_slices = mem.size / bytes_per_slice;
 
-    mem.prebuilt.d_descs_per_dev.assign(mem.dmas.size(), nullptr);
+    mem.prebuilt.devices.assign(mem.dmas.size(), {});
     mem.prebuilt.bytes_per_slice = bytes_per_slice;
-    mem.prebuilt.num_descs = num_slices;
+    mem.prebuilt.num_slices = num_slices;
+
+    auto cleanup_descs = [&]() {
+        for (auto& table : mem.prebuilt.devices) {
+            if (table.d_descs) cudaFree(table.d_descs);
+            table.d_descs = nullptr;
+        }
+    };
 
     for (std::size_t dev = 0; dev < mem.dmas.size(); ++dev) {
         nvm_dma_t* dma = mem.dmas[dev];
-        if (!dma) { status_msg = "dma is null for device " + std::to_string(dev); return false; }
+        if (!dma) {
+            status_msg = "dma is null for device " + std::to_string(dev);
+            cleanup_descs();
+            return false;
+        }
+        auto& table = mem.prebuilt.devices[dev];
+        table.mdts_bytes = device_effective_mdts_(static_cast<std::uint32_t>(dev));
+        table.ios_per_slice =
+            (bytes_per_slice + table.mdts_bytes - 1) / table.mdts_bytes;
+        table.num_descs = num_slices * table.ios_per_slice;
 
-        std::vector<tutti::data_paths::local_nvme::AddressDescriptor> h_descs(num_slices);
+        std::uint64_t num_prp_pages = 0;
+        for (std::uint64_t sub = 0; sub < table.ios_per_slice; ++sub) {
+            const std::uint64_t sub_offset = sub * table.mdts_bytes;
+            const std::uint64_t sub_io = std::min(
+                table.mdts_bytes, bytes_per_slice - sub_offset);
+            if (sub_io / page_size > 2) num_prp_pages += num_slices;
+        }
+        if (num_prp_pages > 0) {
+            table.prp_buf_ref = prp_buf_pools_[dev]->alloc_pages(num_prp_pages);
+            if (!table.prp_buf_ref.valid) {
+                status_msg = "striped prebuilt host PrpBufPool allocation failed";
+                cleanup_descs();
+                return false;
+            }
+        }
+        table.num_prp_pages = num_prp_pages;
+
+        std::vector<tutti::data_paths::local_nvme::AddressDescriptor> h_descs(
+            table.num_descs);
+        std::uint64_t prp_page_idx = 0;
         for (std::uint64_t s = 0; s < num_slices; ++s) {
-            std::uint64_t start_page = s * pages_per_io;
-            h_descs[s].data_length = bytes_per_slice;
-            h_descs[s].prp1 = dma->ioaddrs[start_page];
-            if (pages_per_io == 1) {
-                h_descs[s].prp2 = 0;
-            } else if (pages_per_io == 2) {
-                h_descs[s].prp2 = dma->ioaddrs[start_page + 1];
-            } else {
-                // PRP LIST path: prp2 = IOVA of a pre-allocated list page.
-                // For simplicity in striped mode, we rely on PRP cache or
-                // dynamic path for LIST-sized sub-IOs.  Set prp2=0 and
-                // let the submit fast-path fall back to dynamic for LIST.
-                // (This is rare: io_granularity is typically ≤ MDTS so
-                // pages_per_io ≤ 2.)
-                h_descs[s].prp2 = 0;  // LIST not pre-built; dynamic fallback
+            const std::uint64_t slice_offset = s * bytes_per_slice;
+            for (std::uint64_t sub = 0; sub < table.ios_per_slice; ++sub) {
+                const std::uint64_t sub_offset = sub * table.mdts_bytes;
+                const std::uint64_t sub_io = std::min(
+                    table.mdts_bytes, bytes_per_slice - sub_offset);
+                const std::uint64_t start_page =
+                    (slice_offset + sub_offset) / page_size;
+                const std::uint64_t pages_per_io = sub_io / page_size;
+                if (start_page + pages_per_io > dma->n_ioaddrs) {
+                    status_msg = "striped prebuilt PRP page out of DMA range";
+                    cleanup_descs();
+                    return false;
+                }
+                auto& desc = h_descs[s * table.ios_per_slice + sub];
+                desc.data_length = sub_io;
+                desc.prp1 = dma->ioaddrs[start_page];
+                if (pages_per_io == 1) {
+                    desc.prp2 = 0;
+                } else if (pages_per_io == 2) {
+                    desc.prp2 = dma->ioaddrs[start_page + 1];
+                } else {
+                    const std::uint64_t prp_page =
+                        table.prp_buf_ref.base_page + prp_page_idx++;
+                    auto* host_page = reinterpret_cast<std::uint64_t*>(
+                        static_cast<char*>(table.prp_buf_ref.segment->vaddr) +
+                        prp_page * page_size);
+                    fill_prp_list_page(
+                        host_page, dma, static_cast<std::uint32_t>(start_page),
+                        static_cast<std::uint32_t>(pages_per_io), page_size);
+                    desc.prp2 = table.prp_buf_ref.segment->ioaddrs[prp_page];
+                }
             }
         }
 
         void* d = nullptr;
-        cudaError_t ce = cudaMalloc(&d, num_slices * sizeof(tutti::data_paths::local_nvme::AddressDescriptor));
+        cudaError_t ce = cudaMalloc(
+            &d, table.num_descs *
+                    sizeof(tutti::data_paths::local_nvme::AddressDescriptor));
         if (ce != cudaSuccess) {
             status_msg = std::string("cudaMalloc d_descs failed: ") + cudaGetErrorString(ce);
-            for (std::size_t j = 0; j < dev; ++j) {
-                if (mem.prebuilt.d_descs_per_dev[j]) {
-                    cudaFree(mem.prebuilt.d_descs_per_dev[j]);
-                    mem.prebuilt.d_descs_per_dev[j] = nullptr;
-                }
-            }
+            cleanup_descs();
             return false;
         }
         ce = cudaMemcpy(d, h_descs.data(),
-                        num_slices * sizeof(tutti::data_paths::local_nvme::AddressDescriptor),
+                        table.num_descs *
+                            sizeof(tutti::data_paths::local_nvme::AddressDescriptor),
                         cudaMemcpyHostToDevice);
         if (ce != cudaSuccess) {
             status_msg = std::string("cudaMemcpy d_descs failed: ") + cudaGetErrorString(ce);
             cudaFree(d);
-            for (std::size_t j = 0; j < dev; ++j) {
-                if (mem.prebuilt.d_descs_per_dev[j]) {
-                    cudaFree(mem.prebuilt.d_descs_per_dev[j]);
-                    mem.prebuilt.d_descs_per_dev[j] = nullptr;
-                }
-            }
+            cleanup_descs();
             return false;
         }
-        mem.prebuilt.d_descs_per_dev[dev] = d;
+        table.d_descs = d;
     }
 
     mem.prebuilt.valid = true;
@@ -926,11 +1063,19 @@ bool StripedDataPath::build_striped_prebuilt_(
 }
 
 void StripedDataPath::destroy_striped_prebuilt_(StripedMemory& mem) {
-    for (auto* d : mem.prebuilt.d_descs_per_dev) {
-        if (d) cudaFree(d);
+    for (auto& table : mem.prebuilt.devices) {
+        if (table.d_descs) cudaFree(table.d_descs);
+        table.d_descs = nullptr;
     }
-    mem.prebuilt.d_descs_per_dev.clear();
+    mem.prebuilt.devices.clear();
     mem.prebuilt.valid = false;
+}
+
+std::uint64_t StripedDataPath::device_effective_mdts_(
+    std::uint32_t device) const {
+    if (device >= devices_.size()) return 0;
+    const std::uint64_t hardware = devices_[device].hardware_mdts;
+    return mdts_override_ > 0 ? std::min(mdts_override_, hardware) : hardware;
 }
 
 // =========================================================================
@@ -941,6 +1086,8 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
                                             std::size_t count,
                                             const HostSubmitContext& ctx) {
     ++test_submit_call_count_;
+    test_last_prebuilt_entry_count_ = 0;
+    test_last_dynamic_entry_count_ = 0;
 
     SubmitOutcome outcome;
     outcome.op = std::nullopt;
@@ -1160,8 +1307,7 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
         // per-submit PRP computation.  The pre-built descriptors are per-
         // device (each device has its own IOVA table), so we index by
         // (memory_offset / bytes_per_slice) into the correct device's array.
-        const bool use_prebuilt = mreg->prebuilt.valid &&
-            (intent.memory_offset % mreg->prebuilt.bytes_per_slice == 0);
+        const bool use_prebuilt = mreg->prebuilt.valid;
 
         while (remaining > 0) {
             // Round 16 S7: shard formula includes the per-target rotation
@@ -1177,7 +1323,9 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
 
             std::uint64_t unit_remaining = tgt->stripe_unit - (cur_off % tgt->stripe_unit);
             std::uint64_t sub_io = std::min(remaining, unit_remaining);
-            sub_io = std::min(sub_io, effective_mdts_bytes_);
+            const std::uint64_t controller_mdts =
+                device_effective_mdts_(shard);
+            sub_io = std::min(sub_io, controller_mdts);
 
             // Clamp to the shard's own extent boundary.
             std::uint64_t ext_end = 0;
@@ -1198,16 +1346,38 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
             entry.direction = direction;
             entry.shard_offset = shard_off;
 
-            if (use_prebuilt && sub_io == mreg->prebuilt.bytes_per_slice &&
-                cur_mem % mreg->prebuilt.bytes_per_slice == 0) {
-                // Pre-built fast path: pointer to GPU-resident descriptor.
-                std::uint64_t slice_idx = cur_mem / mreg->prebuilt.bytes_per_slice;
-                if (slice_idx < mreg->prebuilt.num_descs && shard < mreg->prebuilt.d_descs_per_dev.size()) {
+            const std::uint64_t slice_bytes =
+                mreg->prebuilt.bytes_per_slice;
+            const auto* prebuilt_table =
+                use_prebuilt && shard < mreg->prebuilt.devices.size()
+                    ? &mreg->prebuilt.devices[shard]
+                    : nullptr;
+            const std::uint64_t offset_in_slice = use_prebuilt
+                ? cur_mem % slice_bytes : 0;
+            const bool at_prebuilt_boundary = prebuilt_table &&
+                offset_in_slice % prebuilt_table->mdts_bytes == 0;
+            const std::uint64_t expected_prebuilt_bytes =
+                at_prebuilt_boundary
+                    ? std::min(prebuilt_table->mdts_bytes,
+                               slice_bytes - offset_in_slice)
+                    : 0;
+            if (at_prebuilt_boundary && sub_io == expected_prebuilt_bytes) {
+                const std::uint64_t slice_idx = cur_mem / slice_bytes;
+                const std::uint64_t sub_idx =
+                    offset_in_slice / prebuilt_table->mdts_bytes;
+                const std::uint64_t desc_idx =
+                    slice_idx * prebuilt_table->ios_per_slice + sub_idx;
+                if (slice_idx < mreg->prebuilt.num_slices &&
+                    sub_idx < prebuilt_table->ios_per_slice &&
+                    desc_idx < prebuilt_table->num_descs &&
+                    prebuilt_table->d_descs) {
                     entry.prp_entry = static_cast<const tutti::data_paths::local_nvme::AddressDescriptor*>(
-                        mreg->prebuilt.d_descs_per_dev[shard]) + slice_idx;
+                        prebuilt_table->d_descs) + desc_idx;
                     // Skip PRP computation — kernel will read from prp_entry.
                     h_entries.push_back(entry);
                     h_entry_lengths.push_back(sub_io);
+                    total_bytes += sub_io;
+                    ++test_last_prebuilt_entry_count_;
                     remaining -= sub_io;
                     cur_off += sub_io;
                     cur_mem += sub_io;
@@ -1252,6 +1422,7 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
             }
 
             h_dynamic_descs.push_back(desc);
+            ++test_last_dynamic_entry_count_;
 
             h_entries.push_back(entry);
             h_entry_lengths.push_back(sub_io);
@@ -1300,8 +1471,6 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
     cudaEvent_t event = static_cast<cudaEvent_t>(lease.event);
     StripedDeviceSubmitEntry* d_entries = lease.d_entries;
     EntryCompletionStatus* d_status = lease.d_status;
-    void* prp_pages = lease.prp_pages_devptr;
-    std::uint32_t prp_ioaddrs_base = lease.prp_ioaddrs_base;
     cudaError_t ce;
 
     // Cache refs checked out during this submit: released on error paths
@@ -1317,7 +1486,8 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
     // the cache produces the page content itself from the data DMA table;
     // miss = plain host memcpy, no H2D, no staging).  Lookups run as ONE
     // locked batch per device (was: one mutex round-trip per entry).
-    // Otherwise: arena pool + H2D fill (only when cache disabled/exhausted).
+    // Otherwise: growing host-pinned pool (no GPU backing or PRP H2D).
+    std::vector<tutti::data_paths::local_nvme::PrpBufRef> prp_buf_refs;
     if (!list_infos.empty()) {
         std::vector<bool> li_cached(list_infos.size(), false);
         std::vector<std::uint64_t> li_ioaddr(list_infos.size(), 0);
@@ -1350,29 +1520,40 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
                 }
             }
         }
-        std::vector<std::uint64_t> h_page(page_size / sizeof(std::uint64_t), 0);
-        std::uint32_t list_idx = 0;
+        std::vector<std::uint64_t> misses_per_dev(devices_.size(), 0);
+        for (std::size_t i = 0; i < list_infos.size(); ++i) {
+            if (!li_cached[i]) ++misses_per_dev[list_infos[i].dev_idx];
+        }
+        std::vector<tutti::data_paths::local_nvme::PrpBufRef> refs_by_dev(
+            devices_.size());
+        for (std::size_t d = 0; d < devices_.size(); ++d) {
+            if (misses_per_dev[d] == 0) continue;
+            refs_by_dev[d] = prp_buf_pools_[d]->alloc_pages(misses_per_dev[d]);
+            if (!refs_by_dev[d].valid) {
+                release_cache_refs();
+                arena_.release(lease.slot_index);
+                reject_all(StatusCode::RESOURCE_EXHAUSTED,
+                           "striped host PrpBufPool allocation failed");
+                return outcome;
+            }
+            prp_buf_refs.push_back(refs_by_dev[d]);
+        }
+        std::vector<std::uint64_t> next_page(devices_.size(), 0);
         for (std::size_t i = 0; i < list_infos.size(); ++i) {
             const auto& li = list_infos[i];
             if (li_cached[i]) {
                 h_dynamic_descs[li.desc_idx].prp2 = li_ioaddr[i];
-                continue;  // skip arena pool path
+                continue;
             }
-            // Arena pool path (original)
-            fill_prp_list_page(h_page.data(), li.dma,
+            auto& ref = refs_by_dev[li.dev_idx];
+            const std::uint64_t page_index =
+                ref.base_page + next_page[li.dev_idx]++;
+            auto* host_page = reinterpret_cast<std::uint64_t*>(
+                static_cast<char*>(ref.segment->vaddr) + page_index * page_size);
+            fill_prp_list_page(host_page, li.dma,
                                li.start_page, li.pages_in_io, page_size);
-            ce = cudaMemcpyAsync(
-                static_cast<char*>(prp_pages) + list_idx * page_size,
-                h_page.data(), page_size, cudaMemcpyHostToDevice, ctx.stream);
-            if (ce != cudaSuccess) {
-                release_cache_refs();
-                arena_.release(lease.slot_index);
-                reject_all(StatusCode::DEVICE_ERROR, "H2D PRP page failed");
-                return outcome;
-            }
             h_dynamic_descs[li.desc_idx].prp2 =
-                arena_.prp_dma(li.dev_idx)->ioaddrs[prp_ioaddrs_base + list_idx];
-            ++list_idx;
+                ref.segment->ioaddrs[page_index];
         }
     }
 
@@ -1433,7 +1614,9 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
         return outcome;
     }
 
-    ce = cudaMemsetAsync(d_status, 0, total_entries * sizeof(EntryCompletionStatus),
+    // Match local: pending must be fail-closed if an entry never executes.
+    ce = cudaMemsetAsync(d_status, 0xFF,
+                        total_entries * sizeof(EntryCompletionStatus),
                         ctx.stream);
     if (ce != cudaSuccess) {
         release_cache_refs();
@@ -1442,12 +1625,17 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
         return outcome;
     }
 
+    const NvtxIoStyle nvtx_style = nvtx_io_style(requests, count);
+    nvtx_push_io(nvtx_style);
+    // Keep the legacy exact marker as a nested range for existing report
+    // queries; the outer range carries the direction and color.
     nvtxRangePushA("tutti.striped_nvme.io_kernel");
     cudaError_t launch_err = launch_fused_submit(
         d_entries, d_status,
         reinterpret_cast<const DeviceTargetHandle* const*>(lease.d_dev_table),
         total_entries, total_dev_table, cq_poll_budget_, threads_per_block_,
         0, ctx.stream);
+    nvtxRangePop();
     nvtxRangePop();
     if (launch_err != cudaSuccess) {
         release_cache_refs();
@@ -1470,9 +1658,7 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
     op.event = event;
     op.stream = ctx.stream;
     op.arena_slot = lease.slot_index;
-    op.prp_ioaddrs_base = prp_ioaddrs_base;
-    op.prp_pages_devptr = prp_pages;
-    op.prp_list_page_count = static_cast<std::uint32_t>(list_infos.size());
+    op.prp_buf_refs = std::move(prp_buf_refs);
     op.op_token = op_token;
     op.op_generation = 1;
     op.target_token = targets_in_batch[0].token;  // Round 16 S4: first target for tracking
@@ -1500,6 +1686,8 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
             aggregate_completion_status_(op);
         } else {
             op.bytes_transferred = 0;
+            set_completion_failure(op.completion_detail,
+                                   IoFailureKind::CUDA_QUERY_ERROR, 0);
         }
     } else {
         op.state = OpState::IN_FLIGHT;
@@ -1549,16 +1737,10 @@ Result<ProgressResult> StripedDataPath::progress_impl_(ProgressBudget budget) {
             break;
         }
 
-        // Round 16 S7: spin on cudaEventQuery within the budget timeout
-        // to avoid the 1ms condition-variable sleep in Runtime::wait().
-        // The legacy uses cudaStreamSynchronize (blocking); our HOST_POLL
-        // model uses non-blocking queries, but spinning within the budget
-        // gives equivalent latency without changing the progress model.
-        cudaError_t ce = cudaErrorNotReady;
-        while (ce == cudaErrorNotReady &&
-               std::chrono::steady_clock::now() < deadline) {
-            ce = cudaEventQuery(static_cast<cudaEvent_t>(op.event));
-        }
+        // One query = one work unit. Runtime::wait() supplies the polling
+        // cadence; spinning here defeats max_work_units and can generate
+        // millions of CUDA API calls while an event is not ready.
+        cudaError_t ce = cudaEventQuery(static_cast<cudaEvent_t>(op.event));
         if (ce == cudaSuccess) {
             aggregate_completion_status_(op);
             cudaGetLastError();
@@ -1570,6 +1752,9 @@ Result<ProgressResult> StripedDataPath::progress_impl_(ProgressBudget budget) {
             op.status = Status(StatusCode::DEVICE_ERROR,
                                "cudaEventQuery error: " +
                                std::string(cudaGetErrorString(ce)));
+            set_completion_failure(op.completion_detail,
+                                   IoFailureKind::CUDA_QUERY_ERROR,
+                                   op.bytes_transferred);
             cudaGetLastError();
             ++result.operations_terminal;
         }
@@ -1588,10 +1773,12 @@ Result<ProgressResult> StripedDataPath::progress_impl_(ProgressBudget budget) {
 // =========================================================================
 
 void StripedDataPath::aggregate_completion_status_(OpEntry& op) {
+    op.completion_detail = IoCompletionDetail{};
     if (!op.d_status || op.entry_count == 0) {
         op.state = OpState::COMPLETED;
         op.status = Status::Ok();
         op.bytes_transferred = op.total_bytes;
+        op.completion_detail.confirmed_bytes = op.total_bytes;
         return;
     }
 
@@ -1606,6 +1793,8 @@ void StripedDataPath::aggregate_completion_status_(OpEntry& op) {
                           "D2H completion status failed: " +
                           std::string(cudaGetErrorString(ce)));
         op.bytes_transferred = 0;
+        set_completion_failure(op.completion_detail,
+                               IoFailureKind::STATUS_D2H_ERROR, 0);
         return;
     }
 
@@ -1615,6 +1804,9 @@ void StripedDataPath::aggregate_completion_status_(OpEntry& op) {
     std::uint64_t confirmed_bytes = 0;
     bool any_failed = false;
     std::string first_error;
+    std::uint32_t first_failed_entry = UINT32_MAX;
+    std::uint32_t first_failure_result = 0;
+    std::uint32_t first_raw_cq_status = 0;
 
     for (std::uint32_t i = 0; i < op.entry_count; ++i) {
         const auto& s = h_status[i];
@@ -1622,6 +1814,11 @@ void StripedDataPath::aggregate_completion_status_(OpEntry& op) {
             confirmed_bytes += op.entry_lengths[i];
         } else {
             any_failed = true;
+            if (first_failed_entry == UINT32_MAX) {
+                first_failed_entry = i;
+                first_failure_result = s.result;
+                first_raw_cq_status = s.nvme_status_dword3;
+            }
             if (s.result == 2) op.has_timeout = true;
             if (first_error.empty()) {
                 first_error = "entry " + std::to_string(i) + ": result " +
@@ -1634,10 +1831,15 @@ void StripedDataPath::aggregate_completion_status_(OpEntry& op) {
         op.state = OpState::FAILED;
         op.status = Status(StatusCode::DEVICE_ERROR, first_error);
         op.bytes_transferred = confirmed_bytes;
+        set_completion_failure(
+            op.completion_detail,
+            completion_failure_kind(first_failure_result), confirmed_bytes,
+            op.has_timeout, first_failed_entry, first_raw_cq_status);
     } else {
         op.state = OpState::COMPLETED;
         op.status = Status::Ok();
-        op.bytes_transferred = op.total_bytes;
+        op.bytes_transferred = confirmed_bytes;
+        op.completion_detail.confirmed_bytes = confirmed_bytes;
     }
 }
 
@@ -1655,6 +1857,7 @@ Result<DataPathSnapshot> StripedDataPath::query_impl_(DataPathOp op) const {
     snap.state = entry->state;
     snap.status = entry->status;
     snap.bytes_transferred = entry->bytes_transferred;
+    snap.detail = entry->completion_detail;
     return Result<DataPathSnapshot>::Success(std::move(snap));
 }
 
@@ -1674,9 +1877,12 @@ Status StripedDataPath::release_impl_(DataPathOp op) {
         }
         entry->arena_slot = UINT32_MAX;
     }
-    // Release the PRP cache pins held for this op's lifetime.
-    for (const auto& ref : entry->prp_cache_refs) {
-        ref.cache->unpin(ref.entry);
+    if (entry->has_timeout) timeout_prp_retained_ = true;
+    // A timed-out controller command may still fetch cached host PRP pages.
+    if (!entry->has_timeout) {
+        for (const auto& ref : entry->prp_cache_refs) {
+            ref.cache->unpin(ref.entry);
+        }
     }
     entry->prp_cache_refs.clear();
     ops_.erase(op.token());

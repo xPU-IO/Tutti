@@ -23,6 +23,8 @@
 from __future__ import annotations
 
 import os
+import threading
+import time
 from pathlib import Path
 
 #: chunk_key 的固定字节长度。
@@ -36,6 +38,7 @@ _ZERO_BLOCK = b"\x00" * _EXTEND_BLOCK_BYTES
 _DATA_SUFFIX = ".bin"
 _MARKER_SUFFIX = ".ok"
 _MANIFEST_NAME = "namespace.manifest"
+_SCAN_GENERATION_NAME = ".scan-generation"
 
 
 def decode_io_key(io_key: bytes) -> tuple[bytes, int]:
@@ -62,7 +65,7 @@ class Layout:
         self.layer_span: int | None = None
         self._chunks_dir = self.root / "chunks"
         self._meta_dir = self.root / "meta"
-        self._scan_signature: tuple[int, int] | None = None
+        self._scan_signature: tuple[int, int, bytes] | None = None
         self._scan_cache: set[bytes] = set()
 
     def set_layer_span(self, num_layers: int) -> None:
@@ -131,7 +134,11 @@ class Layout:
             return live
         try:
             stat = self._meta_dir.stat()
-            signature = (stat.st_mtime_ns, stat.st_ctime_ns)
+            signature = (
+                stat.st_mtime_ns,
+                stat.st_ctime_ns,
+                _read_scan_generation(self._meta_dir),
+            )
         except OSError:
             self._scan_signature = None
             self._scan_cache = set()
@@ -195,6 +202,7 @@ class Layout:
         """数据落盘后建层标记（崩溃安全窗口：先数据后标记）。"""
         for io_key in io_keys:
             self.marker_file(io_key).touch(exist_ok=True)
+        _bump_scan_generation(self._meta_dir)
         self._scan_signature = None
 
     def drop(self, io_keys) -> None:
@@ -208,6 +216,7 @@ class Layout:
             if any(self._meta_dir.glob(chunk_id.hex() + "*" + _MARKER_SUFFIX)):
                 continue  # 该 chunk 仍有存活层段
             self.chunk_file(chunk_id).unlink(missing_ok=True)
+        _bump_scan_generation(self._meta_dir)
         self._scan_signature = None
 
 
@@ -225,3 +234,25 @@ def _append_real_zeros(path: Path, start: int, end: int) -> None:
             position += block
         handle.flush()
         os.fsync(handle.fileno())
+
+
+def _read_scan_generation(meta_dir: Path) -> bytes:
+    try:
+        return (meta_dir / _SCAN_GENERATION_NAME).read_bytes()
+    except OSError:
+        return b""
+
+
+def _bump_scan_generation(meta_dir: Path) -> None:
+    """Publish a cross-process marker-generation token with atomic replace."""
+    now = time.time_ns()
+    token = f"{os.getpid()}:{threading.get_ident()}:{now}".encode("ascii")
+    target = meta_dir / _SCAN_GENERATION_NAME
+    temporary = meta_dir / (
+        f"{_SCAN_GENERATION_NAME}.{os.getpid()}.{threading.get_ident()}.{now}"
+    )
+    try:
+        temporary.write_bytes(token)
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)

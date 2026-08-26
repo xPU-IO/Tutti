@@ -9,12 +9,13 @@
 //   - N cudaEvent_t (one per slot, cudaEventDisableTiming)
 //   - One contiguous GPU buffer for all DeviceSubmitEntry arrays
 //   - One contiguous GPU buffer for all EntryCompletionStatus arrays
-//   - One 64 KiB-aligned GPU buffer for PRP-list pages, DMA-mapped as a whole
+// PRP-list pages are deliberately NOT arena resources. They come from the
+// host-pinned PrpBufPool/PrpPageCache.
 //
 // submit() calls acquire() to lease a slot; release() returns it.
 // Arena exhaustion → submit() returns RESOURCE_EXHAUSTED (no fallback
-// to cudaMalloc).  Timeout ops use release_with_timeout_leak(): the
-// slot is permanently consumed (bounded leak, matches Round 8 semantics).
+// to cudaMalloc). Timeout only retains the separate host PRP lease; GPU
+// metadata slots remain reusable.
 
 #include <cstdint>
 #include <deque>
@@ -47,13 +48,6 @@ public:
         void* event = nullptr;                        // cudaEvent_t
         DeviceSubmitEntry* d_entries = nullptr;      // GPU: entry array base
         EntryCompletionStatus* d_status = nullptr;   // GPU: status array base
-        // PRP-list workspace (pre-allocated, DMA-mapped).
-        // Each slot has max_entries_per_slot PRP pages available
-        // (worst case: every entry is a LIST sub-IO).
-        void* prp_pages_devptr = nullptr;             // GPU: this slot's PRP page base
-        std::uint32_t prp_ioaddrs_base = 0;           // index into arena DMA ioaddrs[]
-        std::uint32_t prp_page_capacity = 0;          // max PRP pages for this slot
-
         // Round 16 S6 (REQUIRED 0): per-slot descriptor pool for the
         // dynamic (non-pre-built) submit path.  The kernel ALWAYS reads
         // prp1/prp2/data_length from e.prp_entry; for dynamic-path
@@ -71,6 +65,7 @@ public:
         std::uint64_t cuda_event_destroy = 0;
         std::uint64_t nvm_dma_map = 0;
         std::uint64_t nvm_dma_unmap = 0;
+        std::uint64_t gpu_prp_cuda_malloc = 0;
     };
 
     MetadataArena() = default;
@@ -79,16 +74,14 @@ public:
     MetadataArena(const MetadataArena&) = delete;
     MetadataArena& operator=(const MetadataArena&) = delete;
 
-    // Pre-allocate all GPU memory, events, and PRP-list DMA mapping.
-    // Must be called after the controller is attached.
+    // Pre-allocate GPU entry/status/descriptor memory and events. `ctrl` is
+    // retained in the signature for source compatibility and is not mapped.
     // Returns false on any CUDA/DMA failure.
     bool init(const Config& cfg, nvm_ctrl_t* ctrl);
 
     // Free all resources. Idempotent. Caller must ensure no in-flight
     // GPU work touches arena memory (sync all streams first).
-    // If skip_prp is true, the PRP-list pool (DMA mapping + CUDA allocation)
-    // is NOT freed — used when a timeout op's command may still be in the
-    // controller queue.  Events and entry/status pools are always freed.
+    // `skip_prp` is a compatibility no-op: the arena owns no PRP backing.
     void shutdown(bool skip_prp = false);
 
     bool initialized() const { return initialized_; }
@@ -102,17 +95,13 @@ public:
     // Return a slot for reuse (normal completion).
     void release(std::uint32_t slot_index);
 
-    // Return a slot but permanently leak its PRP-list pages (timeout).
-    // The slot is consumed forever; available() decreases by 1
-    // and never recovers. Upper bound on leaked slots = capacity.
+    // Compatibility alias. With host PRP leases outside the arena, timeout
+    // no longer consumes GPU metadata slots.
     void release_with_timeout_leak(std::uint32_t slot_index);
 
     // Test seam: allocation counters.
     const AllocCounts& alloc_counts() const { return alloc_counts_; }
     void reset_alloc_counts() { alloc_counts_ = {}; }
-
-    // Access the shared DMA mapping (for test observability).
-    const nvm_dma_t* prp_dma() const { return prp_dma_; }
 
 private:
     Config cfg_{};
@@ -128,15 +117,6 @@ private:
 
     // Status pool: one contiguous GPU buffer for all slots.
     EntryCompletionStatus* d_status_pool_ = nullptr;
-
-    // PRP-list pool: one contiguous GPU buffer, 64 KiB-aligned, DMA-mapped.
-    void* prp_raw_ = nullptr;        // cudaMalloc return (owner)
-    void* prp_aligned_ = nullptr;    // 64 KiB-aligned base
-    nvm_dma_t* prp_dma_ = nullptr;   // DMA mapping (shared across all slots)
-    std::size_t prp_aligned_bytes_ = 0;
-
-    // Per-slot PRP page capacity (worst case = max_entries_per_slot).
-    std::uint32_t prp_pages_per_slot_ = 0;
 
     // Round 16 S6 (REQUIRED 0): descriptor pool for dynamic-path entries.
     // One contiguous GPU buffer: num_slots * max_entries_per_slot * sizeof(AddressDescriptor).

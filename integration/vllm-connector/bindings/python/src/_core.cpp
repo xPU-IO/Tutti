@@ -60,12 +60,51 @@ struct SubmitResult {
     std::vector<std::int64_t> rejected;  // request indices, for resubmit
 };
 
+struct WaitResult {
+    std::string observation;
+    std::string state;
+    std::uint64_t confirmed_bytes = 0;
+    bool timeout_seen = false;
+    std::vector<std::uint32_t> failed_request_indices;
+    std::string failure_scope = "NONE";
+    std::optional<std::string> failure_kind;
+    std::optional<std::uint32_t> first_failed_entry;
+    std::optional<std::uint32_t> raw_cq_status;
+    std::string message;
+};
+
+const char* failure_kind_str(tutti::IoFailureKind kind) {
+    switch (kind) {
+        case tutti::IoFailureKind::NONE: return "NONE";
+        case tutti::IoFailureKind::RESOLVE_LBA: return "RESOLVE_LBA";
+        case tutti::IoFailureKind::CQ_TIMEOUT: return "CQ_TIMEOUT";
+        case tutti::IoFailureKind::NVME_CQ_ERROR: return "NVME_CQ_ERROR";
+        case tutti::IoFailureKind::CUDA_QUERY_ERROR: return "CUDA_QUERY_ERROR";
+        case tutti::IoFailureKind::STATUS_D2H_ERROR: return "STATUS_D2H_ERROR";
+        case tutti::IoFailureKind::UNKNOWN: return "UNKNOWN";
+    }
+    return "UNKNOWN";
+}
+
+const char* failure_scope_str(tutti::IoFailureScope scope) {
+    switch (scope) {
+        case tutti::IoFailureScope::NONE: return "NONE";
+        case tutti::IoFailureScope::REQUEST_INDICES: return "REQUEST_INDICES";
+        case tutti::IoFailureScope::WHOLE_OPERATION: return "WHOLE_OPERATION";
+    }
+    return "WHOLE_OPERATION";
+}
+
 class PyRuntime {
 public:
     explicit PyRuntime(std::unique_ptr<tutti::StorageRuntime> rt, bool stub,
-                       std::uint64_t max_batch, std::uint64_t max_inflight)
+                       std::uint64_t max_batch, std::uint64_t max_inflight,
+                       std::int32_t bound_accel_id,
+                       std::uint64_t max_concurrent_streams)
         : rt_(std::move(rt)), stub_mode_(stub),
-          caps_max_batch_(max_batch), caps_max_inflight_(max_inflight) {}
+          caps_max_batch_(max_batch), caps_max_inflight_(max_inflight),
+          caps_bound_accel_id_(bound_accel_id),
+          caps_max_concurrent_streams_(max_concurrent_streams) {}
 
     // ---- caps ----
     std::unordered_map<std::string, std::uint64_t> caps() const {
@@ -73,14 +112,21 @@ public:
         // component mode: the public facade exposes no DataPath capability
         // query; report the preset-supplied limits and conservative
         // alignment = 1.
-        return {
+        std::unordered_map<std::string, std::uint64_t> caps{
             {"target_alignment_bytes", 1},
             {"memory_alignment_bytes", 1},
             {"length_alignment_bytes", 1},
             {"max_single_io_bytes", 0},
             {"max_batch_requests", caps_max_batch_},
             {"max_in_flight_operations", caps_max_inflight_},
+            {"supports_multi_stream", caps_max_concurrent_streams_ >= 2},
+            {"max_concurrent_streams", caps_max_concurrent_streams_},
         };
+        if (caps_bound_accel_id_ >= 0) {
+            caps["bound_accel_id"] = static_cast<std::uint64_t>(
+                caps_bound_accel_id_);
+        }
+        return caps;
     }
 
     // ---- targets ----
@@ -215,34 +261,76 @@ public:
     // ---- io lifecycle ----
     void release_io(std::uint64_t ticket) {
         const IoHandle handle = lookup_io_(ticket);
+        // Capture terminal detail before Runtime invalidates the handle. The
+        // ticket-level cache keeps diagnostics observable after release_io().
+        WaitResult observed = wait_result(ticket, 0);
         tutti::Status status = rt_->release_io(handle);
         if (!status.ok()) {
             throw_status("release_io failed", status);
+        }
+        if (observed.observation == "OK" &&
+            (observed.state == "COMPLETED" || observed.state == "FAILED")) {
+            terminal_results_[ticket] = std::move(observed);
         }
         ios_.erase(ticket);
     }
 
     std::pair<std::string, std::string> wait(std::uint64_t ticket,
                                              std::uint64_t timeout_ms) {
+        WaitResult result = wait_result(ticket, timeout_ms);
+        return {result.observation, result.state};
+    }
+
+    WaitResult wait_result(std::uint64_t ticket,
+                           std::uint64_t timeout_ms) {
+        auto retained = terminal_results_.find(ticket);
+        if (retained != terminal_results_.end()) {
+            return retained->second;
+        }
         const IoHandle handle = lookup_io_(ticket);
         tutti::WaitOutcome outcome;
         {
             py::gil_scoped_release release;
-            outcome = rt_->wait(handle, timeout_ms);
+            outcome = rt_->wait_result(handle, timeout_ms);
         }
+        WaitResult result;
         if (!outcome.observation_status.ok()) {
-            // TIMEOUT / handle error: no terminal state observed.
-            return {status_code_str(outcome.observation_status.code()), ""};
+            result.observation = status_code_str(
+                outcome.observation_status.code());
+            result.message = outcome.observation_status.message();
+            return result;
         }
         if (!outcome.result.has_value()) {
-            return {"INTERNAL", ""};
+            result.observation = "INTERNAL";
+            result.message = "terminal wait returned no result";
+            return result;
         }
+        result.observation = "OK";
         switch (outcome.result->state) {
-            case tutti::IoState::COMPLETED: return {"OK", "COMPLETED"};
-            case tutti::IoState::FAILED: return {"OK", "FAILED"};
-            case tutti::IoState::IN_FLIGHT: return {"OK", ""};
+            case tutti::IoState::COMPLETED: result.state = "COMPLETED"; break;
+            case tutti::IoState::FAILED: result.state = "FAILED"; break;
+            case tutti::IoState::IN_FLIGHT: result.state = "IN_FLIGHT"; break;
         }
-        return {"OK", ""};
+        const auto& detail = outcome.result->detail;
+        result.confirmed_bytes = detail.confirmed_bytes;
+        result.timeout_seen = detail.timeout_seen;
+        result.failed_request_indices = detail.failed_request_indices;
+        result.failure_scope = failure_scope_str(detail.failure_scope);
+        if (detail.failure_kind != tutti::IoFailureKind::NONE) {
+            result.failure_kind = failure_kind_str(detail.failure_kind);
+            result.raw_cq_status = detail.raw_cq_status;
+        }
+        if (detail.first_failed_entry != UINT32_MAX) {
+            result.first_failed_entry = detail.first_failed_entry;
+        }
+        result.message = outcome.result->status.message();
+        terminal_results_[ticket] = result;
+        return result;
+    }
+
+    WaitResult wait_detail(std::uint64_t ticket,
+                           std::uint64_t timeout_ms) {
+        return wait_result(ticket, timeout_ms);
     }
 
     void shutdown(std::uint64_t timeout_ms) {
@@ -348,10 +436,13 @@ private:
     bool stub_mode_;
     std::uint64_t caps_max_batch_;
     std::uint64_t caps_max_inflight_;
+    std::int32_t caps_bound_accel_id_;
+    std::uint64_t caps_max_concurrent_streams_;
     std::uint64_t next_ticket_ = 1;
     std::unordered_map<std::uint64_t, TargetHandle> targets_;
     std::unordered_map<std::uint64_t, MemoryHandle> memories_;
     std::unordered_map<std::uint64_t, IoHandle> ios_;
+    std::unordered_map<std::uint64_t, WaitResult> terminal_results_;
 };
 
 // ---------------------------------------------------------------------------
@@ -515,22 +606,24 @@ PyRuntime make_local_nvme_runtime(const py::dict& preset) {
     tutti::presets::LocalNvmePreset p = parse_local_preset(preset);
     auto assembled = tutti::presets::make_local_nvme_runtime(p);
     if (!assembled.runtime) {
-        throw std::runtime_error(
-            "make_local_nvme_runtime failed to assemble the runtime");
+        throw_status("make_local_nvme_runtime failed",
+                     assembled.creation_status);
     }
     return PyRuntime(std::move(assembled.runtime), /*stub=*/false,
-                     p.max_batch_entries, p.max_in_flight_operations);
+                     p.max_batch_entries, p.max_in_flight_operations,
+                     p.gpu_id, /*max_concurrent_streams=*/2);
 }
 
 PyRuntime make_striped_nvme_runtime(const py::dict& preset) {
     tutti::presets::StripedNvmePreset p = parse_striped_preset(preset);
     auto assembled = tutti::presets::make_striped_nvme_runtime(p);
     if (!assembled.runtime) {
-        throw std::runtime_error(
-            "make_striped_nvme_runtime failed to assemble the runtime");
+        throw_status("make_striped_nvme_runtime failed",
+                     assembled.creation_status);
     }
     return PyRuntime(std::move(assembled.runtime), /*stub=*/false,
-                     p.max_batch_entries, p.max_in_flight_operations);
+                     p.max_batch_entries, p.max_in_flight_operations,
+                     p.gpu_id, /*max_concurrent_streams=*/2);
 }
 
 PyRuntime make_stub_runtime(std::int32_t accel_id) {
@@ -541,7 +634,8 @@ PyRuntime make_stub_runtime(std::int32_t accel_id) {
         throw_status("make_stub_runtime failed", created.status());
     }
     return PyRuntime(std::move(created).value(), /*stub=*/true,
-                     /*max_batch=*/0, /*max_inflight=*/0);
+                     /*max_batch=*/0, /*max_inflight=*/0,
+                     accel_id, /*max_concurrent_streams=*/0);
 }
 
 } // namespace
@@ -557,6 +651,19 @@ PYBIND11_MODULE(_core, m) {
         .def_readonly("initial_states", &SubmitResult::initial_states)
         .def_readonly("rejected", &SubmitResult::rejected);
 
+    py::class_<WaitResult>(m, "WaitResult")
+        .def_readonly("observation", &WaitResult::observation)
+        .def_readonly("state", &WaitResult::state)
+        .def_readonly("confirmed_bytes", &WaitResult::confirmed_bytes)
+        .def_readonly("timeout_seen", &WaitResult::timeout_seen)
+        .def_readonly("failed_request_indices",
+                      &WaitResult::failed_request_indices)
+        .def_readonly("failure_scope", &WaitResult::failure_scope)
+        .def_readonly("failure_kind", &WaitResult::failure_kind)
+        .def_readonly("first_failed_entry", &WaitResult::first_failed_entry)
+        .def_readonly("raw_cq_status", &WaitResult::raw_cq_status)
+        .def_readonly("message", &WaitResult::message);
+
     py::class_<PyRuntime>(m, "Runtime")
         .def("caps", &PyRuntime::caps)
         .def("open_batch", &PyRuntime::open_batch, py::arg("uris"))
@@ -569,6 +676,10 @@ PYBIND11_MODULE(_core, m) {
         .def("release_io", &PyRuntime::release_io, py::arg("io_handle"))
         .def("wait", &PyRuntime::wait, py::arg("io_handle"),
              py::arg("timeout_ms"))
+        .def("wait_result", &PyRuntime::wait_result, py::arg("io_handle"),
+             py::arg("timeout_ms") = 0)
+        .def("wait_detail", &PyRuntime::wait_detail, py::arg("io_handle"),
+             py::arg("timeout_ms") = 0)
         .def("shutdown", &PyRuntime::shutdown, py::arg("timeout_ms"))
         .def("testing_force_complete", &PyRuntime::testing_force_complete,
              py::arg("io_handle"), py::arg("state") = "COMPLETED");

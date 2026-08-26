@@ -38,6 +38,7 @@
 #include "tutti/bindings/striped_local_nvme/binding.h"
 #include "tutti/data_paths/striped_local_nvme/striped_arena.h"
 #include "tutti/data_paths/local_nvme/metadata/prp_page_cache.h"  // Round 16 S5
+#include "tutti/data_paths/local_nvme/metadata/prp_buf_pool.h"
 
 #include <nvm_ctrl.h>
 #include <nvm_types.h>
@@ -161,6 +162,12 @@ public:
         return device_descs_;
     }
     std::uint64_t test_effective_mdts() const { return effective_mdts_bytes_; }
+    std::uint64_t test_device_hardware_mdts(std::uint32_t device) const {
+        return device < devices_.size() ? devices_[device].hardware_mdts : 0;
+    }
+    std::uint64_t test_device_effective_mdts(std::uint32_t device) const {
+        return device_effective_mdts_(device);
+    }
     std::uint32_t test_threads_per_block() const {
         return threads_per_block_;
     }
@@ -169,9 +176,21 @@ public:
     void test_reset_submit_counters() {
         test_submit_call_count_ = 0;
         test_kernel_launch_count_ = 0;
+        test_last_prebuilt_entry_count_ = 0;
+        test_last_dynamic_entry_count_ = 0;
+    }
+    std::uint64_t test_last_prebuilt_entry_count() const {
+        return test_last_prebuilt_entry_count_;
+    }
+    std::uint64_t test_last_dynamic_entry_count() const {
+        return test_last_dynamic_entry_count_;
     }
     std::uint32_t test_arena_capacity() const { return arena_.capacity(); }
     std::uint32_t test_arena_available() const { return arena_.available(); }
+    StripedArena::AllocCounts test_arena_alloc_counts() const {
+        return arena_.alloc_counts();
+    }
+    void test_arena_reset_alloc_counts() { arena_.reset_alloc_counts(); }
     bool test_op_has_timeout(DataPathOp op) const;
     // Number of fan-out entries the given op produced (0 if op not found).
     std::uint32_t test_entry_count(DataPathOp op) const;
@@ -244,14 +263,21 @@ private:
         std::vector<nvm_dma_t*> dmas;
         std::uint64_t generation = 0;
 
-        // Round 16 S5 (V3): per-device pre-built AddressDescriptor[].
-        // Populated when io_granularity > 0 at registration time.
-        // d_descs[d] = GPU-resident AddressDescriptor[] for device d.
-        // Each descriptor covers one sub-IO of bytes_per_slice.
+        // Per-controller pre-built AddressDescriptor tables. io_granularity
+        // remains the logical block size; every device splits that block by
+        // its own driver-reported MDTS.
         struct Prebuilt {
-            std::vector<void*> d_descs_per_dev;   // N GPU pointers
-            std::uint64_t bytes_per_slice = 0;
-            std::uint64_t num_descs = 0;           // same per device (same IOVA layout)
+            struct DeviceTable {
+                void* d_descs = nullptr;
+                std::uint64_t mdts_bytes = 0;
+                std::uint64_t ios_per_slice = 0;
+                std::uint64_t num_descs = 0;
+                tutti::data_paths::local_nvme::PrpBufRef prp_buf_ref;
+                std::uint64_t num_prp_pages = 0;
+            };
+            std::vector<DeviceTable> devices;
+            std::uint64_t bytes_per_slice = 0;  // logical io_granularity
+            std::uint64_t num_slices = 0;
             bool valid = false;
         };
         Prebuilt prebuilt;
@@ -262,6 +288,7 @@ private:
         Status status;
         std::uint64_t bytes_transferred = 0;
         std::uint64_t total_bytes = 0;
+        IoCompletionDetail completion_detail;
 
         std::uint32_t arena_slot = UINT32_MAX;
         StripedDeviceSubmitEntry* d_entries = nullptr;
@@ -273,10 +300,8 @@ private:
         void* event = nullptr;   // cudaEvent_t
         void* stream = nullptr;  // borrowed cudaStream_t
 
-        // PRP-list workspace (borrowed from arena's pre-allocated pool).
-        std::uint32_t prp_ioaddrs_base = 0;
-        void* prp_pages_devptr = nullptr;
-        std::uint32_t prp_list_page_count = 0;
+        // Host-pinned PRP-list leases, one or more per controller.
+        std::vector<tutti::data_paths::local_nvme::PrpBufRef> prp_buf_refs;
 
         bool has_timeout = false;
 
@@ -340,6 +365,9 @@ private:
 
     // Round 16 S5: per-device PRP page cache (one per controller).
     std::vector<std::unique_ptr<tutti::data_paths::local_nvme::PrpPageCache>> prp_caches_;
+    // Growing host-pinned miss/exhaustion pool, one per controller/IOMMU domain.
+    std::vector<std::unique_ptr<tutti::data_paths::local_nvme::PrpBufPool>> prp_buf_pools_;
+    bool timeout_prp_retained_ = false;
 
     std::uint64_t next_target_ = 1;
     std::uint64_t next_memory_ = 1;
@@ -353,9 +381,12 @@ private:
                                   std::uint64_t io_granularity,
                                   std::string& status_msg);
     void destroy_striped_prebuilt_(StripedMemory& mem);
+    std::uint64_t device_effective_mdts_(std::uint32_t device) const;
 
     std::uint64_t test_submit_call_count_ = 0;
     std::uint64_t test_kernel_launch_count_ = 0;
+    std::uint64_t test_last_prebuilt_entry_count_ = 0;
+    std::uint64_t test_last_dynamic_entry_count_ = 0;
 };
 
 } // namespace tutti::data_paths::striped_local_nvme

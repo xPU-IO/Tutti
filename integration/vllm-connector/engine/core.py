@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import Sequence
 
 from engine.staging import RingWindow
@@ -19,6 +20,17 @@ from index.chunk_index import (
 _IO_KEY_BYTES = 18
 
 
+class LoadGateError(RuntimeError):
+    """A layer's runtime/CQ completion failed before scatter."""
+
+    def __init__(self, message: str, failed_batch_indices=(),
+                 whole_operation: bool = True, invalid_block_ids=()):
+        super().__init__(message)
+        self.failed_batch_indices = tuple(failed_batch_indices)
+        self.whole_operation = bool(whole_operation)
+        self.invalid_block_ids = tuple(invalid_block_ids)
+
+
 class _PostCompletion:
     """底层完成句柄与消费侧事件组成的完成句柄。
 
@@ -26,20 +38,50 @@ class _PostCompletion:
     次）；query 在收尾尚未启动时反映底层状态，事件已产生后反映事件状态。
     """
 
-    __slots__ = ("_inner", "_after", "_event", "_done")
+    __slots__ = ("_inner", "_after", "_event", "_done", "_block_tables")
 
-    def __init__(self, inner, after):
+    def __init__(self, inner, after, block_tables=None):
         """inner 为底层完成句柄，after 为无参收尾可调用。"""
         self._inner = inner
         self._after = after
         self._event = None
         self._done = False
+        self._block_tables = block_tables
 
     def wait(self) -> None:
         """阻塞至底层完成并执行收尾动作（恰一次）。"""
         if self._done:
             return
-        self._inner.wait()
+        wait_result = getattr(self._inner, "wait_result", None)
+        if callable(wait_result):
+            result = wait_result()
+            if not getattr(result, "ok", True):
+                failed = tuple(getattr(result, "failed_batch_indices", ()) or ())
+                failures = tuple(getattr(result, "failures", ()) or ())
+                whole = not failed or any(
+                    getattr(item, "failure_scope", "WHOLE_OPERATION")
+                    != "REQUEST_INDICES" for item in failures
+                )
+                selected = self._block_tables
+                if not whole and failed and self._block_tables is not None:
+                    selected = [
+                        self._block_tables[index]
+                        for index in failed
+                        if 0 <= index < len(self._block_tables)
+                    ]
+                invalid_blocks = _flatten_block_ids(selected)
+                raise LoadGateError(
+                    "底层 IO 失败，禁止 scatter",
+                    failed_batch_indices=failed,
+                    whole_operation=whole,
+                    invalid_block_ids=invalid_blocks,
+                )
+        else:
+            # TODO(STRUCTURED-COMPLETION): remove this compatibility branch
+            # once every KVStore completion exposes wait_result().  A legacy
+            # wait exception has no request-index detail, so WorkerImpl maps
+            # it to WHOLE_OPERATION fail-closed.
+            self._inner.wait()
         self._event = self._after()
         if self._event is not None:
             synchronize = getattr(self._event, "synchronize", None)
@@ -47,6 +89,26 @@ class _PostCompletion:
                 synchronize()
             else:
                 self._event.wait()
+        self._done = True
+
+    def abort(self) -> None:
+        """Drain the inner operation without running consumer-side ``after``.
+
+        A look-ahead load may have already submitted later layers when an
+        earlier layer fails.  Those operations still need CQ draining and
+        release, but their scatter callback must never publish data after the
+        step has entered the failed state.
+        """
+        if self._done:
+            return
+        try:
+            wait_result = getattr(self._inner, "wait_result", None)
+            if callable(wait_result):
+                wait_result()
+            else:
+                self._inner.wait()
+        except Exception:
+            pass
         self._done = True
 
     def query(self) -> bool:
@@ -78,6 +140,21 @@ class _AggregateCompletion:
             return
         for handle in self._handles:
             handle.wait()
+        self._done = True
+
+    def abort(self) -> None:
+        """Drain child operations while suppressing all scatter callbacks."""
+        if self._done:
+            return
+        for handle in self._handles:
+            abort = getattr(handle, "abort", None)
+            try:
+                if callable(abort):
+                    abort()
+                else:
+                    handle.wait()
+            except Exception:
+                pass
         self._done = True
 
     def query(self) -> bool:
@@ -152,6 +229,9 @@ class KVEngine:
         if setter is not None and namespace:
             setter(namespace)
         store.open()
+        self._max_in_flight_operations = int(
+            getattr(store, "max_in_flight_operations", 0) or 0
+        )
         self._index = ChunkIndex(store.capacity_chunks, self._chunk_tokens,
                                  namespace=namespace)
         # 冷启动分组：层数定案前暂存；层集合不完整的 chunk 视为缺失。
@@ -164,11 +244,20 @@ class KVEngine:
         # 执行态（bind 后可用；num_layers 预告可先行）
         self._num_layers: int | None = layers_hint
         self._segment_bytes: int | None = None
-        self._window: RingWindow | None = None
+        self._window: RingWindow | None = None  # read-window compatibility alias
+        self._read_window: RingWindow | None = None
+        self._write_window: RingWindow | None = None
         self._transfer: StagedTransfer | None = None
         self._scatter_hook = None
         self._staging_buffer_id: int | None = None
+        self._read_staging_buffer_id: int | None = None
+        self._write_staging_buffer_id: int | None = None
         self._inflight: list = []
+        self._planned_store_keys: set[bytes] = set()
+
+    @property
+    def max_in_flight_operations(self) -> int:
+        return self._max_in_flight_operations
 
     # ---- 计划态 ----
 
@@ -201,6 +290,7 @@ class KVEngine:
         plan = self._index.plan_store(keys)
         if plan is None:
             return None
+        self._planned_store_keys.update(plan.new_keys)
         if plan.evicted_keys and self._num_layers is not None:
             self._store.drop(_expand_io_keys(plan.evicted_keys, self._num_layers))
         return plan
@@ -209,6 +299,11 @@ class KVEngine:
         """结算写入计划（转发语义索引）。"""
         self._require_open()
         self._index.confirm_store(keys, ok)
+        self._planned_store_keys.difference_update(keys)
+
+    def store_plan_pending(self, keys) -> bool:
+        """Return whether every key is already reserved by this engine's plan."""
+        return all(bytes(key) in self._planned_store_keys for key in keys)
 
     def pin(self, keys) -> None:
         """对一批 chunk key 加读保护；任一未驻留 → KeyError。"""
@@ -234,13 +329,15 @@ class KVEngine:
         num_layers: int,
         blocks_per_chunk: int,
         *,
+        write_window: RingWindow | None = None,
         gather_fn=None,
         scatter_fn=None,
     ) -> None:
         """绑定执行态：层数定案、选定传输路径、staging 环窗接入 store。
 
         kv_caches 为布局侧的层缓存映射（staged 路径不使用）；window 为
-        部署层注入的环形窗口；num_layers、blocks_per_chunk 为正整数。
+        read 环窗，write_window 为 write 环窗。write_window 缺省时两方向
+        共享旧环窗；num_layers、blocks_per_chunk 为正整数。
         gather_fn / scatter_fn 为可选搬运钩子，给出时优先于 config 中
         的同名项（部署层在绑定期按池几何构造后注入）。
         重复 bind、chunk_kv_bytes 不能按层数整分、窗口几何不匹配、
@@ -260,6 +357,12 @@ class KVEngine:
             raise ValueError(f"blocks_per_chunk 须为正整数，got {blocks_per_chunk!r}")
         if not isinstance(window, RingWindow):
             raise ValueError(f"window 须为 RingWindow 实例，got {window!r}")
+        if write_window is None:
+            write_window = window
+        if not isinstance(write_window, RingWindow):
+            raise ValueError(
+                f"write_window 须为 RingWindow 实例，got {write_window!r}"
+            )
         for name, fn in (("gather_fn", gather_fn), ("scatter_fn", scatter_fn)):
             if fn is not None and not callable(fn):
                 raise ValueError(f"{name} 须为可调用或 None，got {fn!r}")
@@ -269,18 +372,32 @@ class KVEngine:
                 f"num_layers({num_layers}) 整分"
             )
         segment_bytes = self._chunk_kv_bytes // num_layers
-        if window.segment_bytes != segment_bytes:
-            raise ValueError(
-                f"窗口槽宽 {window.segment_bytes} 与层段宽 {segment_bytes} 不匹配"
-            )
-        if window.capacity_per_wave < self._max_chunks_per_wave:
-            raise ValueError(
-                f"窗口单波容量 {window.capacity_per_wave} 小于 "
-                f"max_chunks_per_wave({self._max_chunks_per_wave})"
-            )
+        for direction, bank in (("read", window), ("write", write_window)):
+            if bank.segment_bytes != segment_bytes:
+                raise ValueError(
+                    f"{direction} 窗口槽宽 {bank.segment_bytes} 与层段宽 "
+                    f"{segment_bytes} 不匹配"
+                )
+            if bank.capacity_per_wave < self._max_chunks_per_wave:
+                raise ValueError(
+                    f"{direction} 窗口单波容量 {bank.capacity_per_wave} 小于 "
+                    f"max_chunks_per_wave({self._max_chunks_per_wave})"
+                )
+        if window is not write_window and window.buffer is write_window.buffer:
+            read_slots = set(range(
+                window.slot_base, window.slot_base + window.num_slots
+            ))
+            write_slots = set(range(
+                write_window.slot_base,
+                write_window.slot_base + write_window.num_slots,
+            ))
+            if read_slots.intersection(write_slots):
+                raise ValueError("read/write RingWindow 物理槽区间不得重叠")
         self._num_layers = num_layers
         self._segment_bytes = segment_bytes
         self._window = window
+        self._read_window = window
+        self._write_window = write_window
         config = dict(self._config)
         if gather_fn is not None:
             config["gather_fn"] = gather_fn
@@ -302,6 +419,8 @@ class KVEngine:
             # this path; load/store delegate below and retain the same engine
             # completion contract.
             self._staging_buffer_id = None
+            self._read_staging_buffer_id = None
+            self._write_staging_buffer_id = None
             self._deferred_restore()
             return
         # 层宽注入布局（可选实现）：段数据首写即全尺寸，避免
@@ -315,6 +434,19 @@ class KVEngine:
                 f"staging 环窗被 store 拒收（granularity={segment_bytes}）"
             )
         self._staging_buffer_id = buffer_id
+        self._read_staging_buffer_id = buffer_id
+        if write_window.buffer is window.buffer:
+            write_buffer_id = buffer_id
+        else:
+            write_buffer_id = self._store.register_buffer(
+                write_window.buffer, segment_bytes
+            )
+            if write_buffer_id is None:
+                raise RuntimeError(
+                    f"write staging 环窗被 store 拒收"
+                    f"（granularity={segment_bytes}）"
+                )
+        self._write_staging_buffer_id = write_buffer_id
         self._deferred_restore()
 
     def load_layer(self, keys, layer_idx: int, dst_first_blocks):
@@ -338,10 +470,10 @@ class KVEngine:
             wave_blocks = _slice_first_blocks(
                 dst_first_blocks, start, end, len(keys)
             )
-            wave, slots = self._window.acquire(len(wave_keys))
+            wave, slots = self._read_window.acquire(len(wave_keys))
             batch = [
-                (derive_io_key(k, layer_idx), self._staging_buffer_id,
-                 self._window.slot_offset(s))
+                (derive_io_key(k, layer_idx), self._read_staging_buffer_id,
+                 self._read_window.slot_offset(s))
                 for k, s in zip(wave_keys, slots)
             ]
             with nvtx_range(
@@ -380,16 +512,21 @@ class KVEngine:
             wave_blocks = _slice_first_blocks(
                 src_first_blocks, start, end, len(keys)
             )
-            wave, slots = self._window.acquire(len(wave_keys))
+            wave, slots = self._write_window.acquire(len(wave_keys))
             with nvtx_range(
                 f"tutti.store.submit|layer={layer_idx}|wave={wave}"
                 f"|chunks={len(wave_keys)}"
             ):
+                # Gather is produced on vLLM's current compute stream. The
+                # store fences its write stream on the returned event before
+                # submitting NVMe IO, preserving compute -> gather -> write.
                 gather_event = self._transfer.gather(
                     wave_keys, layer_idx, wave_blocks, slots
                 )
             if gather_event is not None:
-                wait_event = getattr(self._store, "wait_event", None)
+                wait_event = getattr(self._store, "wait_write_event", None)
+                if not callable(wait_event):
+                    wait_event = getattr(self._store, "wait_event", None)
                 if callable(wait_event):
                     wait_event(gather_event)
                 else:
@@ -399,8 +536,8 @@ class KVEngine:
                     if callable(synchronize):
                         synchronize()
             batch = [
-                (derive_io_key(k, layer_idx), self._staging_buffer_id,
-                 self._window.slot_offset(s))
+                (derive_io_key(k, layer_idx), self._write_staging_buffer_id,
+                 self._write_window.slot_offset(s))
                 for k, s in zip(wave_keys, slots)
             ]
             with nvtx_range(
@@ -420,11 +557,48 @@ class KVEngine:
         return aggregate
 
     def wait_idle(self) -> None:
-        """等待全部在途批次完成。"""
+        """等待全部在途批次并 drain read/write 两个 bank。"""
         inflight = self._inflight
         self._inflight = []
+        first_error = None
         for completion in inflight:
-            completion.wait()
+            try:
+                completion.wait()
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+        for window in self._unique_windows():
+            try:
+                window.drain()
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
+
+    def abort(self) -> None:
+        """安全中间态 abort：不取消底层 DMA，drain 两边后再返回。"""
+        inflight = self._inflight
+        self._inflight = []
+        first_error = None
+        for completion in inflight:
+            abort = getattr(completion, "abort", None)
+            try:
+                if callable(abort):
+                    abort()
+                else:
+                    completion.wait()
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+        for window in self._unique_windows():
+            try:
+                window.drain()
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
 
     def close(self) -> None:
         """收尾：等待在途批次并关闭 store；幂等。"""
@@ -474,17 +648,31 @@ class KVEngine:
                     f"tutti.load.scatter|layer={layer_idx}|wave={wave}"
                     f"|chunks={len(keys)}"
                 ):
-                    return self._scatter_hook(
-                        list(keys), layer_idx, first_blocks, list(slots)
-                    )
+                    with self._store_stream_context("read"):
+                        return self._scatter_hook(
+                            list(keys), layer_idx, first_blocks, list(slots)
+                        )
 
             handle = _PostCompletion(
                 completion,
                 scatter_and_capture,
+                block_tables=first_blocks,
             )
-        self._window.complete(wave, handle)
+        window = self._read_window if is_load else self._write_window
+        window.complete(wave, handle)
         self._inflight.append(handle)
         return handle
+
+    def _store_stream_context(self, direction: str):
+        context = getattr(self._store, "stream_context", None)
+        return context(direction) if callable(context) else nullcontext()
+
+    def _unique_windows(self):
+        windows = []
+        for window in (self._read_window, self._write_window):
+            if window is not None and all(window is not item for item in windows):
+                windows.append(window)
+        return windows
 
     def sync_from_store(self) -> None:
         """从盘上持久层枚举对账近似索引（幂等，可重复调用）。
@@ -504,6 +692,14 @@ class KVEngine:
             if layers >= expected
         ]
         full = set(full_keys)
+        # Scheduler and worker may live in different processes.  Scheduler
+        # plans reserve capacity but must not publish resident before the
+        # worker's durable layer markers exist.  The next authoritative scan
+        # settles those local reservations: complete marker groups become
+        # resident; absent/incomplete groups release pending fail-closed.
+        for key in list(self._planned_store_keys):
+            self._index.confirm_store([key], ok=key in full)
+            self._planned_store_keys.discard(key)
         # 完整性翻转修正：上次对账时完整、现已不完整/消失的组移除
         # 近似项；乐观受理项（从未在盘上判完整）不受影响——worker
         # 落盘前它们只在近似视图，miss 降级兜底。pin 保护而未移除
@@ -572,6 +768,25 @@ def _slice_first_blocks(first_blocks, start: int, end: int, total: int):
         return first_blocks[start:end]
     except TypeError:
         return first_blocks
+
+
+def _flatten_block_ids(block_tables) -> tuple[int, ...]:
+    """Flatten wave-local block tables for fail-closed error reporting."""
+    if block_tables is None:
+        return ()
+    if isinstance(block_tables, (bytes, bytearray, str)):
+        return ()
+    try:
+        values = list(block_tables)
+    except TypeError:
+        return (block_tables,) if isinstance(block_tables, int) else ()
+    flattened = []
+    for value in values:
+        if isinstance(value, (list, tuple, set)):
+            flattened.extend(item for item in value if isinstance(item, int))
+        elif isinstance(value, int):
+            flattened.append(value)
+    return tuple(flattened)
 
 
 def _is_int(value) -> bool:

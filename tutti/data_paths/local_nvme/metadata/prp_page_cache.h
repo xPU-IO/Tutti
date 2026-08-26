@@ -15,10 +15,8 @@
 //       one PCIe fetch either way, equivalent to fetching from GPU memory.
 //     - Host RAM is the right tier for page tables at GB-scale working
 //       sets; HBM is left for payload data.
-//   Sizing requirement: the pool MUST hold the whole deployment working set
-//   (all LIST keys of all registered memories).  Exhaustion falls back to
-//   the arena path (correct, slower) — size prp_cache_capacity accordingly
-//   (~1-2 GB per device for KV-cache-scale deployments).
+//   Exhaustion falls back to the growing host-pinned PrpBufPool; there is no
+//   GPU PRP backing.
 //
 // DMA lifecycle:
 //   The cache owns one contiguous host-pinned allocation and one shared
@@ -101,7 +99,7 @@ public:
 
     // Pre-allocate the pool: one aligned allocation + one DMA map/pin.
     bool init(const Config& cfg, nvm_ctrl_t* ctrl);
-    void shutdown();
+    void shutdown(bool retain = false);
 
     bool enabled() const { return cfg_.capacity > 0 && initialized_; }
     std::uint32_t capacity() const { return cfg_.capacity; }

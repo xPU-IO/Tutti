@@ -30,6 +30,8 @@ class TestCaps:
             "max_single_io_bytes": 0,
             "max_batch_requests": 0,
             "max_in_flight_operations": 0,
+            "supports_multi_stream": 0,
+            "max_concurrent_streams": 0,
         }
 
 
@@ -134,4 +136,23 @@ class TestStubEndToEnd:
         stub_rt.testing_force_complete(result.io_handle, "COMPLETED")
         stub_rt.wait(result.io_handle, timeout_ms=1000)
         stub_rt.release_io(result.io_handle)
+        stub_rt.shutdown(timeout_ms=1000)
+
+    def test_structured_wait_result_survives_release(self, stub_rt):
+        targets = stub_rt.open_batch(["file:///tmp/t101-detail.bin"])
+        buf = _host_buffer(4096)
+        mem = stub_rt.register_memory(ctypes.addressof(buf), 4096, "host")
+        result = stub_rt.submit(
+            [(targets[0], 0, mem, 0, 512, "read")],
+            accel_id=-1, stream=None, execution="host",
+        )
+        stub_rt.testing_force_complete(result.io_handle)
+        detail = stub_rt.wait_result(result.io_handle, timeout_ms=1000)
+        assert detail.observation == "OK"
+        assert detail.state == "COMPLETED"
+        assert detail.confirmed_bytes == 0  # stub force-complete has no byte payload
+        assert detail.failure_scope == "NONE"
+        stub_rt.release_io(result.io_handle)
+        retained = stub_rt.wait_detail(result.io_handle, timeout_ms=0)
+        assert retained.state == "COMPLETED"
         stub_rt.shutdown(timeout_ms=1000)

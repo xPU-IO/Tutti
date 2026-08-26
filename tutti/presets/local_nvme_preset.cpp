@@ -121,8 +121,14 @@ RuntimeWithTelemetry make_local_nvme_runtime(const LocalNvmePreset& p) {
     comps.resolvers.push_back({"file", resolver});
     comps.data_paths.push_back({"local-nvme-ext4", dp, DataPathConfig{"local_nvme"}});
 
-    auto created = StorageRuntime::create({}, std::move(comps));
-    if (!created.ok()) return {};
+    RuntimeConfig runtime_config;
+    runtime_config.accel_id = p.gpu_id;
+    auto created = StorageRuntime::create(runtime_config, std::move(comps));
+    if (!created.ok()) {
+        RuntimeWithTelemetry result;
+        result.creation_status = created.status();
+        return result;
+    }
 
     RuntimeWithTelemetry result;
     result.runtime = std::move(created).value();
@@ -167,8 +173,14 @@ RuntimeWithTelemetry make_striped_nvme_runtime(const StripedNvmePreset& p) {
     comps.data_paths.push_back({std::string(tutti::binding::striped_local_nvme::kRecommendedDataPathKey),
                                  dp, DataPathConfig{"striped-nvme"}});
 
-    auto created = StorageRuntime::create({}, std::move(comps));
-    if (!created.ok()) return {};
+    RuntimeConfig runtime_config;
+    runtime_config.accel_id = p.gpu_id;
+    auto created = StorageRuntime::create(runtime_config, std::move(comps));
+    if (!created.ok()) {
+        RuntimeWithTelemetry result;
+        result.creation_status = created.status();
+        return result;
+    }
 
     RuntimeWithTelemetry result;
     result.runtime = std::move(created).value();

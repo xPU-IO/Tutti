@@ -326,11 +326,44 @@ enum class OpState {
     FAILED,     // terminal failure
 };
 
+// Structured terminal failure classification shared by DataPath and Runtime.
+// NONE is required for successful and in-flight snapshots.
+enum class IoFailureKind : std::uint8_t {
+    NONE,
+    RESOLVE_LBA,
+    CQ_TIMEOUT,
+    NVME_CQ_ERROR,
+    CUDA_QUERY_ERROR,
+    STATUS_D2H_ERROR,
+    UNKNOWN,
+};
+
+// REQUEST_INDICES refers to the request array passed to the corresponding
+// submit() call. WHOLE_OPERATION is the conservative answer when a backend
+// cannot attribute a terminal failure without risking an incomplete bitmap.
+enum class IoFailureScope : std::uint8_t {
+    NONE,
+    REQUEST_INDICES,
+    WHOLE_OPERATION,
+};
+
+struct IoCompletionDetail {
+    std::uint64_t confirmed_bytes = 0;
+    bool timeout_seen = false;
+    // UINT32_MAX means no failed entry was observed or attribution is unknown.
+    std::uint32_t first_failed_entry = UINT32_MAX;
+    IoFailureKind failure_kind = IoFailureKind::NONE;
+    std::uint32_t raw_cq_status = 0;
+    IoFailureScope failure_scope = IoFailureScope::NONE;
+    std::vector<std::uint32_t> failed_request_indices;
+};
+
 // Snapshot returned by query(). query() never destroys the op.
 struct DataPathSnapshot {
     OpState state = OpState::IN_FLIGHT;
     Status status;  // OK while IN_FLIGHT; terminal status otherwise
     std::uint64_t bytes_transferred = 0;
+    IoCompletionDetail detail;
 };
 
 // Budget handed to progress(). Both fields are hard caps on one call.

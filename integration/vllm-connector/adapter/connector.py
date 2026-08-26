@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
@@ -17,23 +17,25 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.logger import init_logger
 
-from adapter.worker import WorkerImpl
-
 # 模块以 adapter.* 顶层包导入，logger 名须落在 vllm 命名空间下
 # 才能继承 vllm 根 logger 的 handler（否则输出被静默吞掉）。
 logger = init_logger("vllm.tutti.connector")
-from engine.core import KVEngine
-from stores.registry import create_store
 
-# 引擎构造所需的配置键（全部与硬件无关）
-_ENGINE_KEYS = ("chunk_tokens", "chunk_kv_bytes", "max_chunks_per_wave")
+if TYPE_CHECKING:
+    from adapter.worker import WorkerImpl
+
+# 引擎构造所需的配置键（全部与硬件无关）。chunk_kv_bytes 与
+# num_layers 优先从 vLLM KVCacheConfig 推导，extra_config 仅作兼容覆盖。
+_ENGINE_REQUIRED_KEYS = ("chunk_tokens", "max_chunks_per_wave")
+_ENGINE_KEYS = (*_ENGINE_REQUIRED_KEYS, "chunk_kv_bytes")
 _ENGINE_OPTIONAL_KEYS = ("direct_transfer", "direct_transfer_strict")
 # 策略键（调度取舍，引擎不消费）
 _STRATEGY_KEYS = ("min_retrieve_tokens", "max_tokens_per_load")
 
 # 同进程同配置的引擎实例表：键 = vllm_config 对象身份（值持有配置
 # 强引用防 id 回收复用），二级键 = 规范化配置三元组。
-_ENGINE_CACHE: dict[int, tuple[Any, dict[tuple, KVEngine]]] = {}
+_ENGINE_CACHE: dict[int, tuple[Any, dict[tuple, Any]]] = {}
+_SCHEDULER_CACHE: dict[int, tuple[Any, dict[tuple, Any]]] = {}
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -57,7 +59,106 @@ def _extra_config(vllm_config) -> dict:
     return dict(extra) if extra else {}
 
 
-def _expand_placeholders(value, vllm_config=None):
+def _resolve_geometry(extra: dict, kv_cache_config) -> dict:
+    """从 vLLM cache spec 推导 Tutti 的单组、定宽逐层几何。
+
+    旧测试/调用方没有 KVCacheConfig 时仍可显式提供 num_layers 与
+    chunk_kv_bytes。生产路径有 KVCacheConfig 时，显式值只允许与权威
+    spec 一致，避免 scheduler 与 worker 使用不同字节布局。
+    """
+    resolved = dict(extra)
+    for key in _ENGINE_REQUIRED_KEYS:
+        value = resolved.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ValueError(f"extra_config 缺少正整数引擎键 {key!r}")
+
+    groups = list(getattr(kv_cache_config, "kv_cache_groups", ()) or ())
+    if not groups:
+        for key in ("num_layers", "chunk_kv_bytes"):
+            value = resolved.get(key)
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(
+                    f"无法从 KVCacheConfig 推导几何；extra_config 须提供"
+                    f"正整数 {key!r}"
+                )
+        return resolved
+    if len(groups) != 1:
+        raise ValueError(
+            "TuttiConnectorV1 当前仅支持单 KV cache group；"
+            f"模型提供了 {len(groups)} groups，需要 HMA/multi-group 支持"
+        )
+
+    group = groups[0]
+    layer_names = list(getattr(group, "layer_names", ()) or ())
+    if not layer_names:
+        raise ValueError("KVCacheConfig 的唯一 cache group 不含层")
+    spec = getattr(group, "kv_cache_spec", None)
+    block_size = getattr(spec, "block_size", None)
+    if not isinstance(block_size, int) or block_size <= 0:
+        raise ValueError("KV cache spec 缺少正整数 block_size")
+    if resolved["chunk_tokens"] % block_size:
+        raise ValueError(
+            f"chunk_tokens({resolved['chunk_tokens']}) 必须是 KV cache "
+            f"block_size({block_size}) 的整数倍"
+        )
+
+    child_specs = getattr(spec, "kv_cache_specs", None)
+    if isinstance(child_specs, dict):
+        try:
+            page_sizes = [child_specs[name].page_size_bytes for name in layer_names]
+        except KeyError as exc:
+            raise ValueError(f"KV cache group 层缺少物理 spec：{exc.args[0]}") from exc
+    else:
+        page_size = getattr(spec, "page_size_bytes", None)
+        page_sizes = [page_size] * len(layer_names)
+    if any(not isinstance(size, int) or size <= 0 for size in page_sizes):
+        raise ValueError("KV cache spec 含无效 page_size_bytes")
+    if len(set(page_sizes)) != 1:
+        raise ValueError(
+            "TuttiConnectorV1 当前要求每层 KV page 字节数一致；"
+            f"得到 {sorted(set(page_sizes))}"
+        )
+
+    num_layers = len(layer_names)
+    blocks_per_chunk = resolved["chunk_tokens"] // block_size
+    segment_bytes = blocks_per_chunk * page_sizes[0]
+    chunk_kv_bytes = num_layers * segment_bytes
+    for key, derived in (
+        ("num_layers", num_layers),
+        ("chunk_kv_bytes", chunk_kv_bytes),
+    ):
+        configured = resolved.get(key)
+        if configured is not None and configured != derived:
+            raise ValueError(
+                f"extra_config[{key!r}]={configured} 与 KVCacheConfig "
+                f"推导值 {derived} 不一致"
+            )
+        resolved[key] = derived
+    return resolved
+
+
+def _deployment_rank(vllm_config=None, *, worker: bool = False) -> str:
+    """Resolve the process-local accelerator rank after vLLM distributed init."""
+    if worker:
+        try:
+            from vllm.distributed.parallel_state import get_world_group
+            return str(get_world_group().local_rank)
+        except (AssertionError, RuntimeError):
+            pass
+        try:
+            import torch
+            if torch.cuda.is_initialized():
+                return str(torch.cuda.current_device())
+        except (ImportError, RuntimeError):
+            pass
+    parallel = getattr(vllm_config, "parallel_config", None)
+    rank = getattr(parallel, "rank", None) if parallel is not None else None
+    if rank is None:
+        rank = os.environ.get("LOCAL_RANK", "0")
+    return str(rank)
+
+
+def _expand_placeholders(value, vllm_config=None, *, rank: str | None = None):
     """递归替换字符串值中的 {LOCAL_RANK} 占位符（多副本部署的按副本分叉）。
 
     rank 源优先级：vllm_config.parallel_config.rank（vLLM 各进程构造
@@ -65,19 +166,17 @@ def _expand_placeholders(value, vllm_config=None):
     vLLM V1 多进程 worker 不设 LOCAL_RANK，仅靠环境变量时 4 个副本
     会全部展开为 0（真机实测），故配置对象优先。
     """
-    rank = None
-    parallel = getattr(vllm_config, "parallel_config", None)
-    if parallel is not None:
-        rank = getattr(parallel, "rank", None)
     if rank is None:
-        rank = os.environ.get("LOCAL_RANK", "0")
-    rank = str(rank)
+        rank = _deployment_rank(vllm_config)
     if isinstance(value, str):
         return value.replace("{LOCAL_RANK}", rank)
     if isinstance(value, dict):
-        return {k: _expand_placeholders(v, vllm_config) for k, v in value.items()}
+        return {
+            k: _expand_placeholders(v, vllm_config, rank=rank)
+            for k, v in value.items()
+        }
     if isinstance(value, list):
-        return [_expand_placeholders(v, vllm_config) for v in value]
+        return [_expand_placeholders(v, vllm_config, rank=rank) for v in value]
     return value
 
 
@@ -104,7 +203,7 @@ def _key_namespace(vllm_config, extra: dict) -> str:
     ])
 
 
-def _engine_for(vllm_config, extra: dict) -> KVEngine:
+def _worker_engine_for(vllm_config, extra: dict):
     """取同进程共享的引擎实例；extra 可直传实例绕过构造。
 
     实例表按配置对象身份索引并持有其强引用（配置存活期内 id 不
@@ -116,7 +215,7 @@ def _engine_for(vllm_config, extra: dict) -> KVEngine:
         return injected
     keys = tuple(sorted(
         (k, extra.get(k))
-        for k in (*_ENGINE_KEYS, *_ENGINE_OPTIONAL_KEYS)
+        for k in (*_ENGINE_KEYS, *_ENGINE_OPTIONAL_KEYS, "num_layers")
     ))
     entry = _ENGINE_CACHE.get(id(vllm_config))
     if entry is None or entry[0] is not vllm_config:
@@ -124,10 +223,22 @@ def _engine_for(vllm_config, extra: dict) -> KVEngine:
         _ENGINE_CACHE[id(vllm_config)] = entry
     engine = entry[1].get(keys)
     if engine is None:
+        from engine.core import KVEngine
+        from stores.registry import create_store
+
         store_spec = extra.get("store") or {"type": "memory", "options": {}}
         options = _expand_placeholders(
-            dict(store_spec.get("options") or {}), vllm_config
+            dict(store_spec.get("options") or {}), vllm_config,
+            rank=_deployment_rank(vllm_config, worker=True),
         )
+        segment_bytes = extra["chunk_kv_bytes"] // extra["num_layers"]
+        configured_segment = options.get("segment_bytes")
+        if configured_segment is not None and configured_segment != segment_bytes:
+            raise ValueError(
+                f"store segment_bytes({configured_segment}) 与 KVCacheConfig "
+                f"推导值 {segment_bytes} 不一致"
+            )
+        options["segment_bytes"] = segment_bytes
         store = create_store(store_spec["type"], options)
         # 可选层数预告：查询侧（不做 bind）的驱逐展开与冷启动完整性
         # 判定依赖层数；与缓存键无关（同配置实例共享同引擎）。
@@ -142,6 +253,50 @@ def _engine_for(vllm_config, extra: dict) -> KVEngine:
         engine = KVEngine(config, store)
         entry[1][keys] = engine
     return engine
+
+
+def _scheduler_index_for(vllm_config, extra: dict):
+    """Build/cache the scheduler metadata client without data-plane imports."""
+    injected = extra.get("tutti_scheduler_index_instance")
+    if injected is None:
+        # Compatibility for existing pure-Python test harnesses. Production
+        # configurations never carry an object in connector extra_config.
+        injected = extra.get("tutti_engine_instance")
+    if injected is not None:
+        return injected
+    keys = tuple(sorted(
+        (k, extra.get(k))
+        for k in (*_ENGINE_KEYS, "num_layers")
+    ))
+    entry = _SCHEDULER_CACHE.get(id(vllm_config))
+    if entry is None or entry[0] is not vllm_config:
+        entry = (vllm_config, {})
+        _SCHEDULER_CACHE[id(vllm_config)] = entry
+    index = entry[1].get(keys)
+    if index is None:
+        from engine.metadata import SchedulerMetadataIndex
+        from stores.metadata import create_metadata_store
+
+        store_spec = extra.get("store") or {"type": "memory", "options": {}}
+        options = _expand_placeholders(
+            dict(store_spec.get("options") or {}), vllm_config,
+            rank=_deployment_rank(vllm_config),
+        )
+        segment_bytes = extra["chunk_kv_bytes"] // extra["num_layers"]
+        configured_segment = options.get("segment_bytes")
+        if configured_segment is not None and configured_segment != segment_bytes:
+            raise ValueError(
+                f"store segment_bytes({configured_segment}) 与 KVCacheConfig "
+                f"推导值 {segment_bytes} 不一致"
+            )
+        options["segment_bytes"] = segment_bytes
+        store = create_metadata_store(store_spec["type"], options)
+        config = {k: extra[k] for k in _ENGINE_KEYS}
+        config["num_layers"] = extra["num_layers"]
+        config["key_namespace"] = _key_namespace(vllm_config, extra)
+        index = SchedulerMetadataIndex(config, store)
+        entry[1][keys] = index
+    return index
 
 
 @dataclass
@@ -214,11 +369,23 @@ class TuttiConnectorV1(KVConnectorBase_V1):
     def __init__(self, vllm_config, role, kv_cache_config=None):
         """三参与 vLLM 工厂签名对齐；role 决定本实例承载的回调面。"""
         super().__init__(vllm_config, role, kv_cache_config)
-        extra = _extra_config(vllm_config)
-        for key in _ENGINE_KEYS:
-            if extra.get(key) is None:
-                raise ValueError(f"extra_config 缺少引擎键 {key!r}")
-        self._engine = _engine_for(vllm_config, extra)
+        extra = _resolve_geometry(_extra_config(vllm_config), kv_cache_config)
+        dcp = getattr(
+            getattr(vllm_config, "parallel_config", None),
+            "decode_context_parallel_size",
+            1,
+        )
+        if dcp != 1:
+            # Scheduler blocks and worker slot mappings are DCP-rank/interleave
+            # dependent. Fail before either role constructs its store/index.
+            raise ValueError(
+                "TuttiConnectorV1 当前不支持 decode context parallelism；"
+                f"decode_context_parallel_size={dcp}，必须为 1"
+            )
+        if role is KVConnectorRole.WORKER:
+            self._engine = _worker_engine_for(vllm_config, extra)
+        else:
+            self._engine = _scheduler_index_for(vllm_config, extra)
         self._chunk_tokens = extra["chunk_tokens"]
         self._min_retrieve_tokens = extra.get("min_retrieve_tokens", 0)
         self._max_tokens_per_load = extra.get("max_tokens_per_load", 0)
@@ -237,9 +404,11 @@ class TuttiConnectorV1(KVConnectorBase_V1):
         # worker 角色实现
         self._impl: WorkerImpl | None = None
         if role is KVConnectorRole.WORKER:
+            from adapter.worker import WorkerImpl
+
             self._impl = WorkerImpl(
                 self._engine,
-                max_in_flight_layers=extra.get("max_in_flight_layers", 0),
+                max_in_flight_layers=extra.get("max_in_flight_layers"),
                 lookahead_k=extra.get(
                     "lookahead_k", extra.get("prefetch_k", 1)
                 ),
@@ -258,6 +427,11 @@ class TuttiConnectorV1(KVConnectorBase_V1):
     def prefer_cross_layer_blocks(self) -> bool:
         """声明偏好单块跨层池（统一层型模型的优化路径原料）。"""
         return True
+
+    @classmethod
+    def get_required_kvcache_layout(cls, vllm_config) -> str:
+        """Require the NHD cross-layer layout implemented by WorkerImpl."""
+        return "NHD"
 
     @classmethod
     def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
@@ -308,6 +482,13 @@ class TuttiConnectorV1(KVConnectorBase_V1):
         """收尾（转发 worker 实现）。"""
         if self._impl is not None:
             self._impl.shutdown()
+        else:
+            self._engine.close()
+
+    def abort(self) -> None:
+        """Fail-closed worker abort hook used by preemption/error paths."""
+        if self._impl is not None:
+            self._impl.abort()
 
     # ---- scheduler 角色回调 ----
 
@@ -418,7 +599,9 @@ class TuttiConnectorV1(KVConnectorBase_V1):
                 save_specs.append((meta, keys[start:start + count]))
             requests.append(meta)
 
-        # 写入的乐观受理：近似视图立即标记驻留，读侧未遂由 worker 上报重算
+        # 写入只做容量计划，不在 scheduler 侧发布 resident。worker 在
+        # 对应 save completion 成功后 confirm_store(ok=True)；失败路径
+        # confirm_store(ok=False)，避免底层失败时产生假命中。
         if save_specs:
             merged: list[bytes] = []
             for _meta, keys in save_specs:
@@ -428,7 +611,6 @@ class TuttiConnectorV1(KVConnectorBase_V1):
                 for meta, _keys in save_specs:
                     meta.save_chunk_start, meta.save_chunk_count = 0, 0
             else:
-                self._engine.confirm_store(plan.new_keys)
                 if not plan.new_keys:
                     # 全部已驻留：本步无需重复写入
                     for meta, _keys in save_specs:

@@ -24,6 +24,66 @@
 
 namespace tutti::data_paths::local_nvme {
 
+namespace {
+
+struct NvtxIoStyle {
+    const char* label;
+    std::uint32_t argb;
+};
+
+NvtxIoStyle nvtx_io_style(const DataPathRequest* requests, std::size_t count) {
+    bool has_read = false;
+    bool has_write = false;
+    for (std::size_t i = 0; i < count; ++i) {
+        has_read |= requests[i].intent.direction == IoDirection::READ;
+        has_write |= requests[i].intent.direction == IoDirection::WRITE;
+    }
+    if (has_read && !has_write) {
+        return {"tutti.local_nvme.io_kernel|op=read", 0xFF00B8D9u};
+    }
+    if (has_write && !has_read) {
+        return {"tutti.local_nvme.io_kernel|op=write", 0xFFFF8C00u};
+    }
+    return {"tutti.local_nvme.io_kernel|op=mixed", 0xFF8D99A6u};
+}
+
+void nvtx_push_io(const NvtxIoStyle& style) {
+    nvtxEventAttributes_t attrs{};
+    attrs.version = NVTX_VERSION;
+    attrs.size = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
+    attrs.colorType = NVTX_COLOR_ARGB;
+    attrs.color = style.argb;
+    attrs.messageType = NVTX_MESSAGE_TYPE_ASCII;
+    attrs.message.ascii = style.label;
+    nvtxRangePushEx(&attrs);
+}
+
+IoFailureKind completion_failure_kind(std::uint32_t result) {
+    switch (result) {
+        case 1: return IoFailureKind::RESOLVE_LBA;
+        case 2: return IoFailureKind::CQ_TIMEOUT;
+        case 3: return IoFailureKind::NVME_CQ_ERROR;
+        default: return IoFailureKind::UNKNOWN;
+    }
+}
+
+void set_completion_failure(IoCompletionDetail& detail,
+                            IoFailureKind kind,
+                            std::uint64_t confirmed_bytes,
+                            bool timeout_seen = false,
+                            std::uint32_t first_failed_entry = UINT32_MAX,
+                            std::uint32_t raw_cq_status = 0) {
+    detail.confirmed_bytes = confirmed_bytes;
+    detail.timeout_seen = timeout_seen;
+    detail.first_failed_entry = first_failed_entry;
+    detail.failure_kind = kind;
+    detail.raw_cq_status = raw_cq_status;
+    detail.failure_scope = IoFailureScope::WHOLE_OPERATION;
+    detail.failed_request_indices.clear();
+}
+
+} // namespace
+
 // -------------------------------------------------------------------------
 // Construction / destruction
 // -------------------------------------------------------------------------
@@ -193,23 +253,20 @@ LocalNvmeDataPath::~LocalNvmeDataPath() {
         }
     }
 
-    // Now safe to free everything in correct order.
-    // FIX 4: ops with has_timeout retain prp_list_dma/prp_list_raw (the
-    // timed-out NVMe command may still be in the controller queue).  event/
-    // d_entries/d_status are freed normally — the kernel has returned.
-    // Arena shutdown frees all events, entry/status pools, and PRP pool.
-    // If any op timed out, skip PRP cleanup (bounded leak of the shared pool).
-    bool any_timeout = false;
+    // GPU metadata is safe after stream synchronization. Timed-out commands
+    // retain host PRP backing through controller teardown.
+    bool any_timeout = timeout_prp_retained_;
     for (const auto& [tok, op] : ops_) {
         if (op.has_timeout) { any_timeout = true; break; }
     }
-    arena_.shutdown(any_timeout);
+    arena_.shutdown();
     ops_.clear();
 
     // Cache shutdown: frees all cached handles + PRP pool.
     // Must happen BEFORE target cleanup loop (cache owns the handle memory).
     handle_cache_.shutdown();
-    prp_cache_.shutdown();
+    prp_cache_.shutdown(any_timeout);
+    prp_buf_pool_.shutdown(any_timeout);
 
     for (auto& [tok, state] : targets_) {
         // Only free handles NOT owned by the cache.
@@ -237,6 +294,7 @@ LocalNvmeDataPath::~LocalNvmeDataPath() {
         ctrl_ = nullptr;
     }
     initialized_ = false;
+    timeout_prp_retained_ = false;
 }
 
 // -------------------------------------------------------------------------
@@ -618,26 +676,21 @@ Status LocalNvmeDataPath::shutdown_impl_(std::uint64_t timeout_ns) {
         }
     }
 
-    // All ops terminal.  Release in order:
-    // op event/entry/status/PRP → target → queue → memory DMA → controller.
-    // FIX 4: ops with has_timeout retain prp_list_dma/prp_list_raw — the
-    // timed-out command may still be in the controller queue; abort/reset
-    // is future work.  The CID is also not returned, so that SQ slot is
-    // degraded (a future submit reusing it would collide).  This is a
-    // bounded, deliberate leak that prevents use-after-unmap.
-    // Arena shutdown frees all events, entry/status pools, and PRP pool.
-    // If any op timed out, skip PRP cleanup (bounded leak of the shared pool).
+    // All ops terminal. GPU metadata is controller-independent once the
+    // submit kernel returned. A timed-out command may still fetch host PRP
+    // pages, so host cache/pool backing is conservatively retained.
     bool any_timeout = false;
     for (const auto& [tok, op] : ops_) {
         if (op.has_timeout) { any_timeout = true; break; }
     }
-    arena_.shutdown(any_timeout);
+    arena_.shutdown();
     ops_.clear();
 
     // Cache shutdown: frees all cached handles + PRP pool.
     // Must happen BEFORE target cleanup (cache owns the handle memory).
     handle_cache_.shutdown();
-    prp_cache_.shutdown();
+    prp_cache_.shutdown(any_timeout);
+    prp_buf_pool_.shutdown(any_timeout);
 
     for (auto& [tok, state] : targets_) {
         // Only free handles NOT owned by the cache.
@@ -1091,24 +1144,27 @@ bool LocalNvmeDataPath::build_prebuilt_descriptors_(
     // Stage 1-2: compute slice plan
     const std::uint64_t page_size = static_cast<std::uint64_t>(ctrl_->page_size);
     const std::uint64_t mdts = effective_mdts_bytes_;
-    const std::uint64_t granularity = std::min(io_granularity, mdts);
-    const std::uint64_t bytes_per_slice = granularity;
-    const std::uint64_t pages_per_io = bytes_per_slice / page_size;
+    const std::uint64_t bytes_per_slice = io_granularity;
+    if (bytes_per_slice == 0 || bytes_per_slice % page_size != 0) {
+        status_msg = "io_granularity must be a positive controller-page multiple";
+        return false;
+    }
     const std::uint64_t num_slices = reg.size_bytes / bytes_per_slice;
     if (reg.size_bytes % bytes_per_slice != 0) {
         status_msg = "io_granularity does not evenly divide memory size";
         return false;
     }
-    const bool needs_prp_list = pages_per_io > 2;
-
-    // R19 S3b REQUIRED 2: fail-closed for MDTS > 128KiB.
-    // h_prp_slot has 32 entries (256B / 8B). pages_per_io - 1 entries
-    // are needed; if > 32, the slot overflows.
-    if (needs_prp_list && pages_per_io - 1 > 32) {
-        status_msg = "MDTS > 128KiB: pages_per_io=" +
-                     std::to_string(pages_per_io) +
-                     " exceeds 256B sub-page packing capacity (max 33 pages)";
-        return false;
+    const std::uint64_t ios_per_slice =
+        (bytes_per_slice + mdts - 1) / mdts;
+    const std::uint64_t total_descs = num_slices * ios_per_slice;
+    std::uint64_t num_prp_pages = 0;
+    for (std::uint64_t sub = 0; sub < ios_per_slice; ++sub) {
+        const std::uint64_t offset = sub * mdts;
+        const std::uint64_t sub_io =
+            std::min(mdts, bytes_per_slice - offset);
+        if (sub_io / page_size > 2) {
+            num_prp_pages += num_slices;
+        }
     }
 
     // Stage 3: validate alignment (already checked 64KiB in register_memory)
@@ -1116,22 +1172,13 @@ bool LocalNvmeDataPath::build_prebuilt_descriptors_(
 
     // Stage 4: allocate PRP-list pages from the host-pinned pool (R19 S3b).
     //
-    // R19 S3 REQUIRED 1: Instead of one 4KiB page per slice, pack 16
-    // slices' PRP lists into each 4KiB page at 256B granularity.
-    // R19 S3b REQUIRED 1: Instead of per-registration nvm_dma_map_data_host,
-    // sub-allocate from a DataPath-level pool (one big nvm_dma_map per segment).
-    //
-    // PRP2 for slice s = pool_segment->ioaddrs[base_page + s / SLOTS_PER_PAGE]
-    //                     + (s % SLOTS_PER_PAGE) * PRP_SLOT_BYTES
-    // The NVMe controller reads from this IOVA via PCIe DMA.
-    //
-    // SLOTS_PER_PAGE and SLOT_BYTES are now dynamic (page_size-aware).
-    const std::uint64_t PRP_SLOT_BYTES = 256;
-    const std::uint64_t PRP_SLOTS_PER_PAGE = page_size / PRP_SLOT_BYTES;  // 16 for 4KiB
+    // PRP2 for a LIST command must identify a page-aligned PRP list. Give
+    // every LIST sub-IO one full controller page: this supports the complete
+    // single-page PRP capacity (up to page_size / 8 + 1 data pages) and keeps
+    // the list valid for 256 KiB and larger IO granularities. The backing is
+    // sub-allocated from one growing DataPath-level host DMA pool.
     PrpBufRef prp_buf_ref;
-    std::uint64_t num_prp_pages = 0;
-    if (needs_prp_list) {
-        num_prp_pages = (num_slices + PRP_SLOTS_PER_PAGE - 1) / PRP_SLOTS_PER_PAGE;
+    if (num_prp_pages > 0) {
         prp_buf_ref = prp_buf_pool_.alloc_pages(num_prp_pages);
         if (!prp_buf_ref.valid) {
             status_msg = "PrpBufPool::alloc_pages failed (nvm_dma_map_data_host"
@@ -1140,39 +1187,38 @@ bool LocalNvmeDataPath::build_prebuilt_descriptors_(
         }
     }
 
-    // Stage 5-6: fill address descriptors + PRP-list pages (sub-page packed)
-    const std::uint64_t total_descs = num_slices;  // 1 desc per slice (1 sub-IO per slice)
-    // Actually: ios_per_slice = 1 (each slice = one sub-IO of bytes_per_slice)
-    // because granularity = min(io_granularity, MDTS) → each sub-IO ≤ MDTS.
-    // So total_descs = num_slices, 1:1.
+    // Stage 5-6: fill address descriptors + page-aligned PRP-list pages.
     std::vector<AddressDescriptor> h_descs(total_descs);
-    std::vector<std::uint64_t> h_prp_slot(PRP_SLOT_BYTES / sizeof(std::uint64_t), 0);
-
+    std::uint64_t prp_page_idx = 0;
     for (std::uint64_t s = 0; s < num_slices; ++s) {
-        const std::uint64_t start_page = s * pages_per_io;
-        AddressDescriptor& d = h_descs[s];
-        d.data_length = bytes_per_slice;
-        d.prp1 = reg.dma->ioaddrs[start_page];
+        const std::uint64_t slice_offset = s * bytes_per_slice;
+        for (std::uint64_t sub = 0; sub < ios_per_slice; ++sub) {
+            const std::uint64_t sub_offset = sub * mdts;
+            const std::uint64_t sub_io =
+                std::min(mdts, bytes_per_slice - sub_offset);
+            const std::uint64_t start_page =
+                (slice_offset + sub_offset) / page_size;
+            const std::uint64_t pages_per_io = sub_io / page_size;
+            AddressDescriptor& d = h_descs[s * ios_per_slice + sub];
+            d.data_length = sub_io;
+            d.prp1 = reg.dma->ioaddrs[start_page];
 
-        if (pages_per_io == 1) {
-            d.prp2 = 0;
-        } else if (pages_per_io == 2) {
-            d.prp2 = reg.dma->ioaddrs[start_page + 1];
-        } else {
-            // PRP LIST: fill slot with ioaddrs[start_page+1 .. +pages_per_io-1]
-            std::fill(h_prp_slot.begin(), h_prp_slot.end(), 0);
-            for (std::uint64_t p = 0; p < pages_per_io - 1; ++p)
-                h_prp_slot[p] = reg.dma->ioaddrs[start_page + 1 + p];
-            // prp2 = IOVA of this slice's sub-page slot within the packed page.
-            // Slice s uses page (base_page + s / SLOTS_PER_PAGE) at byte
-            // offset (s % SLOTS_PER_PAGE) * PRP_SLOT_BYTES within the pool segment.
-            d.prp2 = prp_buf_ref.segment->ioaddrs[prp_buf_ref.base_page + s / PRP_SLOTS_PER_PAGE] +
-                     (s % PRP_SLOTS_PER_PAGE) * PRP_SLOT_BYTES;
-            // Copy slot content to the PRP-list DMA buffer (pool segment's vaddr)
-            std::memcpy(static_cast<char*>(prp_buf_ref.segment->vaddr) +
-                            (prp_buf_ref.base_page + s / PRP_SLOTS_PER_PAGE) * page_size +
-                            (s % PRP_SLOTS_PER_PAGE) * PRP_SLOT_BYTES,
-                        h_prp_slot.data(), PRP_SLOT_BYTES);
+            if (pages_per_io == 1) {
+                d.prp2 = 0;
+            } else if (pages_per_io == 2) {
+                d.prp2 = reg.dma->ioaddrs[start_page + 1];
+            } else {
+                const std::uint64_t prp_page =
+                    prp_buf_ref.base_page + prp_page_idx++;
+                auto* host_page = reinterpret_cast<std::uint64_t*>(
+                    static_cast<char*>(prp_buf_ref.segment->vaddr) +
+                    prp_page * page_size);
+                fill_prp_list_page(host_page, reg.dma,
+                                   static_cast<std::uint32_t>(start_page),
+                                   static_cast<std::uint32_t>(pages_per_io),
+                                   page_size);
+                d.prp2 = prp_buf_ref.segment->ioaddrs[prp_page];
+            }
         }
     }
 
@@ -1206,7 +1252,7 @@ bool LocalNvmeDataPath::build_prebuilt_descriptors_(
     reg.prebuilt.d_descs = d_descs;
     reg.prebuilt.num_descs = total_descs;
     reg.prebuilt.bytes_per_slice = bytes_per_slice;
-    reg.prebuilt.ios_per_slice = 1;  // 1 sub-IO per slice
+    reg.prebuilt.ios_per_slice = ios_per_slice;
     reg.prebuilt.prp_buf_ref = prp_buf_ref;  // pool-managed; freed on shutdown
     reg.prebuilt.num_prp_pages = num_prp_pages;
     reg.prebuilt.valid = true;
@@ -1233,6 +1279,8 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
     const HostSubmitContext& ctx) {
 
     ++test_submit_call_count_;  // Round 15 S4 test seam (see header).
+    test_last_prebuilt_entry_count_ = 0;
+    test_last_dynamic_entry_count_ = 0;
 
     SubmitOutcome outcome;
     outcome.op = std::nullopt;
@@ -1418,40 +1466,7 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
         std::uint64_t cur_mem = intent.memory_offset;
         std::uint32_t direction = (intent.direction == IoDirection::READ) ? 0 : 1;
 
-        // Round 16 S5 (V3): pre-built descriptor fast path.
-        // If the memory was registered with io_granularity > 0 and the
-        // request shape matches (offset and length are multiples of
-        // bytes_per_slice), use pointer arithmetic instead of PRP computation.
-        // This is the legacy "e.prp_entry = v.d_ios + sub" pattern.
-        if (mreg->prebuilt.valid &&
-            intent.memory_offset % mreg->prebuilt.bytes_per_slice == 0 &&
-            intent.length % mreg->prebuilt.bytes_per_slice == 0) {
-            const std::uint64_t bps = mreg->prebuilt.bytes_per_slice;
-            const std::uint64_t n_sub = intent.length / bps;
-            for (std::uint64_t s = 0; s < n_sub; ++s) {
-                DeviceSubmitEntry e;
-                e.target = tstate->dev_handle;
-                e.target_offset = cur_target;
-                e.direction = direction;
-                e._pad = 0;
-                // Pointer to the pre-built AddressDescriptor for this sub-IO.
-                // Slice index = (memory_offset / bytes_per_slice) + s
-                std::uint64_t slice_idx = (intent.memory_offset / bps) + s;
-                if (slice_idx >= mreg->prebuilt.num_descs) {
-                    reject_one(i, StatusCode::OUT_OF_RANGE,
-                              "pre-built descriptor index out of range");
-                    return false;
-                }
-                e.prp_entry = static_cast<const AddressDescriptor*>(
-                    mreg->prebuilt.d_descs) + slice_idx;
-                pr.entries.push_back(e);
-                pr.lengths.push_back(bps);
-                total_entries++;
-                cur_target += bps;
-                cur_mem += bps;
-            }
-            remaining = 0;  // all consumed by fast path
-        }
+        const bool use_prebuilt = mreg->prebuilt.valid;
 
         while (remaining > 0) {
             std::uint64_t sub_io = std::min(remaining, effective_mdts);
@@ -1469,6 +1484,44 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
             }
             if (ext_end > 0) {
                 sub_io = std::min(sub_io, ext_end - cur_target);
+            }
+
+            const std::uint64_t slice_bytes =
+                mreg->prebuilt.bytes_per_slice;
+            const std::uint64_t offset_in_slice = use_prebuilt
+                ? cur_mem % slice_bytes : 0;
+            const bool at_prebuilt_boundary = use_prebuilt &&
+                offset_in_slice % effective_mdts == 0;
+            const std::uint64_t expected_prebuilt_bytes =
+                at_prebuilt_boundary
+                ? std::min(effective_mdts, slice_bytes - offset_in_slice)
+                : 0;
+            if (at_prebuilt_boundary && sub_io == expected_prebuilt_bytes) {
+                const std::uint64_t slice_idx = cur_mem / slice_bytes;
+                const std::uint64_t sub_idx =
+                    offset_in_slice / effective_mdts;
+                const std::uint64_t desc_idx =
+                    slice_idx * mreg->prebuilt.ios_per_slice + sub_idx;
+                if (sub_idx >= mreg->prebuilt.ios_per_slice ||
+                    desc_idx >= mreg->prebuilt.num_descs) {
+                    reject_one(i, StatusCode::OUT_OF_RANGE,
+                               "pre-built descriptor index out of range");
+                    return false;
+                }
+                DeviceSubmitEntry entry{};
+                entry.target = tstate->dev_handle;
+                entry.target_offset = cur_target;
+                entry.direction = direction;
+                entry.prp_entry = static_cast<const AddressDescriptor*>(
+                    mreg->prebuilt.d_descs) + desc_idx;
+                pr.entries.push_back(entry);
+                pr.lengths.push_back(sub_io);
+                total_entries++;
+                ++test_last_prebuilt_entry_count_;
+                cur_target += sub_io;
+                cur_mem += sub_io;
+                remaining -= sub_io;
+                continue;
             }
 
             std::uint32_t start_page = static_cast<std::uint32_t>(cur_mem / page_size);
@@ -1510,6 +1563,7 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
             }
 
             pr.dynamic_descs.push_back(desc);
+            ++test_last_dynamic_entry_count_;
 
             pr.entries.push_back(entry);
             pr.lengths.push_back(sub_io);
@@ -1590,18 +1644,15 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
     EntryCompletionStatus* d_status = lease.d_status;
     cudaError_t ce;
 
-    // PRP-list pages come from the arena's pre-allocated DMA-mapped pool.
-    // prp_pages_devptr = this slot's PRP page GPU base.
-    // prp_ioaddrs_base = this slot's first IOVA index into arena DMA ioaddrs[].
-    void* prp_pages = lease.prp_pages_devptr;
-    nvm_dma_t* prp_dma = const_cast<nvm_dma_t*>(arena_.prp_dma());  // shared
-    std::uint32_t prp_ioaddrs_base = lease.prp_ioaddrs_base;
+    PrpBufRef prp_buf_ref;
+    nvm_dma_t* prp_dma = nullptr;
+    std::uint32_t prp_ioaddrs_base = 0;
 
     // Fill PRP-list pages if needed.
     // Two paths:
-    //   - PrpPageCache enabled: content-addressed cache (hit = no H2D).
-    //     Falls back to arena if cache is exhausted (all slots in_use).
-    //   - PrpPageCache disabled: arena's PRP pool + H2D fill (Session 1 path).
+    //   - PrpPageCache enabled: content-addressed host-pinned cache.
+    //   - Cache miss/exhaustion: growing host-pinned PrpBufPool.
+    // No PRP-list page is ever cudaMalloc'd or copied H2D.
     std::vector<OpEntry::PrpCacheRef> prp_cache_refs;  // filled if cache used
     bool prp_all_from_cache = false;  // true if ALL PRP pages came from cache
 
@@ -1642,50 +1693,46 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
             if (!cache_ok) {
                 // Cache exhausted: release ALL checkouts (including items
                 // after the failing one that got entries but no ref) and
-                // fall back to arena.
+                // fall back to the growing host-pinned pool.
                 for (const auto& item : items) {
                     if (item.result != nullptr)
                         prp_cache_.release_checkout(item.result);
                 }
                 prp_cache_refs.clear();
-                // Reset all prp2 fields to 0 (will be filled by arena path).
+                // Reset all prp2 fields to 0 (filled by host pool below).
                 for (auto& pr : pending) {
                     if (!pr.accepted) continue;
                     for (const auto& li : pr.list_infos) {
                         pr.dynamic_descs[li.desc_idx].prp2 = 0;
                     }
                 }
-                // Fall through to arena path below.
+                // Fall through to host pool path below.
             } else {
                 prp_all_from_cache = true;
             }
         }
 
         if (!prp_all_from_cache) {
-            // Arena path: H2D fill into arena's pre-allocated PRP pool.
-            std::vector<std::uint64_t> h_page(page_size / sizeof(std::uint64_t), 0);
+            prp_buf_ref = prp_buf_pool_.alloc_pages(total_list_ios);
+            if (!prp_buf_ref.valid) {
+                arena_.release(lease.slot_index);
+                reject_all(StatusCode::RESOURCE_EXHAUSTED,
+                           "host PrpBufPool allocation failed");
+                return outcome;
+            }
+            prp_dma = prp_buf_ref.segment;
+            prp_ioaddrs_base = static_cast<std::uint32_t>(prp_buf_ref.base_page);
             std::uint32_t list_idx = 0;
             for (auto& pr : pending) {
                 if (!pr.accepted) continue;
                 for (const auto& li : pr.list_infos) {
-                    fill_prp_list_page(h_page.data(), pr.mreg->dma,
+                    auto* host_page = reinterpret_cast<std::uint64_t*>(
+                        static_cast<char*>(prp_dma->vaddr) +
+                        (prp_buf_ref.base_page + list_idx) * page_size);
+                    fill_prp_list_page(host_page, pr.mreg->dma,
                                        li.start_page, li.pages_in_io, page_size);
-                    // ASYNC H2D on caller stream.
-                    ce = cudaMemcpyAsync(
-                        static_cast<char*>(prp_pages) + list_idx * page_size,
-                        h_page.data(), page_size, cudaMemcpyHostToDevice,
-                        ctx.stream);
-                    if (ce != cudaSuccess) {
-                        arena_.release(lease.slot_index);
-                        // Also release any PRP cache entries acquired.
-                        for (const auto& ref : prp_cache_refs) {
-                            prp_cache_.release_checkout(ref.entry);
-                        }
-                        reject_all(StatusCode::DEVICE_ERROR, "H2D PRP page failed");
-                        return outcome;
-                    }
                     pr.dynamic_descs[li.desc_idx].prp2 =
-                        prp_dma->ioaddrs[prp_ioaddrs_base + list_idx];
+                        prp_dma->ioaddrs[prp_buf_ref.base_page + list_idx];
                     list_idx++;
                 }
             }
@@ -1777,11 +1824,16 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
         if (test_inject_resolve_lba_failure_) inject_flag |= 0x1u;
         if (test_inject_nvme_error_)          inject_flag |= 0x2u;
 
+        const NvtxIoStyle nvtx_style = nvtx_io_style(requests, count);
+        nvtx_push_io(nvtx_style);
+        // Keep the legacy exact marker as a nested range for existing report
+        // queries; the outer range carries the direction and color.
         nvtxRangePushA("tutti.local_nvme.io_kernel");
         launch_err = launch_submit_one(d_entries, d_status, total_entries,
                                        cq_poll_budget_, threads_per_block_,
                                        inject_flag,
                                        ctx.stream);
+        nvtxRangePop();
         nvtxRangePop();
     }
     if (launch_err != cudaSuccess) {
@@ -1868,6 +1920,10 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
                      "stream sync failed after event record failure");
         op.bytes_transferred = (sync_err == cudaSuccess) ? total_bytes : 0;
         op.total_bytes = total_bytes;
+        if (sync_err != cudaSuccess) {
+            set_completion_failure(op.completion_detail,
+                                   IoFailureKind::CUDA_QUERY_ERROR, 0);
+        }
         op.d_entries = d_entries;
         op.d_status = d_status;
         op.entry_count = total_entries;
@@ -1878,7 +1934,7 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
         op.arena_slot = lease.slot_index;
         op.prp_list_dma = prp_dma;
         op.prp_ioaddrs_base = prp_ioaddrs_base;
-        op.prp_pages_devptr = prp_pages;
+        op.prp_buf_ref = prp_buf_ref;
         op.prp_list_page_count = total_list_ios;
         op.op_token = op_token;
         op.op_generation = 1;
@@ -1940,7 +1996,7 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
     op.arena_slot = lease.slot_index;
     op.prp_list_dma = prp_dma;
     op.prp_ioaddrs_base = prp_ioaddrs_base;
-    op.prp_pages_devptr = prp_pages;
+    op.prp_buf_ref = prp_buf_ref;
     op.prp_list_page_count = total_list_ios;
     op.op_token = op_token;
     op.op_generation = 1;
@@ -2021,16 +2077,12 @@ Result<ProgressResult> LocalNvmeDataPath::progress_impl_(ProgressBudget budget) 
             break;
         }
 
-        // One query = one work unit.
-        // Round 16 S7: spin on cudaEventQuery within the budget timeout
-        // to avoid the 1ms condition-variable sleep in Runtime::wait().
+        // One query = one work unit. Runtime::wait() supplies the polling
+        // cadence; spinning here defeats max_work_units and can generate
+        // millions of CUDA API calls while an event is not ready.
         cudaError_t ce;
         if (op.completion_mode == CompletionMode::EVENT) {
-            ce = cudaErrorNotReady;
-            while (ce == cudaErrorNotReady &&
-                   std::chrono::steady_clock::now() < deadline) {
-                ce = cudaEventQuery(static_cast<cudaEvent_t>(op.event));
-            }
+            ce = cudaEventQuery(static_cast<cudaEvent_t>(op.event));
         } else {
             // STREAM_QUERY fallback.
             ce = cudaStreamQuery(static_cast<cudaStream_t>(op.stream));
@@ -2061,6 +2113,9 @@ Result<ProgressResult> LocalNvmeDataPath::progress_impl_(ProgressBudget budget) 
             op.status = Status(StatusCode::DEVICE_ERROR,
                                "cudaEventQuery error: " +
                                std::string(cudaGetErrorString(ce)));
+            set_completion_failure(op.completion_detail,
+                                   IoFailureKind::CUDA_QUERY_ERROR,
+                                   op.bytes_transferred);
             cudaGetLastError();  // clear sticky error
             ++result.operations_terminal;
         }
@@ -2092,6 +2147,7 @@ Result<DataPathSnapshot> LocalNvmeDataPath::query_impl_(DataPathOp op) const {
     snap.state = entry->state;
     snap.status = entry->status;
     snap.bytes_transferred = entry->bytes_transferred;
+    snap.detail = entry->completion_detail;
     return Result<DataPathSnapshot>::Success(std::move(snap));
 }
 
@@ -2106,13 +2162,8 @@ Status LocalNvmeDataPath::release_impl_(DataPathOp op) {
                       "release: op is still in flight");
     }
 
-    // Terminal: return arena slot.
-    // FIX 4: if any entry timed out (result==2), the NVMe command may still
-    // be in the controller SQ/CQ and could DMA into the PRP-list pages after
-    // the slot is reused.  We call release_with_timeout_leak() to permanently
-    // consume the slot (bounded leak; abort/reset is future work).  The CID
-    // was also not returned, so that SQ slot is degraded until an explicit
-    // abort/reset (future work).
+    // Terminal: GPU metadata slot is reusable. Host PRP backing is pool-owned
+    // and remains stable; timeout-safe retention is handled at pool shutdown.
     if (entry->arena_slot != UINT32_MAX) {
         if (entry->has_timeout) {
             arena_.release_with_timeout_leak(entry->arena_slot);
@@ -2121,6 +2172,7 @@ Status LocalNvmeDataPath::release_impl_(DataPathOp op) {
         }
         entry->arena_slot = UINT32_MAX;
     }
+    if (entry->has_timeout) timeout_prp_retained_ = true;
 
     // Unpin cache entries (handle + PRP).
     // Note: for timeout ops, PRP cache entries are NOT unpinned (conservative
@@ -2330,6 +2382,14 @@ std::uint64_t LocalNvmeDataPath::test_kernel_launch_count() const {
     return test_kernel_launch_count_;
 }
 
+std::uint64_t LocalNvmeDataPath::test_last_prebuilt_entry_count() const {
+    return test_last_prebuilt_entry_count_;
+}
+
+std::uint64_t LocalNvmeDataPath::test_last_dynamic_entry_count() const {
+    return test_last_dynamic_entry_count_;
+}
+
 void LocalNvmeDataPath::test_reset_submit_counters() {
     test_submit_call_count_ = 0;
     test_kernel_launch_count_ = 0;
@@ -2375,11 +2435,13 @@ bool LocalNvmeDataPath::test_op_has_timeout(DataPathOp op) const {
 // -------------------------------------------------------------------------
 
 void LocalNvmeDataPath::aggregate_completion_status_(OpEntry& op) {
+    op.completion_detail = IoCompletionDetail{};
     if (!op.d_status || op.entry_count == 0) {
         // No status array (shouldn't happen for real ops).
         op.state = OpState::COMPLETED;
         op.status = Status::Ok();
         op.bytes_transferred = op.total_bytes;
+        op.completion_detail.confirmed_bytes = op.total_bytes;
         return;
     }
 
@@ -2400,6 +2462,8 @@ void LocalNvmeDataPath::aggregate_completion_status_(OpEntry& op) {
                            "D2H completion status failed: " +
                            std::string(cudaGetErrorString(ce)));
         op.bytes_transferred = 0;
+        set_completion_failure(op.completion_detail,
+                               IoFailureKind::STATUS_D2H_ERROR, 0);
         return;
     }
 
@@ -2407,6 +2471,9 @@ void LocalNvmeDataPath::aggregate_completion_status_(OpEntry& op) {
     std::uint64_t confirmed_bytes = 0;
     bool any_failed = false;
     std::string first_error;
+    std::uint32_t first_failed_entry = UINT32_MAX;
+    std::uint32_t first_failure_result = 0;
+    std::uint32_t first_raw_cq_status = 0;
 
     // D2H entries to get per-entry byte lengths.
     std::vector<DeviceSubmitEntry> h_entries(op.entry_count);
@@ -2415,10 +2482,20 @@ void LocalNvmeDataPath::aggregate_completion_status_(OpEntry& op) {
                      cudaMemcpyDeviceToHost);
     if (ce != cudaSuccess) {
         cudaGetLastError();
-        // Can't get entry lengths; use total_bytes if no failures.
+        // The device entry array is diagnostic-only here: host-side
+        // entry_lengths already carries the exact byte count for each entry.
+        // Keep confirmed_bytes accurate even when this optional D2H fails.
+        std::uint64_t fallback_confirmed_bytes = 0;
         for (std::uint32_t i = 0; i < op.entry_count; ++i) {
-            if (h_status[i].result != 0) {
+            if (h_status[i].result == 0) {
+                fallback_confirmed_bytes += op.entry_lengths[i];
+            } else {
                 any_failed = true;
+                if (first_failed_entry == UINT32_MAX) {
+                    first_failed_entry = i;
+                    first_failure_result = h_status[i].result;
+                    first_raw_cq_status = h_status[i].nvme_status_dword3;
+                }
                 if (h_status[i].result == 2) {
                     op.has_timeout = true;  // FIX 4
                 }
@@ -2431,11 +2508,17 @@ void LocalNvmeDataPath::aggregate_completion_status_(OpEntry& op) {
         if (any_failed) {
             op.state = OpState::FAILED;
             op.status = Status(StatusCode::DEVICE_ERROR, first_error);
-            op.bytes_transferred = 0;
+            op.bytes_transferred = fallback_confirmed_bytes;
+            set_completion_failure(
+                op.completion_detail,
+                completion_failure_kind(first_failure_result),
+                fallback_confirmed_bytes,
+                op.has_timeout, first_failed_entry, first_raw_cq_status);
         } else {
             op.state = OpState::COMPLETED;
             op.status = Status::Ok();
             op.bytes_transferred = op.total_bytes;
+            op.completion_detail.confirmed_bytes = op.total_bytes;
         }
         return;
     }
@@ -2447,6 +2530,11 @@ void LocalNvmeDataPath::aggregate_completion_status_(OpEntry& op) {
             confirmed_bytes += op.entry_lengths[i];
         } else {
             any_failed = true;
+            if (first_failed_entry == UINT32_MAX) {
+                first_failed_entry = i;
+                first_failure_result = s.result;
+                first_raw_cq_status = s.nvme_status_dword3;
+            }
             if (s.result == 2) {
                 // FIX 4: a CQ timeout means the NVMe command may still be in
                 // the controller queue; mark the op so release()/shutdown()
@@ -2491,10 +2579,15 @@ void LocalNvmeDataPath::aggregate_completion_status_(OpEntry& op) {
         op.state = OpState::FAILED;
         op.status = Status(StatusCode::DEVICE_ERROR, first_error);
         op.bytes_transferred = confirmed_bytes;  // only confirmed bytes
+        set_completion_failure(
+            op.completion_detail,
+            completion_failure_kind(first_failure_result), confirmed_bytes,
+            op.has_timeout, first_failed_entry, first_raw_cq_status);
     } else {
         op.state = OpState::COMPLETED;
         op.status = Status::Ok();
         op.bytes_transferred = confirmed_bytes;
+        op.completion_detail.confirmed_bytes = confirmed_bytes;
     }
 }
 

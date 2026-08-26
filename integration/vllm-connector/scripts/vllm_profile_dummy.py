@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Drive a small, deterministic 128K prefix-reuse workload through vLLM.
+"""Drive a deterministic prefix-reuse workload through a vLLM server.
 
 The request body uses token ids instead of a giant text prompt, so the
 requested context length is exact.  Request A is cold, B shares 80% of A's

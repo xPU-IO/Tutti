@@ -7,8 +7,7 @@
 //   memory/src/host_device_memory_subsystem.cu:828-893 (fill_address_descriptors)
 //
 // Computes SINGLE/DUAL/LIST PRP descriptors from nvm_dma_t::ioaddrs[].
-// The owned PRP-list fallback (cudaMalloc + DMA map + fill) is in
-// local_nvme_data_path.cpp because it needs nvm_ctrl_t* and CUDA calls.
+// PRP-list backing is supplied by host-pinned PrpBufPool/PrpPageCache.
 
 #include <nvm_types.h>
 

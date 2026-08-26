@@ -18,6 +18,8 @@ import ctypes
 import logging
 import os
 import threading
+from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 
 from .layout import Layout, decode_io_key
@@ -70,23 +72,55 @@ def _buffer_info(buffer) -> tuple[int, int, str, int] | None:
     return addr, size, "host", -1
 
 
-class _TuttiCompletion:
-    """一批 runtime IO 的完成句柄。
+@dataclass(frozen=True)
+class _SubmittedHandle:
+    handle: int
+    batch_indices: tuple[int, ...] = ()
 
-    runtime.wait 在 C++ 层已经是条件变量等待，但旧实现由调用线程以
-    100ms 轮询它。这里把阻塞观察移到 daemon watcher，调用线程只等待
-    一个 Python Event；settle/release 和 store 回调仍由 query/wait 执行，
-    避免后台线程并发修改 store 的布局与 live 集合。
-    """
+
+@dataclass(frozen=True)
+class TuttiTerminalResult:
+    handle: int
+    observation: str
+    state: str
+    confirmed_bytes: int = 0
+    timeout_seen: bool = False
+    failed_request_indices: tuple[int, ...] = ()
+    failure_scope: str = "NONE"
+    failure_kind: str | None = None
+    first_failed_entry: int | None = None
+    raw_cq_status: int | None = None
+    message: str = ""
+    batch_indices: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class TuttiBatchResult:
+    ok: bool
+    failed_batch_indices: tuple[int, ...]
+    timeout_seen: bool
+    failures: tuple[TuttiTerminalResult, ...]
+    results: tuple[TuttiTerminalResult, ...]
+
+
+class _TuttiCompletion:
+    """一批 runtime IO 的完成句柄，terminal 详情在 release 后仍保留。"""
 
     def __init__(self, runtime, handles, on_settled):
         self._runtime = runtime
-        self._handles = list(handles)
+        self._submitted = [
+            item if isinstance(item, _SubmittedHandle)
+            else _SubmittedHandle(int(item))
+            for item in handles
+        ]
+        self._handles = [item.handle for item in self._submitted]
         self._on_settled = on_settled
         self._settled = False
         self._failed = False
         self._failure_message = "tutti IO 批失败"
         self._terminal: bool | None = None
+        self._terminal_results: dict[int, TuttiTerminalResult] = {}
+        self._batch_result: TuttiBatchResult | None = None
         self._terminal_lock = threading.Lock()
         self._ready = threading.Event()
         self._watcher = threading.Thread(
@@ -99,8 +133,6 @@ class _TuttiCompletion:
     def query(self) -> bool:
         if self._settled:
             return not self._failed
-        # Preserve the old eager-query behavior for already-completed fake
-        # runtimes; this probe is nonblocking and does not reintroduce polling.
         if not self._ready.is_set():
             self._probe_runtime()
         if not self._ready.is_set():
@@ -108,54 +140,97 @@ class _TuttiCompletion:
         return self._finish()
 
     def wait(self, timeout: float | None = None) -> None:
+        result = self.wait_result(timeout)
+        if not result.ok:
+            raise RuntimeError(self._failure_message)
+
+    def wait_result(self, timeout: float | None = None) -> TuttiBatchResult:
         if self._settled:
-            if self._failed:
-                raise RuntimeError(self._failure_message)
-            return
+            assert self._batch_result is not None
+            return self._batch_result
         with nvtx_range("tutti.runtime.wait"):
             if not self._ready.wait(timeout):
                 raise TimeoutError("等待 tutti IO 批超时")
         self._finish()
-        if self._failed:
-            raise RuntimeError(self._failure_message)
+        assert self._batch_result is not None
+        return self._batch_result
+
+    def wait_detail(self, timeout: float | None = None) -> TuttiBatchResult:
+        return self.wait_result(timeout)
+
+    def _observe(self, submitted: _SubmittedHandle,
+                 timeout_ms: int) -> TuttiTerminalResult:
+        structured_wait = getattr(self._runtime, "wait_result", None)
+        if callable(structured_wait):
+            raw = structured_wait(submitted.handle, timeout_ms)
+            return TuttiTerminalResult(
+                handle=submitted.handle,
+                observation=str(raw.observation),
+                state=str(raw.state),
+                confirmed_bytes=int(raw.confirmed_bytes),
+                timeout_seen=bool(raw.timeout_seen),
+                failed_request_indices=tuple(raw.failed_request_indices),
+                failure_scope=str(raw.failure_scope),
+                failure_kind=raw.failure_kind,
+                first_failed_entry=raw.first_failed_entry,
+                raw_cq_status=raw.raw_cq_status,
+                message=str(raw.message),
+                batch_indices=submitted.batch_indices,
+            )
+        observation, state = self._runtime.wait(submitted.handle, timeout_ms)
+        failed = state == "FAILED"
+        return TuttiTerminalResult(
+            handle=submitted.handle,
+            observation=observation,
+            state=state,
+            failure_scope="WHOLE_OPERATION" if failed else "NONE",
+            failure_kind="UNKNOWN" if failed else None,
+            batch_indices=submitted.batch_indices,
+        )
+
+    def _record_result(self, result: TuttiTerminalResult) -> None:
+        with self._terminal_lock:
+            self._terminal_results.setdefault(result.handle, result)
 
     def _probe_runtime(self) -> None:
         """做一次非阻塞观察，避免 query 对 watcher 启动存在竞态。"""
         try:
-            for handle in self._handles:
-                observation, state = self._runtime.wait(handle, 0)
-                if observation == "TIMEOUT" or state not in ("COMPLETED", "FAILED"):
+            observed = []
+            for submitted in self._submitted:
+                result = self._observe(submitted, 0)
+                if (result.observation == "TIMEOUT" or
+                        result.state not in ("COMPLETED", "FAILED")):
                     return
-                if observation != "OK" or state == "FAILED":
-                    self._mark_terminal(False, f"tutti IO 失败（io handle={handle}）")
-                    return
-            self._mark_terminal(True, None)
+                observed.append(result)
+            for result in observed:
+                self._record_result(result)
+            failures = [result for result in observed
+                        if result.observation != "OK" or result.state == "FAILED"]
+            self._mark_terminal(not failures,
+                                self._format_failure(failures[0])
+                                if failures else None)
         except Exception as exc:
             self._mark_terminal(False, f"tutti IO 等待异常：{exc}")
 
     def _watch_runtime(self) -> None:
-        """在后台阻塞等待整批 terminal；不触碰 store 回调。"""
+        """阻塞等待并 drain 每个 partial-commit handle，恰好记录一次。"""
         try:
-            for handle in self._handles:
+            failures = []
+            for submitted in self._submitted:
                 while True:
-                    observation, state = self._runtime.wait(
-                        handle, _COMPLETION_WAIT_MS
-                    )
-                    if observation == "TIMEOUT":
+                    result = self._observe(submitted, _COMPLETION_WAIT_MS)
+                    if result.observation == "TIMEOUT":
                         continue
-                    if observation != "OK":
-                        self._mark_terminal(
-                            False, f"tutti IO 等待异常（io handle={handle}）"
-                        )
-                        return
-                    if state == "COMPLETED":
+                    if (result.observation != "OK" or
+                            result.state in ("COMPLETED", "FAILED")):
+                        self._record_result(result)
+                        if (result.observation != "OK" or
+                                result.state == "FAILED"):
+                            failures.append(result)
                         break
-                    if state == "FAILED":
-                        self._mark_terminal(
-                            False, f"tutti IO 失败（io handle={handle}）"
-                        )
-                        return
-            self._mark_terminal(True, None)
+            self._mark_terminal(not failures,
+                                self._format_failure(failures[0])
+                                if failures else None)
         except Exception as exc:
             self._mark_terminal(False, f"tutti IO 等待异常：{exc}")
 
@@ -168,6 +243,38 @@ class _TuttiCompletion:
                 self._failure_message = message
             self._ready.set()
 
+    @staticmethod
+    def _format_failure(result: TuttiTerminalResult) -> str:
+        kind = f"，kind={result.failure_kind}" if result.failure_kind else ""
+        message = f"：{result.message}" if result.message else ""
+        return f"tutti IO 失败（io handle={result.handle}{kind}）{message}"
+
+    def _build_batch_result(self) -> TuttiBatchResult:
+        results = tuple(
+            self._terminal_results[item.handle] for item in self._submitted
+            if item.handle in self._terminal_results
+        )
+        failures = tuple(
+            result for result in results
+            if result.observation != "OK" or result.state == "FAILED"
+        )
+        failed_batch_indices: set[int] = set()
+        for result in failures:
+            if (result.failure_scope == "REQUEST_INDICES" and
+                    result.failed_request_indices):
+                for index in result.failed_request_indices:
+                    if 0 <= index < len(result.batch_indices):
+                        failed_batch_indices.add(result.batch_indices[index])
+            else:
+                failed_batch_indices.update(result.batch_indices)
+        return TuttiBatchResult(
+            ok=not failures,
+            failed_batch_indices=tuple(sorted(failed_batch_indices)),
+            timeout_seen=any(result.timeout_seen for result in failures),
+            failures=failures,
+            results=results,
+        )
+
     def _finish(self) -> bool:
         with self._terminal_lock:
             terminal = self._terminal
@@ -177,17 +284,16 @@ class _TuttiCompletion:
                 return not self._failed
             self._settled = True
             self._failed = not terminal
+            self._batch_result = self._build_batch_result()
         for handle in self._handles:
             try:
                 self._runtime.release_io(handle)
             except Exception:
-                pass  # release 尽力而为：shutdown 路径可能先行回收
+                pass
         self._on_settled(terminal)
         return terminal
 
     def _settle(self, ok: bool) -> None:
-        # Kept as a small compatibility hook for callers/tests that used the
-        # former implementation's private method.
         self._mark_terminal(ok, None)
         self._finish()
 
@@ -242,7 +348,14 @@ class TuttiKVStore:
         # 其余取值（int 句柄 / None）原样使用。
         self._io_stream_raw = io_stream
         self._io_stream = None if io_stream == "auto" else io_stream
-        self._io_stream_obj = None  # 专用流引用，防句柄悬空
+        # Keep direction-specific handles private.  Workers use the context
+        # and fence helpers below instead of replacing these values.
+        self._read_stream = None
+        self._write_stream = None
+        self._read_stream_obj = None
+        self._write_stream_obj = None
+        self._stream_mode = "host"
+        self._stream_accel_id = None
         self._execution = "device"
 
     # ---------- 生命周期 ----------
@@ -250,6 +363,18 @@ class TuttiKVStore:
     @property
     def capacity_chunks(self) -> int:
         return self._num_chunks
+
+    @property
+    def max_in_flight_operations(self) -> int:
+        """Runtime admission window; 0 means unknown/unbounded."""
+        if self._runtime is None:
+            return 0
+        try:
+            value = self._runtime.caps().get("max_in_flight_operations", 0)
+            value = int(value or 0)
+        except (AttributeError, TypeError, ValueError):
+            return 0
+        return max(value, 0)
 
     def open(self) -> None:
         if self._opened:
@@ -273,30 +398,102 @@ class TuttiKVStore:
                 self._live = set()
         if self._io_stream_raw == "auto":
             self._resolve_auto_stream()
+        else:
+            self._configure_shared_stream(self._io_stream)
         self._sync_execution_mode()
         self._opened = True
 
+    def _runtime_supports_multi_stream(self) -> bool:
+        """Return the advertised two-stream capability, conservatively.
+
+        Current bindings expose both fields from the assembled DataPath.
+        Missing fields mean an older/unknown runtime, which conservatively
+        selects the shared-stream compatibility path.
+        """
+        try:
+            caps = self._runtime.caps()
+        except Exception:
+            return False
+        try:
+            return bool(caps.get("supports_multi_stream", False)) and int(
+                caps.get("max_concurrent_streams", 0)
+            ) >= 2
+        except (TypeError, ValueError):
+            return False
+
+    def _runtime_accel(self) -> int:
+        """Resolve one accelerator shared by runtime, read, and write streams."""
+        preset_accel = None
+        if isinstance(self._preset, dict) and "gpu_id" in self._preset:
+            try:
+                preset_accel = int(self._preset["gpu_id"])
+            except (TypeError, ValueError):
+                preset_accel = None
+        bound_accel = None
+        try:
+            raw = self._runtime.caps().get("bound_accel_id")
+            if raw is not None and int(raw) >= 0:
+                bound_accel = int(raw)
+        except (AttributeError, TypeError, ValueError):
+            bound_accel = None
+        if (bound_accel is not None and preset_accel is not None
+                and bound_accel != preset_accel):
+            raise RuntimeError(
+                "runtime bound_accel_id 与 preset gpu_id 不一致："
+                f"{bound_accel} != {preset_accel}"
+            )
+        return bound_accel if bound_accel is not None else (preset_accel or 0)
+
+    def _configure_shared_stream(self, stream) -> None:
+        self._read_stream = stream
+        self._write_stream = stream
+        self._read_stream_obj = None
+        self._write_stream_obj = None
+        self._stream_mode = "shared" if stream is not None else "host"
+
     def _resolve_auto_stream(self) -> None:
-        """在 runtime 加速器上建专用 IO 流并取其句柄。
+        """在 runtime 加速器上建方向化 IO 流并取其句柄。
 
         默认流句柄为 0，与绑定的空指针语义冲突（submit 会当作未给流
-        拒绝），故 'auto' 一律建专用流；落在 preset 的 gpu_id 设备上
-        （runtime 校验流须属于自身加速器）。open 仅发生在 worker 进程，
-        此处 CUDA 必已初始化。
+        拒绝）。落在 preset 的 gpu_id 设备上（runtime 校验流须属于自身
+        加速器）。旧 runtime 或不支持 multi-stream 的 target 明确回退
+        到共享专用流。
         """
         import torch
 
         if not torch.cuda.is_available():
             raise RuntimeError("io_stream='auto' 需要 CUDA 可用")
-        accel = 0
-        if isinstance(self._preset, dict):
-            raw = self._preset.get("gpu_id", 0)
-            try:
-                accel = int(raw)
-            except (TypeError, ValueError):
-                accel = 0
-        self._io_stream_obj = torch.cuda.Stream(device=f"cuda:{accel}")
-        self._io_stream = int(self._io_stream_obj.cuda_stream)
+        accel = self._runtime_accel()
+        self._accel_id = accel
+        self._stream_accel_id = accel
+        read_obj = torch.cuda.Stream(device=f"cuda:{accel}")
+        if not self._runtime_supports_multi_stream():
+            self._read_stream_obj = read_obj
+            self._write_stream_obj = read_obj
+            self._read_stream = int(read_obj.cuda_stream)
+            self._write_stream = self._read_stream
+            self._io_stream = self._read_stream
+            self._stream_mode = "shared"
+            return
+
+        write_obj = torch.cuda.Stream(device=f"cuda:{accel}")
+        # Both streams are constructed on the same explicit CUDA device.  A
+        # custom torch stream implementation must still expose a compatible
+        # device, otherwise fail before any IO is submitted.
+        for stream_obj in (read_obj, write_obj):
+            device = getattr(stream_obj, "device", None)
+            index = getattr(device, "index", None)
+            if index is not None and int(index) != accel:
+                raise RuntimeError(
+                    "read/write CUDA stream 必须属于 runtime accel device "
+                    f"{accel}，得到 {index}"
+                )
+        self._read_stream_obj = read_obj
+        self._write_stream_obj = write_obj
+        self._read_stream = int(read_obj.cuda_stream)
+        self._write_stream = int(write_obj.cuda_stream)
+        self._io_stream = None
+        self._stream_mode = "dual"
 
     def close(self) -> None:
         if not self._opened:
@@ -314,12 +511,21 @@ class TuttiKVStore:
             except Exception:
                 pass
             self._runtime = None
+        # Keep both CUDA stream objects alive through runtime shutdown, then
+        # release the pair together so neither handle can outlive its owner.
+        self._read_stream = None
+        self._write_stream = None
+        self._read_stream_obj = None
+        self._write_stream_obj = None
+        self._stream_mode = "host"
+        self._stream_accel_id = None
+        self._io_stream = None
         self._own_runtime = self._runtime is None
 
     def _sync_execution_mode(self) -> None:
         """推导 submit 执行模式：无 io_stream → host 路径；有则按 runtime
         能力（device 优先，host-only 回退）。"""
-        if self._io_stream is None:
+        if self._read_stream is None and self._write_stream is None:
             self._execution = "host"
             return
         try:
@@ -411,22 +617,68 @@ class TuttiKVStore:
             segment_bytes=segment_bytes,
         )
 
-    def wait_event(self, event) -> None:
-        """Fence the IO stream behind a producer CUDA event.
+    def _stream_for(self, direction: str):
+        if direction == "read":
+            return self._read_stream, self._read_stream_obj
+        if direction == "write":
+            return self._write_stream, self._write_stream_obj
+        raise ValueError(f"未知 IO 方向：{direction!r}")
 
-        The worker records this event after gathering paged KV into staging;
-        waiting on the dedicated IO stream preserves overlap without a
-        device-wide synchronize. Stores using a raw stream handle fall back
-        to a stream-local host wait.
+    def stream_context(self, direction: str):
+        """Return a context for worker scatter/gather enqueue.
+
+        The returned context selects the store-owned stream and does not
+        expose a setter for replacing it.  Host/shared-stream fallbacks are a
+        no-op context.
         """
+        _, stream_obj = self._stream_for(direction)
+        if stream_obj is None:
+            return nullcontext()
+        import torch
+
+        return torch.cuda.stream(stream_obj)
+
+    def _wait_event(self, direction: str, event) -> None:
+        _, stream_obj = self._stream_for(direction)
         if event is None:
             return
-        if self._io_stream_obj is not None:
-            self._io_stream_obj.wait_event(event)
+        if stream_obj is not None:
+            stream_obj.wait_event(event)
             return
         synchronize = getattr(event, "synchronize", None)
         if callable(synchronize):
             synchronize()
+
+    def wait_read_event(self, event) -> None:
+        """Make the read stream wait for a worker producer fence."""
+        self._wait_event("read", event)
+
+    def wait_write_event(self, event) -> None:
+        """Make the write stream wait for a worker gather fence."""
+        self._wait_event("write", event)
+
+    def wait_event(self, event) -> None:
+        """Backward-compatible alias for the write-side fence."""
+        self.wait_write_event(event)
+
+    def _record_event(self, direction: str, event=None):
+        _, stream_obj = self._stream_for(direction)
+        if stream_obj is None:
+            return event
+        if event is None:
+            import torch
+
+            event = torch.cuda.Event()
+        event.record(stream_obj)
+        return event
+
+    def record_read_event(self, event=None):
+        """Record and return a fence on the store-owned read stream."""
+        return self._record_event("read", event)
+
+    def record_write_event(self, event=None):
+        """Record and return a fence on the store-owned write stream."""
+        return self._record_event("write", event)
 
     def put_batch(self, batch) -> _TuttiCompletion:
         self._require_open()
@@ -449,7 +701,7 @@ class TuttiKVStore:
                 )
             )
         with nvtx_range(f"tutti.runtime.submit|op=write|requests={len(requests)}"):
-            handles = self._submit_retry(requests)
+            handles = self._submit_retry(requests, "write")
         return _TuttiCompletion(
             self._runtime, handles, lambda ok: self._on_put_settled(ok, io_keys)
         )
@@ -473,7 +725,7 @@ class TuttiKVStore:
                 )
             )
         with nvtx_range(f"tutti.runtime.submit|op=read|requests={len(requests)}"):
-            handles = self._submit_retry(requests)
+            handles = self._submit_retry(requests, "read")
         return _TuttiCompletion(self._runtime, handles, lambda ok: None)
 
     def drop(self, keys) -> None:
@@ -587,32 +839,54 @@ class TuttiKVStore:
             self._layout.commit_layers(io_keys)
             self._live.update(io_keys)
 
-    def _submit_retry(self, requests):
+    def _submit_retry(self, requests, direction: str):
         """提交整批；partial-commit 的被拒请求窗口重发。
 
         连续两轮零接受（runtime 窗口彻底耗尽）→ RuntimeError。
         """
         handles = []
-        pending = list(requests)
+        pending = list(enumerate(requests))
         all_rejected_rounds = 0
+        rejection_diagnostics = []
         while pending:
             result = self._runtime.submit(
-                pending,
+                [request for _, request in pending],
                 accel_id=self._accel_id,
-                stream=self._io_stream,
+                stream=self._stream_for(direction)[0],
                 execution=self._execution,
             )
-            if not result.status_ok or result.io_handle is None:
-                raise RuntimeError(f"tutti submit 整批被拒：{result.status_msg}")
-            handles.append(result.io_handle)
             rejected = list(result.rejected or [])
+            # Runtime partial-commit deliberately returns a non-OK status
+            # together with a valid handle for the accepted prefix/subset.
+            # That handle must be drained exactly once; only rejected indices
+            # are retried.  Treating status_ok as all-or-nothing loses issued IO.
+            if result.io_handle is not None:
+                accepted_indices = tuple(
+                    pending[i][0]
+                    for i, accepted in enumerate(result.initial_states or [])
+                    if accepted
+                )
+                handles.append(_SubmittedHandle(result.io_handle,
+                                                accepted_indices))
+            elif len(rejected) != len(pending):
+                raise RuntimeError(
+                    "tutti submit 返回部分受理状态但缺少 IO handle："
+                    f"{result.status_msg}"
+                )
             if not rejected:
+                if result.io_handle is None or not result.status_ok:
+                    raise RuntimeError(f"tutti submit 失败：{result.status_msg}")
                 break
             if len(rejected) == len(pending):
                 all_rejected_rounds += 1
+                rejection_diagnostics.append(
+                    f"round={all_rejected_rounds} pending={len(pending)} "
+                    f"status={result.status_msg}"
+                )
                 if all_rejected_rounds >= 2:
                     raise RuntimeError(
-                        "partial-commit 连续两轮零接受：runtime IO 窗口不可用"
+                        "partial-commit 连续两轮零接受："
+                        + "; ".join(rejection_diagnostics[-2:])
                     )
             else:
                 all_rejected_rounds = 0

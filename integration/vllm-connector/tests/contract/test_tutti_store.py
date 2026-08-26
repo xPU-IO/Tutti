@@ -43,6 +43,15 @@ FakeSubmitResult = namedtuple(
     ["status_ok", "status_msg", "io_handle", "initial_states", "rejected"],
 )
 
+FakeWaitResult = namedtuple(
+    "FakeWaitResult",
+    [
+        "observation", "state", "confirmed_bytes", "timeout_seen",
+        "failed_request_indices", "failure_scope", "failure_kind",
+        "first_failed_entry", "raw_cq_status", "message",
+    ],
+)
+
 
 def _reject_none(round_idx: int, count: int) -> set[int]:
     return set()
@@ -51,7 +60,8 @@ def _reject_none(round_idx: int, count: int) -> set[int]:
 class FakeRuntime:
     """tutti_runtime 的文件系统级 fake（数据真搬运，提交即完成）。"""
 
-    def __init__(self, reject_plan=None):
+    def __init__(self, reject_plan=None, supports_multi_stream=None,
+                 bound_accel_id=None, partial_status_non_ok=False):
         self._next_ticket = 0
         self._targets: dict[int, str] = {}
         self._memories: dict[int, tuple[int, int]] = {}
@@ -60,10 +70,14 @@ class FakeRuntime:
         self.register_calls: list[tuple] = []
         self.submit_rounds = 0
         self.shutdown_called = False
+        self.submit_streams: list[tuple[str, int | None]] = []
+        self._supports_multi_stream = supports_multi_stream
+        self._bound_accel_id = bound_accel_id
+        self._partial_status_non_ok = partial_status_non_ok
         self._reject_plan = reject_plan or _reject_none
 
     def caps(self):
-        return {
+        caps = {
             "target": ["stub"],
             "memory": ["host"],
             "length_alignment_bytes": 1,
@@ -71,6 +85,12 @@ class FakeRuntime:
             "max_batch_requests": None,
             "max_in_flight_operations": None,
         }
+        if self._supports_multi_stream is not None:
+            caps["supports_multi_stream"] = self._supports_multi_stream
+            caps["max_concurrent_streams"] = 2 if self._supports_multi_stream else 1
+        if self._bound_accel_id is not None:
+            caps["bound_accel_id"] = self._bound_accel_id
+        return caps
 
     def open_batch(self, uris):
         tickets = []
@@ -89,6 +109,7 @@ class FakeRuntime:
         return self._next_ticket
 
     def submit(self, requests, accel_id=-1, stream=None, execution="device"):
+        self.submit_streams.append((requests[0][-1] if requests else "", stream))
         rejected = set(self._reject_plan(self.submit_rounds, len(requests)))
         self.submit_rounds += 1
         for idx, req in enumerate(requests):
@@ -98,8 +119,8 @@ class FakeRuntime:
         handle = self._next_ticket
         self._io_done.add(handle)
         return FakeSubmitResult(
-            status_ok=True,
-            status_msg="",
+            status_ok=not (rejected and self._partial_status_non_ok),
+            status_msg="partial submit" if rejected else "",
             io_handle=handle,
             initial_states=[idx not in rejected for idx in range(len(requests))],
             rejected=sorted(rejected),
@@ -209,6 +230,223 @@ def test_partial_commit_retried(tmp_path):
     store.get_batch([(k, dst_id, i * SEG) for i, k in enumerate(keys)]).wait()
     for i in range(4):
         assert dst[i * SEG:(i + 1) * SEG] == bytes([0x30 + i]) * SEG
+
+
+def test_partial_commit_non_ok_status_still_drains_handle(tmp_path):
+    """Non-OK partial status carries issued IO that must not be discarded."""
+    runtime = FakeRuntime(
+        reject_plan=lambda rnd, n: {0} if rnd == 0 else set(),
+        partial_status_non_ok=True,
+    )
+    store = make_store(tmp_path, runtime=runtime)
+    store.open()
+    src = bytearray(2 * SEG)
+    src[:SEG] = b"a" * SEG
+    src[SEG:] = b"b" * SEG
+    src_id = store.register_buffer(src, SEG)
+    keys = [io_key(b"a" * 16, 0), io_key(b"b" * 16, 0)]
+
+    completion = store.put_batch(
+        [(keys[0], src_id, 0), (keys[1], src_id, SEG)]
+    )
+    completion.wait()
+
+    assert runtime.submit_rounds == 2
+    assert len(runtime._released) == 2
+    assert store.scan() == keys
+
+
+def test_auto_routes_read_and_write_to_distinct_streams(tmp_path, monkeypatch):
+    """auto creates distinct read/write submit and worker stream routes."""
+    import types
+    import torch
+
+    class FakeStream:
+        next_handle = 100
+
+        def __init__(self, device):
+            self.device = types.SimpleNamespace(index=int(str(device).split(":")[-1]))
+            FakeStream.next_handle += 1
+            self.cuda_stream = FakeStream.next_handle
+            self.waited = []
+            self.recorded = []
+
+        def wait_event(self, event):
+            self.waited.append(event)
+
+    class FakeEvent:
+        def __init__(self):
+            self.recorded_on = None
+
+        def record(self, stream):
+            self.recorded_on = stream
+
+    class FakeStreamContext:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            return self.stream
+
+        def __exit__(self, *_exc):
+            return False
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "Stream", FakeStream)
+    monkeypatch.setattr(torch.cuda, "Event", FakeEvent)
+    monkeypatch.setattr(torch.cuda, "stream", FakeStreamContext)
+
+    runtime = FakeRuntime(supports_multi_stream=True, bound_accel_id=0)
+    store = TuttiKVStore(
+        root=tmp_path / "pool", num_chunks=2, segment_bytes=SEG,
+        runtime=runtime, io_stream="auto", preset={"gpu_id": 0},
+    )
+    store.open()
+    assert store._stream_mode == "dual"
+    assert store._read_stream != store._write_stream
+    assert store._read_stream_obj is not store._write_stream_obj
+    with store.stream_context("read") as selected:
+        assert selected is store._read_stream_obj
+    with store.stream_context("write") as selected:
+        assert selected is store._write_stream_obj
+
+    src = bytearray(b"r" * SEG)
+    src_id = store.register_buffer(src, SEG)
+    key = io_key(b"r" * 16, 0)
+    store.put_batch([(key, src_id, 0)]).wait()
+    dst = bytearray(SEG)
+    dst_id = store.register_buffer(dst, SEG)
+    store.get_batch([(key, dst_id, 0)]).wait()
+
+    assert runtime.submit_streams == [
+        ("write", store._write_stream),
+        ("read", store._read_stream),
+    ]
+    event = FakeEvent()
+    store.wait_read_event(event)
+    store.wait_write_event(event)
+    assert store._read_stream_obj.waited == [event]
+    assert store._write_stream_obj.waited == [event]
+    assert store.record_read_event().recorded_on is store._read_stream_obj
+    assert store.record_write_event().recorded_on is store._write_stream_obj
+    store.close()
+    assert store._read_stream_obj is None
+    assert store._write_stream_obj is None
+
+
+def test_auto_falls_back_when_caps_reject_multi_stream(tmp_path, monkeypatch):
+    """An explicit no-multi-stream capability selects the shared fallback."""
+    import types
+    import torch
+
+    class FakeStream:
+        def __init__(self, device):
+            self.device = types.SimpleNamespace(index=0)
+            self.cuda_stream = 777
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "Stream", FakeStream)
+    runtime = FakeRuntime(supports_multi_stream=False)
+    store = TuttiKVStore(
+        root=tmp_path / "pool", num_chunks=2, segment_bytes=SEG,
+        runtime=runtime, io_stream="auto", preset={"gpu_id": 0},
+    )
+    store.open()
+    assert store._stream_mode == "shared"
+    assert store._read_stream == store._write_stream == 777
+    assert store._read_stream_obj is store._write_stream_obj
+
+
+def test_auto_falls_back_when_multi_stream_caps_are_missing(tmp_path, monkeypatch):
+    """An older binding without stream caps uses one shared stream."""
+    import types
+    import torch
+
+    class FakeStream:
+        def __init__(self, device):
+            self.device = types.SimpleNamespace(index=0)
+            self.cuda_stream = 778
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "Stream", FakeStream)
+    runtime = FakeRuntime()
+    store = TuttiKVStore(
+        root=tmp_path / "pool", num_chunks=2, segment_bytes=SEG,
+        runtime=runtime, io_stream="auto", preset={"gpu_id": 0},
+    )
+    store.open()
+    assert store._stream_mode == "shared"
+    assert store._read_stream == store._write_stream == 778
+
+
+def test_auto_rejects_runtime_and_preset_device_mismatch(tmp_path, monkeypatch):
+    """Read/write streams cannot be created away from the runtime accelerator."""
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    runtime = FakeRuntime(supports_multi_stream=True, bound_accel_id=1)
+    store = TuttiKVStore(
+        root=tmp_path / "pool", num_chunks=2, segment_bytes=SEG,
+        runtime=runtime, io_stream="auto", preset={"gpu_id": 0},
+    )
+    with pytest.raises(RuntimeError, match="bound_accel_id.*gpu_id"):
+        store.open()
+
+
+def test_explicit_legacy_stream_is_shared_for_both_directions(tmp_path):
+    """An explicit io_stream keeps the pre-existing single-stream contract."""
+    import types
+
+    runtime = FakeRuntime(supports_multi_stream=True)
+    store = TuttiKVStore(
+        root=tmp_path / "pool", num_chunks=2, segment_bytes=SEG,
+        runtime=runtime, io_stream=1234,
+    )
+    store.open()
+    assert store._stream_mode == "shared"
+    assert store._read_stream == store._write_stream == 1234
+    event = types.SimpleNamespace(synchronize=lambda: None)
+    store.wait_read_event(event)
+    store.wait_write_event(event)
+
+
+def test_owned_runtime_shutdown_precedes_stream_release(tmp_path, monkeypatch):
+    """close keeps both stream owners alive through runtime shutdown."""
+    import types
+    import torch
+    import stores.tutti_nvme.store as store_module
+
+    class FakeStream:
+        next_handle = 900
+
+        def __init__(self, device):
+            self.device = types.SimpleNamespace(index=0)
+            FakeStream.next_handle += 1
+            self.cuda_stream = FakeStream.next_handle
+
+    class OwnedRuntime(FakeRuntime):
+        owner = None
+
+        def shutdown(self, timeout_ms):
+            assert self.owner._read_stream_obj is not None
+            assert self.owner._write_stream_obj is not None
+            super().shutdown(timeout_ms)
+
+    runtime = OwnedRuntime()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "Stream", FakeStream)
+    monkeypatch.setattr(store_module, "_build_runtime", lambda _preset: runtime)
+    store = TuttiKVStore(
+        root=tmp_path / "pool", num_chunks=2, segment_bytes=SEG,
+        runtime=None, io_stream="auto", preset={"gpu_id": 0},
+    )
+    runtime.owner = store
+    store.open()
+    store.close()
+    assert runtime.shutdown_called is True
+    assert store._runtime is None
+    assert store._read_stream_obj is None
+    assert store._write_stream_obj is None
 
 
 def test_double_stall_raises(tmp_path):
@@ -385,6 +623,33 @@ def test_completion_wait_uses_runtime_notification_without_polling():
     # The first blocking observation is one long runtime wait, rather than
     # repeated 100ms probes from the model thread.
     assert 1000 in runtime.timeouts
+
+
+def test_completion_wait_detail_is_retained_after_release():
+    class StructuredRuntime:
+        def __init__(self):
+            self.released = []
+
+        def wait_result(self, handle, timeout_ms=0):
+            return FakeWaitResult(
+                "OK", "FAILED", 4096, True, (), "WHOLE_OPERATION",
+                "CQ_TIMEOUT", 7, 0x1234, "controller timeout",
+            )
+
+        def release_io(self, handle):
+            self.released.append(handle)
+
+    runtime = StructuredRuntime()
+    completion = _TuttiCompletion(runtime, [11], lambda _ok: None)
+    result = completion.wait_result(timeout=1.0)
+    assert not result.ok
+    assert result.timeout_seen
+    assert result.failures[0].failure_kind == "CQ_TIMEOUT"
+    assert result.failures[0].first_failed_entry == 7
+    assert result.failures[0].raw_cq_status == 0x1234
+    assert runtime.released == [11]
+    retained = completion.wait_detail(timeout=0)
+    assert retained == result
 
 
 # ---------- register_buffer ----------

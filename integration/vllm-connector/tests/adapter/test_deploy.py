@@ -7,7 +7,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from adapter.connector import TuttiConnectorV1, _expand_placeholders
+from adapter.connector import (
+    TuttiConnectorV1,
+    _deployment_rank,
+    _expand_placeholders,
+)
 from stores.tutti_nvme.store import _normalize_preset
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
@@ -52,6 +56,22 @@ class TestLocalRankPlaceholder:
         finally:
             del os.environ["LOCAL_RANK"]
 
+    def test_initialized_world_local_rank_is_authoritative(self, monkeypatch):
+        """Worker config is shared; process-local world rank selects hardware."""
+        import vllm.distributed.parallel_state as parallel_state
+
+        monkeypatch.setattr(
+            parallel_state,
+            "get_world_group",
+            lambda: SimpleNamespace(local_rank=2),
+        )
+        cfg = SimpleNamespace(parallel_config=SimpleNamespace(rank=0))
+        assert _deployment_rank(cfg, worker=True) == "2"
+        assert _expand_placeholders(
+            {"device_id": "{LOCAL_RANK}", "gpu_id": "{LOCAL_RANK}"}, cfg,
+            rank=_deployment_rank(cfg, worker=True),
+        ) == {"device_id": "2", "gpu_id": "2"}
+
     def test_env_used_when_config_absent(self):
         os.environ["LOCAL_RANK"] = "2"
         try:
@@ -67,7 +87,7 @@ class TestLocalRankPlaceholder:
         """engine 构造时 options 已按 LOCAL_RANK 展开。"""
         captured = {}
 
-        import adapter.connector as conn_mod
+        import stores.metadata as metadata_mod
 
         def fake_create_store(type_name, options):
             captured["type"] = type_name
@@ -76,13 +96,14 @@ class TestLocalRankPlaceholder:
 
             return MemoryKVStore(segment_bytes=4096, num_chunks=4)
 
-        monkeypatch.setattr(conn_mod, "create_store", fake_create_store)
+        monkeypatch.setattr(metadata_mod, "create_metadata_store", fake_create_store)
         monkeypatch.setenv("LOCAL_RANK", "2")
         cfg = SimpleNamespace(
             kv_transfer_config=SimpleNamespace(kv_connector_extra_config={
                 "chunk_tokens": 8,
                 "chunk_kv_bytes": 12288,
                 "max_chunks_per_wave": 4,
+                "num_layers": 3,
                 "store": {"type": "tutti_nvme", "options": {
                     "root": "/mnt/nvme{LOCAL_RANK}/kv-pool",
                 }},
@@ -93,6 +114,43 @@ class TestLocalRankPlaceholder:
         connector.shutdown()
         assert captured["type"] == "tutti_nvme"
         assert captured["options"]["root"] == "/mnt/nvme2/kv-pool"
+
+    def test_rank_local_nvme_and_gpu_are_expanded_together(self, monkeypatch):
+        """TP rank selects matching mount, daemon device, and CUDA device."""
+        captured = {}
+        import stores.metadata as metadata_mod
+
+        def fake_create_store(type_name, options):
+            captured.update(options)
+            from stores.memory import MemoryKVStore
+            return MemoryKVStore(segment_bytes=4096, num_chunks=4)
+
+        monkeypatch.setattr(metadata_mod, "create_metadata_store", fake_create_store)
+        cfg = SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(kv_connector_extra_config={
+                "chunk_tokens": 8,
+                "chunk_kv_bytes": 12288,
+                "max_chunks_per_wave": 4,
+                "num_layers": 3,
+                "store": {"type": "tutti_nvme", "options": {
+                    "root": "/mnt/nvme{LOCAL_RANK}/pool",
+                    "preset": {
+                        "device_id": "{LOCAL_RANK}",
+                        "gpu_id": "{LOCAL_RANK}",
+                    },
+                }},
+            }),
+            cache_config=SimpleNamespace(block_size=16),
+            parallel_config=SimpleNamespace(
+                rank=3, tensor_parallel_size=4,
+                decode_context_parallel_size=1,
+            ),
+        )
+        connector = TuttiConnectorV1(cfg, KVConnectorRole.SCHEDULER, object())
+        connector.shutdown()
+        assert captured["root"] == "/mnt/nvme3/pool"
+        assert captured["preset"]["device_id"] == "3"
+        assert captured["preset"]["gpu_id"] == "3"
 
 
 class TestPresetNormalization:

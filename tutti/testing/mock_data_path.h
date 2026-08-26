@@ -77,6 +77,9 @@ public:
     std::atomic<bool> manual_mode{false};        // progress() does not auto-complete
     std::atomic<bool> block_progress_flag{false}; // progress() blocks until cleared
     std::uint64_t bytes_per_request = 4096;     // bytes counted per accepted request
+    OpState terminal_state = OpState::COMPLETED;
+    Status terminal_status = Status::Ok();
+    IoCompletionDetail terminal_detail;         // copied into terminal snapshots
 
     // Domain key: constant by default (all targets share one domain).
     // Set to "mock-domain-{token}" pattern by tests that need per-target domains.
@@ -99,6 +102,7 @@ public:
 
     // ---- Last submit snapshot (for test inspection) ----
     std::vector<tutti::DataPathRequest> last_requests;
+    tutti::DataPathMemoryView last_registered_memory_view{};
 
     // ---- Constructor: default capabilities ----
     MockDataPath() {
@@ -239,9 +243,10 @@ public:
     }
 
     Result<DataPathMemory> register_memory(
-        const DataPathMemoryView&,
+        const DataPathMemoryView& view,
         const RegistrationDomainKey&) override {
         ++register_calls;
+        last_registered_memory_view = view;
         return detail::SpiIdentityMint::mint<detail::DataPathMemoryTag>(next_memory_++, 1);
     }
 
@@ -343,9 +348,14 @@ public:
                 if (remaining == 0) break;
                 OpRecord& rec = kv.second;
                 if (rec.state == OpState::IN_FLIGHT && !manual_mode.load()) {
-                    rec.state = OpState::COMPLETED;
-                    rec.terminal_status = Status::Ok();
+                    rec.state = terminal_state;
+                    rec.terminal_status = terminal_status;
                     rec.bytes_transferred = rec.accepted_count * bytes_per_request;
+                    rec.completion_detail = terminal_detail;
+                    if (rec.completion_detail.failure_kind == IoFailureKind::NONE) {
+                        rec.completion_detail.confirmed_bytes =
+                            rec.bytes_transferred;
+                    }
                     ++result.work_units_consumed;
                     ++result.operations_advanced;
                     ++result.operations_terminal;
@@ -387,6 +397,7 @@ public:
         snap.state = rec.state;
         snap.status = rec.terminal_status;
         snap.bytes_transferred = rec.bytes_transferred;
+        snap.detail = rec.completion_detail;
         return snap;
     }
 
@@ -419,6 +430,7 @@ private:
         OpState state = OpState::IN_FLIGHT;
         Status terminal_status;  // OK while IN_FLIGHT
         std::uint64_t bytes_transferred = 0;
+        IoCompletionDetail completion_detail;
         std::size_t accepted_count = 0;
         std::vector<char> scratch;  // per-op private; never shared
     };
