@@ -89,7 +89,22 @@ cudaError_t launch_submit_one(
 // GPU kernel writes are visible to NVMe DMA; cudaMemsetAsync may not be
 // due to L2 cache coherency.  Defined in submit_one.cu.
 void launch_fill_pattern(void* buf, unsigned char val, std::uint64_t n,
-                          void* stream);
+    void* stream);
+
+cudaError_t launch_step_feeder(
+    const DeviceSubmitEntry* d_entries,
+    EntryCompletionStatus* d_status,
+    const StepFeederLayer* d_layers,
+    std::uint32_t layer_count,
+    std::uint32_t layer_base,
+    volatile std::uint32_t* ready_flags,
+    volatile std::uint32_t* release_flags,
+    std::uint32_t cq_poll_budget,
+    std::uint32_t threads_per_block,
+    std::uint32_t inject_flag,
+    void* stream);
+
+cudaError_t launch_feeder_signal(volatile std::uint32_t* flag, void* stream);
 
 } // namespace tutti::data_paths::local_nvme
 
@@ -134,6 +149,69 @@ void submit_one_kernel(const DeviceSubmitEntry* entries,
         submit_write_one(e.target, desc->prp1, desc->prp2,
                          e.target_offset, desc->data_length,
                          s, cq_poll_budget, inject_flag);
+    }
+}
+
+TUTTI_GLOBAL
+void step_feeder_kernel(const DeviceSubmitEntry* entries,
+                        EntryCompletionStatus* status,
+                        const StepFeederLayer* layers,
+                        std::uint32_t layer_count,
+                        std::uint32_t layer_base,
+                        volatile std::uint32_t* ready_flags,
+                        volatile std::uint32_t* release_flags,
+                        std::uint32_t cq_poll_budget,
+                        std::uint32_t inject_flag) {
+    TUTTI_SHARED std::uint32_t failed;
+    if (TUTTI_THREAD_IDX_X == 0) failed = 0;
+    TUTTI_SYNC_THREADS;
+    for (std::uint32_t local_layer = 0; local_layer < layer_count;
+         ++local_layer) {
+        const std::uint32_t layer = layer_base + local_layer;
+        const StepFeederLayer plan = layers[local_layer];
+        const bool is_read = plan.entry_count == 0 ||
+            entries[plan.first_entry].direction == 0;
+        if (!failed) {
+            for (std::uint32_t local = TUTTI_THREAD_IDX_X;
+                 local < plan.entry_count; local += TUTTI_BLOCK_DIM_X) {
+                const std::uint32_t index = plan.first_entry + local;
+                const DeviceSubmitEntry e = entries[index];
+                const AddressDescriptor* desc = e.prp_entry;
+                if (e.direction == 0) {
+                    submit_read_one(e.target, desc->prp1, desc->prp2,
+                                    e.target_offset, desc->data_length,
+                                    &status[index], cq_poll_budget, inject_flag);
+                } else {
+                    submit_write_one(e.target, desc->prp1, desc->prp2,
+                                     e.target_offset, desc->data_length,
+                                     &status[index], cq_poll_budget, inject_flag);
+                }
+            }
+        }
+        TUTTI_SYNC_THREADS;
+        if (TUTTI_THREAD_IDX_X == 0) {
+            if (!failed) {
+                for (std::uint32_t local = 0; local < plan.entry_count; ++local) {
+                    if (status[plan.first_entry + local].result != 0) {
+                        failed = 1;
+                        break;
+                    }
+                }
+            }
+            TUTTI_THREADFENCE_SYSTEM;
+            if (is_read) ready_flags[layer] = failed ? 2u : 1u;
+            else release_flags[layer] = 1u;
+            TUTTI_THREADFENCE_SYSTEM;
+        }
+        TUTTI_SYNC_THREADS;
+    }
+}
+
+TUTTI_GLOBAL
+void feeder_signal_kernel(volatile std::uint32_t* flag) {
+    if (TUTTI_THREAD_IDX_X == 0) {
+        *flag = 1u;
+        TUTTI_THREADFENCE_SYSTEM;
     }
 }
 

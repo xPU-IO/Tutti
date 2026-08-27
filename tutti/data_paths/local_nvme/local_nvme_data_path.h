@@ -36,6 +36,7 @@
 #include <nvm_types.h>
 
 #include <cstdint>
+#include <atomic>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -48,6 +49,7 @@ class NvmeQueueGroup;
 struct DeviceTargetHandle;
 struct DeviceSubmitEntry;
 struct EntryCompletionStatus;
+struct StepFeederLayer;
 
 // -------------------------------------------------------------------------
 // LbaExtent -- block-unit extent (converted from binding's byte-unit Extent)
@@ -188,6 +190,11 @@ public:
     Result<ProgressResult> progress(ProgressBudget budget) override;
     Result<DataPathSnapshot> query(DataPathOp op) const override;
     Status release(DataPathOp op) override;
+    Result<FeederLayerState> wait_feeder_layer(
+        DataPathOp op, std::uint32_t layer,
+        std::uint64_t timeout_ms) override;
+    Status signal_feeder_layer(
+        DataPathOp op, std::uint32_t layer, cudaStream_t stream) override;
 
     // ---- test-only accessor ----
     // Returns nullptr if the target identity is invalid or not found.
@@ -473,6 +480,17 @@ private:
         // degraded until an abort/reset (future work).  event/d_entries/
         // d_status are still returned to the arena -- the kernel has returned.
         bool has_timeout = false;
+
+        StepFeederLayer* d_feeder_layers = nullptr;
+        std::uint32_t* h_feeder_ready = nullptr;
+        std::uint32_t* d_feeder_ready = nullptr;
+        std::uint32_t* h_feeder_release = nullptr;
+        std::uint32_t* d_feeder_release = nullptr;
+        std::uint32_t feeder_layer_count = 0;
+        std::uint32_t feeder_staging_depth = 0;
+        bool feeder_is_read = false;
+        void* feeder_poll_stream = nullptr;
+        std::shared_ptr<std::atomic<bool>> feeder_event_recorded;
 
         // Target/memory identities referenced by this op (for in-flight tracking).
         std::vector<std::uint64_t> target_tokens;

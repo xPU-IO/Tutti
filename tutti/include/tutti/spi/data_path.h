@@ -366,6 +366,12 @@ struct DataPathSnapshot {
     IoCompletionDetail detail;
 };
 
+enum class FeederLayerState : std::uint8_t {
+    PENDING,
+    READY,
+    FAILED,
+};
+
 // Budget handed to progress(). Both fields are hard caps on one call.
 struct ProgressBudget {
     std::uint64_t max_work_units = 0;  // hard cap on work units consumed
@@ -466,6 +472,17 @@ public:
     virtual Result<ProgressResult> progress(ProgressBudget budget) = 0;
     virtual Result<DataPathSnapshot> query(DataPathOp op) const = 0;
     virtual Status release(DataPathOp op) = 0;
+
+    virtual Result<FeederLayerState> wait_feeder_layer(
+        DataPathOp, std::uint32_t, std::uint64_t) {
+        return Result<FeederLayerState>::Failure(Status(
+            StatusCode::UNSUPPORTED, "DataPath has no step feeder"));
+    }
+    virtual Status signal_feeder_layer(
+        DataPathOp, std::uint32_t, cudaStream_t) {
+        return Status(StatusCode::UNSUPPORTED,
+                      "DataPath has no step feeder");
+    }
 };
 
 } // namespace tutti

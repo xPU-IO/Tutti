@@ -17,12 +17,15 @@ from __future__ import annotations
 import ctypes
 import logging
 import os
+import time
 import threading
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
 from .layout import Layout, decode_io_key
+from .object_pool import ObjectPool, PoolConfig
+from .commit import RankCommitRecord, remove_rank_commit, write_rank_commit
 from .striped_layout import StripedLayout
 from engine.nvtx import range as nvtx_range
 
@@ -79,6 +82,13 @@ class _SubmittedHandle:
 
 
 @dataclass(frozen=True)
+class _TargetCacheEntry:
+    ticket: int
+    size: int
+    generation: int
+
+
+@dataclass(frozen=True)
 class TuttiTerminalResult:
     handle: int
     observation: str
@@ -103,10 +113,61 @@ class TuttiBatchResult:
     results: tuple[TuttiTerminalResult, ...]
 
 
+class TuttiStepCompletion:
+    """One Runtime/DataPath feeder operation for an eager model step."""
+
+    def __init__(self, runtime, submitted, completion, layer_count,
+                 staging_depth, direction):
+        self._runtime = runtime
+        self._submitted = submitted
+        self._completion = completion
+        self.layer_count = layer_count
+        self.staging_depth = staging_depth
+        self.direction = direction
+
+    @property
+    def handle(self):
+        return self._submitted.handle
+
+    def wait_layer(self, layer: int, timeout_ms: int = 30000) -> bool:
+        if os.environ.get("TUTTI_FEEDER_DIAGNOSTICS") == "1":
+            _LOG.warning("FEEDER_DIAG store wait t_ns=%d direction=%s handle=%s layer=%d",
+                         time.monotonic_ns(), self.direction, self.handle, layer)
+        state = self._runtime.wait_step_layer(self.handle, layer, timeout_ms)
+        if state == "PENDING":
+            raise TimeoutError(f"等待 feeder layer {layer} 超时")
+        return state == "READY"
+
+    def signal_layer(self, layer: int, stream: int) -> None:
+        if os.environ.get("TUTTI_FEEDER_DIAGNOSTICS") == "1":
+            _LOG.warning("FEEDER_DIAG store signal t_ns=%d direction=%s handle=%s layer=%d stream=%d",
+                         time.monotonic_ns(), self.direction, self.handle, layer,
+                         int(stream))
+        self._runtime.signal_step_layer(self.handle, layer, int(stream))
+
+    def wait(self, timeout=None):
+        return self._completion.wait(timeout)
+
+    def wait_result(self, timeout=None):
+        return self._completion.wait_result(timeout)
+
+    def query(self):
+        return self._completion.query()
+
+    def drain(self, stream: int = 0) -> None:
+        # Release every possible feeder wait. Re-signalling is idempotent.
+        for layer in range(self.layer_count):
+            try:
+                self.signal_layer(layer, stream)
+            except Exception:
+                pass
+        self.wait_result()
+
+
 class _TuttiCompletion:
     """一批 runtime IO 的完成句柄，terminal 详情在 release 后仍保留。"""
 
-    def __init__(self, runtime, handles, on_settled):
+    def __init__(self, runtime, handles, on_settled, *, auto_watch: bool = True):
         self._runtime = runtime
         self._submitted = [
             item if isinstance(item, _SubmittedHandle)
@@ -122,13 +183,11 @@ class _TuttiCompletion:
         self._terminal_results: dict[int, TuttiTerminalResult] = {}
         self._batch_result: TuttiBatchResult | None = None
         self._terminal_lock = threading.Lock()
+        self._done_callbacks = []
         self._ready = threading.Event()
-        self._watcher = threading.Thread(
-            target=self._watch_runtime,
-            name="tutti-io-completion",
-            daemon=True,
-        )
-        self._watcher.start()
+        self._watcher = None
+        if auto_watch:
+            self._start_watcher()
 
     def query(self) -> bool:
         if self._settled:
@@ -148,6 +207,7 @@ class _TuttiCompletion:
         if self._settled:
             assert self._batch_result is not None
             return self._batch_result
+        self._start_watcher()
         with nvtx_range("tutti.runtime.wait"):
             if not self._ready.wait(timeout):
                 raise TimeoutError("等待 tutti IO 批超时")
@@ -157,6 +217,26 @@ class _TuttiCompletion:
 
     def wait_detail(self, timeout: float | None = None) -> TuttiBatchResult:
         return self.wait_result(timeout)
+
+    def add_done_callback(self, callback) -> None:
+        with self._terminal_lock:
+            if self._settled:
+                result = self._batch_result
+            else:
+                self._done_callbacks.append(callback)
+                return
+        callback(result)
+
+    def _start_watcher(self) -> None:
+        with self._terminal_lock:
+            if self._watcher is not None or self._terminal is not None:
+                return
+            self._watcher = threading.Thread(
+                target=self._watch_runtime,
+                name="tutti-io-completion",
+                daemon=True,
+            )
+            self._watcher.start()
 
     def _observe(self, submitted: _SubmittedHandle,
                  timeout_ms: int) -> TuttiTerminalResult:
@@ -291,6 +371,12 @@ class _TuttiCompletion:
             except Exception:
                 pass
         self._on_settled(terminal)
+        with self._terminal_lock:
+            callbacks = self._done_callbacks
+            self._done_callbacks = []
+            result = self._batch_result
+        for callback in callbacks:
+            callback(result)
         return terminal
 
     def _settle(self, ok: bool) -> None:
@@ -303,7 +389,12 @@ class TuttiKVStore:
 
     def __init__(self, root, num_chunks: int, segment_bytes: int,
                  runtime=None, io_stream=None, preset=None,
-                 layout="file_per_chunk", mounts=None, stripe_unit=None):
+                 layout="file_per_chunk", mounts=None, stripe_unit=None,
+                 initial_slots=None, low_watermark=None,
+                 high_watermark=None, max_slots=None,
+                 pool_wait_timeout_s: float = 5.0,
+                 allocator_enabled: bool = True,
+                 rank_id: int = 0, tp_size: int = 1):
         """preset 为 dict 时优先于 TUTTI_NVME_PRESET 环境变量构造 runtime。
 
         preset 的字符串值恰为纯十进制整数时转为 int（配置占位符替换后
@@ -316,8 +407,30 @@ class TuttiKVStore:
             raise ValueError(f"num_chunks 必须为正数，得到 {num_chunks}")
         if segment_bytes <= 0:
             raise ValueError(f"segment_bytes 必须为正数，得到 {segment_bytes}")
+        if (not isinstance(rank_id, int) or isinstance(rank_id, bool)
+                or rank_id < 0):
+            raise ValueError(f"rank_id must be a non-negative integer: {rank_id!r}")
+        if (not isinstance(tp_size, int) or isinstance(tp_size, bool)
+                or tp_size <= rank_id):
+            raise ValueError(
+                f"tp_size must be greater than rank_id: {tp_size!r} <= {rank_id!r}"
+            )
         self._root = Path(root)
-        self._num_chunks = num_chunks
+        self._rank_id = rank_id
+        self._tp_size = tp_size
+        max_slots = num_chunks if max_slots is None else max_slots
+        initial_slots = min(32, max_slots) if initial_slots is None else initial_slots
+        high_watermark = initial_slots if high_watermark is None else high_watermark
+        low_watermark = high_watermark // 2 if low_watermark is None else low_watermark
+        pool_config = PoolConfig(
+            initial_slots=initial_slots,
+            low_watermark=low_watermark,
+            high_watermark=high_watermark,
+            max_slots=max_slots,
+            wait_timeout_s=float(pool_wait_timeout_s),
+        )
+        pool_config.validate()
+        self._num_chunks = min(num_chunks, max_slots)
         self._segment_bytes = segment_bytes
         self._runtime = runtime
         self._own_runtime = runtime is None
@@ -335,12 +448,17 @@ class TuttiKVStore:
             )
         else:
             raise ValueError(f"未知 tutti_nvme layout：{layout!r}")
+        self._object_pool = ObjectPool(
+            self._layout, pool_config, allocator_enabled=allocator_enabled
+        )
+        self._layout.attach_object_pool(self._object_pool)
         self._opened = False
         self._live: set[bytes] = set()
         self._buffers: dict[int, tuple[int, int]] = {}
         self._mem_cache: dict[tuple[int, int], int] = {}
-        self._targets: dict[str, int] = {}
-        self._target_sizes: dict[str, int] = {}
+        self._targets: dict[str, _TargetCacheEntry] = {}
+        self._inflight_by_chunk: dict[bytes, set[_TuttiCompletion]] = {}
+        self._inflight_lock = threading.Lock()
         self._keepers: list = []  # 持有 ctypes 视图防 GC
         self._next_buffer_id = 0
         self._accel_id = -1
@@ -357,6 +475,59 @@ class TuttiKVStore:
         self._stream_mode = "host"
         self._stream_accel_id = None
         self._execution = "device"
+
+    def begin_rank_commit(self, keys, generations) -> None:
+        """Invalidate this rank's old visibility before overwriting payload."""
+        self._require_open()
+        keys = [bytes(key) for key in keys]
+        if len(keys) != len(list(generations)):
+            raise ValueError("rank commit keys/generations length mismatch")
+        for key in keys:
+            remove_rank_commit(self._root, key)
+
+    def commit_rank_chunks(self, keys, generations) -> None:
+        """Publish one rank record only after all local layer writes succeed."""
+        self._require_open()
+        keys = [bytes(key) for key in keys]
+        generations = list(generations)
+        if len(keys) != len(generations):
+            raise ValueError("rank commit keys/generations length mismatch")
+        if self._key_namespace is None:
+            raise RuntimeError("rank commit requires a key namespace")
+        num_layers = self._layout.layer_span
+        if not num_layers:
+            raise RuntimeError("rank commit requires complete layer geometry")
+        slot_bytes = num_layers * self._segment_bytes
+        marker_token = self._layout.marker_generation()
+        if not marker_token:
+            raise RuntimeError("rank commit requires a marker generation")
+        for key, generation in zip(keys, generations):
+            if not self._layout.pool_chunk_complete(key, num_layers):
+                raise RuntimeError(
+                    f"rank {self._rank_id} chunk {key.hex()} lacks complete markers"
+                )
+            pool_generation = self._layout.target_generation(key)
+            if pool_generation <= 0:
+                raise RuntimeError(
+                    f"rank {self._rank_id} chunk {key.hex()} lacks pool generation"
+                )
+            record = RankCommitRecord(
+                version=1,
+                namespace=self._key_namespace.hex(),
+                chunk_key=key.hex(),
+                generation=str(generation),
+                num_layers=num_layers,
+                slot_bytes=slot_bytes,
+                rank_id=self._rank_id,
+                marker_generation=marker_token,
+                pool_generation=pool_generation,
+            )
+            write_rank_commit(self._root, record)
+
+    def abort_rank_commit(self, keys, generations=None) -> None:
+        """Fail closed for this rank without deleting payload or peer data."""
+        for key in keys:
+            remove_rank_commit(self._root, bytes(key))
 
     # ---------- 生命周期 ----------
 
@@ -498,12 +669,20 @@ class TuttiKVStore:
     def close(self) -> None:
         if not self._opened:
             return
-        self._opened = False
+        self._layout.close_object_pool()
+        try:
+            self._wait_chunk_io(set(self._inflight_by_chunk))
+        except Exception:
+            _LOG.exception("等待对象池 target IO 完成失败；继续关闭句柄")
+        try:
+            self._close_cached_targets(list(self._targets))
+        finally:
+            self._opened = False
         self._live = set()
         self._buffers = {}
         self._mem_cache = {}
         self._targets = {}
-        self._target_sizes = {}
+        self._inflight_by_chunk = {}
         self._keepers = []
         if self._own_runtime and self._runtime is not None:
             try:
@@ -684,15 +863,18 @@ class TuttiKVStore:
         self._require_open()
         entries = self._normalize(batch, require_live=False)
         io_keys = [io_key for io_key, _, _ in entries]
-        self._layout.prepare_put(io_keys, self._num_chunks)  # 容量不足 → ValueError
-        self._invalidate_stale_targets(entries)
+        chunk_ids = tuple(dict.fromkeys(
+            decode_io_key(io_key)[0] for io_key in io_keys
+        ))
+        self._layout.prepare_put(io_keys, self._num_chunks)
+        targets = self._ensure_targets(entries)
         requests = []
         for io_key, buffer_id, offset in entries:
             chunk_id, layer = decode_io_key(io_key)
             uri = self._layout.target_uri(chunk_id)
             requests.append(
                 (
-                    self._target(uri, self._layout.target_size(chunk_id)),
+                    targets[uri],
                     layer * self._segment_bytes,
                     self._mem_for(buffer_id),
                     offset,
@@ -702,21 +884,26 @@ class TuttiKVStore:
             )
         with nvtx_range(f"tutti.runtime.submit|op=write|requests={len(requests)}"):
             handles = self._submit_retry(requests, "write")
-        return _TuttiCompletion(
+        completion = _TuttiCompletion(
             self._runtime, handles, lambda ok: self._on_put_settled(ok, io_keys)
         )
+        self._track_completion(completion, chunk_ids)
+        return completion
 
     def get_batch(self, batch) -> _TuttiCompletion:
         self._require_open()
         entries = self._normalize(batch, require_live=True)
-        self._invalidate_stale_targets(entries)
+        targets = self._ensure_targets(entries)
+        chunk_ids = tuple(dict.fromkeys(
+            decode_io_key(io_key)[0] for io_key, _, _ in entries
+        ))
         requests = []
         for io_key, buffer_id, offset in entries:
             chunk_id, layer = decode_io_key(io_key)
             uri = self._layout.target_uri(chunk_id)
             requests.append(
                 (
-                    self._target(uri, self._layout.target_size(chunk_id)),
+                    targets[uri],
                     layer * self._segment_bytes,
                     self._mem_for(buffer_id),
                     offset,
@@ -726,7 +913,81 @@ class TuttiKVStore:
             )
         with nvtx_range(f"tutti.runtime.submit|op=read|requests={len(requests)}"):
             handles = self._submit_retry(requests, "read")
-        return _TuttiCompletion(self._runtime, handles, lambda ok: None)
+        completion = _TuttiCompletion(
+            self._runtime, handles, lambda _ok: None
+        )
+        self._track_completion(completion, chunk_ids)
+        return completion
+
+    def submit_step(self, layer_batches, direction: str,
+                    staging_depth: int) -> TuttiStepCompletion:
+        """Submit all layer/chunk IO as one device feeder operation."""
+        self._require_open()
+        if direction not in ("read", "write"):
+            raise ValueError(f"未知 step IO 方向：{direction!r}")
+        normalized = [
+            self._normalize(batch, require_live=direction == "read")
+            for batch in layer_batches
+        ]
+        flat = [entry for layer in normalized for entry in layer]
+        if not flat:
+            raise ValueError("step feeder batch 不能为空")
+        io_keys = [entry[0] for entry in flat]
+        chunk_ids = tuple(dict.fromkeys(
+            decode_io_key(io_key)[0] for io_key in io_keys
+        ))
+        if direction == "write":
+            self._layout.prepare_put(io_keys, self._num_chunks)
+        try:
+            targets = self._ensure_targets(flat)
+            requests_by_layer = []
+            for entries in normalized:
+                requests = []
+                for io_key, buffer_id, offset in entries:
+                    chunk_id, layer = decode_io_key(io_key)
+                    uri = self._layout.target_uri(chunk_id)
+                    requests.append((
+                        targets[uri], layer * self._segment_bytes,
+                        self._mem_for(buffer_id), offset,
+                        self._segment_bytes, direction,
+                    ))
+                requests_by_layer.append(requests)
+            result = self._runtime.submit_step(
+                requests_by_layer, staging_depth=staging_depth,
+                accel_id=self._accel_id,
+                stream=self._stream_for(direction)[0],
+                execution=self._execution,
+            )
+            if (result.io_handle is None or not result.status_ok or
+                    not all(result.initial_states or [])):
+                raise RuntimeError(
+                    f"tutti step submit 未完整受理：{result.status_msg}"
+                )
+        except Exception:
+            if direction == "write":
+                self._close_cached_targets([
+                    self._layout.target_uri(chunk_id) for chunk_id in chunk_ids
+                ])
+                self._layout.abort_uncommitted(chunk_ids)
+            raise
+        submitted = _SubmittedHandle(
+            int(result.io_handle), tuple(range(len(flat)))
+        )
+        settled = (
+            (lambda ok: self._on_put_settled(ok, io_keys))
+            if direction == "write" else (lambda _ok: None)
+        )
+        # Per-layer feeder callbacks own progress until every callback gate has
+        # been published. A whole-op watcher started here can repeatedly take
+        # Runtime's registry mutex and starve the last wait/signal gate.
+        completion = _TuttiCompletion(
+            self._runtime, [submitted], settled, auto_watch=False
+        )
+        self._track_completion(completion, chunk_ids)
+        return TuttiStepCompletion(
+            self._runtime, submitted, completion, len(normalized),
+            staging_depth, direction,
+        )
 
     def drop(self, keys) -> None:
         self._require_open()
@@ -736,15 +997,13 @@ class TuttiKVStore:
             chunk_id, _ = decode_io_key(key)  # 类型/非空校验
             io_keys.append(bytes(key))
             chunk_ids.add(chunk_id)
+        released = self._layout.releasable_chunks(io_keys)
+        self._wait_chunk_io(released)
+        self._close_cached_targets(
+            [self._layout.target_uri(chunk_id) for chunk_id in released]
+        )
         self._layout.drop(io_keys)
         self._live.difference_update(io_keys)
-        # Dropping the last layer unlinks the backing file(s).  Do not reuse
-        # a runtime target ticket that still owns the old unlinked inode when
-        # the same chunk is written again.
-        for chunk_id in chunk_ids:
-            uri = self._layout.target_uri(chunk_id)
-            self._targets.pop(uri, None)
-            self._target_sizes.pop(uri, None)
 
     def scan(self):
         self._require_open()
@@ -769,8 +1028,20 @@ class TuttiKVStore:
         self._key_namespace = bytes(namespace)
 
     def set_layer_span(self, num_layers: int) -> None:
-        """声明层宽（bind 后由引擎注入）：数据文件按层宽全尺寸预分配。"""
+        """Bind rank-local geometry and synchronously create initial slots."""
         self._layout.set_layer_span(num_layers)
+
+    def object_pool_snapshot(self) -> dict | None:
+        return self._layout.object_pool_snapshot()
+
+    def abort_chunks(self, chunk_ids) -> None:
+        """Rollback incomplete chunks after the step has drained all IO."""
+        chunks = tuple(dict.fromkeys(bytes(chunk_id) for chunk_id in chunk_ids))
+        self._wait_chunk_io(chunks)
+        self._close_cached_targets(
+            [self._layout.target_uri(chunk_id) for chunk_id in chunks]
+        )
+        self._layout.abort_uncommitted(chunks)
 
     # ---------- 内部 ----------
 
@@ -796,38 +1067,86 @@ class TuttiKVStore:
             entries.append((bytes(io_key), buffer_id, offset))
         return entries
 
-    def _target(self, uri: str, target_size: int | None = None) -> int:
-        ticket = self._targets.get(uri)
-        if ticket is None:
-            ticket = self._runtime.open_batch([uri])[0]
-            self._targets[uri] = ticket
-            if target_size is not None:
-                self._target_sizes[uri] = target_size
-            elif uri.startswith("file://"):
-                try:
-                    self._target_sizes[uri] = os.stat(uri[len("file://"):]).st_size
-                except OSError:
-                    self._target_sizes[uri] = -1
-            else:
-                self._target_sizes[uri] = -1
-        return ticket
-
-    def _invalidate_stale_targets(self, entries) -> None:
-        """按当前文件尺寸失效过期的 target 票据。
-
-        数据文件随写入逐层增长，runtime 票据在开票时解析文件尺寸——
-        文件增长后旧票据的 target 尺寸过期，写更高层段会被
-        OUT_OF_RANGE 拒绝。组批前按 stat 对账，尺寸变化即弃票重开
-        （旧票据由 runtime 在 shutdown 统一回收，无逐票释放接口）。
-        """
+    def _ensure_targets(self, entries) -> dict[str, int]:
+        descriptors = []
+        seen = set()
+        stale = []
         for io_key, _, _ in entries:
             chunk_id, _ = decode_io_key(io_key)
             uri = self._layout.target_uri(chunk_id)
-            if uri not in self._targets:
+            if uri in seen:
                 continue
-            size_now = self._layout.target_size(chunk_id)
-            if size_now != self._target_sizes.get(uri):
-                self._targets.pop(uri, None)
+            seen.add(uri)
+            size = self._layout.target_size(chunk_id)
+            generation = self._layout.target_generation(chunk_id)
+            cached = self._targets.get(uri)
+            if cached is not None and (
+                cached.size != size or cached.generation != generation
+            ):
+                stale.append(uri)
+                cached = None
+            descriptors.append((uri, size, generation))
+        if stale:
+            self._close_cached_targets(stale)
+        missing = [item for item in descriptors if item[0] not in self._targets]
+        if missing:
+            uris = [uri for uri, _, _ in missing]
+            tickets = self._runtime.open_batch(uris)
+            if len(tickets) != len(uris):
+                raise RuntimeError("Runtime.open_batch returned wrong handle count")
+            for (uri, size, generation), ticket in zip(missing, tickets):
+                self._targets[uri] = _TargetCacheEntry(
+                    int(ticket), int(size), int(generation)
+                )
+        return {uri: self._targets[uri].ticket for uri, _, _ in descriptors}
+
+    def _close_cached_targets(self, uris) -> None:
+        records = [(uri, self._targets[uri]) for uri in dict.fromkeys(uris)
+                   if uri in self._targets]
+        if not records:
+            return
+        tickets = [record.ticket for _, record in records]
+        close_batch = getattr(self._runtime, "close_batch", None)
+        if callable(close_batch):
+            close_batch(tickets)
+        else:
+            close_target = getattr(self._runtime, "close_target", None)
+            if not callable(close_target):
+                raise RuntimeError(
+                    "Runtime must expose close_batch or close_target for target lifecycle"
+                )
+            for ticket in tickets:
+                close_target(ticket)
+        for uri, _ in records:
+            self._targets.pop(uri, None)
+
+    def _track_completion(self, completion, chunk_ids) -> None:
+        chunks = tuple(dict.fromkeys(bytes(chunk_id) for chunk_id in chunk_ids))
+        with self._inflight_lock:
+            for chunk_id in chunks:
+                self._inflight_by_chunk.setdefault(chunk_id, set()).add(completion)
+
+        def done(_result):
+            with self._inflight_lock:
+                for chunk_id in chunks:
+                    active = self._inflight_by_chunk.get(chunk_id)
+                    if active is None:
+                        continue
+                    active.discard(completion)
+                    if not active:
+                        self._inflight_by_chunk.pop(chunk_id, None)
+
+        completion.add_done_callback(done)
+
+    def _wait_chunk_io(self, chunk_ids) -> None:
+        with self._inflight_lock:
+            completions = {
+                completion
+                for chunk_id in chunk_ids
+                for completion in self._inflight_by_chunk.get(chunk_id, ())
+            }
+        for completion in completions:
+            completion.wait_result()
 
     def _mem_for(self, buffer_id: int) -> int:
         addr, size = self._buffers[buffer_id]
@@ -838,6 +1157,14 @@ class TuttiKVStore:
         if ok:
             self._layout.commit_layers(io_keys)
             self._live.update(io_keys)
+            return
+        chunk_ids = tuple(dict.fromkeys(
+            decode_io_key(io_key)[0] for io_key in io_keys
+        ))
+        self._close_cached_targets([
+            self._layout.target_uri(chunk_id) for chunk_id in chunk_ids
+        ])
+        self._layout.abort_uncommitted(chunk_ids)
 
     def _submit_retry(self, requests, direction: str):
         """提交整批；partial-commit 的被拒请求窗口重发。
@@ -848,49 +1175,56 @@ class TuttiKVStore:
         pending = list(enumerate(requests))
         all_rejected_rounds = 0
         rejection_diagnostics = []
-        while pending:
-            result = self._runtime.submit(
-                [request for _, request in pending],
-                accel_id=self._accel_id,
-                stream=self._stream_for(direction)[0],
-                execution=self._execution,
-            )
-            rejected = list(result.rejected or [])
-            # Runtime partial-commit deliberately returns a non-OK status
-            # together with a valid handle for the accepted prefix/subset.
-            # That handle must be drained exactly once; only rejected indices
-            # are retried.  Treating status_ok as all-or-nothing loses issued IO.
-            if result.io_handle is not None:
-                accepted_indices = tuple(
-                    pending[i][0]
-                    for i, accepted in enumerate(result.initial_states or [])
-                    if accepted
+        try:
+            while pending:
+                result = self._runtime.submit(
+                    [request for _, request in pending],
+                    accel_id=self._accel_id,
+                    stream=self._stream_for(direction)[0],
+                    execution=self._execution,
                 )
-                handles.append(_SubmittedHandle(result.io_handle,
-                                                accepted_indices))
-            elif len(rejected) != len(pending):
-                raise RuntimeError(
-                    "tutti submit 返回部分受理状态但缺少 IO handle："
-                    f"{result.status_msg}"
-                )
-            if not rejected:
-                if result.io_handle is None or not result.status_ok:
-                    raise RuntimeError(f"tutti submit 失败：{result.status_msg}")
-                break
-            if len(rejected) == len(pending):
-                all_rejected_rounds += 1
-                rejection_diagnostics.append(
-                    f"round={all_rejected_rounds} pending={len(pending)} "
-                    f"status={result.status_msg}"
-                )
-                if all_rejected_rounds >= 2:
-                    raise RuntimeError(
-                        "partial-commit 连续两轮零接受："
-                        + "; ".join(rejection_diagnostics[-2:])
+                rejected = list(result.rejected or [])
+                # Runtime partial-commit deliberately returns a non-OK status
+                # together with a valid handle for the accepted prefix/subset.
+                # That handle must be drained exactly once; only rejected indices
+                # are retried.  Treating status_ok as all-or-nothing loses issued IO.
+                if result.io_handle is not None:
+                    accepted_indices = tuple(
+                        pending[i][0]
+                        for i, accepted in enumerate(result.initial_states or [])
+                        if accepted
                     )
-            else:
-                all_rejected_rounds = 0
-            pending = [pending[i] for i in rejected]
+                    handles.append(_SubmittedHandle(result.io_handle,
+                                                    accepted_indices))
+                elif len(rejected) != len(pending):
+                    raise RuntimeError(
+                        "tutti submit 返回部分受理状态但缺少 IO handle："
+                        f"{result.status_msg}"
+                    )
+                if not rejected:
+                    if result.io_handle is None or not result.status_ok:
+                        raise RuntimeError(f"tutti submit 失败：{result.status_msg}")
+                    break
+                if len(rejected) == len(pending):
+                    all_rejected_rounds += 1
+                    rejection_diagnostics.append(
+                        f"round={all_rejected_rounds} pending={len(pending)} "
+                        f"status={result.status_msg}"
+                    )
+                    if all_rejected_rounds >= 2:
+                        raise RuntimeError(
+                            "partial-commit 连续两轮零接受："
+                            + "; ".join(rejection_diagnostics[-2:])
+                        )
+                else:
+                    all_rejected_rounds = 0
+                pending = [pending[i] for i in rejected]
+        except Exception:
+            if handles:
+                _TuttiCompletion(
+                    self._runtime, handles, lambda _ok: None
+                ).wait_result()
+            raise
         return handles
 
 

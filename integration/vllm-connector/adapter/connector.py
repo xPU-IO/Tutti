@@ -7,7 +7,8 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, field
 from typing import Any, TYPE_CHECKING
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -134,6 +135,7 @@ def _resolve_geometry(extra: dict, kv_cache_config) -> dict:
                 f"推导值 {derived} 不一致"
             )
         resolved[key] = derived
+    resolved["kv_group_layer_names"] = tuple(layer_names)
     return resolved
 
 
@@ -227,10 +229,20 @@ def _worker_engine_for(vllm_config, extra: dict):
         from stores.registry import create_store
 
         store_spec = extra.get("store") or {"type": "memory", "options": {}}
+        worker_rank = _deployment_rank(vllm_config, worker=True)
         options = _expand_placeholders(
             dict(store_spec.get("options") or {}), vllm_config,
-            rank=_deployment_rank(vllm_config, worker=True),
+            rank=worker_rank,
         )
+        if store_spec["type"] == "tutti_nvme":
+            options.setdefault("rank_id", int(worker_rank))
+            options.setdefault(
+                "tp_size",
+                int(getattr(
+                    getattr(vllm_config, "parallel_config", None),
+                    "tensor_parallel_size", 1,
+                )),
+            )
         segment_bytes = extra["chunk_kv_bytes"] // extra["num_layers"]
         configured_segment = options.get("segment_bytes")
         if configured_segment is not None and configured_segment != segment_bytes:
@@ -278,10 +290,33 @@ def _scheduler_index_for(vllm_config, extra: dict):
         from stores.metadata import create_metadata_store
 
         store_spec = extra.get("store") or {"type": "memory", "options": {}}
-        options = _expand_placeholders(
-            dict(store_spec.get("options") or {}), vllm_config,
-            rank=_deployment_rank(vllm_config),
-        )
+        raw_options = dict(store_spec.get("options") or {})
+        tp_size = int(getattr(
+            getattr(vllm_config, "parallel_config", None),
+            "tensor_parallel_size", 1,
+        ))
+        if store_spec["type"] == "tutti_nvme":
+            metadata_ranks = (
+                list(range(tp_size)) if tp_size > 1
+                else [int(_deployment_rank(vllm_config))]
+            )
+            rank_options = [
+                _expand_placeholders(raw_options, vllm_config, rank=str(rank))
+                for rank in metadata_ranks
+            ]
+            roots = [str(item.get("root", "")) for item in rank_options]
+            if tp_size > 1 and len(set(roots)) != tp_size:
+                raise ValueError(
+                    "TP ranks require distinct metadata roots; include "
+                    "{LOCAL_RANK} in the Tutti root"
+                )
+            options = dict(rank_options[0])
+            options["rank_options"] = rank_options
+            options["tp_size"] = tp_size
+        else:
+            options = _expand_placeholders(
+                raw_options, vllm_config, rank=_deployment_rank(vllm_config)
+            )
         segment_bytes = extra["chunk_kv_bytes"] // extra["num_layers"]
         configured_segment = options.get("segment_bytes")
         if configured_segment is not None and configured_segment != segment_bytes:
@@ -350,6 +385,7 @@ class _ReqMeta:
     load_start_token: int = 0   # 加载区间起点（vLLM 已计 token 数）
     save_chunk_start: int = 0
     save_chunk_count: int = 0
+    save_generations: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -410,7 +446,7 @@ class TuttiConnectorV1(KVConnectorBase_V1):
                 self._engine,
                 max_in_flight_layers=extra.get("max_in_flight_layers"),
                 lookahead_k=extra.get(
-                    "lookahead_k", extra.get("prefetch_k", 1)
+                    "lookahead_k", extra.get("prefetch_k", 2)
                 ),
             )
             self._impl.configure(
@@ -419,8 +455,9 @@ class TuttiConnectorV1(KVConnectorBase_V1):
                 max_chunks_per_wave=extra["max_chunks_per_wave"],
                 block_size=self._block_size,
                 lookahead_k=extra.get(
-                    "lookahead_k", extra.get("prefetch_k", 1)
+                    "lookahead_k", extra.get("prefetch_k", 2)
                 ),
+                kv_group_layer_names=extra.get("kv_group_layer_names"),
             )
 
     @property
@@ -610,11 +647,21 @@ class TuttiConnectorV1(KVConnectorBase_V1):
             if plan is None:
                 for meta, _keys in save_specs:
                     meta.save_chunk_start, meta.save_chunk_count = 0, 0
+                    meta.save_generations = []
             else:
                 if not plan.new_keys:
                     # 全部已驻留：本步无需重复写入
                     for meta, _keys in save_specs:
                         meta.save_chunk_start, meta.save_chunk_count = 0, 0
+                        meta.save_generations = []
+                else:
+                    generation_by_key = {
+                        key: uuid.uuid4().hex for key in dict.fromkeys(merged)
+                    }
+                    for meta, keys in save_specs:
+                        meta.save_generations = [
+                            generation_by_key[key] for key in keys
+                        ]
         return TuttiConnectorMetadata(requests=requests)
 
     def request_finished(self, request, block_ids: list[int]) -> tuple[bool, dict[str, Any] | None]:

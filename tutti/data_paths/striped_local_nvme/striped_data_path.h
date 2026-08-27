@@ -44,6 +44,7 @@
 #include <nvm_types.h>
 
 #include <cstdint>
+#include <atomic>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -53,6 +54,7 @@ namespace tutti::data_paths::local_nvme {
 class NvmeQueueGroup;
 struct DeviceTargetHandle;
 struct EntryCompletionStatus;
+struct StepFeederLayer;
 } // namespace tutti::data_paths::local_nvme
 
 namespace tutti::data_paths::striped_local_nvme {
@@ -153,6 +155,11 @@ public:
     Result<ProgressResult> progress(ProgressBudget budget) override;
     Result<DataPathSnapshot> query(DataPathOp op) const override;
     Status release(DataPathOp op) override;
+    Result<FeederLayerState> wait_feeder_layer(
+        DataPathOp op, std::uint32_t layer,
+        std::uint64_t timeout_ms) override;
+    Status signal_feeder_layer(
+        DataPathOp op, std::uint32_t layer, cudaStream_t stream) override;
 
     // ---- test-only accessors ----
     std::uint32_t test_num_devices() const {
@@ -304,6 +311,16 @@ private:
         std::vector<tutti::data_paths::local_nvme::PrpBufRef> prp_buf_refs;
 
         bool has_timeout = false;
+        local_nvme::StepFeederLayer* d_feeder_layers = nullptr;
+        std::uint32_t* h_feeder_ready = nullptr;
+        std::uint32_t* d_feeder_ready = nullptr;
+        std::uint32_t* h_feeder_release = nullptr;
+        std::uint32_t* d_feeder_release = nullptr;
+        std::uint32_t feeder_layer_count = 0;
+        std::uint32_t feeder_staging_depth = 0;
+        bool feeder_is_read = false;
+        void* feeder_poll_stream = nullptr;
+        std::shared_ptr<std::atomic<bool>> feeder_event_recorded;
 
         std::uint64_t target_token = 0;
         // P0-2 fix: collect ALL accepted requests' memory tokens so

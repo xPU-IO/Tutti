@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from engine.core import KVEngine, LoadGateError, _PostCompletion
+from engine.core import KVEngine, LoadGateError, _EngineStepIO, _PostCompletion
 from engine.staging import RingWindow
 from engine.transfer import DirectTransferUnavailable
 from index.chunk_index import chunk_key_of, derive_io_key, layer_of
@@ -37,6 +37,120 @@ def _segment_bytes(chunk_i: int, layer: int) -> bytes:
     """每个 (chunk, layer) 的层段内容：首字节作标记，其余填充。"""
     marker = (chunk_i * 37 + layer * 11) & 0xFF
     return bytes([marker]) + bytes([marker ^ 0xFF]) * (SEG - 1)
+
+
+def test_step_read_failure_never_scatters():
+    class Inner:
+        staging_depth = 2
+        layer_count = 3
+
+        @staticmethod
+        def wait_layer(_layer):
+            return False
+
+        @staticmethod
+        def drain(_stream=0):
+            return None
+
+    class Engine:
+        def __init__(self):
+            self.scatter_calls = 0
+            self._store = object()
+
+            def scatter(*_args):
+                self.scatter_calls += 1
+
+            self._scatter_hook = scatter
+
+    engine = Engine()
+    step = _EngineStepIO(
+        Inner(), engine, [b"k" * 16], [[0]], [[0], [1], [0]], "read",
+        [0, 1, 2],
+    )
+    with pytest.raises(LoadGateError):
+        step.wait_layer(0, 0)
+    assert engine.scatter_calls == 0
+
+
+class _CallbackInner:
+    staging_depth = 2
+
+    def __init__(self, layer_count):
+        self.layer_count = layer_count
+        self.waits = []
+        self.signals = []
+        self.drains = 0
+        self.whole_waits = 0
+
+    def wait_layer(self, callback):
+        self.waits.append(callback)
+        return True
+
+    def signal_layer(self, callback, stream):
+        self.signals.append(callback)
+
+    def drain(self, stream=0):
+        self.drains += 1
+
+    def wait(self):
+        self.whole_waits += 1
+
+    def wait_result(self):
+        self.whole_waits += 1
+
+
+class _CallbackEngine:
+    def __init__(self):
+        self.scatter = []
+        self._transfer = None
+        self._scatter_hook = self._scatter
+
+    def _scatter(self, keys, physical, block_tables, slots):
+        self.scatter.append((physical, tuple(slots)))
+
+
+def _callback_step(physical_layers):
+    inner = _CallbackInner(len(physical_layers))
+    engine = _CallbackEngine()
+    slots = [[callback] for callback in range(len(physical_layers))]
+    step = _EngineStepIO(
+        inner, engine, [b"k" * 16], [[0]], slots, "read",
+        physical_layers,
+    )
+    return step, inner, engine
+
+
+def test_step_callback_subset_maps_to_physical_ordinals():
+    step, inner, engine = _callback_step([1, 3])
+    step.wait_layer(0, 1)
+    step.wait_layer(1, 3)
+    step.wait()
+    assert [item[0] for item in engine.scatter] == [1, 3]
+    assert inner.waits == [0, 1]
+    assert step.pending_callbacks == ()
+
+
+def test_step_duplicate_callback_is_idempotent():
+    step, inner, engine = _callback_step([2])
+    step.wait_layer(0, 2)
+    step.wait_layer(0, 2)
+    assert inner.waits == [0]
+    assert len(engine.scatter) == 1
+
+
+def test_step_out_of_order_callback_fails_and_drains():
+    step, inner, _engine = _callback_step([0, 1, 2])
+    with pytest.raises(RuntimeError, match="out-of-order callback"):
+        step.wait_layer(1, 1)
+    assert inner.drains == 1
+
+
+def test_step_missing_callback_fails_and_drains_at_finalize():
+    step, inner, _engine = _callback_step([0, 1])
+    step.wait_layer(0, 0)
+    with pytest.raises(RuntimeError, match="missing feeder callbacks"):
+        step.wait()
+    assert inner.drains == 1
 
 
 class MovingHooks:
@@ -99,6 +213,7 @@ class StoreSpy:
     def __init__(self, inner):
         self._inner = inner
         self.dropped: list[list[bytes]] = []
+        self.aborted: list[list[bytes]] = []
         self.register_calls: list[int] = []
 
     @property
@@ -124,6 +239,9 @@ class StoreSpy:
     def drop(self, keys):
         self.dropped.append(list(keys))
         self._inner.drop(keys)
+
+    def abort_chunks(self, keys):
+        self.aborted.append(list(keys))
 
     def scan(self):
         return self._inner.scan()
@@ -316,7 +434,18 @@ class TestRoundtrip:
             engine.load_layer(keys, layer, dst_first_blocks=50 + layer).wait()
         for layer in range(NUM_LAYERS):
             for i, k in enumerate(keys):
-                assert hooks.sink[(k, layer)] == _segment_bytes(i + 1, layer)
+                    assert hooks.sink[(k, layer)] == _segment_bytes(i + 1, layer)
+
+    def test_failed_store_plan_rolls_back_physical_chunks_at_settlement(self):
+        store = StoreSpy(MemoryKVStore(SEG, NUM_CHUNKS))
+        engine, _, _ = _make_engine(store)
+        keys = _chunk_keys(engine, 91, 2)
+        assert engine.plan_store(keys).new_keys == keys
+
+        engine.confirm_store(keys, ok=False)
+
+        assert store.aborted == [keys]
+        assert not engine.store_plan_pending(keys)
 
     def test_load_completion_runs_scatter_on_wait(self):
         store = MemoryKVStore(SEG, NUM_CHUNKS)

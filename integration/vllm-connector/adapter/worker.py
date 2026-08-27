@@ -7,7 +7,9 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
+import time
 
 import torch
 from tutti_kv_transfer import (
@@ -250,7 +252,7 @@ class WorkerImpl:
         if lookahead_k is None:
             engine_config = getattr(engine, "_config", {})
             lookahead_k = engine_config.get(
-                "lookahead_k", engine_config.get("prefetch_k", 1)
+                "lookahead_k", engine_config.get("prefetch_k", 2)
             )
         if not isinstance(lookahead_k, int) or isinstance(lookahead_k, bool) \
                 or lookahead_k <= 0:
@@ -278,6 +280,7 @@ class WorkerImpl:
         self._load_keys: list[bytes] = []
         self._load_block_tables: list[list[int]] = []
         self._load_handles: dict[int, object] = {}
+        self._load_step = None
         self._pinned = False
         self._load_failed = False
         self._load_error_blocks: set[int] = set()
@@ -285,8 +288,17 @@ class WorkerImpl:
         # wait/save 两次调用凭此解析一致）
         self._name_to_idx: dict[str, int] = {}
         self._save_keys: list[bytes] | None = None
+        self._save_generations: list[str] = []
         self._save_block_tables: list[list[int]] = []
         self._save_inflight: list = []
+        self._write_step = None
+        self._kv_group_layer_names: tuple[str, ...] = ()
+        self._callback_to_physical: tuple[int, ...] = ()
+        self._callback_by_name: dict[str, int] = {}
+        self._physical_by_name: dict[str, int] = {}
+        self._diag_enabled = os.environ.get("TUTTI_FEEDER_DIAGNOSTICS") == "1"
+        self._diag_wait_sequence: list[str] = []
+        self._diag_save_sequence: list[str] = []
 
     # ---- 配置与登记 ----
 
@@ -297,6 +309,7 @@ class WorkerImpl:
         max_chunks_per_wave: int,
         block_size: int,
         lookahead_k: int | None = None,
+        kv_group_layer_names=None,
     ) -> None:
         """注入编排所需的几何参数（由挂载点从配置读出）。
 
@@ -314,6 +327,13 @@ class WorkerImpl:
                 )
             self._lookahead_k = lookahead_k
         self._block_size = block_size
+        if kv_group_layer_names is not None:
+            self._kv_group_layer_names = tuple(kv_group_layer_names)
+        if self._diag_enabled:
+            _LOG.warning(
+                "FEEDER_DIAG config t_ns=%d kv_group_layer_names=%r",
+                time.monotonic_ns(), self._kv_group_layer_names,
+            )
         # 已有登记且尚未绑定 → 立即补绑（见 register_kv_caches 的时序说明）
         if (self._kv_caches or self._cross_pool is not None) and not self._bound:
             self._ensure_bound()
@@ -365,6 +385,9 @@ class WorkerImpl:
         self._load_keys = []
         self._load_block_tables = []
         self._load_handles = {}
+        self._load_step = None
+        self._diag_wait_sequence = []
+        self._diag_save_sequence = []
         self._pinned = False
         keys: list[bytes] = []
         block_tables: list[list[int]] = []
@@ -400,7 +423,16 @@ class WorkerImpl:
                 f"|chunks={len(keys)}|K={self._lookahead_k}"
             ):
                 try:
-                    self._prefetch_load_layers(0)
+                    step_factory = getattr(self._engine, "start_step_io", None)
+                    if (callable(step_factory) and
+                            getattr(self._engine, "supports_step_io", False)):
+                        self._load_step = step_factory(
+                            self._load_keys, self._load_block_tables,
+                            "read", self._lookahead_k,
+                            physical_layers=self._callback_to_physical,
+                        )
+                    else:
+                        self._prefetch_load_layers(0)
                 except Exception:
                     self._mark_load_failure()
                     self._abort_step()
@@ -408,7 +440,20 @@ class WorkerImpl:
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """等待指定层读取完成，并预取下一层。"""
-        idx = self._resolve_layer(layer_name)
+        callback, idx = self._resolve_callback(layer_name)
+        self._diag_callback("wait", layer_name, callback, idx)
+        if self._load_step is not None:
+            try:
+                with nvtx_range(f"tutti.request.wait_load|layer={idx}"):
+                    self._load_step.wait_layer(callback, idx)
+            except LoadGateError as exc:
+                self._mark_load_failure(exc)
+                self._abort_step()
+                return
+            if idx == self._num_layers - 1 and self._pinned:
+                self._engine.unpin(self._load_keys)
+                self._pinned = False
+            return
         handle = self._load_handles.pop(idx, None)
         if handle is not None:
             try:
@@ -453,9 +498,11 @@ class WorkerImpl:
         if self._load_failed:
             return
         self._ensure_bound()
-        idx = self._resolve_layer(layer_name)
+        callback, idx = self._resolve_callback(layer_name)
+        self._diag_callback("save", layer_name, callback, idx)
         if self._save_keys is None:
             keys: list[bytes] = []
+            generations: list[str] = []
             block_tables: list[list[int]] = []
             for meta in getattr(self._metadata, "requests", []) or []:
                 if meta.save_chunk_count <= 0:
@@ -464,6 +511,16 @@ class WorkerImpl:
                 start = meta.save_chunk_start
                 end = start + meta.save_chunk_count
                 keys.extend(req_keys[start:end])
+                meta_generations = list(
+                    getattr(meta, "save_generations", None) or []
+                )
+                if meta_generations and len(meta_generations) != end - start:
+                    raise RuntimeError(
+                        "scheduler save generation count does not match chunks"
+                    )
+                generations.extend(
+                    meta_generations or [""] * (end - start)
+                )
                 block_tables.extend(self._chunk_block_tables(meta, end)[start:end])
             if keys:
                 plan = self._engine.plan_store(keys)
@@ -477,12 +534,38 @@ class WorkerImpl:
                             self._engine.capacity_chunks, len(keys),
                         )
                         keys = []
+                        generations = []
                         block_tables = []
             self._save_keys = keys
+            self._save_generations = generations
             self._save_block_tables = block_tables
             if not keys:
                 return
+            try:
+                self._engine.begin_rank_commit(keys, generations)
+            except Exception:
+                self._abort_step()
+                raise
         if not self._save_keys:
+            return
+        if self._write_step is None:
+            step_factory = getattr(self._engine, "start_step_io", None)
+            if (callable(step_factory) and
+                    getattr(self._engine, "supports_step_io", False)):
+                self._write_step = step_factory(
+                    self._save_keys, self._save_block_tables,
+                    "write", self._lookahead_k,
+                    physical_layers=self._callback_to_physical,
+                )
+        if self._write_step is not None:
+            try:
+                with nvtx_range(
+                    f"tutti.request.save|layer={idx}|chunks={len(self._save_keys)}"
+                ):
+                    self._write_step.publish_layer(callback, idx)
+            except Exception:
+                self._abort_step()
+                raise
             return
         try:
             # The DataPath counts an operation as in-flight until progress/wait
@@ -506,6 +589,11 @@ class WorkerImpl:
     def wait_for_save(self) -> None:
         """等待全部写入完成并结算。"""
         first_error = None
+        if self._write_step is not None:
+            try:
+                self._write_step.wait()
+            except Exception as exc:
+                first_error = exc
         for handle in self._save_inflight:
             try:
                 handle.wait()
@@ -523,9 +611,25 @@ class WorkerImpl:
             if first_error is None:
                 first_error = exc
         if self._save_keys:
+            if first_error is None:
+                try:
+                    self._engine.commit_rank_chunks(
+                        self._save_keys, self._save_generations
+                    )
+                except Exception as exc:
+                    first_error = exc
+            if first_error is not None:
+                try:
+                    self._engine.abort_rank_commit(
+                        self._save_keys, self._save_generations
+                    )
+                except Exception:
+                    pass
             self._engine.confirm_store(self._save_keys, ok=first_error is None)
         self._save_inflight = []
+        self._write_step = None
         self._save_keys = None
+        self._save_generations = []
         self._save_block_tables = []
         if first_error is not None:
             raise first_error
@@ -595,6 +699,13 @@ class WorkerImpl:
             except Exception as exc:
                 if first_error is None:
                     first_error = exc
+        if self._load_step is not None:
+            try:
+                self._load_step.wait_result()
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+            self._load_step = None
         if self._pinned:
             try:
                 self._engine.unpin(self._load_keys)
@@ -616,11 +727,26 @@ class WorkerImpl:
         self._finalize_load_state(suppress_errors=True)
         if self._save_keys:
             try:
+                self._engine.abort_rank_commit(
+                    self._save_keys, self._save_generations
+                )
+            except Exception:
+                pass
+            try:
                 self._engine.confirm_store(self._save_keys, ok=False)
             except Exception:
                 pass
         self._save_inflight = []
+        for step in (self._load_step, self._write_step):
+            if step is not None:
+                try:
+                    step.drain()
+                except Exception:
+                    pass
+        self._load_step = None
+        self._write_step = None
         self._save_keys = None
+        self._save_generations = []
         self._save_block_tables = []
 
     def _mark_load_failure(self, error=None) -> None:
@@ -642,6 +768,36 @@ class WorkerImpl:
                 self._load_error_blocks.update(blocks)
             elif blocks is not None:
                 self._load_error_blocks.add(blocks)
+
+    def _diag_callback(self, direction: str, layer_name: str,
+                       callback: int, physical: int) -> None:
+        if not self._diag_enabled:
+            return
+        sequence = (self._diag_wait_sequence if direction == "wait"
+                    else self._diag_save_sequence)
+        sequence.append(layer_name)
+        _LOG.warning(
+            "FEEDER_DIAG callback t_ns=%d direction=%s callback_index=%d "
+            "callback_ordinal=%d physical_ordinal=%d layer_name=%s",
+            time.monotonic_ns(), direction, len(sequence) - 1, callback,
+            physical, layer_name,
+        )
+
+    def _resolve_callback(self, layer_name: str) -> tuple[int, int]:
+        callback = self._callback_by_name.get(layer_name)
+        if callback is not None:
+            return callback, self._callback_to_physical[callback]
+        physical = self._resolve_layer(layer_name)
+        if not self._callback_to_physical:
+            return physical, physical
+        try:
+            callback = self._callback_to_physical.index(physical)
+        except ValueError as exc:
+            raise ValueError(
+                f"physical KV layer {physical} has no feeder callback: "
+                f"{layer_name!r}"
+            ) from exc
+        return callback, physical
 
     def _chunk_block_tables(self, meta, count: int) -> list[list[int]]:
         """计算前 count 个 chunk 各自的块号表（块号可任意分布）。"""
@@ -670,6 +826,9 @@ class WorkerImpl:
         登记模式下列表未收录的层名、任何越界结果均抛错——
         层号错位会静默写错层，宁可失败。
         """
+        exact = self._physical_by_name.get(layer_name)
+        if exact is not None:
+            return exact
         if self._kv_caches:
             try:
                 return self._layer_names.index(layer_name)
@@ -692,6 +851,44 @@ class WorkerImpl:
                 f"（层数 {self._num_layers}）"
             )
         return idx
+
+    def _configure_callback_map(self, num_layers: int) -> None:
+        """Separate callback order from physical KV-cache ordinal."""
+        physical_names = tuple(self._layer_names)
+        if not physical_names and len(self._kv_group_layer_names) == num_layers:
+            physical_names = self._kv_group_layer_names
+        self._physical_by_name = {
+            name: ordinal for ordinal, name in enumerate(physical_names)
+        }
+
+        callback_names = self._kv_group_layer_names or physical_names
+        callback_to_physical = []
+        for callback, name in enumerate(callback_names):
+            physical = self._physical_by_name.get(name)
+            if physical is None:
+                match = _LAYER_NAME_RE.search(name)
+                if match:
+                    physical = int(match.group(1))
+            if physical is None or not 0 <= physical < num_layers:
+                raise ValueError(
+                    f"callback layer {name!r} cannot map to physical KV layer"
+                )
+            callback_to_physical.append(physical)
+        if not callback_to_physical:
+            callback_to_physical = list(range(num_layers))
+        if len(set(callback_to_physical)) != len(callback_to_physical):
+            raise ValueError("callback plan maps multiple names to one physical layer")
+        self._callback_to_physical = tuple(callback_to_physical)
+        self._callback_by_name = {
+            name: callback for callback, name in enumerate(callback_names)
+        }
+        if self._diag_enabled:
+            _LOG.warning(
+                "FEEDER_DIAG callback_map t_ns=%d physical_count=%d "
+                "callback_count=%d callback_to_physical=%r",
+                time.monotonic_ns(), num_layers,
+                len(self._callback_to_physical), self._callback_to_physical,
+            )
 
     def _ensure_bound(self) -> None:
         """惰性绑定：分配 staging 环窗显存并接入引擎（恰一次）。
@@ -723,6 +920,7 @@ class WorkerImpl:
                 f"chunk_kv_bytes({self._chunk_kv_bytes}) 不能按层数"
                 f"({num_layers}) 整分"
             )
+        self._configure_callback_map(num_layers)
         segment_bytes = self._chunk_kv_bytes // num_layers
         # 原 staging 总槽数不变，但静态拆为 read/write 两个 bank。
         # 每个 bank 各容纳 K 个满波；K=1 时同方向下一波在复用前

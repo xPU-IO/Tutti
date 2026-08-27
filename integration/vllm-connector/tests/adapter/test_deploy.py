@@ -148,9 +148,17 @@ class TestLocalRankPlaceholder:
         )
         connector = TuttiConnectorV1(cfg, KVConnectorRole.SCHEDULER, object())
         connector.shutdown()
-        assert captured["root"] == "/mnt/nvme3/pool"
-        assert captured["preset"]["device_id"] == "3"
-        assert captured["preset"]["gpu_id"] == "3"
+        assert captured["root"] == "/mnt/nvme0/pool"
+        assert captured["tp_size"] == 4
+        assert [item["root"] for item in captured["rank_options"]] == [
+            f"/mnt/nvme{rank}/pool" for rank in range(4)
+        ]
+        assert [item["preset"]["device_id"]
+                for item in captured["rank_options"]] == [str(rank)
+                                                          for rank in range(4)]
+        assert [item["preset"]["gpu_id"]
+                for item in captured["rank_options"]] == [str(rank)
+                                                          for rank in range(4)]
 
 
 class TestPresetNormalization:

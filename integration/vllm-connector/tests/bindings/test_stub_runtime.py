@@ -45,6 +45,17 @@ class TestOpenBatch:
         assert all(isinstance(h, int) for h in handles)
         assert len(set(handles)) == 2
 
+    def test_close_target_and_close_batch_invalidate_tickets(self, stub_rt):
+        handles = stub_rt.open_batch(
+            ["file:///tmp/close-a.bin", "file:///tmp/close-b.bin"]
+        )
+        stub_rt.close_target(handles[0])
+        with pytest.raises(RuntimeError, match="unknown target handle"):
+            stub_rt.close_target(handles[0])
+        stub_rt.close_batch([handles[1]])
+        with pytest.raises(RuntimeError, match="unknown target handle"):
+            stub_rt.close_batch([handles[1]])
+
 
 class TestRegisterMemory:
     def test_register_host_memory_returns_int(self, stub_rt):

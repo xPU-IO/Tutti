@@ -290,7 +290,9 @@ class TestGeometryResolution:
             "num_layers": NUM_LAYERS,
             "chunk_kv_bytes": 2 * SEG * NUM_LAYERS,
         }
-        assert _resolve_geometry(extra, self._kv_cache_config()) == extra
+        resolved = _resolve_geometry(extra, self._kv_cache_config())
+        assert {key: resolved[key] for key in extra} == extra
+        assert len(resolved["kv_group_layer_names"]) == NUM_LAYERS
 
     def test_mismatched_explicit_geometry_is_rejected(self):
         extra = {
@@ -416,6 +418,8 @@ class TestCachedStepForkSemantics:
         )])
         meta = h.scheduler.build_connector_meta(so)
         assert meta.requests[0].save_chunk_count == 3
+        assert len(meta.requests[0].save_generations) == 3
+        assert len(set(meta.requests[0].save_generations)) == 3
 
         # ---- decode 步：fork 形态（new_token_ids 空、new_block_ids 嵌套）----
         req.all_token_ids.extend(range(1000, 1000 + CHUNK_TOKENS))  # 活序列增长
@@ -662,15 +666,22 @@ class TestLoadSemantics:
         assert worker._save_inflight == []
         assert worker._load_handles == {}
 
-    def test_save_failure_drains_and_never_publishes_resident(self):
+    @pytest.mark.parametrize(
+        "failure",
+        [RuntimeError("write cq failed"), TimeoutError("write cq timeout")],
+        ids=["failure", "timeout"],
+    )
+    def test_save_failure_drains_and_never_publishes_resident(self, failure):
         class FailedHandle:
             def wait(self):
-                raise RuntimeError("write cq failed")
+                raise failure
 
         class Engine:
             def __init__(self):
                 self.wait_idle_count = 0
                 self.confirm_calls = []
+                self.rank_commit_calls = []
+                self.rank_abort_calls = []
 
             def wait_idle(self):
                 self.wait_idle_count += 1
@@ -678,16 +689,24 @@ class TestLoadSemantics:
             def confirm_store(self, keys, ok=True):
                 self.confirm_calls.append((tuple(keys), ok))
 
+            def commit_rank_chunks(self, keys, generations):
+                self.rank_commit_calls.append((tuple(keys), tuple(generations)))
+
+            def abort_rank_commit(self, keys, generations=None):
+                self.rank_abort_calls.append((tuple(keys), tuple(generations or ())))
+
         from adapter.worker import WorkerImpl
 
         engine = Engine()
         worker = WorkerImpl(engine)
         worker._save_keys = [b"k"]
         worker._save_inflight = [FailedHandle()]
-        with pytest.raises(RuntimeError, match="write cq failed"):
+        with pytest.raises(type(failure), match=str(failure)):
             worker.wait_for_save()
         assert engine.wait_idle_count == 1
         assert engine.confirm_calls == [((b"k",), False)]
+        assert engine.rank_commit_calls == []
+        assert engine.rank_abort_calls == [((b"k",), ())]
         assert worker._save_keys is None
         assert worker._save_inflight == []
 
@@ -870,11 +889,12 @@ class TestEndToEnd:
         assert h.worker._impl.window is not None
         read = h.worker._impl.read_window
         write = h.worker._impl.write_window
-        assert read.num_slots == write.num_slots == MAX_WAVE
+        # Eager step feeder defaults to K=2 staging layers per direction.
+        assert read.num_slots == write.num_slots == 2 * MAX_WAVE
         assert read.slot_base == 0
-        assert write.slot_base == MAX_WAVE
+        assert write.slot_base == 2 * MAX_WAVE
         assert read.buffer is write.buffer
-        assert len(read.buffer) == 2 * MAX_WAVE * (SEG * NUM_LAYERS // NUM_LAYERS)
+        assert len(read.buffer) == 4 * MAX_WAVE * (SEG * NUM_LAYERS // NUM_LAYERS)
 
     def test_max_in_flight_layers_caps(self):
         h = _make_harness(extra={"max_in_flight_layers": 1})

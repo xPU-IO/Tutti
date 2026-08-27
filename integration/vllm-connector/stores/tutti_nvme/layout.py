@@ -27,6 +27,8 @@ import threading
 import time
 from pathlib import Path
 
+from .commit import marker_generation, remove_rank_commit
+
 #: chunk_key 的固定字节长度。
 CHUNK_PREFIX_BYTES = 16
 
@@ -38,6 +40,7 @@ _ZERO_BLOCK = b"\x00" * _EXTEND_BLOCK_BYTES
 _DATA_SUFFIX = ".bin"
 _MARKER_SUFFIX = ".ok"
 _MANIFEST_NAME = "namespace.manifest"
+_OBJECT_POOL_MANIFEST = "object-pool.manifest.json"
 _SCAN_GENERATION_NAME = ".scan-generation"
 
 
@@ -64,7 +67,9 @@ class Layout:
         #: 已知层宽时数据文件首写即全尺寸（层宽未定则按需增长）。
         self.layer_span: int | None = None
         self._chunks_dir = self.root / "chunks"
+        self._free_dir = self.root / "free"
         self._meta_dir = self.root / "meta"
+        self._object_pool = None
         self._scan_signature: tuple[int, int, bytes] | None = None
         self._scan_cache: set[bytes] = set()
 
@@ -77,6 +82,11 @@ class Layout:
         if num_layers <= 0:
             raise ValueError(f"num_layers 必须为正数，得到 {num_layers}")
         self.layer_span = num_layers
+        if self._object_pool is not None:
+            self._object_pool.configure(num_layers, self.segment_bytes)
+
+    def attach_object_pool(self, pool) -> None:
+        self._object_pool = pool
 
     # ---------- 池归属 ----------
 
@@ -93,8 +103,13 @@ class Layout:
         except FileNotFoundError:
             self.root.mkdir(parents=True, exist_ok=True)
             path.write_bytes(namespace)
+            if self._object_pool is not None:
+                self._object_pool.set_namespace(namespace)
             return True
-        return stored == namespace
+        matches = stored == namespace
+        if matches and self._object_pool is not None:
+            self._object_pool.set_namespace(namespace)
+        return matches
 
     # ---------- 命名 ----------
 
@@ -115,10 +130,18 @@ class Layout:
     def marker_file(self, io_key: bytes) -> Path:
         return self._meta_dir / (bytes(io_key).hex() + _MARKER_SUFFIX)
 
+    def marker_generation(self) -> str:
+        return marker_generation(self._meta_dir)
+
+    def remove_rank_commit(self, chunk_id: bytes) -> None:
+        remove_rank_commit(self.root, chunk_id)
+
     # ---------- 生命周期 ----------
 
     def ensure_dirs(self) -> None:
         self._chunks_dir.mkdir(parents=True, exist_ok=True)
+        if self._object_pool is not None:
+            self._free_dir.mkdir(parents=True, exist_ok=True)
         self._meta_dir.mkdir(parents=True, exist_ok=True)
 
     def scan(self) -> set[bytes]:
@@ -187,6 +210,15 @@ class Layout:
                 f"{new_chunks} > 上限 {capacity_chunks}"
             )
 
+        if self._object_pool is not None and self._object_pool.configured:
+            if self.layer_span is None:
+                raise RuntimeError("object pool requires complete layer geometry")
+            if any(layer_count > self.layer_span
+                   for layer_count in grouped.values()):
+                raise ValueError("io_key layer exceeds configured layer span")
+            self._object_pool.allocate(grouped)
+            return decoded
+
         for chunk_id, layer_count in grouped.items():
             path = self.chunk_file(chunk_id)
             need = layer_count * self.segment_bytes
@@ -212,12 +244,151 @@ class Layout:
             chunk_id, _ = decode_io_key(io_key)
             self.marker_file(io_key).unlink(missing_ok=True)
             touched_chunks.add(chunk_id)
+        released = []
         for chunk_id in touched_chunks:
             if any(self._meta_dir.glob(chunk_id.hex() + "*" + _MARKER_SUFFIX)):
                 continue  # 该 chunk 仍有存活层段
-            self.chunk_file(chunk_id).unlink(missing_ok=True)
+            released.append(chunk_id)
+        if self._object_pool is not None and self._object_pool.configured:
+            self._object_pool.recycle(released)
+        else:
+            for chunk_id in released:
+                self.chunk_file(chunk_id).unlink(missing_ok=True)
+        for chunk_id in released:
+            self.remove_rank_commit(chunk_id)
         _bump_scan_generation(self._meta_dir)
         self._scan_signature = None
+
+    def releasable_chunks(self, io_keys) -> set[bytes]:
+        dropping: dict[bytes, set[bytes]] = {}
+        for io_key in io_keys:
+            chunk_id, _ = decode_io_key(io_key)
+            dropping.setdefault(chunk_id, set()).add(bytes(io_key))
+        released = set()
+        for chunk_id, removed in dropping.items():
+            remaining = {
+                bytes.fromhex(path.name[:-len(_MARKER_SUFFIX)])
+                for path in self._meta_dir.glob(
+                    chunk_id.hex() + "*" + _MARKER_SUFFIX
+                )
+                if path.name.endswith(_MARKER_SUFFIX)
+            } - removed
+            if not remaining:
+                released.add(chunk_id)
+        return released
+
+    def target_generation(self, chunk_id: bytes) -> int:
+        if self._object_pool is None or not self._object_pool.configured:
+            return 0
+        generation = self._object_pool.generation(chunk_id)
+        return -1 if generation is None else generation
+
+    def abort_uncommitted(self, chunk_ids) -> None:
+        if self._object_pool is not None and self._object_pool.configured:
+            self._object_pool.abort_uncommitted(chunk_ids)
+
+    def close_object_pool(self) -> None:
+        if self._object_pool is not None:
+            self._object_pool.close()
+
+    def object_pool_snapshot(self) -> dict | None:
+        return None if self._object_pool is None else self._object_pool.snapshot()
+
+    # ---------- object-pool backend ----------
+
+    def pool_manifest_path(self) -> Path:
+        return self.root / _OBJECT_POOL_MANIFEST
+
+    def pool_geometry(self, *, num_layers, segment_bytes, slot_bytes) -> dict:
+        return {
+            "layout": "file_per_chunk",
+            "num_layers": num_layers,
+            "segment_bytes": segment_bytes,
+            "slot_bytes": slot_bytes,
+            "physical_slot_bytes": slot_bytes,
+        }
+
+    def pool_physical_sizes(self, slot_bytes: int) -> tuple[int]:
+        return (slot_bytes,)
+
+    def pool_slot_paths(self, slot: int) -> tuple[Path]:
+        return (self._free_dir / f"{slot:08d}{_DATA_SUFFIX}",)
+
+    def pool_chunk_paths(self, chunk_id: bytes) -> tuple[Path]:
+        return (self.chunk_file(chunk_id),)
+
+    def pool_create_slot(self, slot: int, slot_bytes: int) -> None:
+        path = self.pool_slot_paths(slot)[0]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _append_real_zeros(path, 0, slot_bytes)
+
+    def pool_zero_slot(self, slot: int, slot_bytes: int) -> None:
+        path = self.pool_slot_paths(slot)[0]
+        _rewrite_real_zeros(path, slot_bytes)
+
+    def pool_discover_free_slots(self) -> set[int]:
+        slots = set()
+        if not self._free_dir.is_dir():
+            return slots
+        for path in self._free_dir.glob("*" + _DATA_SUFFIX):
+            try:
+                slots.add(int(path.name[:-len(_DATA_SUFFIX)]))
+            except ValueError:
+                continue
+        return slots
+
+    def pool_discover_chunks(self) -> set[bytes]:
+        chunks = set()
+        if not self._chunks_dir.is_dir():
+            return chunks
+        for path in self._chunks_dir.glob("*" + _DATA_SUFFIX):
+            try:
+                chunks.add(bytes.fromhex(path.name[:-len(_DATA_SUFFIX)]))
+            except ValueError:
+                continue
+        return chunks
+
+    def pool_chunk_complete(self, chunk_id: bytes,
+                            num_layers: int | None = None) -> bool:
+        layers = self.layer_span if num_layers is None else num_layers
+        if not layers:
+            return False
+        expected = {
+            self.marker_file(bytes(chunk_id) + layer.to_bytes(2, "little"))
+            for layer in range(layers)
+        }
+        return all(path.exists() for path in expected)
+
+    def pool_remove_markers(self, chunk_id: bytes) -> None:
+        for path in self._meta_dir.glob(
+            bytes(chunk_id).hex() + "*" + _MARKER_SUFFIX
+        ):
+            path.unlink(missing_ok=True)
+        self.remove_rank_commit(chunk_id)
+
+    @staticmethod
+    def pool_rename_group(sources, destinations) -> None:
+        if len(sources) != len(destinations):
+            raise RuntimeError("object-pool rename group shape mismatch")
+        if not all(path.exists() for path in sources):
+            raise RuntimeError("object-pool source group is incomplete")
+        if any(path.exists() for path in destinations):
+            raise RuntimeError("object-pool destination already exists")
+        completed = []
+        try:
+            for source, destination in zip(sources, destinations):
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(source, destination)
+                completed.append((source, destination))
+        except Exception:
+            for source, destination in reversed(completed):
+                os.replace(destination, source)
+            raise
+
+    @staticmethod
+    def pool_remove_group(paths) -> None:
+        for path in paths:
+            path.unlink(missing_ok=True)
 
 
 def _append_real_zeros(path: Path, start: int, end: int) -> None:
@@ -230,6 +401,18 @@ def _append_real_zeros(path: Path, start: int, end: int) -> None:
         position = start
         while position < end:
             block = min(_EXTEND_BLOCK_BYTES, end - position)
+            handle.write(_ZERO_BLOCK[:block])
+            position += block
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _rewrite_real_zeros(path: Path, size: int) -> None:
+    """Overwrite an existing regular file with real zeros and fsync."""
+    with open(path, "wb") as handle:
+        position = 0
+        while position < size:
+            block = min(_EXTEND_BLOCK_BYTES, size - position)
             handle.write(_ZERO_BLOCK[:block])
             position += block
         handle.flush()

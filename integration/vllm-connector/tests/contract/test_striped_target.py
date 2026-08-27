@@ -60,6 +60,13 @@ class StripedFakeRuntime:
             tickets.append(self._next)
         return tickets
 
+    def close_target(self, ticket):
+        self._targets.pop(ticket, None)
+
+    def close_batch(self, tickets):
+        for ticket in tickets:
+            self.close_target(ticket)
+
     def register_memory(self, addr, size, kind, accel_id=-1, io_granularity=0):
         self._next += 1
         self._memories[self._next] = (addr, size)

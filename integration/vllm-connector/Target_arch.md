@@ -282,6 +282,13 @@ build_connector_meta
 scheduler只做reservation。worker全部写成功后才`confirm_store(ok=True)`；失败
 必须`confirm_store(ok=False)`。
 
+TP部署还要求 all-rank commit：scheduler 为每个 chunk 下发同一逻辑
+generation；每个worker在本rank全部层完成后写rank-local commit record。scheduler
+同时扫描所有rank独立root，只有rank集合、层marker、namespace、slot bytes、
+object-pool generation和逻辑generation全部一致时才恢复resident。任一rank缺失、
+失败或generation不一致都使整个chunk miss；restart只清理不完整commit record，
+不删除其他rank payload/marker。
+
 ## 7. Eager 逐层执行编排
 
 ### 7.1 总时间线
@@ -424,6 +431,29 @@ Hy3有8个KV heads，TP4时每rank持有2个不同KV heads，因此payload不重
 关闭后rename回free pool。slot inode/FIEMAP extent保持稳定，请求热路径不再扩文件
 或fsync。不同rank即使未来PP/HMA导致文件尺寸不同，也各自使用本rank manifest和
 slot size，不要求全局文件等长。scheduler发布公共命中前仍需all-rank commit仲裁。
+
+对象池必须接通Tutti public Runtime生命周期，而不是只改Python文件名：
+
+```text
+allocate batch:
+  ChunkIndex selects unpinned LRU victims
+  wait victim IO terminal
+  Runtime.close(TargetHandle) / close_batch
+  rename victim chunk file -> free slot
+  rename free slots -> new chunk-key files
+  Runtime.open_batch(all missing URIs) exactly once
+  cache returned TargetHandles by URI + slot generation
+```
+
+当前binding虽暴露`open_batch`，但store逐URI调用`open_batch([uri])`，没有真正批量
+打开；binding也尚未暴露target close，Python pop ticket不会释放C++ TargetHandle。
+对象池实现必须先补`close_target/close_batch`，并禁止旧handle跨slot generation
+访问已复用inode。
+
+pool采用`initial_slots/low_watermark/high_watermark/max_slots`。初始化同步创建
+`initial_slots`；free slots降到low watermark时后台真实写零补到high watermark，
+不超过max slots。请求先通过LRU回收已分配slot；仍不足时只允许有界等待后台allocator
+或返回结构化`RESOURCE_EXHAUSTED`，不得在请求线程回退到同步扩文件/fsync。
 
 ## 9. Structured completion
 
@@ -585,10 +615,9 @@ Nsight SQLite证明三条CUDA stream在每个rank上实际分离：Transformer c
 `index_elementwise`/`vectorized_elementwise`是scatter数据搬运，不是模型计算；
 GUI按NVTX projection显示时可能看起来在同一组。
 
-但当前提交粒度仍错误：只完成“单层内chunk融合”，没有step融合。一次A-cold加
-B-80pct在每个rank产生80个read kernel和160个write kernel；TP4合计960个
-`submit_one_kernel`。同时有960次`tutti.runtime.wait`和约319K次
-`cudaEventQuery`。因此当前功能通过不等于一次提交/自动编排通过。
+当前已接通step feeder：K=2时每个rank的B read为40个window kernel，A/B write
+合计80个window kernel；每个step只有一个Runtime/DataPath handle。逐层callback
+只消费/publish gate，whole-op completion在全部callback结束后才开始观察。
 
 目标eager实现不使用CUDA Graph，而使用两个step级设备任务：
 
@@ -623,6 +652,36 @@ host `acquire/wait`。Hy3按实际25/32 chunks、256 KiB segment、`K=2`计算�
 12.5 MiB/rank，write约16 MiB/rank。若要求所有80层read完全同时发出，也可选择
 layer-owned全量staging，代价约500 MiB/rank；必须作为显式高内存模式，而非默认。
 
+### 13.5 真实 Hy3 feeder callback/gate准入
+
+2026-08-27诊断确认Hy3的物理KV层与实际callback都是完整顺序0..79；旧结论中
+“callback缺层”并非根因。真正停滞发生在最后read callback 79：DataPath已经记录
+final event，但step构造时立即启动的whole-op completion watcher与per-layer gate
+API竞争Runtime registry lock，callback无法进入`wait_feeder_layer()`。
+
+当前修复：
+
+- 从`KVCacheConfig.kv_cache_groups[*].layer_names`建立callback ordinal到物理KV
+  ordinal的显式映射；feeder layer plan按callback数构造，不盲改物理层数。
+- 无callback的物理层不创建gate；支持多group前仍在store构造前fail-fast。
+- 重复callback幂等；乱序callback立即drain/fail-fast；finalize发现缺失callback
+  时drain并fail-closed，不留下永久gate。
+- step whole-op watcher延迟到全部callback gate发布后启动。
+- Runtime每次只在registry lock内做一次非阻塞gate probe；PENDING时释放lock后
+  再等待，避免长gate wait阻塞progress/signal。
+
+真实Hy3 TP4 eager A/B及Nsight已通过：B命中6400 tokens并正常退出；每rank
+compute/read/write分别位于stream 19/31/35，read 40、write 80个feeder kernel，
+39/40 read windows同时与compute和write overlap。
+
+这里的“step-level”仅表示一次Runtime/DataPath提交和一个arena lease，不表示一次
+GPU kernel发出全部80层I/O。默认`K=2`复用staging bank，host feeder仍分40个
+window依次启动read kernel；每层read完成后的scatter/reshape由vLLM callback在
+当前compute stream 19上发出。因此Nsight中NVMe read kernel位于独立stream 31，
+但read数据搬运kernel会与模型计算共同出现在stream 19。若目标是所有read I/O
+一次性下发并让scatter也脱离compute stream，需要独立的全量read staging或更大的
+K，以及read-copy stream到compute stream的逐层event桥接；当前实现尚未达到该目标。
+
 ## 14. 当前状态
 
 | 能力 | 状态 |
@@ -645,12 +704,15 @@ layer-owned全量staging，代价约500 MiB/rank；必须作为显式高内存�
 | padded page canonical ABI | 未实现 |
 | GPU PRP fallback清理 | 已实现并通过local/striped真机contract |
 | logical block + driver MDTS切分 | 已实现，256KiB/4MiB真机回归通过 |
-| Runtime窗口自动回压 | 已实现，80层×32 chunk及Hy3 TP4通过 |
+| Runtime窗口自动回压 | 已实现，真实Hy3 K=2 feeder通过 |
 | per-stream compact workspace | 设计完成，未实现 |
 | terminal result有界生命周期 | 未实现 |
 | replacement generation原子切换 | 未实现 |
 | rank-local I/O device placement | 已实现并通过Hy3 TP4复验 |
 | scheduler metadata-only role | 已实现，runtime factory 单测为 0 调用 |
+| TP all-rank commit gate | 已实现，任一rank缺失/异代时整chunk fail-closed |
+| step-level feeder | 已实现；synthetic/local/真实Hy3 TP4/Nsight均通过 |
+| feeder callback ordinal map | 已实现；subset/乱序/重复/缺失合同覆盖 |
 
 ## 15. 验收条件
 

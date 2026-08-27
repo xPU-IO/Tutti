@@ -28,6 +28,7 @@ from stores.tutti_nvme.store import (
     _TuttiCompletion,
     _derive_device_fields,
 )
+from stores.tutti_nvme.commit import read_rank_commit
 
 SEG = 4096
 
@@ -67,6 +68,7 @@ class FakeRuntime:
         self._memories: dict[int, tuple[int, int]] = {}
         self._io_done: set[int] = set()
         self._released: set[int] = set()
+        self._closed_targets: set[int] = set()
         self.register_calls: list[tuple] = []
         self.submit_rounds = 0
         self.shutdown_called = False
@@ -101,6 +103,12 @@ class FakeRuntime:
             self._targets[self._next_ticket] = uri[len("file://"):]
             tickets.append(self._next_ticket)
         return tickets
+
+    def close_target(self, ticket):
+        self._closed_targets.add(ticket)
+
+    def close_batch(self, tickets):
+        self._closed_targets.update(tickets)
 
     def register_memory(self, addr, size, kind, accel_id=-1, io_granularity=0):
         self.register_calls.append((addr, size, kind, accel_id, io_granularity))
@@ -590,6 +598,49 @@ def test_marker_only_after_completion(tmp_path):
     assert store.scan() == []  # 数据已落盘但 marker 未建
     completion.wait()
     assert store.scan() == [key]
+
+
+def test_rank_commit_contains_generation_geometry_and_marker_token(tmp_path):
+    root = tmp_path / "pool"
+    namespace = b"all-rank-commit-test"
+    store = TuttiKVStore(
+        root=root,
+        num_chunks=2,
+        segment_bytes=SEG,
+        runtime=FakeRuntime(),
+        rank_id=2,
+        tp_size=4,
+        initial_slots=1,
+        low_watermark=0,
+        high_watermark=1,
+        max_slots=2,
+        allocator_enabled=False,
+    )
+    store.set_key_namespace(namespace)
+    store.open()
+    store.set_layer_span(2)
+    chunk = b"rank-commit-key!"
+    generation = "scheduler-generation-a"
+    store.begin_rank_commit([chunk], [generation])
+    src = bytearray(2 * SEG)
+    src_id = store.register_buffer(src, SEG)
+    store.put_batch([
+        (io_key(chunk, 0), src_id, 0),
+        (io_key(chunk, 1), src_id, SEG),
+    ]).wait()
+    store.commit_rank_chunks([chunk], [generation])
+
+    record = read_rank_commit(root, chunk)
+    assert record is not None
+    assert record.namespace == namespace.hex()
+    assert record.chunk_key == chunk.hex()
+    assert record.generation == generation
+    assert record.num_layers == 2
+    assert record.slot_bytes == 2 * SEG
+    assert record.rank_id == 2
+    assert record.marker_generation
+    assert record.pool_generation > 0
+    store.close()
 
 
 def test_completion_wait_uses_runtime_notification_without_polling():

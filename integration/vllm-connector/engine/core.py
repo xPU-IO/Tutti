@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+import logging
+import os
+import time
 from typing import Sequence
 
 from engine.staging import RingWindow
@@ -18,6 +21,8 @@ from index.chunk_index import (
 
 # 冷启动恢复时 io_key 分组的来源宽度（chunk key 16 字节 + 层编号 2 字节）
 _IO_KEY_BYTES = 18
+_LOG = logging.getLogger(__name__)
+_FEEDER_DIAG = os.environ.get("TUTTI_FEEDER_DIAGNOSTICS") == "1"
 
 
 class LoadGateError(RuntimeError):
@@ -165,6 +170,136 @@ class _AggregateCompletion:
         return all(handle.query() for handle in self._handles)
 
 
+class _EngineStepIO:
+    """Engine-side layer callbacks over one store feeder completion."""
+
+    def __init__(self, inner, engine, keys, block_tables, slots_by_callback,
+                 direction, physical_layers):
+        self._inner = inner
+        self._engine = engine
+        self._keys = list(keys)
+        self._block_tables = block_tables
+        self._slots = slots_by_callback
+        self._direction = direction
+        self._physical_layers = tuple(physical_layers)
+        self._seen: set[int] = set()
+        self._next_callback = 0
+        self._drained = False
+
+    def wait_layer(self, callback: int, physical: int) -> None:
+        if not self._enter_callback(callback, physical):
+            return
+        if _FEEDER_DIAG:
+            _LOG.warning("FEEDER_DIAG engine gate_wait_begin t_ns=%d direction=read callback=%d physical=%d",
+                         time.monotonic_ns(), callback, physical)
+        if not self._inner.wait_layer(callback):
+            raise LoadGateError(
+                f"step read feeder callback {callback} physical {physical} failed",
+                whole_operation=True,
+            )
+        slots = self._slots[callback]
+        event = None
+        if self._engine._scatter_hook is not None:
+            event = self._engine._scatter_hook(
+                self._keys, physical, self._block_tables, slots
+            )
+        if event is not None:
+            synchronize = getattr(event, "synchronize", None)
+            if callable(synchronize):
+                synchronize()
+        if callback + self._inner.staging_depth < self._inner.layer_count:
+            self._inner.signal_layer(callback, self._current_stream())
+            if _FEEDER_DIAG:
+                _LOG.warning("FEEDER_DIAG engine gate_release_publish t_ns=%d direction=read callback=%d physical=%d",
+                             time.monotonic_ns(), callback, physical)
+        if _FEEDER_DIAG:
+            _LOG.warning("FEEDER_DIAG engine gate_wait_end t_ns=%d direction=read callback=%d physical=%d",
+                         time.monotonic_ns(), callback, physical)
+
+    def publish_layer(self, callback: int, physical: int) -> None:
+        if not self._enter_callback(callback, physical):
+            return
+        # Before overwriting bank layer%K, wait until the feeder consumed L-K.
+        if _FEEDER_DIAG:
+            _LOG.warning("FEEDER_DIAG engine gate_release_wait_begin t_ns=%d direction=write callback=%d physical=%d",
+                         time.monotonic_ns(), callback, physical)
+        self._inner.wait_layer(callback)
+        slots = self._slots[callback]
+        event = None
+        transfer = self._engine._transfer
+        if transfer is not None:
+            event = transfer.gather(
+                self._keys, physical, self._block_tables, slots
+            )
+        if event is not None:
+            # The ready signal is enqueued on the same compute stream after
+            # gather; no host synchronization and no feeder-stream deadlock.
+            pass
+        self._inner.signal_layer(callback, self._current_stream())
+        if _FEEDER_DIAG:
+            _LOG.warning("FEEDER_DIAG engine gate_ready_publish t_ns=%d direction=write callback=%d physical=%d",
+                         time.monotonic_ns(), callback, physical)
+
+    def wait(self):
+        self._require_complete()
+        return self._inner.wait()
+
+    def wait_result(self):
+        self._require_complete()
+        return self._inner.wait_result()
+
+    def drain(self):
+        if self._drained:
+            return None
+        self._drained = True
+        return self._inner.drain(self._current_stream())
+
+    def abort(self):
+        return self.drain()
+
+    @property
+    def pending_callbacks(self) -> tuple[int, ...]:
+        return tuple(i for i in range(len(self._physical_layers))
+                     if i not in self._seen)
+
+    def _enter_callback(self, callback: int, physical: int) -> bool:
+        if callback < 0 or callback >= len(self._physical_layers):
+            self.drain()
+            raise RuntimeError(f"callback ordinal out of range: {callback}")
+        expected_physical = self._physical_layers[callback]
+        if physical != expected_physical:
+            self.drain()
+            raise RuntimeError(
+                f"callback {callback} maps to physical {expected_physical}, "
+                f"got {physical}"
+            )
+        if callback in self._seen:
+            return False
+        if callback != self._next_callback:
+            self.drain()
+            raise RuntimeError(
+                f"out-of-order callback: expected {self._next_callback}, "
+                f"got {callback}"
+            )
+        self._seen.add(callback)
+        self._next_callback += 1
+        return True
+
+    def _require_complete(self) -> None:
+        missing = self.pending_callbacks
+        if missing:
+            self.drain()
+            raise RuntimeError(f"missing feeder callbacks: {missing}")
+
+    @staticmethod
+    def _current_stream() -> int:
+        try:
+            import torch
+            return int(torch.cuda.current_stream().cuda_stream)
+        except Exception:
+            return 0
+
+
 class KVEngine:
     """编排核心：构造注入 store，语义索引自建并做冷启动恢复。
 
@@ -259,6 +394,11 @@ class KVEngine:
     def max_in_flight_operations(self) -> int:
         return self._max_in_flight_operations
 
+    @property
+    def supports_step_io(self) -> bool:
+        return (callable(getattr(self._store, "submit_step", None)) and
+                not isinstance(self._transfer, DirectTransfer))
+
     # ---- 计划态 ----
 
     def lookup_prefix(self, token_ids: Sequence[int]) -> int:
@@ -298,12 +438,31 @@ class KVEngine:
     def confirm_store(self, keys, ok: bool = True) -> None:
         """结算写入计划（转发语义索引）。"""
         self._require_open()
+        if not ok:
+            abort_chunks = getattr(self._store, "abort_chunks", None)
+            if callable(abort_chunks):
+                abort_chunks(keys)
         self._index.confirm_store(keys, ok)
         self._planned_store_keys.difference_update(keys)
 
     def store_plan_pending(self, keys) -> bool:
         """Return whether every key is already reserved by this engine's plan."""
         return all(bytes(key) in self._planned_store_keys for key in keys)
+
+    def begin_rank_commit(self, keys, generations) -> None:
+        begin = getattr(self._store, "begin_rank_commit", None)
+        if callable(begin):
+            begin(keys, generations)
+
+    def commit_rank_chunks(self, keys, generations) -> None:
+        commit = getattr(self._store, "commit_rank_chunks", None)
+        if callable(commit):
+            commit(keys, generations)
+
+    def abort_rank_commit(self, keys, generations=None) -> None:
+        abort = getattr(self._store, "abort_rank_commit", None)
+        if callable(abort):
+            abort(keys, generations)
 
     def pin(self, keys) -> None:
         """对一批 chunk key 加读保护；任一未驻留 → KeyError。"""
@@ -555,6 +714,63 @@ class KVEngine:
         del self._inflight[-len(handles):]
         self._inflight.append(aggregate)
         return aggregate
+
+    def start_step_io(self, keys, block_tables, direction: str, depth: int,
+                      physical_layers=None):
+        """Create one Runtime/DataPath feeder submit for every model layer."""
+        self._require_open()
+        if self._num_layers is None or self._segment_bytes is None:
+            raise RuntimeError("step IO requires a bound engine")
+        keys = list(keys)
+        if not keys:
+            return None
+        window = self._read_window if direction == "read" else self._write_window
+        if len(keys) > window.capacity_per_wave:
+            raise ValueError(
+                "step feeder chunks exceed one staging wave; increase "
+                "max_chunks_per_wave"
+            )
+        if physical_layers is None:
+            physical_layers = tuple(range(self._num_layers))
+        else:
+            physical_layers = tuple(physical_layers)
+        if not physical_layers:
+            return None
+        if (len(set(physical_layers)) != len(physical_layers)
+                or any(not isinstance(layer, int)
+                       or not 0 <= layer < self._num_layers
+                       for layer in physical_layers)):
+            raise ValueError("physical feeder layer plan is invalid")
+        slots_by_layer = []
+        layer_batches = []
+        for callback, physical in enumerate(physical_layers):
+            base = window.slot_base + (
+                callback % depth
+            ) * window.capacity_per_wave
+            slots = [base + index for index in range(len(keys))]
+            slots_by_layer.append(slots)
+            layer_batches.append([
+                (derive_io_key(key, physical),
+                 self._read_staging_buffer_id if direction == "read"
+                 else self._write_staging_buffer_id,
+                 window.slot_offset(slot))
+                for key, slot in zip(keys, slots)
+            ])
+        if _FEEDER_DIAG:
+            _LOG.warning(
+                "FEEDER_DIAG physical_plan t_ns=%d direction=%s "
+                "physical_layer_count=%d callback_count=%d depth=%d "
+                "callback_to_physical=%r",
+                time.monotonic_ns(), direction, self._num_layers,
+                len(physical_layers), depth, physical_layers,
+            )
+        inner = self._store.submit_step(layer_batches, direction, depth)
+        step = _EngineStepIO(
+            inner, self, keys, block_tables, slots_by_layer, direction,
+            physical_layers,
+        )
+        self._inflight.append(step)
+        return step
 
     def wait_idle(self) -> None:
         """等待全部在途批次并 drain read/write 两个 bank。"""

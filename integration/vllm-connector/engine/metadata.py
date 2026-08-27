@@ -8,7 +8,6 @@ from index.chunk_index import (
     ChunkIndex,
     StorePlan,
     chunk_key_of,
-    derive_io_key,
     layer_of,
 )
 
@@ -70,10 +69,10 @@ class SchedulerMetadataIndex:
         if plan is None:
             return None
         self._planned_store_keys.update(plan.new_keys)
-        if plan.evicted_keys:
-            self._store.drop(
-                _expand_io_keys(plan.evicted_keys, self._num_layers)
-            )
+        # Scheduler owns only semantic admission. Every TP worker runs the
+        # same store plan against its rank-local index and performs the
+        # physical target close/object recycle in KVEngine.plan_store(). A
+        # metadata-only process must never unlink worker-owned pool objects.
         return plan
 
     def confirm_store(self, keys, ok: bool = True) -> None:
@@ -119,16 +118,6 @@ def _group_scan(store) -> dict[bytes, set[int]]:
         io_key = bytes(io_key)
         groups.setdefault(chunk_key_of(io_key), set()).add(layer_of(io_key))
     return groups
-
-
-def _expand_io_keys(chunk_keys, num_layers: int) -> list[bytes]:
-    return [
-        derive_io_key(chunk_key, layer)
-        for chunk_key in chunk_keys
-        for layer in range(num_layers)
-    ]
-
-
 def _positive_int(config: dict, key: str) -> int:
     value = config.get(key)
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:

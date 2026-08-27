@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <set>
 #include <stdexcept>
@@ -25,6 +26,16 @@
 namespace tutti::data_paths::local_nvme {
 
 namespace {
+
+bool feeder_diag_enabled() {
+    const char* value = std::getenv("TUTTI_FEEDER_DIAGNOSTICS");
+    return value && std::strcmp(value, "1") == 0;
+}
+
+long long feeder_diag_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 struct NvtxIoStyle {
     const char* label;
@@ -215,6 +226,13 @@ LocalNvmeDataPath::~LocalNvmeDataPath() {
     }
 
     if (has_inflight) {
+        for (auto& [tok, op] : ops_) {
+            if (!op.feeder_event_recorded) continue;
+            for (std::uint32_t layer = 0; layer < op.feeder_layer_count; ++layer) {
+                op.h_feeder_ready[layer] = 1u;
+                op.h_feeder_release[layer] = 1u;
+            }
+        }
         // TEST-ONLY SYNC POINT (drain_inflight_ops_):
         // This cudaStreamSynchronize is in the shutdown drain path, not
         // the production submit/progress path.  It ensures all in-flight
@@ -421,6 +439,66 @@ Status LocalNvmeDataPath::release(DataPathOp op) {
     Status result = release_impl_(op);
     Status restored = guard.restore();
     return restored.ok() ? result : restored;
+}
+
+Result<FeederLayerState> LocalNvmeDataPath::wait_feeder_layer(
+    DataPathOp op, std::uint32_t layer, std::uint64_t timeout_ms) {
+    DeviceGuard guard(static_cast<std::int32_t>(cuda_device_));
+    if (!guard.ok()) return Result<FeederLayerState>::Failure(guard.status());
+    OpEntry* entry = find_op_(op);
+    if (!entry || entry->feeder_layer_count == 0 ||
+        layer >= entry->feeder_layer_count) {
+        return Result<FeederLayerState>::Failure(Status(
+            StatusCode::NOT_FOUND, "step feeder layer not found"));
+    }
+    if (!entry->feeder_is_read && layer < entry->feeder_staging_depth)
+        return FeederLayerState::READY;
+    volatile std::uint32_t* host_flags = entry->feeder_is_read
+        ? entry->h_feeder_ready : entry->h_feeder_release;
+    const std::uint32_t index = entry->feeder_is_read
+        ? layer : layer - entry->feeder_staging_depth;
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(timeout_ms);
+    std::uint32_t value = host_flags[index];
+    if (feeder_diag_enabled())
+        std::fprintf(stderr, "FEEDER_DIAG cpp wait_begin t_ns=%lld backend=local direction=%s layer=%u gate_index=%u value=%u\n",
+                     feeder_diag_ns(), entry->feeder_is_read ? "read" : "write",
+                     layer, index, value);
+    while (value == 0) {
+        if (timeout_ms == 0 || std::chrono::steady_clock::now() >= deadline)
+            return FeederLayerState::PENDING;
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+        value = host_flags[index];
+    }
+    if (!entry->feeder_is_read) return FeederLayerState::READY;
+    if (feeder_diag_enabled())
+        std::fprintf(stderr, "FEEDER_DIAG cpp wait_consume t_ns=%lld backend=local direction=read layer=%u gate_index=%u value=%u\n",
+                     feeder_diag_ns(), layer, index, value);
+    return value == 1 ? FeederLayerState::READY : FeederLayerState::FAILED;
+}
+
+Status LocalNvmeDataPath::signal_feeder_layer(
+    DataPathOp op, std::uint32_t layer, cudaStream_t stream) {
+    DeviceGuard guard(static_cast<std::int32_t>(cuda_device_));
+    if (!guard.ok()) return guard.status();
+    OpEntry* entry = find_op_(op);
+    if (!entry || entry->feeder_layer_count == 0 ||
+        layer >= entry->feeder_layer_count) {
+        return Status(StatusCode::NOT_FOUND, "step feeder layer not found");
+    }
+    std::uint32_t* flag = entry->feeder_is_read
+        ? entry->d_feeder_release + layer
+        : entry->d_feeder_ready + layer;
+    if (feeder_diag_enabled())
+        std::fprintf(stderr, "FEEDER_DIAG cpp signal_enqueue t_ns=%lld backend=local direction=%s layer=%u\n",
+                     feeder_diag_ns(), entry->feeder_is_read ? "read" : "write",
+                     layer);
+    cudaError_t ce = launch_feeder_signal(flag, stream);
+    return ce == cudaSuccess
+        ? Status::Ok()
+        : Status(StatusCode::DEVICE_ERROR,
+                 std::string("signal feeder layer failed: ") +
+                 cudaGetErrorString(ce));
 }
 
 Status LocalNvmeDataPath::initialize_impl_(const DataPathConfig& config,
@@ -648,6 +726,14 @@ Status LocalNvmeDataPath::shutdown_impl_(std::uint64_t timeout_ns) {
             // Zero timeout with in-flight ops → TIMEOUT, retain all resources.
             return Status(StatusCode::TIMEOUT,
                           "shutdown: in-flight operations remain");
+        }
+
+        for (auto& [tok, op] : ops_) {
+            if (!op.feeder_event_recorded) continue;
+            for (std::uint32_t layer = 0; layer < op.feeder_layer_count; ++layer) {
+                op.h_feeder_ready[layer] = 1u;
+                op.h_feeder_release[layer] = 1u;
+            }
         }
 
         // Drain within deadline.
@@ -1606,6 +1692,13 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
         return outcome;
     }
 
+    const bool step_feeder = ctx.step_layer_count > 0;
+    if (step_feeder && has_rejection) {
+        reject_all(StatusCode::INVALID_ARGUMENT,
+                   "step feeder requires all requests to validate");
+        return outcome;
+    }
+
     // Entry count check (after fan-out).
     if (total_entries > max_batch_entries_) {
         reject_all(StatusCode::RESOURCE_EXHAUSTED, "too many sub-IOs (entries)");
@@ -1759,6 +1852,41 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
         total_bytes += pr.total_bytes;
     }
 
+    std::vector<StepFeederLayer> h_feeder_layers;
+    if (step_feeder) {
+        if (!ctx.step_layer_request_offsets || ctx.step_staging_depth == 0 ||
+            ctx.step_layer_request_offsets[0] != 0 ||
+            ctx.step_layer_request_offsets[ctx.step_layer_count] != count) {
+            arena_.release(lease.slot_index);
+            reject_all(StatusCode::INVALID_ARGUMENT,
+                       "invalid step feeder layer offsets/depth");
+            return outcome;
+        }
+        h_feeder_layers.resize(ctx.step_layer_count);
+        std::uint32_t cursor = 0;
+        for (std::uint32_t layer = 0; layer < ctx.step_layer_count; ++layer) {
+            const std::uint32_t begin = ctx.step_layer_request_offsets[layer];
+            const std::uint32_t end = ctx.step_layer_request_offsets[layer + 1];
+            if (begin > end || end > count) {
+                arena_.release(lease.slot_index);
+                reject_all(StatusCode::INVALID_ARGUMENT,
+                           "non-monotonic step feeder offsets");
+                return outcome;
+            }
+            StepFeederLayer plan{cursor, 0};
+            for (std::uint32_t req = begin; req < end; ++req)
+                plan.entry_count += pending[req].entries.size();
+            cursor += plan.entry_count;
+            h_feeder_layers[layer] = plan;
+        }
+        if (cursor != total_entries) {
+            arena_.release(lease.slot_index);
+            reject_all(StatusCode::INTERNAL,
+                       "step feeder entry coverage mismatch");
+            return outcome;
+        }
+    }
+
     // H2D dynamic descriptors to the arena's per-slot descriptor pool,
     // then fix up entry.prp_entry from nullptr sentinel to GPU pointer.
     if (!h_dynamic_descs.empty()) {
@@ -1811,32 +1939,83 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
         return outcome;
     }
 
+    StepFeederLayer* d_feeder_layers = nullptr;
+    std::uint32_t* h_feeder_ready = nullptr;
+    std::uint32_t* d_feeder_ready = nullptr;
+    std::uint32_t* h_feeder_release = nullptr;
+    std::uint32_t* d_feeder_release = nullptr;
+    cudaStream_t feeder_poll_stream = nullptr;
+    auto free_feeder = [&]() {
+        if (d_feeder_layers) cudaFree(d_feeder_layers);
+        if (h_feeder_ready) cudaFreeHost(h_feeder_ready);
+        if (h_feeder_release) cudaFreeHost(h_feeder_release);
+        if (feeder_poll_stream) cudaStreamDestroy(feeder_poll_stream);
+        d_feeder_layers = nullptr;
+        h_feeder_ready = d_feeder_ready = nullptr;
+        h_feeder_release = d_feeder_release = nullptr;
+    };
+    if (step_feeder) {
+        const std::size_t plan_bytes =
+            h_feeder_layers.size() * sizeof(StepFeederLayer);
+        const std::size_t flags_bytes =
+            ctx.step_layer_count * sizeof(std::uint32_t);
+        ce = cudaMalloc(reinterpret_cast<void**>(&d_feeder_layers), plan_bytes);
+        if (ce == cudaSuccess)
+            ce = cudaMemcpyAsync(d_feeder_layers, h_feeder_layers.data(),
+                                 plan_bytes, cudaMemcpyHostToDevice, ctx.stream);
+        if (ce == cudaSuccess)
+            ce = cudaHostAlloc(reinterpret_cast<void**>(&h_feeder_ready),
+                               flags_bytes, cudaHostAllocMapped);
+        if (ce == cudaSuccess)
+            ce = cudaHostAlloc(reinterpret_cast<void**>(&h_feeder_release),
+                               flags_bytes, cudaHostAllocMapped);
+        if (ce == cudaSuccess) {
+            std::memset(h_feeder_ready, 0, flags_bytes);
+            std::memset(h_feeder_release, 0, flags_bytes);
+            ce = cudaHostGetDevicePointer(
+                reinterpret_cast<void**>(&d_feeder_ready), h_feeder_ready, 0);
+        }
+        if (ce == cudaSuccess)
+            ce = cudaHostGetDevicePointer(
+                reinterpret_cast<void**>(&d_feeder_release),
+                h_feeder_release, 0);
+        if (ce != cudaSuccess) {
+            free_feeder();
+            arena_.release(lease.slot_index);
+            for (const auto& ref : prp_cache_refs)
+                prp_cache_.release_checkout(ref.entry);
+            reject_all(StatusCode::DEVICE_ERROR,
+                       "step feeder metadata allocation failed");
+            return outcome;
+        }
+    }
+
     // 6. Launch kernel.
     //    If test injection is active, simulate launch failure (kernel NOT issued).
     cudaError_t launch_err = cudaSuccess;
+    std::uint32_t inject_flag = 0u;
+    if (test_inject_resolve_lba_failure_) inject_flag |= 0x1u;
+    if (test_inject_nvme_error_)          inject_flag |= 0x2u;
     if (test_inject_launch_failure_) {
         launch_err = cudaErrorUnknown;
     } else {
         // FIX 1: inject_flag is a scalar passed by value — no per-op device
         // allocation.  bit0 = resolve_lba failure, bit1 = synthesize NVMe CQ
         // error (both test-only; production path is inject_flag == 0).
-        std::uint32_t inject_flag = 0u;
-        if (test_inject_resolve_lba_failure_) inject_flag |= 0x1u;
-        if (test_inject_nvme_error_)          inject_flag |= 0x2u;
-
         const NvtxIoStyle nvtx_style = nvtx_io_style(requests, count);
         nvtx_push_io(nvtx_style);
         // Keep the legacy exact marker as a nested range for existing report
         // queries; the outer range carries the direction and color.
         nvtxRangePushA("tutti.local_nvme.io_kernel");
-        launch_err = launch_submit_one(d_entries, d_status, total_entries,
-                                       cq_poll_budget_, threads_per_block_,
-                                       inject_flag,
-                                       ctx.stream);
+        if (!step_feeder)
+            launch_err = launch_submit_one(
+                d_entries, d_status, total_entries, cq_poll_budget_,
+                threads_per_block_, inject_flag, ctx.stream);
         nvtxRangePop();
         nvtxRangePop();
     }
     if (launch_err != cudaSuccess) {
+        free_feeder();
         // Launch failed: kernel was NOT issued (cudaGetLastError returns
         // launch configuration errors, not runtime errors).
         // Safe to return the arena slot.
@@ -1854,7 +2033,10 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
     // Round 15 S4 test seam: kernel was successfully issued exactly once
     // for this submit() call (one launch_submit_one() call above, whether
     // or not the subsequent cudaEventRecord succeeds).
-    ++test_kernel_launch_count_;
+    test_kernel_launch_count_ += step_feeder
+        ? (ctx.step_layer_count + ctx.step_staging_depth - 1) /
+              ctx.step_staging_depth
+        : 1;
 
     // 7. Record completion fence (after successful launch).
     //
@@ -1882,9 +2064,9 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
     //    If cudaEventRecord fails, IO has been irreversibly issued.
     //    We must NOT return op=nullopt (the kernel is running and
     //    will complete on its own — the arena slot is in use).
-    ce = test_inject_event_record_failure_
+    ce = step_feeder ? cudaSuccess : (test_inject_event_record_failure_
         ? cudaErrorUnknown
-        : cudaEventRecord(event, ctx.stream);
+        : cudaEventRecord(event, ctx.stream));
     if (ce != cudaSuccess) {
         // =============================================================
         // EXPLICIT EXCEPTION: cudaStreamSynchronize on ctx.stream.
@@ -1938,6 +2120,15 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
         op.prp_list_page_count = total_list_ios;
         op.op_token = op_token;
         op.op_generation = 1;
+        op.d_feeder_layers = d_feeder_layers;
+        op.h_feeder_ready = h_feeder_ready;
+        op.d_feeder_ready = d_feeder_ready;
+        op.h_feeder_release = h_feeder_release;
+        op.d_feeder_release = d_feeder_release;
+        op.feeder_layer_count = ctx.step_layer_count;
+        op.feeder_staging_depth = ctx.step_staging_depth;
+        op.feeder_is_read = step_feeder && h_entries.front().direction == 0;
+        op.feeder_poll_stream = feeder_poll_stream;
         // Pin cache entries (IO was issued; entries must survive until release).
         op.prp_cache_refs = std::move(prp_cache_refs);
         for (const auto& ref : op.prp_cache_refs) {
@@ -2000,6 +2191,17 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
     op.prp_list_page_count = total_list_ios;
     op.op_token = op_token;
     op.op_generation = 1;
+    op.d_feeder_layers = d_feeder_layers;
+    op.h_feeder_ready = h_feeder_ready;
+    op.d_feeder_ready = d_feeder_ready;
+    op.h_feeder_release = h_feeder_release;
+    op.d_feeder_release = d_feeder_release;
+    op.feeder_layer_count = ctx.step_layer_count;
+    op.feeder_staging_depth = ctx.step_staging_depth;
+    op.feeder_is_read = step_feeder && h_entries.front().direction == 0;
+    op.feeder_poll_stream = feeder_poll_stream;
+    op.feeder_event_recorded = step_feeder
+        ? std::make_shared<std::atomic<bool>>(false) : nullptr;
     // Pin cache entries (IO was issued; entries must survive until release).
     op.prp_cache_refs = std::move(prp_cache_refs);
     for (const auto& ref : op.prp_cache_refs) {
@@ -2017,7 +2219,75 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
             op.handle_cache_refs.push_back(tit->second.cache_entry);
         }
     }
+    auto feeder_recorded = op.feeder_event_recorded;
     ops_[op_token] = std::move(op);
+    if (step_feeder) {
+        const auto layer_count = ctx.step_layer_count;
+        const auto depth = ctx.step_staging_depth;
+        const bool is_read = h_entries.front().direction == 0;
+        const auto device = cuda_device_;
+        const auto poll_budget = cq_poll_budget_;
+        const auto threads = threads_per_block_;
+        const bool diag = feeder_diag_enabled();
+        std::thread([
+            d_entries, d_status, d_feeder_layers, d_feeder_ready,
+            d_feeder_release, h_feeder_ready, h_feeder_release,
+            layer_count, depth, is_read, device, poll_budget, threads,
+            inject_flag, event, stream = ctx.stream, feeder_recorded, diag
+        ] {
+            cudaSetDevice(device);
+            bool failed = false;
+            for (std::uint32_t base = 0; base < layer_count; base += depth) {
+                const std::uint32_t window =
+                    std::min(depth, layer_count - base);
+                volatile std::uint32_t* gates = is_read
+                    ? h_feeder_release : h_feeder_ready;
+                const std::uint32_t gate_base = is_read && base > 0
+                    ? base - depth : base;
+                if (!is_read || base > 0) {
+                    if (diag)
+                        std::fprintf(stderr, "FEEDER_DIAG cpp window_wait_begin t_ns=%lld backend=local direction=%s base=%u gate_base=%u window=%u\n",
+                                     feeder_diag_ns(), is_read ? "read" : "write",
+                                     base, gate_base, window);
+                    for (;;) {
+                        bool ready = true;
+                        for (std::uint32_t local = 0; local < window; ++local)
+                            ready &= gates[gate_base + local] != 0;
+                        if (ready) break;
+                        std::this_thread::sleep_for(std::chrono::microseconds(50));
+                    }
+                    if (diag)
+                        std::fprintf(stderr, "FEEDER_DIAG cpp window_wait_consume t_ns=%lld backend=local direction=%s base=%u gate_base=%u window=%u\n",
+                                     feeder_diag_ns(), is_read ? "read" : "write",
+                                     base, gate_base, window);
+                }
+                if (diag)
+                    std::fprintf(stderr, "FEEDER_DIAG cpp window_launch t_ns=%lld backend=local direction=%s base=%u window=%u\n",
+                                 feeder_diag_ns(), is_read ? "read" : "write",
+                                 base, window);
+                cudaError_t ce = launch_step_feeder(
+                    d_entries, d_status, d_feeder_layers + base, window, base,
+                    d_feeder_ready, d_feeder_release, poll_budget, threads,
+                    inject_flag, stream);
+                if (ce != cudaSuccess) {
+                    failed = true;
+                    break;
+                }
+            }
+            if (failed) {
+                for (std::uint32_t layer = 0; layer < layer_count; ++layer) {
+                    if (is_read) h_feeder_ready[layer] = 2u;
+                    else h_feeder_release[layer] = 1u;
+                }
+            }
+            (void)cudaEventRecord(event, stream);
+            feeder_recorded->store(true, std::memory_order_release);
+            if (diag)
+                std::fprintf(stderr, "FEEDER_DIAG cpp final_event_recorded t_ns=%lld backend=local direction=%s failed=%d\n",
+                             feeder_diag_ns(), is_read ? "read" : "write",
+                             failed ? 1 : 0);
+        }).detach();
+    }
 
     // Outcome: partial commit status if any rejection.
     if (has_rejection) {
@@ -2070,6 +2340,13 @@ Result<ProgressResult> LocalNvmeDataPath::progress_impl_(ProgressBudget budget) 
         }
 
         if (op.state != OpState::IN_FLIGHT) continue;
+
+        if (op.feeder_event_recorded &&
+            !op.feeder_event_recorded->load(std::memory_order_acquire)) {
+            ++result.operations_advanced;
+            ++work_done;
+            continue;
+        }
 
         // Check work cap before each query.
         if (work_done >= budget.max_work_units) {
@@ -2161,6 +2438,11 @@ Status LocalNvmeDataPath::release_impl_(DataPathOp op) {
         return Status(StatusCode::BUSY,
                       "release: op is still in flight");
     }
+    if (entry->d_feeder_layers) cudaFree(entry->d_feeder_layers);
+    if (entry->h_feeder_ready) cudaFreeHost(entry->h_feeder_ready);
+    if (entry->h_feeder_release) cudaFreeHost(entry->h_feeder_release);
+    if (entry->feeder_poll_stream)
+        cudaStreamDestroy(static_cast<cudaStream_t>(entry->feeder_poll_stream));
 
     // Terminal: GPU metadata slot is reusable. Host PRP backing is pool-owned
     // and remains stable; timeout-safe retention is handled at pool shutdown.

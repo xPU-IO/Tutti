@@ -15,6 +15,8 @@
 
 > 2026-08-26 真机闭环：修复preset/LocalNvmeDataPath旧静态库ABI错配、rank-local RuntimeConfig.accel_id、完整4 KiB host PRP page、logical block/driver MDTS descriptor切分，以及Runtime capability驱动的submit前completion回压。local真机contract 179/179，32x256 KiB write/read byte-exact，80层x32 chunk在窗口4下完成，Python 253/253。Hy3 TP4 `hy3-recompute-real-10f`完成A-cold与B-80pct，B外部命中6400 tokens。随后 scheduler 已拆成 `SchedulerMetadataIndex` 和 metadata-only store；worker 才构造 StorageRuntime/CUDA/NVMe data plane。
 
+> 2026-08-27 feeder闭环：一次性诊断证明Hy3的物理KV层与callback均为完整顺序0..79；旧的“callback缺层”推断不成立。停滞点是最后read callback 79尚未进入DataPath gate wait，原因是step提交时立即启动的whole-op watcher与per-layer gate竞争Runtime registry lock。当前已建立`KVCacheConfig.kv_cache_groups[*].layer_names`到物理ordinal的显式映射，feeder计划按callback数构造；whole-op watcher延迟到全部callback发布后启动，Runtime gate wait改为lock内单次非阻塞probe。subset/乱序/重复/缺失callback均有fail-safe合同。真实Hy3 TP4 A/B和Nsight通过，B命中6400 tokens并正常退出；compute/read/write为stream 19/31/35，每rank read/write feeder kernel为40/80，无永久gate。仍保持eager，不引入CUDA Graph。
+
 ## 1. 总体结论
 
 当前重构的**长期分层方向优于历史实现和 InfiniKV**：

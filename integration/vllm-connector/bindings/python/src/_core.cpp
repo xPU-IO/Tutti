@@ -133,18 +133,43 @@ public:
     std::vector<std::uint64_t> open_batch(const std::vector<std::string>& uris) {
         std::vector<tutti::Result<TargetHandle>> results =
             rt_->open_batch(uris, tutti::OpenOptions{});
+        for (std::size_t i = 0; i < results.size(); ++i) {
+            if (results[i].ok()) continue;
+            for (auto& result : results) {
+                if (result.ok()) (void)rt_->close(result.value());
+            }
+            throw_status("open_batch failed at uri[" + std::to_string(i) +
+                         "] (" + uris[i] + ")", results[i].status());
+        }
         std::vector<std::uint64_t> tickets;
         tickets.reserve(results.size());
         for (std::size_t i = 0; i < results.size(); ++i) {
-            if (!results[i].ok()) {
-                // fail-closed: raise, return no partial handles
-                throw_status("open_batch failed at uri[" + std::to_string(i) +
-                             "] (" + uris[i] + ")",
-                             results[i].status());
-            }
             tickets.push_back(mint_target_(results[i].value()));
         }
         return tickets;
+    }
+
+    void close_target(std::uint64_t ticket) {
+        const TargetHandle handle = lookup_target_(ticket, "target");
+        tutti::Status status = rt_->close(handle);
+        if (!status.ok()) throw_status("close_target failed", status);
+        targets_.erase(ticket);
+    }
+
+    void close_batch(const std::vector<std::uint64_t>& tickets) {
+        std::vector<TargetHandle> handles;
+        handles.reserve(tickets.size());
+        for (std::uint64_t ticket : tickets) {
+            handles.push_back(lookup_target_(ticket, "target"));
+        }
+        for (std::size_t i = 0; i < tickets.size(); ++i) {
+            tutti::Status status = rt_->close(handles[i]);
+            if (!status.ok()) {
+                throw_status("close_batch failed at ticket[" +
+                             std::to_string(i) + "]", status);
+            }
+            targets_.erase(tickets[i]);
+        }
     }
 
     // ---- memory ----
@@ -194,41 +219,7 @@ public:
                 "'");
         }
 
-        std::vector<tutti::IoRequest> reqs;
-        reqs.reserve(py::len(requests));
-        for (std::size_t i = 0; i < py::len(requests); ++i) {
-            py::sequence item = py::reinterpret_borrow<py::sequence>(
-                requests.attr("__getitem__")(i));
-            if (py::len(item) != 6) {
-                throw py::value_error(
-                    "request[" + std::to_string(i) +
-                    "] must be a 6-tuple (target, target_offset, memory, "
-                    "memory_offset, length, direction)");
-            }
-            const std::string index = "request[" + std::to_string(i) + "].";
-            tutti::IoRequest req{};
-            req.target = lookup_target_(
-                checked_int<uint64_t>(item[0], index + "target"), "target");
-            req.target_offset =
-                checked_int<uint64_t>(item[1], index + "target_offset");
-            req.memory = lookup_memory_(
-                checked_int<uint64_t>(item[2], index + "memory"), "memory");
-            req.memory_offset =
-                checked_int<uint64_t>(item[3], index + "memory_offset");
-            req.length = checked_int<uint64_t>(item[4], index + "length");
-            const std::string dir =
-                checked_str(item[5], index + "direction");
-            if (dir == "read") {
-                req.direction = tutti::IoDirection::READ;
-            } else if (dir == "write") {
-                req.direction = tutti::IoDirection::WRITE;
-            } else {
-                throw py::value_error(
-                    index + "direction must be 'read' or 'write', got '" +
-                    dir + "'");
-            }
-            reqs.push_back(req);
-        }
+        std::vector<tutti::IoRequest> reqs = parse_requests_(requests);
 
         tutti::HostSubmitContext ctx{};
         ctx.execution_domain = domain;
@@ -256,6 +247,71 @@ public:
             if (!accepted) out.rejected.push_back(static_cast<std::int64_t>(i));
         }
         return out;
+    }
+
+    SubmitResult submit_step(py::sequence layers, std::uint32_t staging_depth,
+                             std::int32_t accel_id, py::object stream,
+                             const std::string& execution) {
+        if (staging_depth == 0)
+            throw py::value_error("staging_depth must be positive");
+        std::vector<tutti::IoRequest> requests;
+        std::vector<std::uint32_t> offsets{0};
+        for (std::size_t layer = 0; layer < py::len(layers); ++layer) {
+            py::sequence batch = py::reinterpret_borrow<py::sequence>(
+                layers.attr("__getitem__")(layer));
+            auto parsed = parse_requests_(batch);
+            requests.insert(requests.end(), parsed.begin(), parsed.end());
+            offsets.push_back(static_cast<std::uint32_t>(requests.size()));
+        }
+        if (requests.empty())
+            throw py::value_error("step feeder plan must not be empty");
+        const auto direction = requests.front().direction;
+        for (const auto& request : requests) {
+            if (request.direction != direction)
+                throw py::value_error("step feeder direction must be uniform");
+        }
+        tutti::ExecutionDomain domain = execution == "device"
+            ? tutti::ExecutionDomain::DEVICE_EXECUTION
+            : tutti::ExecutionDomain::HOST_EXECUTION;
+        if (execution != "device" && execution != "host")
+            throw py::value_error("execution must be 'device' or 'host'");
+        if (domain == tutti::ExecutionDomain::DEVICE_EXECUTION && stream.is_none())
+            throw py::value_error("execution='device' requires a stream");
+        tutti::HostSubmitContext ctx{};
+        ctx.execution_domain = domain;
+        ctx.accel_id = accel_id;
+        ctx.stream = stream.is_none() ? nullptr : reinterpret_cast<cudaStream_t>(
+            checked_int<std::uintptr_t>(stream, "stream"));
+        ctx.step_layer_request_offsets = offsets.data();
+        ctx.step_layer_count = static_cast<std::uint32_t>(py::len(layers));
+        ctx.step_staging_depth = staging_depth;
+        tutti::IoSubmitOutcome outcome =
+            rt_->submit(requests.data(), requests.size(), ctx);
+        return submit_result_(std::move(outcome));
+    }
+
+    std::string wait_step_layer(std::uint64_t ticket, std::uint32_t layer,
+                                std::uint64_t timeout_ms) {
+        const IoHandle handle = lookup_io_(ticket);
+        auto result = [&] {
+            py::gil_scoped_release release;
+            return rt_->wait_feeder_layer(handle, layer, timeout_ms);
+        }();
+        if (!result.ok()) throw_status("wait_step_layer failed", result.status());
+        switch (result.value()) {
+            case tutti::FeederLayerState::PENDING: return "PENDING";
+            case tutti::FeederLayerState::READY: return "READY";
+            case tutti::FeederLayerState::FAILED: return "FAILED";
+        }
+        return "FAILED";
+    }
+
+    void signal_step_layer(std::uint64_t ticket, std::uint32_t layer,
+                           std::uintptr_t stream) {
+        tutti::Status status = rt_->signal_feeder_layer(
+            lookup_io_(ticket), layer,
+            reinterpret_cast<cudaStream_t>(stream));
+        if (!status.ok()) throw_status("signal_step_layer failed", status);
     }
 
     // ---- io lifecycle ----
@@ -374,6 +430,46 @@ public:
     }
 
 private:
+    std::vector<tutti::IoRequest> parse_requests_(py::sequence requests) const {
+        std::vector<tutti::IoRequest> reqs;
+        reqs.reserve(py::len(requests));
+        for (std::size_t i = 0; i < py::len(requests); ++i) {
+            py::sequence item = py::reinterpret_borrow<py::sequence>(
+                requests.attr("__getitem__")(i));
+            if (py::len(item) != 6)
+                throw py::value_error("step/request item must be a 6-tuple");
+            const std::string index = "request[" + std::to_string(i) + "].";
+            tutti::IoRequest req{};
+            req.target = lookup_target_(
+                checked_int<uint64_t>(item[0], index + "target"), "target");
+            req.target_offset = checked_int<uint64_t>(item[1], index + "target_offset");
+            req.memory = lookup_memory_(
+                checked_int<uint64_t>(item[2], index + "memory"), "memory");
+            req.memory_offset = checked_int<uint64_t>(item[3], index + "memory_offset");
+            req.length = checked_int<uint64_t>(item[4], index + "length");
+            const std::string direction = checked_str(item[5], index + "direction");
+            if (direction == "read") req.direction = tutti::IoDirection::READ;
+            else if (direction == "write") req.direction = tutti::IoDirection::WRITE;
+            else throw py::value_error(index + "invalid direction");
+            reqs.push_back(req);
+        }
+        return reqs;
+    }
+
+    SubmitResult submit_result_(tutti::IoSubmitOutcome outcome) {
+        SubmitResult out;
+        out.status_ok = outcome.status.ok();
+        out.status_msg = status_code_str(outcome.status.code()) + ": " +
+                         outcome.status.message();
+        if (outcome.io.has_value()) out.io_handle = mint_io_(outcome.io.value());
+        for (std::size_t i = 0; i < outcome.initial_states.size(); ++i) {
+            const bool accepted = outcome.initial_states[i].state ==
+                                  tutti::IoRequestState::ACCEPTED;
+            out.initial_states.push_back(accepted);
+            if (!accepted) out.rejected.push_back(static_cast<std::int64_t>(i));
+        }
+        return out;
+    }
     template <typename T>
     static T checked_int(const py::handle& obj, const std::string& name) {
         if (py::isinstance<py::bool_>(obj) || !py::isinstance<py::int_>(obj)) {
@@ -667,12 +763,24 @@ PYBIND11_MODULE(_core, m) {
     py::class_<PyRuntime>(m, "Runtime")
         .def("caps", &PyRuntime::caps)
         .def("open_batch", &PyRuntime::open_batch, py::arg("uris"))
+        .def("close_target", &PyRuntime::close_target,
+             py::arg("target_handle"))
+        .def("close_batch", &PyRuntime::close_batch,
+             py::arg("target_handles"))
         .def("register_memory", &PyRuntime::register_memory,
              py::arg("addr"), py::arg("size"), py::arg("kind"),
              py::arg("accel_id") = -1, py::arg("io_granularity") = 0)
         .def("submit", &PyRuntime::submit, py::arg("requests"),
              py::arg("accel_id"), py::arg("stream"),
              py::arg("execution") = "device")
+        .def("submit_step", &PyRuntime::submit_step, py::arg("layers"),
+             py::arg("staging_depth"), py::arg("accel_id"),
+             py::arg("stream"), py::arg("execution") = "device")
+        .def("wait_step_layer", &PyRuntime::wait_step_layer,
+             py::arg("io_handle"), py::arg("layer"),
+             py::arg("timeout_ms") = 30000)
+        .def("signal_step_layer", &PyRuntime::signal_step_layer,
+             py::arg("io_handle"), py::arg("layer"), py::arg("stream"))
         .def("release_io", &PyRuntime::release_io, py::arg("io_handle"))
         .def("wait", &PyRuntime::wait, py::arg("io_handle"),
              py::arg("timeout_ms"))

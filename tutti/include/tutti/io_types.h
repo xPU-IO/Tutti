@@ -102,6 +102,12 @@ struct HostSubmitContext {
     // accelerator identity, not a daemon NVMe device_id.
     std::int32_t    accel_id;
     cudaStream_t    stream;
+    // Optional eager step feeder plan. Offsets index the public request array
+    // and have layer_count + 1 elements. DataPath copies the plan before
+    // submit returns. A zero layer_count preserves ordinary submit semantics.
+    const std::uint32_t* step_layer_request_offsets = nullptr;
+    std::uint32_t step_layer_count = 0;
+    std::uint32_t step_staging_depth = 0;
 };
 
 } // namespace tutti

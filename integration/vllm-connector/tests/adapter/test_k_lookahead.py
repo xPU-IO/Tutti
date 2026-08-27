@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from adapter.worker import WorkerImpl
 from engine.staging import RingWindow
 
@@ -38,13 +40,13 @@ def _worker(k=None):
     return worker, engine
 
 
-def test_default_k_is_one_and_preserves_stepwise_submission():
+def test_default_k_is_two_and_preserves_bounded_submission():
     worker, engine = _worker()
 
     worker._prefetch_load_layers(0)
-    assert [call[0] for call in engine.calls] == [0]
-    worker.wait_for_layer_load("model.layers.0.self_attn")
     assert [call[0] for call in engine.calls] == [0, 1]
+    worker.wait_for_layer_load("model.layers.0.self_attn")
+    assert [call[0] for call in engine.calls] == [0, 1, 2]
     assert engine.waits[:1] == [("wait", 0)]
 
 
@@ -68,6 +70,24 @@ def test_duplicate_wait_does_not_resubmit_or_unpin_early():
     worker.wait_for_layer_load("model.layers.1.self_attn")
     assert [call[0] for call in engine.calls] == [0, 1, 2, 4]
     assert not any(item[0] == "unpin" for item in engine.waits)
+
+
+def test_callback_subset_maps_names_to_sparse_physical_layers():
+    worker, _engine = _worker(2)
+    worker._kv_group_layer_names = (
+        "model.layers.1.self_attn.attn",
+        "model.layers.3.self_attn.attn",
+    )
+    worker._configure_callback_map(5)
+    assert worker._callback_to_physical == (1, 3)
+    assert worker._resolve_callback(
+        "model.layers.1.self_attn.attn"
+    ) == (0, 1)
+    assert worker._resolve_callback(
+        "model.layers.3.self_attn.attn"
+    ) == (1, 3)
+    with pytest.raises(ValueError, match="has no feeder callback"):
+        worker._resolve_callback("model.layers.2.self_attn.attn")
 
 
 class _WindowEvent:
