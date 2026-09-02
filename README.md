@@ -10,7 +10,7 @@ Tutti (Italian for "all instruments together") makes NVMe SSDs a practical KV-ca
 - **2026.8.11**   Added support for Metax GPU.
 - **2026.8** — **v0.1.1**: stable `StorageRuntime` public API (open/open_batch/register/submit/wait) over replaceable resolver/binding/DataPath boundaries; striped multi-device data path reaches 25.0 GB/s on 4× NVMe (98% of near-saturated per-drive bandwidth); vendor-neutral `cuda_like` GPU framework (CUDA proven; MUSA/MACA profiles); kernel P2P layer split into symmetric nvidia/metax backends; batch open (500 files in ~10 ms).
 
-- **2026.7** — `snvme` kernel module update: dynamic CPU-side and GPU-side queue allocation after mount, a standard POSIX interface, and poll-based I/O submission from both user-space threads and GPU kernel threads.
+- **2026.7** — `snvme` kernel module update: the kernel NVMe stack and GPU-side `libnvm` coexist on one drive — `tutti_daemon` mounts it once, GPU processes lease I/O queues on demand, and crashed processes are reclaimed automatically. Poll-based I/O submission from both user-space threads and GPU kernel threads.
 
 - **2026.5** — Tutti paper released on [arXiv](https://arxiv.org/abs/2605.03375) (SSD-backed KV cache: −78.3% TTFT, 2× request rate, −27% serving cost vs. GDS-enabled LMCache).
 
@@ -21,6 +21,7 @@ Tutti (Italian for "all instruments together") makes NVMe SSDs a practical KV-ca
 - **Millions of files within GPU reach** — ~200-byte GPU-resident file handles plus two-tier (GPU L1 / pinned-host L2) caching; FIEMAP is walked exactly once per file.
 - **Multi-device striping** — a striped target spans up to 4 NVMe SSDs in tensor-sized units (one K/V tensor lands whole on one drive, round-robin by tensor index); a single fused kernel submits to all drives. 25.0 GB/s on 4 drives.
 - **Batch open** — `open_batch` resolves hundreds of per-layer files with a parallel FIEMAP pipeline and fail-closed per-item results: 500 files in ~10 ms vs ~50–115 ms serial (5–12×).
+- **snvme — one drive, kernel and GPU together** — the kernel NVMe stack and GPU-side `libnvm` are served by the same Linux kernel: the drive stays a mounted, POSIX-visible block device while GPU processes get their own user I/O queues. `tutti_daemon` mounts the NVMe driver once; every GPU process then leases queues on demand, and a crashed process has its queues reclaimed by the kernel's fd-close cascade — dynamic allocation, isolated failures.
 - **Beyond NVIDIA** — three-layer `cuda_like` framework (profile selector → vendor shim → kernel primitive macros): CUDA proven in production, MUSA/MACA build profiles in place; the kernel P2P layer is split into symmetric per-vendor backends (nvidia done, metax symmetric).
 
 ## What is Tutti
