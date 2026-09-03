@@ -74,6 +74,9 @@ int snvm_chrdev_create(struct pci_dev *pdev, unsigned int class){
 
 	ctrl = ctrl_get(&ctrl_list, dev_class, pdev, minor);
 	if (IS_ERR(ctrl)) {
+		/* kmalloc failed: ctrl never entered ctrl_list and owns
+		 * nothing, but the minor was already taken from the IDA. */
+		ida_simple_remove(&snvm_chrdev_minor_ida, minor);
 		return PTR_ERR(ctrl);
 	}
 	err = ctrl_chrdev_create(ctrl, dev_first, &snvm_dev_fops);
