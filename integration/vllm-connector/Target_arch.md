@@ -20,7 +20,8 @@ fail-fast 的边界，以及后续优化不可破坏的契约。历史设想只�
   direct write stream 等当前层 compute event 后提交 I/O。
 - staging 保留为布局、对齐、padding 或 backend capability 不满足时的兜底路径；
   仅兜底路径分配不同的 read/write staging bank 并执行 scatter/gather。
-- direct read 在一次 host 编排中按层全部 enqueue；staged fallback 维持有限
+- direct read 使用 layer callback 交错 enqueue：`start_load_kv` 只提交第 0 层，
+  layer L 的 compute 已 enqueue 后再提交 read L+1。staged fallback 维持有限
   `lookahead_k`。两者都要形成：
 
 ```text
@@ -329,11 +330,12 @@ direct 是 capability 和实际 extent 驱动的默认候选，不是只看一�
 host-pinned PRP cache/pool，资源随已 enqueue 的 page request 数增长。后续如需稀疏
 按需 prebuild，必须先单独设计和量化，不能在 Python 层假装整池 prebuild 免费。
 
-direct 全层预提交要求 operation capacity 至少覆盖尚未 terminal/release 的 read
-layer 数。`max_batch_entries` 则只需覆盖单层展开后的 sub-I/O 数，两者是不同维度：
+当前 nonblocking direct 实现中，Python 可能在 GPU progress 前遍历完全部 callback，
+因此 operation capacity 保守覆盖全部 read/write layer。`max_batch_entries` 则只需覆盖
+单层展开后的 sub-I/O 数，两者是不同维度：
 
 ```text
-required_in_flight_ops >= pre-enqueued_read_layers + concurrent_write_ops
+required_in_flight_ops >= 2 * num_layers
 required_batch_entries >= chunks_in_layer * blocks_per_chunk * MDTS_split_factor
 ```
 
@@ -403,7 +405,7 @@ object-pool generation和逻辑generation全部一致时才恢复resident。任�
 
 ```text
 start_load_kv:
-  build load keys/block tables -> pin -> enqueue direct read layers in layer order
+  build load keys/block tables -> pin -> direct submit read layer 0 -> return
   (staged fallback keeps the bounded [0, K) window)
 
 for layer L:
@@ -417,6 +419,7 @@ for layer L:
 
   save_kv_layer(L)
     record compute fence_event[L]
+    direct: submit read layer L+1 and record its fence, if any
     direct: write stream waits fence_event[L] -> submit KV page writes
     staged: gather paged KV -> gather event -> write stream waits -> submit writes
 
@@ -442,12 +445,13 @@ staged host gate:
   staged: read completion -> read-copy scatter -> scatter event -> compute L
 ```
 
-`fence_event[L]` 只建立 GPU 可见性和 stream 顺序，不表示 NVMe success。direct
-模式可以在 `start_load_kv` 的一个 host enqueue 阶段按层连续提交全部 read，因为
-每个 `(block_id, layer_id)` 都是独立 KV page，不存在 staging 槽覆盖或复用；同一
-read stream 按 `read[0], event[0], read[1], event[1]...` 执行，compute stream只等待
-自己当前层的 event，所以 `read[L+1]` 可以与 `compute[L]` overlap。direct read 的
-structured failure由 completion watcher异步收集，不作为逐层host gate。失败后：
+`fence_event[L]` 只建立 GPU 可见性和 stream 顺序，不表示 NVMe success。direct 中
+每个 `(block_id, layer_id)` 都是独立 KV page，不存在 staging 槽覆盖或复用。为了
+避免全层 Python submit 阻塞首个 compute enqueue，`start_load_kv` 只提交 read 0；
+after-layer callback 执行时 compute L 已 enqueue，再提交 read L+1。这样 read L+1
+的 host preparation/I/O 才能与 compute L overlap。direct read 的 structured failure
+由 completion watcher异步收集，不作为逐层host gate。完整证据和状态机见
+`doc/Tutticonnector/README.md`。失败后：
 
 - direct 已排入的 compute 可以继续，但本 step 输出必须丢弃，受影响 request 的
   block IDs按现有connector合同上报并整请求重算；
@@ -849,13 +853,14 @@ block table 直接生成 byte-range I/O；仅不满足 5.1 准入条件时走现
 | DCP>1 fail-fast | 已实现 |
 | required NHD | 已实现 |
 | single-group staged transfer | 已实现 |
-| single-group direct KV page transfer | 接口壳已存在；生产 backend、event 桥和真机准入未实现 |
-| direct-first / staged-fallback selector | 未实现；当前仍由显式 `direct_transfer` bool 选择 |
+| single-group direct KV page transfer | Python backend、event桥和memory lifecycle已实现；待真机准入 |
+| direct-first / staged-fallback selector | 已实现；按layout/alignment/capability在首个I/O前选择 |
 | split read/write bank | 已实现 |
 | local/striped双stream routing | 已实现 |
 | 独立read-copy stream与scatter event桥接 | 已实现并通过真实Hy3/Nsight准入 |
 | staged read plan 全量 pre-enqueue（K=2 future-event fences） | 已回退；生产路径为 host-window submit，禁止 future wait |
-| 实际 read/compute GPU interval overlap | staged 当前实测为0；转向无槽复用的 direct 全层 enqueue 后重新验收 |
+| direct rolling read orchestration | 设计完成，待把当前 `_ReadPlan._submit_all()` 改为 start-R0/after-layer-Rnext |
+| 实际 read/compute GPU interval overlap | staged 当前实测为0；direct rolling实现后重新验收 |
 | host-pinned prebuilt PRP | 已实现并真机命中 |
 | structured completion | 已实现 |
 | partial-commit正确drain/retry | 已实现 |
@@ -922,11 +927,11 @@ block table 直接生成 byte-range I/O；仅不满足 5.1 准入条件时走现
 
 ## 16. 推荐实施顺序
 
-1. 在 Python Tutti store 中实现 single-group cross-layer direct backend；复用现有
-   `register_memory/submit`，默认不增加 C++ layer/paged 语义。
-2. 接通 direct read/write 的 per-layer `fence_event` 编排和整请求 recompute 错误
-   语义，并保留 staged fallback。
-3. 用小模型先验证 block-table/address round-trip，再用真实Hy3 TP4比较 block size
+1. 提交已经完成的 single-group cross-layer direct backend、memory unregister、
+   `2*num_layers` capacity 和 staged fallback 基线。
+2. 按 `doc/Tutticonnector/README.md` 把 direct read 改为 start-R0、after-layer-Rnext，
+   保留 per-layer event 与整请求 recompute，不修改 Runtime/DataPath。
+3. 用小规模合成测试验证精确 enqueue 顺序，再用真实Hy3 TP4比较 block size
    64/128/256 和 Nsight timeline。
 4. 若且仅若真实 KV pool 基址不能满足 64 KiB 注册约束，再评审“aligned containing
    allocation + logical base offset”的最小 Runtime API；不得在 DataPath 下沉 layer
