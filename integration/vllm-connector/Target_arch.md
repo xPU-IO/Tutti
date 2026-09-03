@@ -290,7 +290,7 @@ vLLM KV cache allocation
   -> KVEngine.bind selects path
      -> direct eligible:
         register the KV pool once
-        Runtime.register_memory(io_granularity=page_bytes)
+        Runtime.register_memory(io_granularity=0)
         no staging allocation and no gather/scatter
      -> otherwise staged fallback:
         allocate one 64 KiB-aligned staging allocation
@@ -320,6 +320,26 @@ direct 是 capability 和实际 extent 驱动的默认候选，不是只看一�
 
 任何 direct 注册或准入失败都必须发生在首个真实 I/O 前。普通模式记录原因并
 回退 staged；strict/profile 模式直接失败，防止误把 staged trace 当 direct。
+
+整池 direct 注册初期必须使用 `io_granularity=0`。当前 prebuilt 实现会按
+`registered_bytes / io_granularity` 为整段注册内存建立 descriptor，并为每个
+大于两个 controller page 的 slice 保留完整 4 KiB host PRP page。十几 GiB KV pool
+若按 64/128/256 KiB page 全量 prebuild，会把资源放大到全部 KV 容量；这与只按
+在途 I/O 消耗资源的目标冲突。`io_granularity=0` 复用现有 dynamic descriptor 和
+host-pinned PRP cache/pool，资源随已 enqueue 的 page request 数增长。后续如需稀疏
+按需 prebuild，必须先单独设计和量化，不能在 Python 层假装整池 prebuild 免费。
+
+direct 全层预提交要求 operation capacity 至少覆盖尚未 terminal/release 的 read
+layer 数。`max_batch_entries` 则只需覆盖单层展开后的 sub-I/O 数，两者是不同维度：
+
+```text
+required_in_flight_ops >= pre-enqueued_read_layers + concurrent_write_ops
+required_batch_entries >= chunks_in_layer * blocks_per_chunk * MDTS_split_factor
+```
+
+因此 direct profile 应同时提高 `max_in_flight_operations`、按真实单层上界收紧
+`max_batch_entries`，避免 arena 以“很深 × 很宽”同时过量预留；生产值在 trace 和
+长期稳定性验证前不写死。
 
 ### 5.2 Split bank 几何（仅 staged fallback）
 
@@ -388,10 +408,10 @@ start_load_kv:
 
 for layer L:
   wait_for_layer_load(L)
-    inspect/wait this layer's Runtime/NVMe structured result
-    direct success -> compute stream waits read fence; no scatter
+    direct -> compute stream waits fence_event[L]; no host completion gate
     staged success -> scatter on read-copy stream -> compute waits scatter fence
-    failure -> report invalid blocks; do not expose partial data; drain submitted I/O
+    direct failure -> forward may finish, but step output is discarded and request recomputes
+    staged failure -> no scatter; report invalid blocks and drain submitted I/O
 
   vLLM compute layer L on compute stream
 
@@ -414,24 +434,25 @@ read stream:
   enqueue layer batches in order:
     descriptor H2D -> submit kernel -> CQ poll -> fence_event[L]
 
-host gate:
-  Runtime progress -> structured terminal result
+direct consumer:
+  compute stream wait_event(fence_event[L]) -> compute L
 
-success only:
-  direct: host confirms structured success -> compute stream wait_event(fence_event[L])
-          -> compute L
+staged host gate:
+  Runtime progress -> structured terminal result
   staged: read completion -> read-copy scatter -> scatter event -> compute L
 ```
 
-`fence_event[L]` 只建立 GPU 可见性和 stream 顺序，不等于 NVMe success。success
-来自该层 `TuttiBatchResult.ok`。direct 模式可以在 `start_load_kv` 的一个 host enqueue
-阶段按层连续提交全部 read，因为不存在 staging 槽复用；同一 read stream 会按提交
-顺序执行，各层 callback 只检查自己的 structured result。失败后：
+`fence_event[L]` 只建立 GPU 可见性和 stream 顺序，不表示 NVMe success。direct
+模式可以在 `start_load_kv` 的一个 host enqueue 阶段按层连续提交全部 read，因为
+每个 `(block_id, layer_id)` 都是独立 KV page，不存在 staging 槽覆盖或复用；同一
+read stream 按 `read[0], event[0], read[1], event[1]...` 执行，compute stream只等待
+自己当前层的 event，所以 `read[L+1]` 可以与 `compute[L]` overlap。direct read 的
+structured failure由 completion watcher异步收集，不作为逐层host gate。失败后：
 
-- direct 不放行本层 compute；staged 本层不scatter；
-- 已提交 completion 仍 drain/release，但不再发布成功 fence；
-- 不再补交新layer；
-- 本step后续external save跳过。
+- direct 已排入的 compute 可以继续，但本 step 输出必须丢弃，受影响 request 的
+  block IDs按现有connector合同上报并整请求重算；
+- staged 本层不scatter，后续external save跳过；
+- 两种路径都必须 drain/release 已提交 completion；失败不发布 resident marker。
 
 ### 7.3 Save 依赖
 
@@ -492,13 +513,13 @@ virtual offset先按stripe unit映射shard，再经FIEMAP映射namespace LBA。f
 `io_granularity`已贯通；正常staged READ/WRITE真机contract命中prebuilt
 descriptor，dynamic count为0。
 
-staged 路径的 `io_granularity` 是层段大小 `S`；direct 路径应为实际 KV
-`page_bytes=B`。它只表示 Python 交给 Runtime 的逻辑 I/O slice，不表示 MDTS。生产
-preset不接收MDTS；LocalNvmeDataPath attach后通过`ioctl_get_dev_info()`读取
+staged 路径的 `io_granularity` 是层段大小 `S`；direct 整池注册初期使用 0，按
+在途请求动态构建 descriptor/PRP。该参数不表示 MDTS。生产 preset 不接收 MDTS；
+LocalNvmeDataPath attach后通过`ioctl_get_dev_info()`读取
 `dev_info.max_data_size`，得到hardware/effective MDTS，并在C++中计算：
 
 ```text
-bytes_per_slice = staged ? S : B
+bytes_per_slice = staged prebuilt ? S : current direct request length B
 ios_per_slice   = ceil(bytes_per_slice / effective_MDTS)
 sub_io_bytes    = min(slice_remaining, effective_MDTS, extent_remaining)
 ```
@@ -863,8 +884,10 @@ block table 直接生成 byte-range I/O；仅不满足 5.1 准入条件时走现
 
 ### 15.1 正确性
 
-- read失败不scatter，invalid IDs在同一forward输出上报。
-- `recompute`丢弃失败step输出并重调度；`fail`终止请求。
+- staged read失败不scatter；direct read失败允许已排入的compute继续，但不得提交
+  本step输出或把失败数据标记为resident。invalid IDs在同一forward输出上报。
+- `recompute`丢弃失败step输出并整请求重调度；`fail`终止请求。direct 不增加逐层
+  host completion gate。
 - 编程错误不会被误吞成KV miss。
 - write失败不创建完整marker、不发布resident。
 - partial commit不重复提交accepted request。
