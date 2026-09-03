@@ -1,6 +1,6 @@
 # Tutti vLLM Connector 目标架构与当前实现
 
-> 状态：当前权威架构文档，更新于 2026-08-26。
+> 状态：当前权威架构文档，更新于 2026-09-03。
 > 适用版本：Tutti 当前工作树；vendored vLLM `897ff4f39`。
 > 当前执行目标：vLLM eager 模式下的逐层 read / transfer / compute / write
 > 流水，不以 CUDA Graph、persistent dispatcher 或整步 GPU DAG 为前置条件。
@@ -15,10 +15,13 @@ fail-fast 的边界，以及后续优化不可破坏的契约。历史设想只�
 
 - scheduler 只消费 prefix 命中数、block table 和 connector metadata。
 - worker 在 attention 的既有逐层 callback 中编排 KV I/O。
-- read、write 使用不同 CUDA stream 和不同 staging bank。
-- 当前层 read 在 Runtime/NVMe CQ 确认成功后才允许 scatter。
-- gather 发生在当前 compute stream；write stream 等 gather event 后提交 I/O。
-- 维持有限 `lookahead_k`，形成：
+- 目标主路径把 vLLM KV page 直接注册给 Runtime，read、write 不经过 staging。
+- read、write 使用不同 CUDA stream；direct read 完成事件直接放行当前层 compute，
+  direct write stream 等当前层 compute event 后提交 I/O。
+- staging 保留为布局、对齐、padding 或 backend capability 不满足时的兜底路径；
+  仅兜底路径分配不同的 read/write staging bank 并执行 scatter/gather。
+- direct read 在一次 host 编排中按层全部 enqueue；staged fallback 维持有限
+  `lookahead_k`。两者都要形成：
 
 ```text
 read/transfer[L+1] || compute[L] || write[L-1]
@@ -38,7 +41,8 @@ read/transfer[L+1] || compute[L] || write[L-1]
 - 不用增加 stream 数掩盖错误的 workspace/lifetime 设计。
 - SupportsHMA 完成前不支持 Qwen3.8-27B 的 Tutti 数据面。
 - canonical DCP mapping 完成前不支持 DCP > 1。
-- 当前不承诺 direct paged KV I/O；生产路径是 staged transfer。
+- direct paged KV I/O 尚未完成真机准入；在完成前，当前生产实现仍走 staged
+  transfer。该事实是迁移状态，不是目标架构。
 
 ### 1.0 当前安全闸（READ-SEQUENCE-AND-GATHER-FUSION-19）
 
@@ -94,14 +98,18 @@ TuttiConnectorV1 (worker role)
           |
           v
 KVEngine
-  ChunkIndex + read/write RingWindow + transfer selector
+  ChunkIndex + transfer selector + completion
           |                         |
-          | paged <-> staging       | layer-segment byte I/O
+          | direct (target)         | staged (fallback)
+          | registered KV pages     | RingWindow + gather/scatter
           v                         v
-PagedTransferHooks             TuttiKVStore
-  gather/scatter                layout/marker/target/buffer/stream/completion
+TuttiKVStore direct backend     PagedTransferHooks
+  block table -> byte ranges      paged <-> staging
           |                         |
           +-----------+-------------+
+                      |
+                 TuttiKVStore
+          layout/marker/target/buffer/stream/completion
                       v
 Python binding: tutti_runtime
   open/register/submit/wait_result/release/shutdown
@@ -128,9 +136,10 @@ tutti_daemon
 |---|---|---|
 | vLLM adapter | `adapter/connector.py` | 双角色 API、scheduler 翻译、metadata |
 | worker orchestration | `adapter/worker.py` | K-lookahead、逐层 wait/save、bank 生命周期 |
-| semantic engine | `engine/core.py` | ChunkIndex、layer I/O、transfer、completion |
-| staging | `engine/staging.py` | 有界槽位和复用保护 |
-| transfer | `engine/transfer.py`, `transfer/` | paged KV 与 canonical segment 搬运 |
+| semantic engine | `engine/core.py` | ChunkIndex、layer I/O、路径选择、completion |
+| direct backend | `stores/tutti_nvme/store.py` | KV pool 注册、block table 到 byte-range 映射 |
+| staging fallback | `engine/staging.py` | 不满足 direct 准入时的有界槽位和复用保护 |
+| transfer | `engine/transfer.py`, `transfer/` | direct/staged 选择与 fallback 搬运 |
 | semantic index | `index/chunk_index.py` | chunk hash、LRU、pin、pending/resident |
 | Tutti NVMe store | `stores/tutti_nvme/` | layout、marker、runtime bridge |
 | Python binding | `bindings/python/src/_core.cpp` | C++ handle 和 structured result 映射 |
@@ -141,7 +150,8 @@ tutti_daemon
 ### 2.2 抽象边界
 
 - adapter 理解 vLLM request、token、block table 和 cache group。
-- engine 理解 semantic chunk、layer、staging slot 和 transfer layout。
+- engine 理解 semantic chunk、layer 和 transfer mode；仅 staged mode 理解 staging
+  slot，direct 的物理 byte offset 由 store backend 从已登记布局和 block table 推导。
 - store 理解 `io_key`、target URI、buffer ID、byte offset/length。
 - Runtime 只理解 public target/memory/I/O handle 和 byte-range request。
 - DataPath 理解 controller、LBA、PRP、queue、stream 和 CQ status。
@@ -195,8 +205,8 @@ NVMe 命令；它 drain completion，并禁止后续 scatter/save。
 
 - scheduler 持有 `SchedulerMetadataIndex` 和 metadata-only store；它只扫描
   manifest/marker、维护 `ChunkIndex` 和容量 reservation。
-- worker 的 `KVEngine` 持有 `ChunkIndex`、data-plane store、read/write bank、
-  transfer 和 inflight。
+- worker 的 `KVEngine` 持有 `ChunkIndex`、data-plane store、transfer 和 inflight；
+  仅 staged fallback 持有 read/write bank。
 - 同一进程、同一 `vllm_config` 可经 `_ENGINE_CACHE` 共享 engine；多进程实例
   通过持久 marker 对账。
 - `TuttiKVStore` 持有 runtime、target/memory tickets、buffer IDs、read/write
@@ -230,6 +240,24 @@ F = N * S                                    payload bytes / chunk object
 `num_layers` 和 `chunk_kv_bytes` 不是部署 magic number，不能硬编码 80 层或
 20 MiB。
 
+direct 路径还要求从实际 tensor shape/stride 推导以下几何，不得假设层数或固定
+维序：
+
+```text
+pool_base       = cross_layers_kv_cache.data_ptr()
+block_stride    = stride(block_axis) * element_size
+layer_stride    = stride(layer_axis) * element_size
+page_bytes      = B
+memory_offset   = block_id * block_stride + layer_id * layer_stride
+target_offset   = layer_id * S + block_ordinal_in_chunk * page_bytes
+length          = page_bytes
+```
+
+对 Hy3 的 NHD cross-layer `[num_blocks, num_layers, block_size, 2, kv]`，一个
+物理 block 的某层 page 连续。`block_size=128/256` 会把单次 direct extent 放大到
+128/256 KiB；Runtime/DataPath 仍根据真实 controller MDTS 和 FIEMAP extent 在底层
+切分，Python 不传 MDTS。
+
 ### 4.2 布局准入
 
 - connector 要求 vLLM 使用 `NHD` cross-layer layout。
@@ -258,19 +286,42 @@ TuttiConnectorV1.__init__
 vLLM KV cache allocation
   -> register_kv_caches or register_cross_layers_kv_cache
   -> WorkerImpl._ensure_bound
-  -> determine layer view / transfer format
-  -> allocate one 64 KiB-aligned staging allocation
-  -> split read bank + write bank
-  -> KVEngine.bind
-  -> store.register_buffer(segment_bytes)
-  -> Runtime.register_memory(io_granularity=segment_bytes)
+  -> determine actual tensor shape / stride / page bytes / alignment
+  -> KVEngine.bind selects path
+     -> direct eligible:
+        register the KV pool once
+        Runtime.register_memory(io_granularity=page_bytes)
+        no staging allocation and no gather/scatter
+     -> otherwise staged fallback:
+        allocate one 64 KiB-aligned staging allocation
+        split read bank + write bank
+        store.register_buffer(segment_bytes)
+        Runtime.register_memory(io_granularity=segment_bytes)
   -> lazy DataPath registration on first target submit
 ```
 
 key namespace至少编码模型、KV dtype、TP、chunk bytes、chunk tokens和格式版本。
 未来 DCP/HMA/PP/layout支持必须扩充namespace。
 
-### 5.1 Split bank 几何
+### 5.1 Direct 准入与回退
+
+direct 是 capability 和实际 extent 驱动的默认候选，不是只看一个全局 bool：
+
+- 单 cache group、uniform attention page，且 block 轴和 layer 轴可从实际 stride
+  无歧义识别；
+- 每个 `(block_id, layer_id)` page 是连续内存，`page_bytes` 与 target offset、
+  request length 满足 DataPath alignment；
+- pool 注册基址满足 snvme 当前 64 KiB GPU page 要求，注册范围覆盖所有 byte
+  offset；PyTorch allocator 不提供此契约时必须回退，不能假定偶然对齐；
+- `C % T == 0`，每个 chunk 的 block table 长度为 `C/T`；block id 可以离散，
+  backend 将它们展开为同一 layer batch 内的多个 byte-range request；
+- padded page、HMA/GDN、多 group、非连续/未知布局在各自 canonical ABI 完成前
+  fail-closed 或回退 staged。
+
+任何 direct 注册或准入失败都必须发生在首个真实 I/O 前。普通模式记录原因并
+回退 staged；strict/profile 模式直接失败，防止误把 staged trace 当 direct。
+
+### 5.2 Split bank 几何（仅 staged fallback）
 
 ```text
 W = max_chunks_per_wave
@@ -282,7 +333,7 @@ read  slots = [0, bank_slots)
 write slots = [bank_slots, 2 * bank_slots)
 ```
 
-总 staging HBM 与拆分前相同。两个 `RingWindow` 共享 backing，但物理
+staged fallback 的总 staging HBM 与拆分前相同。两个 `RingWindow` 共享 backing，但物理
 `slot_base`区间不得重叠。store只注册一次原始allocation。
 
 ## 6. Scheduler 调用路径
@@ -332,22 +383,22 @@ object-pool generation和逻辑generation全部一致时才恢复resident。任�
 
 ```text
 start_load_kv:
-  build load keys/block tables -> pin -> submit read layers [0, K)
+  build load keys/block tables -> pin -> enqueue direct read layers in layer order
+  (staged fallback keeps the bounded [0, K) window)
 
 for layer L:
   wait_for_layer_load(L)
-    wait Runtime/NVMe CQ result
-    success -> scatter on read stream -> wait scatter fence
-    failure -> no scatter; report invalid blocks; drain lookahead consumers
-    success path submits read L+K
+    inspect/wait this layer's Runtime/NVMe structured result
+    direct success -> compute stream waits read fence; no scatter
+    staged success -> scatter on read-copy stream -> compute waits scatter fence
+    failure -> report invalid blocks; do not expose partial data; drain submitted I/O
 
   vLLM compute layer L on compute stream
 
   save_kv_layer(L)
-    gather paged KV on current compute stream
-    record gather event
-    write stream waits gather event
-    submit NVMe write on write stream
+    record compute fence_event[L]
+    direct: write stream waits fence_event[L] -> submit KV page writes
+    staged: gather paged KV -> gather event -> write stream waits -> submit writes
 
 step exit:
   wait_for_save
@@ -360,32 +411,44 @@ step exit:
 
 ```text
 read stream:
-  descriptor H2D -> submit kernel -> CQ poll
+  enqueue layer batches in order:
+    descriptor H2D -> submit kernel -> CQ poll -> fence_event[L]
 
 host gate:
   Runtime progress -> structured terminal result
 
 success only:
-  read stream scatter -> scatter event
-  wait_for_layer_load returns -> vLLM submits compute L
+  direct: host confirms structured success -> compute stream wait_event(fence_event[L])
+          -> compute L
+  staged: read completion -> read-copy scatter -> scatter event -> compute L
 ```
 
-`read_done_event` 不等于 NVMe success。success来自`TuttiBatchResult.ok`。失败后：
+`fence_event[L]` 只建立 GPU 可见性和 stream 顺序，不等于 NVMe success。success
+来自该层 `TuttiBatchResult.ok`。direct 模式可以在 `start_load_kv` 的一个 host enqueue
+阶段按层连续提交全部 read，因为不存在 staging 槽复用；同一 read stream 会按提交
+顺序执行，各层 callback 只检查自己的 structured result。失败后：
 
-- 本层不scatter；
-- lookahead completion仍drain/release但不scatter；
+- direct 不放行本层 compute；staged 本层不scatter；
+- 已提交 completion 仍 drain/release，但不再发布成功 fence；
 - 不再补交新layer；
 - 本step后续external save跳过。
 
 ### 7.3 Save 依赖
 
 ```text
-compute stream: compute L -> gather L -> gather_event
-write stream:   wait gather_event -> descriptor H2D -> write kernel -> CQ
+direct:
+  compute stream: compute L -> fence_event[L]
+  write stream:   wait fence_event[L] -> direct KV page write kernel -> CQ
+
+staged fallback:
+  compute stream: compute L -> gather L -> gather_event
+  write stream:   wait gather_event -> staging write kernel -> CQ
 ```
 
-不能在write stream直接发gather而不等待compute。bank隔离只解决内存覆盖，不
-自动建立跨stream依赖。
+direct 省掉 gather，但不能省掉 compute 到 write 的 event。host callback 发生在
+compute kernel enqueue 之后，不等于另一个 CUDA stream 已获得依赖；必须在当前
+compute stream record `fence_event[L]`，再由 write stream wait。staged 的 bank 隔离
+同样只解决内存覆盖，不自动建立跨 stream 依赖。
 
 ### 7.4 Stream 与并发
 
@@ -429,13 +492,14 @@ virtual offset先按stripe unit映射shard，再经FIEMAP映射namespace LBA。f
 `io_granularity`已贯通；正常staged READ/WRITE真机contract命中prebuilt
 descriptor，dynamic count为0。
 
-这里`io_granularity`只表示Python staging中的逻辑block/slice大小`S`。生产
+staged 路径的 `io_granularity` 是层段大小 `S`；direct 路径应为实际 KV
+`page_bytes=B`。它只表示 Python 交给 Runtime 的逻辑 I/O slice，不表示 MDTS。生产
 preset不接收MDTS；LocalNvmeDataPath attach后通过`ioctl_get_dev_info()`读取
 `dev_info.max_data_size`，得到hardware/effective MDTS，并在C++中计算：
 
 ```text
-bytes_per_slice = S
-ios_per_slice   = ceil(S / effective_MDTS)
+bytes_per_slice = staged ? S : B
+ios_per_slice   = ceil(bytes_per_slice / effective_MDTS)
 sub_io_bytes    = min(slice_remaining, effective_MDTS, extent_remaining)
 ```
 
@@ -749,6 +813,13 @@ GPU interval overlap。该路径禁止`event.synchronize()`/`cudaStreamSynchroni
 作为正常依赖；若需稳定重叠，下一步应拆分submit-only与poll阶段或引入经验证的
 full-layer staging，而不是只改变stream颜色。
 
+2026-09-03 的 `write22-batched-final-20260903.nsys-rep` 进一步确认当前 staged
+实现已将 read、read-copy、write 与 compute 分流，并把 cross-layer scatter 从
+逐 chunk 小 kernel 合并到逐层 batch；write 与主 GEMM/MoE 已有实际区间重叠，read
+与主要 compute 仍无稳定重叠。该结果也暴露出 staging 本身的额外 gather/scatter
+kernel 和 HBM 占用。因此下一阶段改为 direct-first：注册 cross-layer KV pool，按
+block table 直接生成 byte-range I/O；仅不满足 5.1 准入条件时走现有 staged 路径。
+
 ## 14. 当前状态
 
 | 能力 | 状态 |
@@ -757,11 +828,13 @@ full-layer staging，而不是只改变stream颜色。
 | DCP>1 fail-fast | 已实现 |
 | required NHD | 已实现 |
 | single-group staged transfer | 已实现 |
+| single-group direct KV page transfer | 接口壳已存在；生产 backend、event 桥和真机准入未实现 |
+| direct-first / staged-fallback selector | 未实现；当前仍由显式 `direct_transfer` bool 选择 |
 | split read/write bank | 已实现 |
 | local/striped双stream routing | 已实现 |
 | 独立read-copy stream与scatter event桥接 | 已实现并通过真实Hy3/Nsight准入 |
-| read plan 全量 pre-enqueue（K=2 future-event fences） | 已回退；生产路径为 host-window submit，禁止 future wait |
-| 实际 read/compute GPU interval overlap | 未通过；当前H20/580.105.08证据为0，需拆分CQ poll或full-layer staging |
+| staged read plan 全量 pre-enqueue（K=2 future-event fences） | 已回退；生产路径为 host-window submit，禁止 future wait |
+| 实际 read/compute GPU interval overlap | staged 当前实测为0；转向无槽复用的 direct 全层 enqueue 后重新验收 |
 | host-pinned prebuilt PRP | 已实现并真机命中 |
 | structured completion | 已实现 |
 | partial-commit正确drain/retry | 已实现 |
@@ -796,7 +869,11 @@ full-layer staging，而不是只改变stream颜色。
 - write失败不创建完整marker、不发布resident。
 - partial commit不重复提交accepted request。
 - read/write bank物理区间不重叠，总staging HBM不增加。
-- gather严格发生在compute后，write严格发生在gather后。
+- direct read 不经过 scatter，direct write 不经过 gather；读取页必须与原 KV page
+  byte-for-byte 一致。
+- direct write严格发生在对应层compute fence后；staged gather严格发生在compute
+  后，write严格发生在gather后。
+- direct准入失败在首个I/O前确定性回退；strict模式必须报告具体不满足的条件。
 - local/striped failure detail对称。
 
 ### 15.2 性能
@@ -804,6 +881,10 @@ full-layer staging，而不是只改变stream颜色。
 - trace可见`read/transfer[L+1] || compute[L] || write[L-1]`。
 - read/write使用不同stream，compute使用vLLM当前stream。
 - routine path无step内memory registration。
+- direct trace无staging allocation、gather/scatter和read-copy stream kernel；KV pool
+  每个rank只注册一次。
+- block size 64/128/256 的离散block table round-trip均正确；128/256真机用于比较
+  IOPS、吞吐、TTFT和KV容量，不能只因单次I/O更大就默认更快。
 - staged path命中prebuilt descriptor，GPU PRP allocation count为0。
 - I/O kernel占用不显著拖慢attention compute。
 
@@ -818,11 +899,17 @@ full-layer staging，而不是只改变stream颜色。
 
 ## 16. 推荐实施顺序
 
-1. 给Runtime/pybind release后result增加有界LRU或consume语义。
-2. 用真实Hy3 TP4验证split bank、双stream、rank-local device和recompute。
-3. 修复packed NHD/padded page canonical测试缺口。
-4. 实现HMA/multi-group，再启用Qwen Tutti数据面。
-5. profiling证明必要后，再把per-op arena改为per-stream compact workspace。
+1. 在 Python Tutti store 中实现 single-group cross-layer direct backend；复用现有
+   `register_memory/submit`，默认不增加 C++ layer/paged 语义。
+2. 接通 direct read/write 的 per-layer `fence_event` 编排和整请求 recompute 错误
+   语义，并保留 staged fallback。
+3. 用小模型先验证 block-table/address round-trip，再用真实Hy3 TP4比较 block size
+   64/128/256 和 Nsight timeline。
+4. 若且仅若真实 KV pool 基址不能满足 64 KiB 注册约束，再评审“aligned containing
+   allocation + logical base offset”的最小 Runtime API；不得在 DataPath 下沉 layer
+   或 block-table 语义。
+5. 修复packed NHD/padded page canonical测试缺口。
+6. 实现HMA/multi-group，再启用Qwen Tutti数据面。
 
 当前不以CUDA Graph为实施阶段。eager逐层流水正确、可恢复、可观测之后，再根据
 CPU submit开销和GPU/PCIe/NVMe利用率决定是否需要更激进的sequence API。
