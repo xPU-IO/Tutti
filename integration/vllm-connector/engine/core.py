@@ -9,7 +9,12 @@ import time
 from typing import Sequence
 
 from engine.staging import RingWindow
-from engine.transfer import DirectTransfer, StagedTransfer, select_transfer
+from engine.transfer import (
+    DirectTransfer,
+    DirectTransferUnavailable,
+    StagedTransfer,
+    select_transfer,
+)
 from engine.nvtx import range as nvtx_range
 from index.chunk_index import (
     ChunkIndex,
@@ -266,11 +271,31 @@ class _ReadPlan:
                     reuse_event=reuse_event,
                     bridge_compute=False,
                 )
+                add_terminal = getattr(
+                    self._handles[layer], "add_terminal_callback", None
+                )
+                if not callable(add_terminal):
+                    add_terminal = getattr(
+                        self._handles[layer], "add_done_callback", None
+                    )
+                if callable(add_terminal):
+                    add_terminal(self._on_completion)
             except Exception as exc:
                 self._failed = exc
                 if callable(self.on_failure):
                     self.on_failure(exc)
                 raise
+
+    def _on_completion(self, result) -> None:
+        if getattr(result, "ok", True) or self._failed is not None:
+            return
+        self._failed = LoadGateError(
+            "direct read failed; recompute the complete step",
+            whole_operation=True,
+            invalid_block_ids=_flatten_block_ids(self.block_tables),
+        )
+        if callable(self.on_failure):
+            self.on_failure(self._failed)
 
     def _new_fence_event(self):
         try:
@@ -626,9 +651,8 @@ class KVEngine:
       链以其为前缀派生——不同命名空间（不同模型/几何复用同一池）
       的 key 天然隔离；支持持久层 manifest 的 store（可选实现）以之
       校验池归属。缺省无命名空间。
-    - direct_transfer：可选 bool。请求 store-native 的 paged KV DMA
-      后端（legacy GeminiFS 风格）；当前 contiguous tutti runtime 不具备
-      该能力时自动回退 staged。
+    - direct_transfer：可选 bool。Tutti store 默认尝试 Python byte-range
+      direct backend；显式 false 关闭。准入失败时自动回退 staged。
     - direct_transfer_strict：可选 bool。direct_transfer 能力缺失时失败，
       用于硬件部署验收，避免误把 staged 当成 direct。
     - gather_fn / scatter_fn：可选搬运钩子（缺省 None，搬运为 no-op），
@@ -693,7 +717,7 @@ class KVEngine:
         self._window: RingWindow | None = None  # read-window compatibility alias
         self._read_window: RingWindow | None = None
         self._write_window: RingWindow | None = None
-        self._transfer: StagedTransfer | None = None
+        self._transfer: DirectTransfer | StagedTransfer | None = None
         self._scatter_hook = None
         self._staging_buffer_id: int | None = None
         self._read_staging_buffer_id: int | None = None
@@ -788,6 +812,79 @@ class KVEngine:
 
     # ---- 执行态 ----
 
+    @property
+    def direct(self) -> bool:
+        return isinstance(self._transfer, DirectTransfer)
+
+    def try_bind_direct(self, kv_pool, num_layers: int,
+                        blocks_per_chunk: int) -> bool:
+        """Attempt direct registration before any staging object is created."""
+        self._require_open()
+        if self._transfer is not None:
+            raise RuntimeError("bind 恰允许一次")
+        if not _is_int(num_layers) or num_layers <= 0:
+            raise ValueError(f"num_layers 须为正整数，got {num_layers!r}")
+        if self._num_layers is not None and self._num_layers != num_layers:
+            raise ValueError(
+                f"bind 层数 {num_layers} 与构造预告 num_layers"
+                f"({self._num_layers}) 不一致"
+            )
+        if not _is_int(blocks_per_chunk) or blocks_per_chunk <= 0:
+            raise ValueError(
+                f"blocks_per_chunk 须为正整数，got {blocks_per_chunk!r}"
+            )
+        if self._chunk_kv_bytes % num_layers:
+            raise ValueError(
+                f"chunk_kv_bytes({self._chunk_kv_bytes}) 不能被 "
+                f"num_layers({num_layers}) 整分"
+            )
+        segment_bytes = self._chunk_kv_bytes // num_layers
+        transfer = select_transfer(
+            kv_pool,
+            self._store,
+            self._config,
+            num_layers=num_layers,
+            blocks_per_chunk=blocks_per_chunk,
+            chunk_tokens=self._chunk_tokens,
+            segment_bytes=segment_bytes,
+            max_chunks_per_wave=self._max_chunks_per_wave,
+        )
+        if not isinstance(transfer, DirectTransfer):
+            return False
+        try:
+            setter = getattr(self._store, "set_layer_span", None)
+            if callable(setter):
+                setter(num_layers)
+        except Exception:
+            transfer.close()
+            raise
+        self._num_layers = num_layers
+        self._segment_bytes = segment_bytes
+        self._transfer = transfer
+        self._scatter_hook = None
+        self._window = None
+        self._read_window = None
+        self._write_window = None
+        self._staging_buffer_id = None
+        self._read_staging_buffer_id = None
+        self._write_staging_buffer_id = None
+        self._deferred_restore()
+        return True
+
+    def validate_direct_block_tables(self, block_tables) -> None:
+        if isinstance(self._transfer, DirectTransfer):
+            self._transfer.validate_block_tables(block_tables)
+
+    def fallback_from_direct(self, reason: Exception) -> None:
+        """Discard a pre-I/O direct binding so Worker can allocate staging."""
+        if not isinstance(self._transfer, DirectTransfer):
+            return
+        if self._config.get("direct_transfer_strict"):
+            raise DirectTransferUnavailable(str(reason)) from reason
+        _LOG.warning("DIRECT_ADMISSION_FALLBACK reason=%s", reason)
+        self._transfer.close()
+        self._transfer = None
+
     def bind(
         self,
         kv_caches: dict,
@@ -798,6 +895,7 @@ class KVEngine:
         write_window: RingWindow | None = None,
         gather_fn=None,
         scatter_fn=None,
+        force_staged: bool = False,
     ) -> None:
         """绑定执行态：层数定案、选定传输路径、staging 环窗接入 store。
 
@@ -810,7 +908,7 @@ class KVEngine:
         staging 环窗被 store 拒收 → RuntimeError / ValueError。
         """
         self._require_open()
-        if self._window is not None:
+        if self._transfer is not None:
             raise RuntimeError("bind 恰允许一次")
         if not _is_int(num_layers) or num_layers <= 0:
             raise ValueError(f"num_layers 须为正整数，got {num_layers!r}")
@@ -870,14 +968,18 @@ class KVEngine:
         if scatter_fn is not None:
             config["scatter_fn"] = scatter_fn
         self._scatter_hook = config.get("scatter_fn")
-        self._transfer = select_transfer(
-            kv_caches,
-            self._store,
-            config,
-            num_layers=num_layers,
-            blocks_per_chunk=blocks_per_chunk,
-            chunk_tokens=self._chunk_tokens,
-            segment_bytes=segment_bytes,
+        self._transfer = (
+            StagedTransfer(config.get("gather_fn"), config.get("scatter_fn"))
+            if force_staged else select_transfer(
+                kv_caches,
+                self._store,
+                config,
+                num_layers=num_layers,
+                blocks_per_chunk=blocks_per_chunk,
+                chunk_tokens=self._chunk_tokens,
+                segment_bytes=segment_bytes,
+                max_chunks_per_wave=self._max_chunks_per_wave,
+            )
         )
         if isinstance(self._transfer, DirectTransfer):
             # Direct backends register the vLLM paged tensors themselves and
@@ -929,6 +1031,14 @@ class KVEngine:
             completion = self._transfer.load_layer(
                 keys, layer_idx, dst_first_blocks
             )
+            record_read = getattr(self._store, "record_read_event", None)
+            if fence_event is not None and not callable(record_read):
+                raise RuntimeError("direct read event recorder is unavailable")
+            if callable(record_read):
+                recorded = record_read(fence_event)
+                if fence_event is not None and recorded is None:
+                    raise RuntimeError("direct read fence was not recorded")
+                completion.fence_event = recorded
             self._inflight.append(completion)
             return completion
         handles = []
@@ -1022,6 +1132,12 @@ class KVEngine:
     def read_plan_supported(self) -> bool:
         """Whether Python can bridge read and read-copy CUDA streams."""
         store = self._store
+        if self.direct:
+            return (
+                getattr(store, "_read_stream_obj", None) is not None
+                and callable(getattr(store, "record_read_event", None))
+                and callable(getattr(store, "wait_compute_event", None))
+            )
         return (
             getattr(store, "_read_stream_obj", None) is not None
             and getattr(store, "_read_copy_stream_obj", None) is not None
@@ -1046,6 +1162,20 @@ class KVEngine:
         """
         keys = self._prepare_layer_call(keys, layer_idx)
         if isinstance(self._transfer, DirectTransfer):
+            record_compute = getattr(self._store, "record_compute_event", None)
+            wait_write = getattr(self._store, "wait_write_event", None)
+            if not callable(record_compute) and not callable(wait_write):
+                completion = self._transfer.store_layer(
+                    keys, layer_idx, src_first_blocks
+                )
+                self._inflight.append(completion)
+                return completion
+            if not callable(record_compute) or not callable(wait_write):
+                raise RuntimeError("direct compute-to-write event bridge unavailable")
+            compute_done = record_compute()
+            if compute_done is None:
+                raise RuntimeError("direct compute fence was not recorded")
+            wait_write(compute_done)
             completion = self._transfer.store_layer(
                 keys, layer_idx, src_first_blocks
             )
@@ -1212,7 +1342,7 @@ class KVEngine:
     def _prepare_layer_call(self, keys, layer_idx: int) -> list[bytes]:
         """校验执行态前置条件，返回保持原序的 key 列表。"""
         self._require_open()
-        if self._window is None:
+        if self._transfer is None:
             raise RuntimeError("执行态方法须在 bind 之后调用")
         if not _is_int(layer_idx) or not 0 <= layer_idx < self._num_layers:
             raise ValueError(

@@ -27,6 +27,8 @@ from .object_pool import ObjectPool, PoolConfig
 from .commit import RankCommitRecord, remove_rank_commit, write_rank_commit
 from .striped_layout import StripedLayout
 from engine.nvtx import range as nvtx_range
+from engine.transfer import DirectTransferUnavailable
+from index.chunk_index import derive_io_key
 
 #: 运行日志（池归属校验等部署问题的非静默说明）。
 _LOG = logging.getLogger(__name__)
@@ -112,6 +114,354 @@ class TuttiBatchResult:
     results: tuple[TuttiTerminalResult, ...]
 
 
+class DirectAdmissionError(DirectTransferUnavailable):
+    """A concrete reason why the cross-layer pool cannot use direct I/O."""
+
+
+@dataclass(frozen=True)
+class DirectPoolGeometry:
+    pool_base: int
+    pool_size: int
+    block_stride_bytes: int
+    layer_stride_bytes: int
+    page_bytes: int
+    num_blocks: int
+    num_layers: int
+    block_size: int
+    blocks_per_chunk: int
+    segment_bytes: int
+    accel_id: int
+
+
+class TuttiDirectBackend:
+    """Direct byte-range I/O against one uniform cross-layer CUDA pool."""
+
+    def __init__(self, store):
+        self._store = store
+        self._pool = None
+        self._memory_ticket = None
+        self._geometry: DirectPoolGeometry | None = None
+        self._closed = False
+
+    @property
+    def geometry(self) -> DirectPoolGeometry:
+        if self._geometry is None:
+            raise RuntimeError("direct backend is not registered")
+        return self._geometry
+
+    def register_paged_caches(
+        self,
+        pool,
+        *,
+        num_layers: int,
+        blocks_per_chunk: int,
+        chunk_tokens: int,
+        segment_bytes: int,
+        max_chunks_per_wave: int | None = None,
+    ) -> bool:
+        if self._memory_ticket is not None:
+            raise DirectAdmissionError("KV pool is already registered")
+        geometry = self._derive_geometry(
+            pool,
+            num_layers=num_layers,
+            blocks_per_chunk=blocks_per_chunk,
+            chunk_tokens=chunk_tokens,
+            segment_bytes=segment_bytes,
+        )
+        self._check_runtime_capacity(
+            geometry, max_chunks_per_wave=max_chunks_per_wave
+        )
+        try:
+            ticket = self._store._runtime.register_memory(
+                geometry.pool_base,
+                geometry.pool_size,
+                "device",
+                accel_id=geometry.accel_id,
+                io_granularity=0,
+            )
+        except Exception as exc:
+            raise DirectAdmissionError(
+                f"Runtime.register_memory(io_granularity=0) failed: {exc}"
+            ) from exc
+        self._pool = pool
+        self._memory_ticket = int(ticket)
+        self._geometry = geometry
+        return True
+
+    @staticmethod
+    def _derive_geometry(pool, *, num_layers, blocks_per_chunk,
+                         chunk_tokens, segment_bytes) -> DirectPoolGeometry:
+        if not bool(getattr(pool, "is_cuda", False)):
+            raise DirectAdmissionError("KV pool must be a CUDA device tensor")
+        dim = getattr(pool, "dim", None)
+        if not callable(dim) or int(dim()) != 5:
+            raise DirectAdmissionError(
+                "KV pool must have rank 5: "
+                "[num_blocks, num_layers, block_size, 2, kv_channels]"
+            )
+        shape = tuple(int(value) for value in pool.shape)
+        if any(value <= 0 for value in shape):
+            raise DirectAdmissionError(f"KV pool has invalid shape {shape}")
+        if shape[1] != int(num_layers):
+            raise DirectAdmissionError(
+                f"KV pool layer axis is {shape[1]}, expected {num_layers}"
+            )
+        if shape[3] != 2:
+            raise DirectAdmissionError(
+                f"KV pool K/V axis must be shape[3] == 2, got {shape[3]}"
+            )
+        if shape[2] != int(chunk_tokens) // int(blocks_per_chunk):
+            raise DirectAdmissionError(
+                f"KV pool block axis is {shape[2]}, inconsistent with "
+                f"chunk_tokens={chunk_tokens} and "
+                f"blocks_per_chunk={blocks_per_chunk}"
+            )
+        if int(chunk_tokens) % shape[2]:
+            raise DirectAdmissionError(
+                f"chunk_tokens({chunk_tokens}) is not divisible by "
+                f"block_size({shape[2]})"
+            )
+        contiguous = getattr(pool, "is_contiguous", None)
+        if not callable(contiguous) or not bool(contiguous()):
+            raise DirectAdmissionError(
+                "KV pool backing storage is not contiguous (padded/strided "
+                "layouts are unsupported)"
+            )
+        stride = tuple(int(value) for value in pool.stride())
+        expected_stride = (
+            shape[1] * shape[2] * shape[3] * shape[4],
+            shape[2] * shape[3] * shape[4],
+            shape[3] * shape[4],
+            shape[4],
+            1,
+        )
+        if stride != expected_stride:
+            raise DirectAdmissionError(
+                f"KV pool stride {stride} is not uniform NHD cross-layer "
+                f"stride {expected_stride}"
+            )
+        element_size = int(pool.element_size())
+        pool_base = int(pool.data_ptr())
+        pool_size = int(pool.numel()) * element_size
+        block_stride_bytes = stride[0] * element_size
+        layer_stride_bytes = stride[1] * element_size
+        page_bytes = shape[2] * shape[3] * shape[4] * element_size
+        derived_blocks = int(chunk_tokens) // shape[2]
+        if derived_blocks != int(blocks_per_chunk):
+            raise DirectAdmissionError(
+                f"blocks_per_chunk mismatch: {blocks_per_chunk} != "
+                f"{derived_blocks}"
+            )
+        if layer_stride_bytes != page_bytes:
+            raise DirectAdmissionError(
+                f"one layer page is not contiguous: layer_stride_bytes="
+                f"{layer_stride_bytes}, page_bytes={page_bytes}"
+            )
+        if int(segment_bytes) != derived_blocks * page_bytes:
+            raise DirectAdmissionError(
+                f"padded or mismatched page geometry: segment_bytes="
+                f"{segment_bytes}, expected {derived_blocks * page_bytes}"
+            )
+        if pool_base % 65536:
+            raise DirectAdmissionError(
+                f"KV pool base 0x{pool_base:x} is not 64 KiB aligned"
+            )
+        for name, value in (
+            ("pool_size", pool_size),
+            ("block_stride_bytes", block_stride_bytes),
+            ("layer_stride_bytes", layer_stride_bytes),
+            ("page_bytes", page_bytes),
+            ("segment_bytes", int(segment_bytes)),
+        ):
+            if value % _IO_PAGE_BYTES:
+                raise DirectAdmissionError(
+                    f"{name}={value} is not 4 KiB I/O aligned"
+                )
+        get_device = getattr(pool, "get_device", None)
+        if not callable(get_device):
+            raise DirectAdmissionError("KV pool does not expose a CUDA device")
+        return DirectPoolGeometry(
+            pool_base=pool_base,
+            pool_size=pool_size,
+            block_stride_bytes=block_stride_bytes,
+            layer_stride_bytes=layer_stride_bytes,
+            page_bytes=page_bytes,
+            num_blocks=shape[0],
+            num_layers=shape[1],
+            block_size=shape[2],
+            blocks_per_chunk=derived_blocks,
+            segment_bytes=int(segment_bytes),
+            accel_id=int(get_device()),
+        )
+
+    def _check_runtime_capacity(self, geometry, *, max_chunks_per_wave) -> None:
+        store = self._store
+        if not callable(getattr(store._runtime, "unregister_memory", None)):
+            raise DirectAdmissionError(
+                "Runtime does not expose unregister_memory for direct KV pool "
+                "lifecycle"
+            )
+        if not store._runtime_supports_multi_stream():
+            raise DirectAdmissionError(
+                "Runtime does not support independent read/write streams"
+            )
+        if (store._read_stream is None or store._write_stream is None
+                or store._read_stream == store._write_stream):
+            raise DirectAdmissionError(
+                "read/write CUDA stream handles are not independent"
+            )
+        stream_accel = getattr(store, "_stream_accel_id", None)
+        if stream_accel is not None and int(stream_accel) != geometry.accel_id:
+            raise DirectAdmissionError(
+                f"KV pool CUDA device {geometry.accel_id} does not match "
+                f"Runtime stream device {stream_accel}"
+            )
+        try:
+            caps = dict(store._runtime.caps())
+        except Exception as exc:
+            raise DirectAdmissionError(f"Runtime capability query failed: {exc}") from exc
+        in_flight = int(caps.get("max_in_flight_operations", 0) or 0)
+        required_ops = 2 * geometry.num_layers
+        if in_flight and in_flight < required_ops:
+            raise DirectAdmissionError(
+                "direct operation capacity is insufficient: "
+                f"configured={in_flight}, required={required_ops}, "
+                f"num_layers={geometry.num_layers}"
+            )
+        max_batch = int(
+            caps.get("max_batch_entries", caps.get("max_batch_requests", 0)) or 0
+        )
+        required_batch = geometry.blocks_per_chunk * int(
+            max_chunks_per_wave or 1
+        )
+        if max_batch and max_batch < required_batch:
+            raise DirectAdmissionError(
+                f"max_batch_entries={max_batch} is below one-layer request "
+                f"bound {required_batch}"
+            )
+
+    def get_paged_batch(self, keys, layer_idx: int, block_tables):
+        return self._submit(keys, layer_idx, block_tables, "read")
+
+    def put_paged_batch(self, keys, layer_idx: int, block_tables):
+        return self._submit(keys, layer_idx, block_tables, "write")
+
+    def validate_block_tables(self, block_tables):
+        geometry = self.geometry
+        validated_tables = []
+        for table in block_tables:
+            table = list(table)
+            if len(table) != geometry.blocks_per_chunk:
+                raise DirectAdmissionError(
+                    f"direct block table length {len(table)} does not match "
+                    f"blocks_per_chunk={geometry.blocks_per_chunk}"
+                )
+            validated = []
+            for raw_block_id in table:
+                if (not isinstance(raw_block_id, int)
+                        or isinstance(raw_block_id, bool)):
+                    raise DirectAdmissionError(
+                        f"direct block id must be int, got {raw_block_id!r}"
+                    )
+                block_id = int(raw_block_id)
+                if not 0 <= block_id < geometry.num_blocks:
+                    raise DirectAdmissionError(
+                        f"direct block id {block_id} is outside "
+                        f"[0, {geometry.num_blocks})"
+                    )
+                validated.append(block_id)
+            validated_tables.append(validated)
+        try:
+            caps = self._store._runtime.caps()
+        except Exception as exc:
+            raise DirectAdmissionError(
+                f"Runtime capability query failed for direct batch: {exc}"
+            ) from exc
+        max_batch = int(
+            caps.get("max_batch_entries", caps.get("max_batch_requests", 0)) or 0
+        )
+        request_count = len(validated_tables) * geometry.blocks_per_chunk
+        if max_batch and request_count > max_batch:
+            raise DirectAdmissionError(
+                f"direct layer expands to {request_count} requests, "
+                f"max_batch_entries={max_batch}"
+            )
+        return validated_tables
+
+    def _submit(self, keys, layer_idx: int, block_tables, direction: str):
+        store = self._store
+        geometry = self.geometry
+        keys = [bytes(key) for key in keys]
+        block_tables = [list(table) for table in block_tables]
+        if len(keys) != len(block_tables):
+            raise ValueError(
+                f"direct {direction} block table count {len(block_tables)} "
+                f"does not match chunk count {len(keys)}"
+            )
+        if not 0 <= int(layer_idx) < geometry.num_layers:
+            raise ValueError(f"direct layer {layer_idx} is out of range")
+        validated_tables = self.validate_block_tables(block_tables)
+        io_keys = [derive_io_key(key, int(layer_idx)) for key in keys]
+        if direction == "write":
+            store._layout.prepare_put(io_keys, store._num_chunks)
+        elif any(io_key not in store._live for io_key in io_keys):
+            missing = next(io_key for io_key in io_keys if io_key not in store._live)
+            raise ValueError(f"direct get has non-resident key: {missing!r}")
+        target_entries = [(io_key, 0, 0) for io_key in io_keys]
+        targets = store._ensure_targets(target_entries)
+        requests = []
+        for io_key, table in zip(io_keys, validated_tables):
+            chunk_id, _ = decode_io_key(io_key)
+            target = targets[store._layout.target_uri(chunk_id)]
+            for block_ordinal, block_id in enumerate(table):
+                memory_offset = (
+                    block_id * geometry.block_stride_bytes
+                    + int(layer_idx) * geometry.layer_stride_bytes
+                )
+                target_offset = (
+                    int(layer_idx) * geometry.segment_bytes
+                    + block_ordinal * geometry.page_bytes
+                )
+                requests.append((
+                    target,
+                    target_offset,
+                    self._memory_ticket,
+                    memory_offset,
+                    geometry.page_bytes,
+                    direction,
+                ))
+        with nvtx_range(
+            f"tutti.runtime.submit|op={direction}|direct=1|requests={len(requests)}"
+        ):
+            handles = store._submit_retry(requests, direction)
+        settled = (
+            (lambda ok: store._on_put_settled(ok, io_keys))
+            if direction == "write" else (lambda _ok: None)
+        )
+        completion = _TuttiCompletion(
+            store._runtime, handles, settled, auto_watch=True
+        )
+        store._track_completion(completion, keys)
+        return completion
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        ticket = self._memory_ticket
+        unregister = getattr(self._store._runtime, "unregister_memory", None)
+        if ticket is not None:
+            if not callable(unregister):
+                raise RuntimeError(
+                    "Runtime lost unregister_memory before direct KV pool close"
+                )
+            unregister(ticket)
+        # Do not clear ownership until Runtime confirms success. A BUSY or
+        # backend failure leaves the backend retryable after the caller drains.
+        self._memory_ticket = None
+        self._pool = None
+        self._closed = True
+
+
 class _TuttiCompletion:
     """一批 runtime IO 的完成句柄，terminal 详情在 release 后仍保留。"""
 
@@ -133,6 +483,7 @@ class _TuttiCompletion:
         self._handles_released = False
         self._terminal_lock = threading.Lock()
         self._done_callbacks = []
+        self._terminal_callbacks = []
         self._ready = threading.Event()
         self._watcher = None
         if auto_watch:
@@ -174,6 +525,15 @@ class _TuttiCompletion:
             else:
                 self._done_callbacks.append(callback)
                 return
+        callback(result)
+
+    def add_terminal_callback(self, callback) -> None:
+        """Observe structured terminal status without waiting for host drain."""
+        with self._terminal_lock:
+            if self._terminal is None:
+                self._terminal_callbacks.append(callback)
+                return
+            result = self._build_batch_result()
         callback(result)
 
     def _start_watcher(self) -> None:
@@ -273,6 +633,11 @@ class _TuttiCompletion:
             if message:
                 self._failure_message = message
             self._ready.set()
+            callbacks = self._terminal_callbacks
+            self._terminal_callbacks = []
+            result = self._build_batch_result()
+        for callback in callbacks:
+            callback(result)
 
     @staticmethod
     def _format_failure(result: TuttiTerminalResult) -> str:
@@ -772,26 +1137,13 @@ class TuttiKVStore:
         chunk_tokens: int,
         segment_bytes: int,
     ):
-        """Return a runtime-native paged backend when one is available.
+        """Create the Python byte-range direct backend.
 
-        The current generic ``tutti`` runtime exposes only contiguous
-        ``register_memory`` buffers, so this returns ``None`` on existing
-        deployments and the engine keeps the staged path.  A runtime that
-        implements legacy-style paged registration can expose
-        ``create_direct_transfer``; no store-side copy or staging buffer is
-        then required.  Keeping the capability probe here makes the direct
-        path explicit and prevents silently treating contiguous IO as paged.
+        The backend uses only Runtime.register_memory/submit and keeps model,
+        layer, and block-table semantics above Runtime/DataPath.
         """
-        factory = getattr(self._runtime, "create_direct_transfer", None)
-        if not callable(factory):
-            return None
-        return factory(
-            kv_caches,
-            num_layers=num_layers,
-            blocks_per_chunk=blocks_per_chunk,
-            chunk_tokens=chunk_tokens,
-            segment_bytes=segment_bytes,
-        )
+        self._require_open()
+        return TuttiDirectBackend(self)
 
     def _stream_for(self, direction: str):
         if direction == "read":
@@ -880,6 +1232,18 @@ class TuttiKVStore:
     def record_write_event(self, event=None):
         """Record and return a fence on the store-owned write stream."""
         return self._record_event("write", event)
+
+    def record_compute_event(self, event=None):
+        """Record a fence on vLLM's current compute stream."""
+        if self._stream_accel_id is None:
+            return None
+        import torch
+
+        stream = torch.cuda.current_stream(device=self._stream_accel_id)
+        if event is None:
+            event = torch.cuda.Event()
+        event.record(stream)
+        return event
 
     def wait_compute_event(self, event) -> None:
         """Enqueue a device-side wait on vLLM's restored current stream."""

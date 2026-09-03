@@ -70,6 +70,48 @@ class TestRegisterMemory:
         with pytest.raises(ValueError):
             stub_rt.register_memory(ctypes.addressof(buf), 4096, "pinned")
 
+    def test_register_unregister_pair_and_duplicate_failure(self, stub_rt):
+        buf = _host_buffer(4096)
+        ticket = stub_rt.register_memory(
+            ctypes.addressof(buf), 4096, "host"
+        )
+        stub_rt.unregister_memory(ticket)
+        with pytest.raises(RuntimeError, match="unknown memory handle"):
+            stub_rt.unregister_memory(ticket)
+
+    def test_unregister_unknown_ticket_fails(self, stub_rt):
+        with pytest.raises(RuntimeError, match="unknown memory handle: 999999"):
+            stub_rt.unregister_memory(999999)
+
+    def test_unregister_busy_preserves_ticket_for_retry(self, stub_rt):
+        target = stub_rt.open_batch(["file:///tmp/unregister-busy.bin"])[0]
+        buf = _host_buffer(4096)
+        memory = stub_rt.register_memory(
+            ctypes.addressof(buf), 4096, "host"
+        )
+        submitted = stub_rt.submit(
+            [(target, 0, memory, 0, 512, "read")],
+            accel_id=-1, stream=None, execution="host",
+        )
+        with pytest.raises(
+            RuntimeError,
+            match=r"unregister_memory failed.*BUSY.*inflight",
+        ):
+            stub_rt.unregister_memory(memory)
+        stub_rt.testing_force_complete(submitted.io_handle)
+        stub_rt.wait(submitted.io_handle, timeout_ms=1000)
+        stub_rt.release_io(submitted.io_handle)
+        stub_rt.unregister_memory(memory)
+
+    def test_shutdown_clears_memory_ticket_table(self, stub_rt):
+        buf = _host_buffer(4096)
+        memory = stub_rt.register_memory(
+            ctypes.addressof(buf), 4096, "host"
+        )
+        stub_rt.shutdown(timeout_ms=1000)
+        with pytest.raises(RuntimeError, match="unknown memory handle"):
+            stub_rt.unregister_memory(memory)
+
 
 class TestSubmitValidation:
     def test_read_failure_injection_is_disabled_by_default(self, stub_rt):

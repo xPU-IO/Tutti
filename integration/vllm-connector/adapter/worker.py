@@ -425,6 +425,7 @@ class WorkerImpl:
         # 显存对象登记
         self._kv_caches: dict | None = None
         self._cross_pool = None
+        self._cross_attn_backend = None
         self._layer_names: list[str] = []
         # 绑定态
         self._num_layers = 0
@@ -521,8 +522,9 @@ class WorkerImpl:
             self._ensure_bound()
 
     def register_cross_layers_kv_cache(self, kv_cache, attn_backend) -> None:
-        """登记单块跨层显存对象（第 0 维为层数）。"""
+        """登记 uniform cross-layer KV pool 及其 attention backend。"""
         self._cross_pool = kv_cache
+        self._cross_attn_backend = attn_backend
         if self._config_ready():
             self._ensure_bound()
 
@@ -610,6 +612,7 @@ class WorkerImpl:
                 chunk_count=n_chunks,
             ))
         if keys:
+            self._validate_direct_or_fallback(block_tables)
             self._load_keys = keys
             self._load_block_tables = block_tables
             self._pinned = True
@@ -622,7 +625,7 @@ class WorkerImpl:
                     if (getattr(self._engine, "read_plan_supported", False)
                             and callable(getattr(
                                 self._engine, "start_read_plan", None))):
-                        depth = max(
+                        depth = 1 if getattr(self._engine, "direct", False) else max(
                             1,
                             self._read_window.num_slots
                             // max(1, self._max_chunks_per_wave),
@@ -665,7 +668,10 @@ class WorkerImpl:
         """为指定层在 compute stream 排入已完成 scatter fence 的等待。"""
         callback, idx = self._resolve_callback(layer_name)
         self._diag_callback("wait", layer_name, callback, idx)
-        if callback in self._load_waited_callbacks or self._load_failed:
+        direct = bool(getattr(self._engine, "direct", False))
+        if callback in self._load_waited_callbacks:
+            return
+        if self._load_failed and not direct:
             return
         if not self._load_keys:
             return
@@ -690,7 +696,7 @@ class WorkerImpl:
             return
         if self._read_plan is not None:
             try:
-                if self._read_plan.failed is not None:
+                if self._read_plan.failed is not None and not direct:
                     raise self._read_plan.failed
                 fence_event = self._read_plan.wait_layer(callback)
                 if fence_event is None:
@@ -781,6 +787,7 @@ class WorkerImpl:
                 )
                 block_tables.extend(self._chunk_block_tables(meta, end)[start:end])
             if keys:
+                self._validate_direct_or_fallback(block_tables)
                 plan = self._engine.plan_store(keys)
                 if plan is None:
                     pending = getattr(self._engine, "store_plan_pending", None)
@@ -1340,7 +1347,7 @@ class WorkerImpl:
             )
 
     def _ensure_bound(self) -> None:
-        """惰性绑定：分配 staging 环窗显存并接入引擎（恰一次）。
+        """Direct-first 绑定；不满足准入时才分配 staged 环窗。
 
         池为加速侧内存时构造两端搬运钩子并经 bind 注入（bind 参数
         优先于引擎配置中的同名钩子；逐层常见布局走布局发现 + 搬运
@@ -1371,6 +1378,22 @@ class WorkerImpl:
             )
         self._configure_callback_map(num_layers)
         segment_bytes = self._chunk_kv_bytes // num_layers
+        blocks_per_chunk = -(-self._chunk_tokens // self._block_size)
+        direct_pool = self._cross_pool if self._cross_pool is not None else self._kv_caches
+        try_direct = getattr(self._engine, "try_bind_direct", None)
+        if callable(try_direct) and try_direct(
+                direct_pool, num_layers, blocks_per_chunk):
+            self._num_layers = num_layers
+            self._window = None
+            self._read_window = None
+            self._write_window = None
+            self._bound = True
+            return
+        self._bind_staged(num_layers, segment_bytes, blocks_per_chunk)
+
+    def _bind_staged(self, num_layers: int, segment_bytes: int,
+                     blocks_per_chunk: int) -> None:
+        """Allocate and bind the staged fallback after direct rejection."""
         # 原 staging 总槽数不变，但静态拆为 read/write 两个 bank。
         # 槽位深度只决定 CUDA event 保护下的复用距离；层计划始终
         # 在 start_load_kv 的同一 host enqueue 阶段完整提交。
@@ -1417,7 +1440,6 @@ class WorkerImpl:
             capacity_per_wave=self._max_chunks_per_wave,
             slot_base=bank_slots,
         )
-        blocks_per_chunk = -(-self._chunk_tokens // self._block_size)
         gather_fn = scatter_fn = None
         layer_view = self._layer_view()
         if layer_view is not None and getattr(layer_view(0), "is_cuda", False):
@@ -1441,12 +1463,32 @@ class WorkerImpl:
             read_window, num_layers, blocks_per_chunk,
             write_window=write_window,
             gather_fn=gather_fn, scatter_fn=scatter_fn,
+            force_staged=True,
         )
         self._num_layers = num_layers
         self._window = read_window
         self._read_window = read_window
         self._write_window = write_window
         self._bound = True
+
+    def _validate_direct_or_fallback(self, block_tables) -> None:
+        if not bool(getattr(self._engine, "direct", False)):
+            return
+        validate = getattr(self._engine, "validate_direct_block_tables", None)
+        if not callable(validate):
+            return
+        try:
+            validate(block_tables)
+        except Exception as exc:
+            fallback = getattr(self._engine, "fallback_from_direct", None)
+            if not callable(fallback):
+                raise
+            fallback(exc)
+            segment_bytes = self._chunk_kv_bytes // self._num_layers
+            blocks_per_chunk = -(-self._chunk_tokens // self._block_size)
+            self._bind_staged(
+                self._num_layers, segment_bytes, blocks_per_chunk
+            )
 
     def _layer_view(self):
         """返回层序号 → paged 张量的访问器；未登记任何池时为 None。

@@ -200,6 +200,23 @@ public:
         return mint_memory_(result.value());
     }
 
+    void unregister_memory(std::uint64_t ticket) {
+        const MemoryHandle handle = lookup_memory_(ticket, "memory");
+        tutti::Status status;
+        {
+            py::gil_scoped_release release;
+            status = rt_->unregister_memory(handle);
+        }
+        if (!status.ok()) {
+            throw_status(
+                "unregister_memory failed for memory ticket " +
+                std::to_string(ticket), status);
+        }
+        // Preserve the ticket when Runtime rejects the unregister (for
+        // example BUSY due to in-flight I/O), so callers can drain and retry.
+        memories_.erase(ticket);
+    }
+
     // ---- submit ----
     SubmitResult submit(py::sequence requests, std::int32_t accel_id,
                         py::object stream, const std::string& execution) {
@@ -362,6 +379,11 @@ public:
         if (!status.ok()) {
             throw_status("testing_force_complete failed", status);
         }
+    }
+
+    void testing_inject_next_read_nvme_error(std::uint32_t) {
+        throw std::runtime_error(
+            "read NVMe error injection is disabled in this binding build");
     }
 
 private:
@@ -714,6 +736,8 @@ PYBIND11_MODULE(_core, m) {
         .def("register_memory", &PyRuntime::register_memory,
              py::arg("addr"), py::arg("size"), py::arg("kind"),
              py::arg("accel_id") = -1, py::arg("io_granularity") = 0)
+        .def("unregister_memory", &PyRuntime::unregister_memory,
+             py::arg("memory_ticket"))
         .def("submit", &PyRuntime::submit, py::arg("requests"),
              py::arg("accel_id"), py::arg("stream"),
              py::arg("execution") = "device")
@@ -726,7 +750,10 @@ PYBIND11_MODULE(_core, m) {
              py::arg("timeout_ms") = 0)
         .def("shutdown", &PyRuntime::shutdown, py::arg("timeout_ms"))
         .def("testing_force_complete", &PyRuntime::testing_force_complete,
-             py::arg("io_handle"), py::arg("state") = "COMPLETED");
+             py::arg("io_handle"), py::arg("state") = "COMPLETED")
+        .def("testing_inject_next_read_nvme_error",
+             &PyRuntime::testing_inject_next_read_nvme_error,
+             py::arg("raw_cq_status"));
 
     m.def("make_local_nvme_runtime", &make_local_nvme_runtime,
           py::arg("preset"));

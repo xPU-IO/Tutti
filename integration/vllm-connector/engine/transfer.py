@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Sequence
+
+
+_LOG = logging.getLogger(__name__)
 
 
 class DirectTransferUnavailable(RuntimeError):
@@ -31,6 +35,7 @@ class DirectTransfer:
         blocks_per_chunk: int,
         chunk_tokens: int,
         segment_bytes: int,
+        max_chunks_per_wave: int | None = None,
     ):
         self._backend = backend
         register = getattr(backend, "register_paged_caches", None)
@@ -38,13 +43,14 @@ class DirectTransfer:
             raise DirectTransferUnavailable(
                 "direct backend lacks register_paged_caches"
             )
-        accepted = register(
-            kv_caches,
+        kwargs = dict(
             num_layers=num_layers,
             blocks_per_chunk=blocks_per_chunk,
             chunk_tokens=chunk_tokens,
             segment_bytes=segment_bytes,
+            max_chunks_per_wave=max_chunks_per_wave,
         )
+        accepted = register(kv_caches, **kwargs)
         if accepted is False:
             raise DirectTransferUnavailable(
                 "direct backend rejected paged cache registration"
@@ -65,6 +71,11 @@ class DirectTransfer:
                 "direct backend lacks put_paged_batch"
             )
         return method(list(keys), layer_idx, list(block_tables))
+
+    def validate_block_tables(self, block_tables) -> None:
+        method = getattr(self._backend, "validate_block_tables", None)
+        if callable(method):
+            method(list(block_tables))
 
     def close(self) -> None:
         close = getattr(self._backend, "close", None)
@@ -125,16 +136,16 @@ def select_transfer(
     blocks_per_chunk: int | None = None,
     chunk_tokens: int | None = None,
     segment_bytes: int | None = None,
+    max_chunks_per_wave: int | None = None,
 ):
     """bind 期一次性定案传输路径。
 
     契约：接受布局对象、store 实例与引擎配置，返回选定路径且此后
-    固定不变。direct_transfer=true 时仅在 store 显式提供
-    ``create_direct_transfer`` 且完成 paged cache 注册后启用；否则
-    自动回退 staged。设置 direct_transfer_strict=true 可把能力缺失
-    升级为 RuntimeError，避免部署误以为走了零拷贝路径。
+    固定不变。store 暴露 ``create_direct_transfer`` 时默认先尝试 direct；
+    ``direct_transfer=false`` 可显式关闭。声明的准入失败自动回退 staged，
+    ``direct_transfer_strict=true`` 则保留具体失败原因并抛出。
     """
-    if config.get("direct_transfer"):
+    if config.get("direct_transfer", True):
         factory = getattr(store, "create_direct_transfer", None)
         if callable(factory):
             backend = factory(
@@ -153,19 +164,33 @@ def select_transfer(
                         blocks_per_chunk=blocks_per_chunk,
                         chunk_tokens=chunk_tokens,
                         segment_bytes=segment_bytes,
+                        max_chunks_per_wave=max_chunks_per_wave,
                     )
-                except DirectTransferUnavailable:
+                except DirectTransferUnavailable as exc:
                     close = getattr(backend, "close", None)
                     if callable(close):
                         close()
                     if config.get("direct_transfer_strict"):
                         raise
+                    _LOG.warning(
+                        "DIRECT_ADMISSION_FALLBACK reason=%s",
+                        exc,
+                    )
         elif config.get("direct_transfer_strict"):
             raise DirectTransferUnavailable(
                 "store lacks create_direct_transfer"
+            )
+        elif config.get("direct_transfer") is True:
+            _LOG.warning(
+                "DIRECT_ADMISSION_FALLBACK reason=store lacks "
+                "create_direct_transfer"
             )
         if config.get("direct_transfer_strict"):
             raise DirectTransferUnavailable(
                 "store did not accept direct paged cache registration"
             )
+    elif config.get("direct_transfer_strict"):
+        raise DirectTransferUnavailable(
+            "direct_transfer_strict requires direct transfer to be enabled"
+        )
     return StagedTransfer(config.get("gather_fn"), config.get("scatter_fn"))
