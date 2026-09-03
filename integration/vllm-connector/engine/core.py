@@ -43,12 +43,19 @@ class _PostCompletion:
     次）；query 在收尾尚未启动时反映底层状态，事件已产生后反映事件状态。
     """
 
-    __slots__ = ("_inner", "_after", "_event", "_done", "_block_tables")
+    __slots__ = (
+        "_inner", "_after", "_before", "_after_event", "_event", "_done",
+        "_block_tables", "_fence_event",
+    )
 
-    def __init__(self, inner, after, block_tables=None):
+    def __init__(self, inner, after, block_tables=None, after_event=None,
+                 before=None, fence_event=None):
         """inner 为底层完成句柄，after 为无参收尾可调用。"""
         self._inner = inner
         self._after = after
+        self._before = before
+        self._fence_event = fence_event
+        self._after_event = after_event
         self._event = None
         self._done = False
         self._block_tables = block_tables
@@ -57,46 +64,61 @@ class _PostCompletion:
         """阻塞至底层完成并执行收尾动作（恰一次）。"""
         if self._done:
             return
-        wait_result = getattr(self._inner, "wait_result", None)
-        if callable(wait_result):
-            result = wait_result()
-            if not getattr(result, "ok", True):
-                failed = tuple(getattr(result, "failed_batch_indices", ()) or ())
-                failures = tuple(getattr(result, "failures", ()) or ())
-                whole = not failed or any(
-                    getattr(item, "failure_scope", "WHOLE_OPERATION")
-                    != "REQUEST_INDICES" for item in failures
-                )
-                selected = self._block_tables
-                if not whole and failed and self._block_tables is not None:
-                    selected = [
-                        self._block_tables[index]
-                        for index in failed
-                        if 0 <= index < len(self._block_tables)
-                    ]
-                invalid_blocks = _flatten_block_ids(selected)
-                raise LoadGateError(
-                    "底层 IO 失败，禁止 scatter",
-                    failed_batch_indices=failed,
-                    whole_operation=whole,
-                    invalid_block_ids=invalid_blocks,
-                )
-        else:
-            # TODO(STRUCTURED-COMPLETION): remove this compatibility branch
-            # once every KVStore completion exposes wait_result().  A legacy
-            # wait exception has no request-index detail, so WorkerImpl maps
-            # it to WHOLE_OPERATION fail-closed.
-            self._inner.wait()
-        self._event = self._after()
-        if self._event is not None:
-            synchronize = getattr(self._event, "synchronize", None)
-            if callable(synchronize):
-                synchronize()
+        try:
+            wait_result = getattr(self._inner, "wait_result", None)
+            if callable(wait_result):
+                result = wait_result()
+                if not getattr(result, "ok", True):
+                    failed = tuple(getattr(result, "failed_batch_indices", ()) or ())
+                    failures = tuple(getattr(result, "failures", ()) or ())
+                    whole = not failed or any(
+                        getattr(item, "failure_scope", "WHOLE_OPERATION")
+                        != "REQUEST_INDICES" for item in failures
+                    )
+                    selected = self._block_tables
+                    if not whole and failed and self._block_tables is not None:
+                        selected = [
+                            self._block_tables[index]
+                            for index in failed
+                            if 0 <= index < len(self._block_tables)
+                        ]
+                    invalid_blocks = _flatten_block_ids(selected)
+                    raise LoadGateError(
+                        "底层 IO 失败，禁止 scatter",
+                        failed_batch_indices=failed,
+                        whole_operation=whole,
+                        invalid_block_ids=invalid_blocks,
+                    )
             else:
-                self._event.wait()
-        self._done = True
+                # Legacy completions have no request-index detail; fail closed.
+                self._inner.wait()
+            if self._before is not None:
+                self._before()
+            self._event = self._after()
+            if self._event is not None:
+                if callable(self._after_event):
+                    self._after_event(self._event)
+                else:
+                    wait = getattr(self._event, "wait", None)
+                    if callable(wait):
+                        wait()
+        finally:
+            self._done = True
 
-    def abort(self) -> None:
+    def poll(self) -> bool:
+        """Non-blocking terminal probe with exactly-once post processing."""
+        if self._done:
+            return True
+        if not self._inner.query():
+            return False
+        self.wait()
+        return True
+
+    @property
+    def fence_event(self):
+        return self._fence_event if self._fence_event is not None else self._event
+
+    def abort(self, timeout=None) -> None:
         """Drain the inner operation without running consumer-side ``after``.
 
         A look-ahead load may have already submitted later layers when an
@@ -143,11 +165,18 @@ class _AggregateCompletion:
     def wait(self) -> None:
         if self._done:
             return
+        first_error = None
         for handle in self._handles:
-            handle.wait()
+            try:
+                handle.wait()
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
         self._done = True
+        if first_error is not None:
+            raise first_error
 
-    def abort(self) -> None:
+    def abort(self, timeout=None) -> None:
         """Drain child operations while suppressing all scatter callbacks."""
         if self._done:
             return
@@ -155,7 +184,13 @@ class _AggregateCompletion:
             abort = getattr(handle, "abort", None)
             try:
                 if callable(abort):
-                    abort()
+                    if timeout is None:
+                        abort()
+                    else:
+                        try:
+                            abort(timeout=timeout)
+                        except TypeError:
+                            abort()
                 else:
                     handle.wait()
             except Exception:
@@ -169,9 +204,113 @@ class _AggregateCompletion:
         # 在这里标记聚合句柄完成，否则后续 wait 会跳过必要收尾。
         return all(handle.query() for handle in self._handles)
 
+    @property
+    def fence_event(self):
+        if not self._handles:
+            return None
+        return getattr(self._handles[-1], "fence_event", None)
+
+
+class _ReadPlan:
+    """Python-owned eager layer plan.
+
+    Construction submits every layer immediately.  The engine keeps staging
+    reuse asynchronous by inserting read-stream waits on the previous layer's
+    already-recorded scatter fence; no host observer or callback submission is
+    involved.
+    """
+
+    def __init__(self, engine, keys, block_tables, physical_layers, depth,
+                 on_failure=None):
+        self.engine = engine
+        self.keys = list(keys)
+        self.block_tables = list(block_tables)
+        self.physical_layers = tuple(physical_layers)
+        self.depth = max(1, int(depth))
+        self.on_failure = on_failure
+        self._handles = {}
+        self._fence_slots = {}
+        self._failed = None
+        self._submit_all()
+
+    @property
+    def layer_count(self):
+        return len(self.physical_layers)
+
+    @property
+    def failed(self):
+        return self._failed
+
+    def fence_event(self, layer):
+        return self._fence_slots.get(layer)
+
+    def _submit_all(self):
+        for layer in range(len(self.physical_layers)):
+            physical = self.physical_layers[layer]
+            wait_for_reuse = layer >= self.depth
+            fence_event = self._new_fence_event()
+            self._fence_slots[layer] = fence_event
+            reuse_event = (
+                self._fence_slots.get(layer - self.depth)
+                if wait_for_reuse else None
+            )
+            try:
+                self._handles[layer] = self.engine.load_layer(
+                    self.keys, physical, self.block_tables,
+                    # Every eager-plan wave must avoid RingWindow's host
+                    # reuse wait, including a second wave within one layer.
+                    # The optional predecessor fence is inserted on the read
+                    # stream only when this layer wraps the staging bank.
+                    async_reuse=True,
+                    fence_event=fence_event,
+                    reuse_event=reuse_event,
+                    bridge_compute=False,
+                )
+            except Exception as exc:
+                self._failed = exc
+                if callable(self.on_failure):
+                    self.on_failure(exc)
+                raise
+
+    def _new_fence_event(self):
+        try:
+            import torch
+            if torch.cuda.is_available():
+                return torch.cuda.Event(enable_timing=False)
+        except Exception:
+            pass
+        store = getattr(self.engine, "_store", None)
+        factory = getattr(store, "new_event", None)
+        if callable(factory):
+            return factory()
+        # Host/fake stores used by contract tests can provide their own event
+        # object through record_* methods; None keeps that compatibility path.
+        return None
+
+    def wait_layer(self, layer):
+        if self._failed is not None:
+            raise self._failed
+        return self._fence_slots.get(layer)
+
+    def abort(self):
+        for handle in self._handles.values():
+            try:
+                abort = getattr(handle, "abort", None)
+                if callable(abort):
+                    abort()
+                else:
+                    handle.wait()
+            except Exception:
+                pass
+
 
 class _EngineStepIO:
-    """Engine-side layer callbacks over one store feeder completion."""
+    """Compatibility layer callback helper for contract tests.
+
+    Production WorkerImpl uses ordinary per-layer handles directly.  This
+    helper remains isolated in the engine test surface and does not call any
+    lower-layer feeder API.
+    """
 
     def __init__(self, inner, engine, keys, block_tables, slots_by_callback,
                  direction, physical_layers):
@@ -184,7 +323,9 @@ class _EngineStepIO:
         self._physical_layers = tuple(physical_layers)
         self._seen: set[int] = set()
         self._next_callback = 0
+        self._released_after_failure: set[int] = set()
         self._drained = False
+        self._drain_result_value = None
 
     def wait_layer(self, callback: int, physical: int) -> None:
         if not self._enter_callback(callback, physical):
@@ -192,26 +333,97 @@ class _EngineStepIO:
         if _FEEDER_DIAG:
             _LOG.warning("FEEDER_DIAG engine gate_wait_begin t_ns=%d direction=read callback=%d physical=%d",
                          time.monotonic_ns(), callback, physical)
-        if not self._inner.wait_layer(callback):
+        wait_detail = getattr(self._inner, "wait_layer_detail", None)
+        if callable(wait_detail):
+            state, failed_flat_index = wait_detail(callback)
+            layer_ready = state == "READY"
+        else:
+            layer_ready = self._inner.wait_layer(callback)
+            failed_flat_index = None
+        if _FEEDER_DIAG:
+            _LOG.warning(
+                "FEEDER_DIAG layer_event t_ns=%d phase=read_ready "
+                "callback=%d physical=%d ready=%s",
+                time.monotonic_ns(), callback, physical, layer_ready,
+            )
+        if not layer_ready:
+            # The callback must return quickly so this TP rank can execute the
+            # old forward's remaining model collectives. Structured CQ detail
+            # is harvested after the all-rank failure collective at finalize.
+            chunk_count = len(self._keys)
+            failed_chunks = () if failed_flat_index is None else (
+                int(failed_flat_index) % chunk_count,
+            )
+            selected = self._block_tables if not failed_chunks else [
+                self._block_tables[index] for index in failed_chunks
+            ]
+            invalid_blocks = _flatten_block_ids(selected)
+            _LOG.error(
+                "REAL_LOAD_FAILURE_GATE callback=%d physical=%d "
+                "scope=%s deferred_drain=true failed_flat_index=%s "
+                "failed_chunks=%s invalid_block_ids=%s",
+                callback, physical,
+                "REQUEST_INDICES" if failed_chunks else "WHOLE_OPERATION",
+                failed_flat_index, failed_chunks, invalid_blocks,
+            )
             raise LoadGateError(
                 f"step read feeder callback {callback} physical {physical} failed",
-                whole_operation=True,
+                failed_batch_indices=failed_chunks,
+                whole_operation=not bool(failed_chunks),
+                invalid_block_ids=invalid_blocks,
             )
         slots = self._slots[callback]
-        event = None
-        if self._engine._scatter_hook is not None:
-            event = self._engine._scatter_hook(
+        if _FEEDER_DIAG:
+            _LOG.warning(
+                "FEEDER_DIAG layer_event t_ns=%d phase=scatter_enqueue "
+                "callback=%d physical=%d stream=%d",
+                time.monotonic_ns(), callback, physical,
+                self._read_copy_stream_handle(),
+            )
+        with nvtx_range(
+            f"tutti.load.scatter|mode=feeder|layer={physical}"
+            f"|chunks={len(self._keys)}"
+        ):
+            event = self._scatter_on_read_copy(
                 self._keys, physical, self._block_tables, slots
             )
-        if event is not None:
-            synchronize = getattr(event, "synchronize", None)
-            if callable(synchronize):
-                synchronize()
+        if _FEEDER_DIAG:
+            _LOG.warning(
+                "FEEDER_DIAG layer_event t_ns=%d phase=scatter_done_record "
+                "callback=%d physical=%d event=%s",
+                time.monotonic_ns(), callback, physical, event is not None,
+            )
+        self._bridge_read_copy_event(event)
+        if _FEEDER_DIAG:
+            _LOG.warning(
+                "FEEDER_DIAG layer_event t_ns=%d phase=compute_wait_event "
+                "callback=%d physical=%d",
+                time.monotonic_ns(), callback, physical,
+            )
         if callback + self._inner.staging_depth < self._inner.layer_count:
-            self._inner.signal_layer(callback, self._current_stream())
+            # The release kernel is enqueued after scatter/event-record on the
+            # same read-copy stream, so K=2 staging cannot be reused early.
+            self._inner.signal_layer(
+                callback, self._read_copy_stream_handle()
+            )
+            if _FEEDER_DIAG:
+                _LOG.warning(
+                    "FEEDER_DIAG layer_event t_ns=%d phase=staging_release "
+                    "callback=%d physical=%d stream=%d",
+                    time.monotonic_ns(), callback, physical,
+                    self._read_copy_stream_handle(),
+                )
             if _FEEDER_DIAG:
                 _LOG.warning("FEEDER_DIAG engine gate_release_publish t_ns=%d direction=read callback=%d physical=%d",
                              time.monotonic_ns(), callback, physical)
+        # Windowed reads use this notification only to wake the detached
+        # feeder.  The feeder enqueues the read-stream wait before it reuses
+        # the bank; the attention callback never submits a window and never
+        # performs a host CUDA wait.  Mark the final window as consumed too,
+        # even though it has no successor bank to protect.
+        release = getattr(self._inner, "release_layer", None)
+        if callable(release):
+            release(callback, event)
         if _FEEDER_DIAG:
             _LOG.warning("FEEDER_DIAG engine gate_wait_end t_ns=%d direction=read callback=%d physical=%d",
                          time.monotonic_ns(), callback, physical)
@@ -224,6 +436,12 @@ class _EngineStepIO:
             _LOG.warning("FEEDER_DIAG engine gate_release_wait_begin t_ns=%d direction=write callback=%d physical=%d",
                          time.monotonic_ns(), callback, physical)
         self._inner.wait_layer(callback)
+        if _FEEDER_DIAG:
+            _LOG.warning(
+                "FEEDER_DIAG layer_event t_ns=%d phase=write_gather "
+                "callback=%d physical=%d stream=%d",
+                time.monotonic_ns(), callback, physical, self._current_stream(),
+            )
         slots = self._slots[callback]
         event = None
         transfer = self._engine._transfer
@@ -237,6 +455,12 @@ class _EngineStepIO:
             pass
         self._inner.signal_layer(callback, self._current_stream())
         if _FEEDER_DIAG:
+            _LOG.warning(
+                "FEEDER_DIAG layer_event t_ns=%d phase=write_ready "
+                "callback=%d physical=%d stream=%d",
+                time.monotonic_ns(), callback, physical, self._current_stream(),
+            )
+        if _FEEDER_DIAG:
             _LOG.warning("FEEDER_DIAG engine gate_ready_publish t_ns=%d direction=write callback=%d physical=%d",
                          time.monotonic_ns(), callback, physical)
 
@@ -245,17 +469,62 @@ class _EngineStepIO:
         return self._inner.wait()
 
     def wait_result(self):
+        if self._drained:
+            return self._drain_result_value
         self._require_complete()
         return self._inner.wait_result()
 
-    def drain(self):
-        if self._drained:
-            return None
-        self._drained = True
-        return self._inner.drain(self._current_stream())
+    def drain(self, timeout=None):
+        return self._drain_result(timeout)
 
-    def abort(self):
-        return self.drain()
+    def _drain_result(self, timeout=None):
+        if self._drained:
+            return self._drain_result_value
+        self._drained = True
+        if self._direction == "read":
+            # Abort/shutdown can happen before attention consumes every
+            # callback. Release all outstanding future waits so the
+            # pre-enqueued read plan reaches its terminal event.
+            stream = self._read_copy_stream_handle()
+            for callback in range(len(self._physical_layers)):
+                if (callback in self._seen or
+                        callback in self._released_after_failure):
+                    continue
+                self._inner.signal_layer(callback, stream)
+                self._released_after_failure.add(callback)
+        if timeout is None:
+            self._drain_result_value = self._inner.drain(
+                self._current_stream()
+            )
+        else:
+            self._drain_result_value = self._inner.drain(
+                self._current_stream(), timeout=timeout
+            )
+        return self._drain_result_value
+
+    def abort(self, timeout=None):
+        return self.drain(timeout)
+
+    def release_after_failure(self, callback: int) -> None:
+        """Unblock pre-enqueued read windows without submitting new I/O.
+
+        A failed layer has no scatter fence.  Recording release events for the
+        failed and later layers lets already-enqueued kernels observe the
+        fail-closed ready flag and exit without issuing NVMe commands.
+        """
+        if self._direction != "read":
+            return
+        stream = self._read_copy_stream_handle()
+        release = getattr(self._inner, "release_after_failure", None)
+        if callable(release):
+            # Stop the detached feeder before walking the remaining callback
+            # ordinals; unsent windows must not be awaited or signalled.
+            release(callback)
+        for layer in range(callback, len(self._physical_layers)):
+            if layer in self._released_after_failure:
+                continue
+            self._inner.signal_layer(layer, stream)
+            self._released_after_failure.add(layer)
 
     @property
     def pending_callbacks(self) -> tuple[int, ...]:
@@ -290,6 +559,48 @@ class _EngineStepIO:
         if missing:
             self.drain()
             raise RuntimeError(f"missing feeder callbacks: {missing}")
+
+    def _scatter_on_read_copy(self, keys, physical, block_tables, slots):
+        method = getattr(self._engine, "_scatter_on_read_copy", None)
+        if callable(method):
+            return method(keys, physical, block_tables, slots)
+        hook = getattr(self._engine, "_scatter_hook", None)
+        if not callable(hook):
+            return None
+        store = getattr(self._engine, "_store", None)
+        context = getattr(store, "stream_context", None)
+        with (context("read_copy") if callable(context) else nullcontext()):
+            event = hook(keys, physical, block_tables, slots)
+            record = getattr(store, "record_read_copy_event", None)
+            return record(event) if callable(record) else event
+
+    def _bridge_read_copy_event(self, event) -> None:
+        method = getattr(self._engine, "_bridge_read_copy_event", None)
+        if callable(method):
+            if _FEEDER_DIAG:
+                _LOG.warning(
+                    "FEEDER_DIAG layer_event t_ns=%d phase=compute_wait_enqueue",
+                    time.monotonic_ns(),
+                )
+            method(event, protect_read_io=False)
+            return
+        store = getattr(self._engine, "_store", None)
+        wait_compute = getattr(store, "wait_compute_event", None)
+        if event is not None and callable(wait_compute):
+            if _FEEDER_DIAG:
+                _LOG.warning(
+                    "FEEDER_DIAG layer_event t_ns=%d phase=compute_wait_enqueue",
+                    time.monotonic_ns(),
+                )
+            wait_compute(event)
+
+    def _read_copy_stream_handle(self) -> int:
+        method = getattr(self._engine, "_read_copy_stream_handle", None)
+        if callable(method):
+            return int(method())
+        store = getattr(self._engine, "_store", None)
+        handle = getattr(store, "read_copy_stream_handle", None)
+        return int(handle()) if callable(handle) else self._current_stream()
 
     @staticmethod
     def _current_stream() -> int:
@@ -389,15 +700,11 @@ class KVEngine:
         self._write_staging_buffer_id: int | None = None
         self._inflight: list = []
         self._planned_store_keys: set[bytes] = set()
+        self._write_reuse_event = None
 
     @property
     def max_in_flight_operations(self) -> int:
         return self._max_in_flight_operations
-
-    @property
-    def supports_step_io(self) -> bool:
-        return (callable(getattr(self._store, "submit_step", None)) and
-                not isinstance(self._transfer, DirectTransfer))
 
     # ---- 计划态 ----
 
@@ -608,7 +915,9 @@ class KVEngine:
         self._write_staging_buffer_id = write_buffer_id
         self._deferred_restore()
 
-    def load_layer(self, keys, layer_idx: int, dst_first_blocks):
+    def load_layer(self, keys, layer_idx: int, dst_first_blocks, *,
+                   fence_event=None, reuse_event=None, async_reuse=False,
+                   bridge_compute=True):
         """发起一批读取：一层 × N chunk，持久化 → staging 槽 → 目的侧。
 
         返回聚合完成句柄；wait 返回即全部波次的源侧搬运（scatter）
@@ -623,13 +932,20 @@ class KVEngine:
             self._inflight.append(completion)
             return completion
         handles = []
+        reuse_fence = reuse_event
         for start in range(0, len(keys), self._max_chunks_per_wave):
             end = min(start + self._max_chunks_per_wave, len(keys))
             wave_keys = keys[start:end]
             wave_blocks = _slice_first_blocks(
                 dst_first_blocks, start, end, len(keys)
             )
-            wave, slots = self._read_window.acquire(len(wave_keys))
+            if async_reuse and reuse_fence is not None:
+                wait_copy = getattr(self._store, "wait_read_event", None)
+                if callable(wait_copy):
+                    wait_copy(reuse_fence)
+            wave, slots = self._read_window.acquire(
+                len(wave_keys), wait_for_reuse=not async_reuse
+            )
             batch = [
                 (derive_io_key(k, layer_idx), self._read_staging_buffer_id,
                  self._read_window.slot_offset(s))
@@ -639,17 +955,88 @@ class KVEngine:
                 f"tutti.load.submit|layer={layer_idx}|wave={wave}"
                 f"|chunks={len(wave_keys)}"
             ):
-                completion = self._store.get_batch(batch)
-            handles.append(
-                self._settle(
-                    wave, wave_keys, layer_idx, wave_blocks, slots,
-                    completion, is_load=True
+                try:
+                    completion = self._store.get_batch(batch)
+                except Exception as exc:
+                    _LOG.error(
+                        "READ_ADMISSION_REJECTED layer=%d wave=%d "
+                        "chunks=%d reason=%s",
+                        layer_idx, wave, len(wave_keys), exc,
+                    )
+                    raise
+            if not async_reuse and fence_event is None:
+                handles.append(
+                    self._settle(
+                        wave, wave_keys, layer_idx, wave_blocks, slots,
+                        completion, is_load=True
+                    )
                 )
+                continue
+            # The IO submission itself is the only operation on the read
+            # stream.  Record its completion before touching read-copy, then
+            # enqueue exactly one batched scatter there.  The returned handle
+            # only drains runtime completion; scatter is never host-triggered.
+            read_done = None
+            record_read = getattr(self._store, "record_read_event", None)
+            if callable(record_read):
+                read_done = record_read()
+            wait_copy = getattr(self._store, "wait_read_copy_event", None)
+            if callable(wait_copy) and read_done is not None:
+                wait_copy(read_done)
+            with nvtx_range(
+                f"tutti.load.scatter|layer={layer_idx}|wave={wave}"
+                f"|chunks={len(wave_keys)}"
+            ):
+                scatter_event = self._scatter_on_read_copy(
+                    list(wave_keys), layer_idx, wave_blocks, list(slots),
+                    record=False,
+                )
+            if fence_event is not None:
+                record_copy = getattr(
+                    self._store, "record_read_copy_event", None
+                )
+                if callable(record_copy):
+                    record_copy(fence_event)
+                # A layer may contain several waves.  The next wave can wrap
+                # onto the same staging slots, so it waits on this wave's
+                # scatter fence as well as on the predecessor layer fence.
+                reuse_fence = fence_event
+            elif scatter_event is not None:
+                reuse_fence = scatter_event
+            post = _PostCompletion(
+                completion,
+                lambda: None,
+                block_tables=wave_blocks,
+                fence_event=(
+                    fence_event if fence_event is not None else scatter_event
+                ),
             )
+            self._read_window.complete(wave, post)
+            handles.append(post)
         aggregate = _AggregateCompletion(handles)
         del self._inflight[-len(handles):]
         self._inflight.append(aggregate)
         return aggregate
+
+    @property
+    def read_plan_supported(self) -> bool:
+        """Whether Python can bridge read and read-copy CUDA streams."""
+        store = self._store
+        return (
+            getattr(store, "_read_stream_obj", None) is not None
+            and getattr(store, "_read_copy_stream_obj", None) is not None
+            and all(callable(getattr(store, name, None)) for name in (
+                "record_read_event", "wait_read_copy_event", "stream_context",
+            ))
+        )
+
+    def start_read_plan(self, keys, block_tables, physical_layers, depth,
+                        on_failure=None):
+        if not self.read_plan_supported:
+            raise RuntimeError("read CUDA event bridge unavailable")
+        return _ReadPlan(
+            self, keys, block_tables, physical_layers, depth, on_failure
+        )
 
     def store_layer(self, keys, layer_idx: int, src_first_blocks):
         """发起一批写入：一层 × N chunk，源侧 → staging 槽 → 持久化。
@@ -665,13 +1052,28 @@ class KVEngine:
             self._inflight.append(completion)
             return completion
         handles = []
+        reuse_event = self._write_reuse_event
         for start in range(0, len(keys), self._max_chunks_per_wave):
             end = min(start + self._max_chunks_per_wave, len(keys))
             wave_keys = keys[start:end]
             wave_blocks = _slice_first_blocks(
                 src_first_blocks, start, end, len(keys)
             )
-            wave, slots = self._write_window.acquire(len(wave_keys))
+            if reuse_event is not None:
+                wait_write = getattr(self._store, "wait_write_event", None)
+                if not callable(wait_write):
+                    wait_write = getattr(self._store, "wait_event", None)
+                if not callable(wait_write):
+                    raise RuntimeError(
+                        "write staging reuse requires a write completion fence"
+                    )
+                wait_write(reuse_event)
+            # Never let RingWindow perform its host-side reuse wait from a
+            # save callback.  The preceding write fence, when available, is
+            # consumed by the write stream above.
+            wave, slots = self._write_window.acquire(
+                len(wave_keys), wait_for_reuse=False
+            )
             with nvtx_range(
                 f"tutti.store.submit|layer={layer_idx}|wave={wave}"
                 f"|chunks={len(wave_keys)}"
@@ -689,11 +1091,10 @@ class KVEngine:
                 if callable(wait_event):
                     wait_event(gather_event)
                 else:
-                    # Test/fallback stores have no IO stream to fence. Keep
-                    # correctness with a stream-local event wait only.
-                    synchronize = getattr(gather_event, "synchronize", None)
-                    if callable(synchronize):
-                        synchronize()
+                    raise RuntimeError(
+                        "write stream fence bridge is unavailable; refusing "
+                        "host synchronization in save callback"
+                    )
             batch = [
                 (derive_io_key(k, layer_idx), self._write_staging_buffer_id,
                  self._write_window.slot_offset(s))
@@ -703,74 +1104,36 @@ class KVEngine:
                 f"tutti.store.io|layer={layer_idx}|wave={wave}"
                 f"|chunks={len(wave_keys)}"
             ):
-                completion = self._store.put_batch(batch)
+                try:
+                    completion = self._store.put_batch(batch)
+                except Exception as exc:
+                    _LOG.error(
+                        "WRITE_ADMISSION_REJECTED layer=%d wave=%d "
+                        "chunks=%d reason=%s",
+                        layer_idx, wave, len(wave_keys), exc,
+                    )
+                    raise
+            # Keep a write-stream fence for the next wave/layer's staging
+            # reuse.  Stores with a real CUDA write stream record this event
+            # after the put enqueue; stores lacking that capability are
+            # rejected on the first attempted reuse instead of overwriting a
+            # live slot.
+            record_write = getattr(self._store, "record_write_event", None)
+            if callable(record_write):
+                recorded = record_write()
+                if recorded is not None:
+                    reuse_event = recorded
             handles.append(
                 self._settle(
                     wave, wave_keys, layer_idx, wave_blocks, slots,
                     completion, is_load=False
                 )
             )
+        self._write_reuse_event = reuse_event
         aggregate = _AggregateCompletion(handles)
         del self._inflight[-len(handles):]
         self._inflight.append(aggregate)
         return aggregate
-
-    def start_step_io(self, keys, block_tables, direction: str, depth: int,
-                      physical_layers=None):
-        """Create one Runtime/DataPath feeder submit for every model layer."""
-        self._require_open()
-        if self._num_layers is None or self._segment_bytes is None:
-            raise RuntimeError("step IO requires a bound engine")
-        keys = list(keys)
-        if not keys:
-            return None
-        window = self._read_window if direction == "read" else self._write_window
-        if len(keys) > window.capacity_per_wave:
-            raise ValueError(
-                "step feeder chunks exceed one staging wave; increase "
-                "max_chunks_per_wave"
-            )
-        if physical_layers is None:
-            physical_layers = tuple(range(self._num_layers))
-        else:
-            physical_layers = tuple(physical_layers)
-        if not physical_layers:
-            return None
-        if (len(set(physical_layers)) != len(physical_layers)
-                or any(not isinstance(layer, int)
-                       or not 0 <= layer < self._num_layers
-                       for layer in physical_layers)):
-            raise ValueError("physical feeder layer plan is invalid")
-        slots_by_layer = []
-        layer_batches = []
-        for callback, physical in enumerate(physical_layers):
-            base = window.slot_base + (
-                callback % depth
-            ) * window.capacity_per_wave
-            slots = [base + index for index in range(len(keys))]
-            slots_by_layer.append(slots)
-            layer_batches.append([
-                (derive_io_key(key, physical),
-                 self._read_staging_buffer_id if direction == "read"
-                 else self._write_staging_buffer_id,
-                 window.slot_offset(slot))
-                for key, slot in zip(keys, slots)
-            ])
-        if _FEEDER_DIAG:
-            _LOG.warning(
-                "FEEDER_DIAG physical_plan t_ns=%d direction=%s "
-                "physical_layer_count=%d callback_count=%d depth=%d "
-                "callback_to_physical=%r",
-                time.monotonic_ns(), direction, self._num_layers,
-                len(physical_layers), depth, physical_layers,
-            )
-        inner = self._store.submit_step(layer_batches, direction, depth)
-        step = _EngineStepIO(
-            inner, self, keys, block_tables, slots_by_layer, direction,
-            physical_layers,
-        )
-        self._inflight.append(step)
-        return step
 
     def wait_idle(self) -> None:
         """等待全部在途批次并 drain read/write 两个 bank。"""
@@ -789,10 +1152,18 @@ class KVEngine:
             except Exception as exc:
                 if first_error is None:
                     first_error = exc
+        drain_deferred = getattr(self._store, "drain_deferred_completions", None)
+        if callable(drain_deferred):
+            try:
+                drain_deferred()
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+        self._write_reuse_event = None
         if first_error is not None:
             raise first_error
 
-    def abort(self) -> None:
+    def abort(self, timeout=None) -> None:
         """安全中间态 abort：不取消底层 DMA，drain 两边后再返回。"""
         inflight = self._inflight
         self._inflight = []
@@ -813,6 +1184,14 @@ class KVEngine:
             except Exception as exc:
                 if first_error is None:
                     first_error = exc
+        drain_deferred = getattr(self._store, "drain_deferred_completions", None)
+        if callable(drain_deferred):
+            try:
+                drain_deferred()
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+        self._write_reuse_event = None
         if first_error is not None:
             raise first_error
 
@@ -864,15 +1243,17 @@ class KVEngine:
                     f"tutti.load.scatter|layer={layer_idx}|wave={wave}"
                     f"|chunks={len(keys)}"
                 ):
-                    with self._store_stream_context("read"):
-                        return self._scatter_hook(
-                            list(keys), layer_idx, first_blocks, list(slots)
-                        )
+                    return self._scatter_on_read_copy(
+                        list(keys), layer_idx, first_blocks, list(slots)
+                    )
 
             handle = _PostCompletion(
                 completion,
                 scatter_and_capture,
                 block_tables=first_blocks,
+                after_event=lambda event: self._bridge_read_copy_event(
+                    event, protect_read_io=True
+                ),
             )
         window = self._read_window if is_load else self._write_window
         window.complete(wave, handle)
@@ -882,6 +1263,44 @@ class KVEngine:
     def _store_stream_context(self, direction: str):
         context = getattr(self._store, "stream_context", None)
         return context(direction) if callable(context) else nullcontext()
+
+    def _scatter_on_read_copy(self, keys, layer_idx, block_tables, slots,
+                              *, record=True):
+        """Enqueue scatter on the controlled copy stream and record its tail."""
+        if self._scatter_hook is None:
+            return None
+        with self._store_stream_context("read_copy"):
+            event = self._scatter_hook(
+                list(keys), layer_idx, block_tables, list(slots)
+            )
+            recorder = getattr(self._store, "record_read_copy_event", None)
+            return recorder(event) if record and callable(recorder) else event
+
+    def _bridge_read_copy_event(self, event, *, protect_read_io: bool) -> None:
+        """Bridge copy completion without a host CUDA synchronization."""
+        if event is None:
+            return
+        wait_compute = getattr(self._store, "wait_compute_event", None)
+        if callable(wait_compute):
+            wait_compute(event)
+        else:
+            wait = getattr(event, "wait", None)
+            if callable(wait):
+                wait()
+        if protect_read_io:
+            wait_read = getattr(self._store, "wait_read_event", None)
+            if callable(wait_read):
+                wait_read(event)
+
+    def _read_copy_stream_handle(self) -> int:
+        handle = getattr(self._store, "read_copy_stream_handle", None)
+        if callable(handle):
+            return int(handle())
+        try:
+            import torch
+            return int(torch.cuda.current_stream().cuda_stream)
+        except Exception:
+            return 0
 
     def _unique_windows(self):
         windows = []

@@ -20,6 +20,29 @@ Source `profile-env.sh` before starting vLLM or Nsight Systems:
 source integration/vllm-connector/run/profile-env.sh
 ```
 
+## Daemon/reboot monitor
+
+`monitor_tutti_daemon.sh` is a read-only watchdog. It records boot ID, uptime,
+daemon/port transitions, daemon log tail, GPU/NVMe state, and relevant kernel
+messages under `/data/home/ryeqiu/tutti-daemon-watch`. It never restarts the
+daemon or submits CUDA/NVMe work.
+
+The optional systemd unit uses `Restart=on-failure`; if another monitor already
+holds the lock, the unit exits cleanly and does not enter a restart loop.
+
+For a one-session observation:
+
+```bash
+mkdir -p /data/home/ryeqiu/tutti-daemon-watch
+TUTTI_MONITOR_INTERVAL_S=2 nohup \
+  integration/vllm-connector/run/monitor_tutti_daemon.sh \
+  >/data/home/ryeqiu/tutti-daemon-watch/stdout.log 2>&1 &
+```
+
+For monitoring across reboots, install the supplied
+`tutti-daemon-monitor.service` into systemd and inspect
+`/data/home/ryeqiu/tutti-daemon-watch/events.log` after the machine returns.
+
 ## Profile workload
 
 The acceptance workload is Hy3-FP8, TP4, eager execution, 65,528 prompt

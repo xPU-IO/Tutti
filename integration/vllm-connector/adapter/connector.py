@@ -448,6 +448,9 @@ class TuttiConnectorV1(KVConnectorBase_V1):
                 lookahead_k=extra.get(
                     "lookahead_k", extra.get("prefetch_k", 2)
                 ),
+                failure_collective_timeout_s=extra.get(
+                    "failure_collective_timeout_s", 30.0
+                ),
             )
             self._impl.configure(
                 chunk_tokens=self._chunk_tokens,
@@ -514,6 +517,10 @@ class TuttiConnectorV1(KVConnectorBase_V1):
     def get_block_ids_with_load_errors(self) -> set[int]:
         """上报读取未遂的块（由上层重算兜底）。"""
         return self._require_worker().get_block_ids_with_load_errors()
+
+    def get_request_ids_with_load_errors(self) -> set[str]:
+        """Return request IDs whose sampled output must be discarded."""
+        return self._require_worker().get_request_ids_with_load_errors()
 
     def shutdown(self) -> None:
         """收尾（转发 worker 实现）。"""

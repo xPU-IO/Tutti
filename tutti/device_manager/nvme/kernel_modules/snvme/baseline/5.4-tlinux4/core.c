@@ -1583,6 +1583,22 @@ static int nvme_user_cmd64(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
 	return status;
 }
 
+/* Controller passthrough entry used by the snvme per-controller cdev. */
+int snvme_admin_ioctl(struct nvme_ctrl *ctrl, unsigned int cmd,
+		void __user *argp, bool open_for_write)
+{
+	(void)open_for_write;
+	switch (cmd) {
+	case NVME_IOCTL_ADMIN_CMD:
+		return nvme_user_cmd(ctrl, NULL, argp);
+	case NVME_IOCTL_ADMIN64_CMD:
+		return nvme_user_cmd64(ctrl, NULL, argp);
+	default:
+		return -ENOTTY;
+	}
+}
+EXPORT_SYMBOL_GPL(snvme_admin_ioctl);
+
 /*
  * Issue ioctl requests on the first available path.  Note that unlike normal
  * block layer requests we will not retry failed request on another controller.

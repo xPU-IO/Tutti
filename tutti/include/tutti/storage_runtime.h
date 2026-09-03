@@ -1071,59 +1071,6 @@ public:
         return Result<IoResult>::Success(std::move(outcome.result.value()));
     }
 
-    Result<FeederLayerState> wait_feeder_layer(
-        const IoHandle& handle, std::uint32_t layer,
-        std::uint64_t timeout_ms) {
-        const auto deadline = std::chrono::steady_clock::now() +
-            std::chrono::milliseconds(timeout_ms);
-        for (;;) {
-            Result<FeederLayerState> result = [&] {
-                std::lock_guard<std::mutex> lock(registry_mutex_);
-                if (!validate_io_(handle)) {
-                    return Result<FeederLayerState>::Failure(Status(
-                        StatusCode::NOT_FOUND, "invalid IO handle"));
-                }
-                IoEntry& entry = io_entries_[handle.slot_];
-                if (entry.data_path_operations.size() != 1) {
-                    return Result<FeederLayerState>::Failure(Status(
-                        StatusCode::UNSUPPORTED,
-                        "step feeder requires exactly one DataPath operation"));
-                }
-                const auto& sub = entry.data_path_operations.front();
-                return call_data_path_result_<FeederLayerState>(
-                    *sub.data_path, [&] {
-                        // Never hold Runtime's registry lock across a long
-                        // DataPath wait. One immediate probe keeps DataPath
-                        // access serialized while allowing completion/query
-                        // and the next signal gate to acquire the registry.
-                        return sub.data_path->wait_feeder_layer(
-                            sub.op, layer, 0);
-                    });
-            }();
-            if (!result.ok() || result.value() != FeederLayerState::PENDING)
-                return result;
-            if (timeout_ms == 0 || std::chrono::steady_clock::now() >= deadline)
-                return FeederLayerState::PENDING;
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
-        }
-    }
-
-    Status signal_feeder_layer(const IoHandle& handle, std::uint32_t layer,
-                               cudaStream_t stream) {
-        std::lock_guard<std::mutex> lock(registry_mutex_);
-        if (!validate_io_(handle))
-            return Status(StatusCode::NOT_FOUND, "invalid IO handle");
-        IoEntry& entry = io_entries_[handle.slot_];
-        if (entry.data_path_operations.size() != 1) {
-            return Status(StatusCode::UNSUPPORTED,
-                          "step feeder requires exactly one DataPath operation");
-        }
-        const auto& sub = entry.data_path_operations.front();
-        return call_data_path_status_(*sub.data_path, [&] {
-            return sub.data_path->signal_feeder_layer(sub.op, layer, stream);
-        });
-    }
-
     Status release_io(const IoHandle& handle) {
         std::lock_guard<std::mutex> lock(registry_mutex_);
         if (!validate_io_(handle)) {

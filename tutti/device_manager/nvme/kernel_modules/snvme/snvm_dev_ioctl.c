@@ -14,6 +14,7 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
+#include <linux/nvme_ioctl.h>
 
 #include "snvm_glue.h"
 #include "snvm_qgroup.h"
@@ -1016,6 +1017,25 @@ rollback_unlocked:
 			break;
 		}
         default:
+            /*
+             * Host monitoring tools use the standard NVMe controller
+             * passthrough ABI for identify/log-health probes.  Reuse the
+             * selected baseline's complete implementation (including
+             * user-buffer mapping, permissions, timeout, and result
+             * handling) rather than duplicating it in this dispatcher.
+             */
+            if (cmd == NVME_IOCTL_ADMIN_CMD ||
+                cmd == NVME_IOCTL_ADMIN64_CMD) {
+                struct nvme_dev *admin_ndev;
+
+                admin_ndev = snvm_ctrl_get_live_ndev(ctrl);
+                if (!admin_ndev)
+                    return -ENODEV;
+                return snvme_admin_ioctl(&admin_ndev->ctrl, cmd,
+                                        (void __user *)arg,
+                                        !!(file->f_mode & FMODE_WRITE));
+            }
+
             printk(KERN_NOTICE "Unknown ioctl command from process %d: %u\n",
                     current->pid, cmd);
             ret = -EINVAL;

@@ -42,11 +42,6 @@ struct EntryCompletionStatus {
     std::uint32_t nvme_status_dword3 = 0;
 };
 
-struct StepFeederLayer {
-    std::uint32_t first_entry = 0;
-    std::uint32_t entry_count = 0;
-};
-
 } // namespace tutti::data_paths::local_nvme
 
 // =========================================================================

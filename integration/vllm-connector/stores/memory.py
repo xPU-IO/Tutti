@@ -132,6 +132,23 @@ class MemoryKVStore:
         self._require_open()
         return iter(list(self._pool.keys()))
 
+    def wait_read_event(self, event) -> None:
+        """Protect host-written staging in the test/reference backend.
+
+        Unlike the Tutti device DataPath, ``get_batch`` writes from the host,
+        so a CUDA stream wait cannot order the next overwrite. This fallback
+        is intentionally outside the production NVMe/read-copy path.
+        """
+        synchronize = getattr(event, "synchronize", None)
+        if callable(synchronize):
+            synchronize()
+
+    def wait_read_copy_event(self, event) -> None:
+        """Compatibility hook for the synchronous reference backend."""
+        synchronize = getattr(event, "synchronize", None)
+        if callable(synchronize):
+            synchronize()
+
     def _require_open(self) -> None:
         if not self._opened:
             raise RuntimeError("store 未 open（或已 close），数据面操作不可用")

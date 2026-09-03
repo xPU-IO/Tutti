@@ -249,71 +249,6 @@ public:
         return out;
     }
 
-    SubmitResult submit_step(py::sequence layers, std::uint32_t staging_depth,
-                             std::int32_t accel_id, py::object stream,
-                             const std::string& execution) {
-        if (staging_depth == 0)
-            throw py::value_error("staging_depth must be positive");
-        std::vector<tutti::IoRequest> requests;
-        std::vector<std::uint32_t> offsets{0};
-        for (std::size_t layer = 0; layer < py::len(layers); ++layer) {
-            py::sequence batch = py::reinterpret_borrow<py::sequence>(
-                layers.attr("__getitem__")(layer));
-            auto parsed = parse_requests_(batch);
-            requests.insert(requests.end(), parsed.begin(), parsed.end());
-            offsets.push_back(static_cast<std::uint32_t>(requests.size()));
-        }
-        if (requests.empty())
-            throw py::value_error("step feeder plan must not be empty");
-        const auto direction = requests.front().direction;
-        for (const auto& request : requests) {
-            if (request.direction != direction)
-                throw py::value_error("step feeder direction must be uniform");
-        }
-        tutti::ExecutionDomain domain = execution == "device"
-            ? tutti::ExecutionDomain::DEVICE_EXECUTION
-            : tutti::ExecutionDomain::HOST_EXECUTION;
-        if (execution != "device" && execution != "host")
-            throw py::value_error("execution must be 'device' or 'host'");
-        if (domain == tutti::ExecutionDomain::DEVICE_EXECUTION && stream.is_none())
-            throw py::value_error("execution='device' requires a stream");
-        tutti::HostSubmitContext ctx{};
-        ctx.execution_domain = domain;
-        ctx.accel_id = accel_id;
-        ctx.stream = stream.is_none() ? nullptr : reinterpret_cast<cudaStream_t>(
-            checked_int<std::uintptr_t>(stream, "stream"));
-        ctx.step_layer_request_offsets = offsets.data();
-        ctx.step_layer_count = static_cast<std::uint32_t>(py::len(layers));
-        ctx.step_staging_depth = staging_depth;
-        tutti::IoSubmitOutcome outcome =
-            rt_->submit(requests.data(), requests.size(), ctx);
-        return submit_result_(std::move(outcome));
-    }
-
-    std::string wait_step_layer(std::uint64_t ticket, std::uint32_t layer,
-                                std::uint64_t timeout_ms) {
-        const IoHandle handle = lookup_io_(ticket);
-        auto result = [&] {
-            py::gil_scoped_release release;
-            return rt_->wait_feeder_layer(handle, layer, timeout_ms);
-        }();
-        if (!result.ok()) throw_status("wait_step_layer failed", result.status());
-        switch (result.value()) {
-            case tutti::FeederLayerState::PENDING: return "PENDING";
-            case tutti::FeederLayerState::READY: return "READY";
-            case tutti::FeederLayerState::FAILED: return "FAILED";
-        }
-        return "FAILED";
-    }
-
-    void signal_step_layer(std::uint64_t ticket, std::uint32_t layer,
-                           std::uintptr_t stream) {
-        tutti::Status status = rt_->signal_feeder_layer(
-            lookup_io_(ticket), layer,
-            reinterpret_cast<cudaStream_t>(stream));
-        if (!status.ok()) throw_status("signal_step_layer failed", status);
-    }
-
     // ---- io lifecycle ----
     void release_io(std::uint64_t ticket) {
         const IoHandle handle = lookup_io_(ticket);
@@ -583,6 +518,15 @@ void opt_int_field(const py::dict& d, const std::string& key, T& target) {
     target = static_cast<T>(v.cast<std::int64_t>());
 }
 
+void opt_bool_field(const py::dict& d, const std::string& key, bool& target) {
+    if (!d.contains(key.c_str())) return;
+    const py::object v = d[key.c_str()];
+    if (!py::isinstance<py::bool_>(v)) {
+        value_error("preset key '" + key + "' must be a bool");
+    }
+    target = v.cast<bool>();
+}
+
 std::string get_str_field(const py::dict& d, const std::string& key) {
     if (!d.contains(key.c_str())) {
         value_error("missing preset key: '" + key + "'");
@@ -773,14 +717,6 @@ PYBIND11_MODULE(_core, m) {
         .def("submit", &PyRuntime::submit, py::arg("requests"),
              py::arg("accel_id"), py::arg("stream"),
              py::arg("execution") = "device")
-        .def("submit_step", &PyRuntime::submit_step, py::arg("layers"),
-             py::arg("staging_depth"), py::arg("accel_id"),
-             py::arg("stream"), py::arg("execution") = "device")
-        .def("wait_step_layer", &PyRuntime::wait_step_layer,
-             py::arg("io_handle"), py::arg("layer"),
-             py::arg("timeout_ms") = 30000)
-        .def("signal_step_layer", &PyRuntime::signal_step_layer,
-             py::arg("io_handle"), py::arg("layer"), py::arg("stream"))
         .def("release_io", &PyRuntime::release_io, py::arg("io_handle"))
         .def("wait", &PyRuntime::wait, py::arg("io_handle"),
              py::arg("timeout_ms"))

@@ -1,5 +1,4 @@
 #pragma once
-
 #include "tutti/data_paths/local_nvme/io/prp_builder.h"  // AddressDescriptor
 
 // tutti/data_paths/striped_local_nvme/fused_submit_kernel.cuh
@@ -34,7 +33,6 @@ namespace tutti::data_paths::striped_local_nvme {
 
 using tutti::data_paths::local_nvme::DeviceTargetHandle;
 using tutti::data_paths::local_nvme::EntryCompletionStatus;
-using tutti::data_paths::local_nvme::StepFeederLayer;
 
 // -------------------------------------------------------------------------
 // StripedDeviceSubmitEntry — one IO request entry for the fused kernel.
@@ -79,21 +77,6 @@ cudaError_t launch_fused_submit(
     std::uint32_t                   threads_per_block,
     std::uint32_t                   inject_flag,
     void*                           stream);
-
-cudaError_t launch_striped_step_feeder(
-    const StripedDeviceSubmitEntry* d_entries,
-    EntryCompletionStatus* d_status,
-    const DeviceTargetHandle* const* d_dev_table,
-    const StepFeederLayer* d_layers,
-    std::uint32_t layer_count,
-    std::uint32_t layer_base,
-    volatile std::uint32_t* ready_flags,
-    volatile std::uint32_t* release_flags,
-    std::uint32_t num_devs,
-    std::uint32_t cq_poll_budget,
-    std::uint32_t threads_per_block,
-    std::uint32_t inject_flag,
-    void* stream);
 
 } // namespace tutti::data_paths::striped_local_nvme
 
@@ -154,65 +137,6 @@ void fused_submit_kernel(const StripedDeviceSubmitEntry* entries,
     } else {
         submit_write_one(h, desc->prp1, desc->prp2, e.shard_offset, desc->data_length,
                          s, cq_poll_budget, inject_flag);
-    }
-}
-
-TUTTI_GLOBAL
-void striped_step_feeder_kernel(
-    const StripedDeviceSubmitEntry* entries, EntryCompletionStatus* status,
-    const DeviceTargetHandle* const* dev_table, const StepFeederLayer* layers,
-    std::uint32_t layer_count, std::uint32_t layer_base,
-    volatile std::uint32_t* ready_flags,
-    volatile std::uint32_t* release_flags, std::uint32_t num_devs,
-    std::uint32_t cq_poll_budget, std::uint32_t inject_flag) {
-    TUTTI_SHARED std::uint32_t failed;
-    if (TUTTI_THREAD_IDX_X == 0) failed = 0;
-    TUTTI_SYNC_THREADS;
-    for (std::uint32_t local_layer = 0; local_layer < layer_count;
-         ++local_layer) {
-        const std::uint32_t layer = layer_base + local_layer;
-        const StepFeederLayer plan = layers[local_layer];
-        const bool is_read = plan.entry_count == 0 ||
-            entries[plan.first_entry].direction == 0;
-        if (!failed) {
-            for (std::uint32_t local = TUTTI_THREAD_IDX_X;
-                 local < plan.entry_count; local += TUTTI_BLOCK_DIM_X) {
-                const std::uint32_t index = plan.first_entry + local;
-                const StripedDeviceSubmitEntry e = entries[index];
-                EntryCompletionStatus* out = &status[index];
-                if (e.dev_idx >= num_devs) {
-                    out->result = 1;
-                    continue;
-                }
-                const DeviceTargetHandle* h = dev_table[e.dev_idx];
-                const AddressDescriptor* desc = e.prp_entry;
-                if (e.direction == 0) {
-                    submit_read_one(h, desc->prp1, desc->prp2,
-                                    e.shard_offset, desc->data_length, out,
-                                    cq_poll_budget, inject_flag);
-                } else {
-                    submit_write_one(h, desc->prp1, desc->prp2,
-                                     e.shard_offset, desc->data_length, out,
-                                     cq_poll_budget, inject_flag);
-                }
-            }
-        }
-        TUTTI_SYNC_THREADS;
-        if (TUTTI_THREAD_IDX_X == 0) {
-            if (!failed) {
-                for (std::uint32_t local = 0; local < plan.entry_count; ++local) {
-                    if (status[plan.first_entry + local].result != 0) {
-                        failed = 1;
-                        break;
-                    }
-                }
-            }
-            TUTTI_THREADFENCE_SYSTEM;
-            if (is_read) ready_flags[layer] = failed ? 2u : 1u;
-            else release_flags[layer] = 1u;
-            TUTTI_THREADFENCE_SYSTEM;
-        }
-        TUTTI_SYNC_THREADS;
     }
 }
 

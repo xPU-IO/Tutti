@@ -20,9 +20,6 @@ class _Runtime:
         self.close_batches = []
         self.submit_calls = []
         self.released = []
-        self.step_submits = []
-        self.step_waits = []
-        self.step_signals = []
         self.next_ticket = 1
 
     def caps(self):
@@ -52,27 +49,12 @@ class _Runtime:
             [True] * len(requests), [],
         )
 
-    def submit_step(self, layers, staging_depth, **_kwargs):
-        self.step_submits.append((layers, staging_depth))
-        count = sum(len(layer) for layer in layers)
-        handle = self.next_ticket
-        self.next_ticket += 1
-        return namedtuple(
-            "StepSubmit", "status_ok status_msg io_handle initial_states rejected"
-        )(True, "", handle, [True] * count, [])
-
-    def wait_step_layer(self, handle, layer, timeout_ms):
-        self.step_waits.append((handle, layer, timeout_ms))
-        return "READY"
-
-    def signal_step_layer(self, handle, layer, stream):
-        self.step_signals.append((handle, layer, stream))
-
     def wait(self, handle, timeout_ms):
         return "OK", "COMPLETED"
 
     def release_io(self, handle):
         self.released.append(handle)
+
 
 
 def _key(value: int, layer: int = 0) -> bytes:
@@ -264,58 +246,3 @@ def test_restart_reclaims_orphan_without_markers(tmp_path):
     assert pool2.free_count == 1
     assert not layout2.chunk_file(key).exists()
     pool2.close()
-
-
-def test_store_step_submit_is_single_runtime_operation(tmp_path):
-    runtime = _Runtime()
-    store = TuttiKVStore(
-        tmp_path, 2, SEG, runtime=runtime,
-        initial_slots=2, low_watermark=0, high_watermark=2, max_slots=2,
-    )
-    store.open()
-    store.set_layer_span(4)
-    buffer_id = store.register_buffer(bytearray(2 * SEG), SEG)
-    key = bytes([21]) * 16
-    layers = [[(key + layer.to_bytes(2, "little"), buffer_id,
-                (layer % 2) * SEG)] for layer in range(4)]
-    step = store.submit_step(layers, "write", 2)
-    assert step._completion._watcher is None
-    for layer in range(4):
-        assert step.wait_layer(layer)
-        step.signal_layer(layer, 123)
-    step.wait()
-    assert step._completion._watcher is not None
-    assert len(runtime.step_submits) == 1
-    assert len(runtime.step_submits[0][0]) == 4
-    assert runtime.step_submits[0][1] == 2
-    # Per-layer callbacks use feeder flags, never Runtime.wait(). The one
-    # whole-step watcher starts only after all callback gates are published.
-    assert [item[1] for item in runtime.step_waits] == [0, 1, 2, 3]
-    assert len(runtime.released) == 1
-    store.close()
-
-
-def test_write_step_failure_creates_no_markers_or_resident_keys(tmp_path):
-    class FailedRuntime(_Runtime):
-        def wait(self, handle, timeout_ms):
-            return "OK", "FAILED"
-
-    runtime = FailedRuntime()
-    store = TuttiKVStore(
-        tmp_path, 1, SEG, runtime=runtime,
-        initial_slots=1, low_watermark=0, high_watermark=1, max_slots=1,
-    )
-    store.open()
-    store.set_layer_span(2)
-    buffer_id = store.register_buffer(bytearray(2 * SEG), SEG)
-    key = bytes([22]) * 16
-    layers = [[(key + layer.to_bytes(2, "little"), buffer_id,
-                layer * SEG)] for layer in range(2)]
-    step = store.submit_step(layers, "write", 2)
-    for layer in range(2):
-        step.signal_layer(layer, 123)
-    with pytest.raises(RuntimeError):
-        step.wait()
-    assert store.scan() == []
-    assert not store._layout.chunk_file(key).exists()
-    store.close()

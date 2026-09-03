@@ -40,6 +40,43 @@ read/transfer[L+1] || compute[L] || write[L-1]
 - canonical DCP mapping 完成前不支持 DCP > 1。
 - 当前不承诺 direct paged KV I/O；生产路径是 staged transfer。
 
+### 1.0 当前安全闸（READ-SEQUENCE-AND-GATHER-FUSION-19）
+
+当前工作树中曾尝试把 K-window ready/release 门控下沉到 C++ DataPath，
+并使用 device-side future flag 维持 sequence。该方案已确认存在
+进程级 GPU/NVMe stream hang 风险：write 可能在 Python `signal_step_layer()`
+之前等待未来 ready，read reuse 可能等待后续 compute/scatter 发布的 release；
+普通 abort/release 不能取消已经排入 CUDA stream 的 wait。故在架构修正前：
+
+- 禁止对真实 `/dev/ssnvme*`、CUDA device buffer 执行整步预排或 future wait；
+  当前只允许上层把已物化的当前层/窗口 flatten 成普通 byte-range
+  `DataPathRequest[]` 后提交，窗口推进和 staging 复用由 Python host 编排；
+- 不以增加 arena、`max_in_flight_operations` 或超时杀进程作为修复；
+- 生产准入只保留已经验证的普通 `submit()`、host-pinned PRP、driver MDTS
+  切分和 structured completion；
+- 如未来需要 sequence API，必须先定义 immutable plan、ownership、
+  terminal-before-release 和可证明的 abort/timeout 协议，再恢复真机验收；
+- packed gather/scatter 应先作为独立 native transfer 优化验收，不与 NVMe
+  feeder gate 同时改动。
+
+本机近期多次 reboot 的 journal 原因是外部 `Power key pressed` 的干净关机，
+尚未证明由 Tutti 直接触发；但 feeder hang 已由代码和 smoke 直接确认，必须
+按高风险路径隔离处理。
+
+### 1.3 Read pipeline safety baseline (STAGED-READ-PIPELINE-18)
+
+The active read path is legacy-compatible layer orchestration. Worker/KVEngine
+submits the first bounded lookahead using ordinary `get_batch()` operations;
+each layer callback waits only for its own completion, enqueues scatter on the
+read-copy stream, bridges `scatter_done[L]` to compute, then submits the next
+layer. The read/write RingWindows remain separate and bounded. No lower layer
+knows callback ordinals, windows, ready/release flags, or future events.
+
+The old whole-plan future-event experiment is not part of the production
+interface. A later layer can reuse a bank only after the upper layer observes
+the prior completion/scatter event. Write uses one ordinary `put_batch()` per
+layer after the compute/gather fence.
+
 ## 2. 系统层次
 
 ```text
@@ -527,6 +564,27 @@ LMCache也是通过`_invalid_block_ids`接入，不依靠裸异常。
 受影响输出，再重算或终止。若要求失败层后完全不compute，需要扩展vLLM
 model-runner abort协议，不属于当前LMCache标准路径。
 
+TP failure barrier不传播allocator产生的raw block ID，更不能把离散ID压缩成
+`[min, max]`。每个rank在现有TP CPU process group上以固定数值tensor交换：
+
+```text
+step generation
++ repeated(request ordinal, first failed chunk ordinal, affected chunk count)
+```
+
+所有rank合并逻辑区间后，使用本rank同一request的block table重建invalid IDs。
+因此离散block ID、同一步多request和多rank同时失败都不会误伤无关block。callback
+只记录失败且不scatter；旧forward完成全部模型collective后，在connector finalize中
+执行一次failure collective、各rank drain，再执行failure-only drain barrier。
+
+async scheduler可能已在失败step之后预留依赖其sample token的后续step。当前失败
+sample在worker bookkeeping前通过discard mask撤销；若已有下游placeholder，则使用
+既有preempt/stale-output协议清空完整request执行状态，并由scheduler权威
+`all_token_ids`重建worker persistent batch。只减少一个placeholder不足以恢复语义。
+speculative decode的deferred connector finalize还必须同步撤销accepted/sample token、
+draft token、`num_tokens_no_spec`和generator offset。TP collective超时会把该process
+group视为poisoned并要求worker/process-group重启，不在同一group上假装继续服务。
+
 ### 10.3 HMA限制
 
 vendored scheduler的invalid-block recovery仍强制单group解构。Qwen HMA失败恢复
@@ -610,77 +668,86 @@ C++外层range带`|op=read/write`，内层保留旧marker
 
 ### 13.4 `hy3-visible-r1` 调度证据与未完成项
 
-Nsight SQLite证明三条CUDA stream在每个rank上实际分离：Transformer compute为
-`streamId=19`，read I/O/scatter为`31`，write I/O为`35`。read stream中的
-`index_elementwise`/`vectorized_elementwise`是scatter数据搬运，不是模型计算；
-GUI按NVTX projection显示时可能看起来在同一组。
+历史`hy3-visible-r1`报告中只有三条CUDA stream：Transformer compute为
+`streamId=19`，read I/O为`31`，write I/O为`35`；scatter/reshape实际回落在
+compute stream 19。NVTX projection不能替代CUDA stream ID判断。
 
-当前已接通step feeder：K=2时每个rank的B read为40个window kernel，A/B write
-合计80个window kernel；每个step只有一个Runtime/DataPath handle。逐层callback
-只消费/publish gate，whole-op completion在全部callback结束后才开始观察。
+当前已删除底层 step feeder：上层按 K 窗口构造普通 byte-range batch，每次
+DataPath submit 只包含当前已物化层/窗口；DataPath 不接收 layer plan 或 gate。
 
-目标eager实现不使用CUDA Graph，而使用两个step级设备任务：
+当前eager实现不使用CUDA Graph。一次普通 submit 只表示当前层/窗口的 operation
+handle 和 arena lease，不表示一个 GPU kernel 覆盖整步：
 
 ```text
-start_load_kv once:
-  submit all-layer read descriptors
-  one read kernel updates layer_done[L] / layer_status[L]
+start_load_kv:
+  Worker/KVEngine builds current layer/window byte-range descriptors
+  submit one ordinary batch; the next window is admitted by host/event ordering
 
 wait_for_layer_load(L):
-  compute stream device-waits layer_done[L]
-  guarded scatter(L)
-  return without host Runtime.wait
-
-start/save step once:
-  launch one low-occupancy write feeder
+  host waits for the current ordinary completion
+  read-copy stream enqueues scatter(L) and records scatter_done[L]
+  compute stream wait_event(scatter_done[L])
+  read-copy stream publishes release[L] after scatter
 
 save_kv_layer(L):
-  gather into layer-owned staging
-  publish write_ready[L]
-
-write feeder:
-  wait write_ready[L] -> issue layer L writes -> compact status
-
-step end:
-  harvest one read handle + one write handle
+  gather current layer into staging, then submit current layer's ordinary write batch
 ```
 
 read/write staging必须保证同时在途layer物理隔离，不能让未scatter/未write的
-数据被后续层覆盖。默认资源模型是每个stream固定`K`个layer slot，并由device-side
-`ready/consumed`握手控制复用；read/write feeder复用slot前等待consumer完成，不走
-host `acquire/wait`。Hy3按实际25/32 chunks、256 KiB segment、`K=2`计算，read约
-12.5 MiB/rank，write约16 MiB/rank。若要求所有80层read完全同时发出，也可选择
-layer-owned全量staging，代价约500 MiB/rank；必须作为显式高内存模式，而非默认。
+数据被后续层覆盖。默认资源模型是每个stream固定`K`个layer slot。read方向由
+`Worker/KVEngine` 预先构造层计划，先提交一个`K`层窗口；后续窗口只在前一窗口
+的 read-copy scatter/release 已完成后由 host feeder 提交。每个窗口内部由一个
+普通 DataPath submit 发一个当前窗口 kernel，DataPath 不排 future wait，也不负责
+推进后续窗口。write 方向遵循 legacy：当前 compute stream 完成后，逐层在 write
+stream 提交当前层的 gather+write，不能把未 ready 的后续层交给 C++ feeder。
 
-### 13.5 真实 Hy3 feeder callback/gate准入
+Hy3按实际25/32 chunks、256 KiB segment、`K=2`计算，read约12.5 MiB/rank，write
+约16 MiB/rank；窗口 submit 不增加全层 HBM，只保留固定 read/write bank。窗口
+推进使用已完成的 host/runtime completion 和现有 stream event，不依赖 future wait。
+
+### 13.4.1 Legacy 连续 enqueue 对照
+
+`examples/layerwise_kv_overlap/layerwise_kv_overlap.cpp`中的 legacy 路径在 host
+循环中按层执行：先在 read stream 提交`read(L+1)`并记录`er[L+1]`，compute stream
+等待`er[L]`后执行 compute(L)并记录`ec[L]`，write stream等待`ec[L-1]`后提交
+`write(L-1)`。同一层的所有 chunk 在一个 DataPath batch 内聚合；层间依赖仍由
+host/stream event 编排。当前 A 路径保持这个边界：`Worker/KVEngine` 管理层序、
+窗口和 staging 生命周期，C++ DataPath 只提交当前窗口/当前层并回报 completion。
+
+Nsight CUDA activity用于独立测量 kernel 实际执行间隔；host submit 连续不等于
+NVMe kernel 同时执行。
+
+### 13.5 真实 Hy3 逐层准入
 
 2026-08-27诊断确认Hy3的物理KV层与实际callback都是完整顺序0..79；旧结论中
-“callback缺层”并非根因。真正停滞发生在最后read callback 79：DataPath已经记录
-final event，但step构造时立即启动的whole-op completion watcher与per-layer gate
-API竞争Runtime registry lock，callback无法进入`wait_feeder_layer()`。
+“callback缺层”并非根因。此前的底层 feeder/gate 方案因下沉了 layer 调度和生命周期而删除；当前由
+Worker/KVEngine 逐层提交普通 batch。
 
-当前修复：
+当前约束：
 
-- 从`KVCacheConfig.kv_cache_groups[*].layer_names`建立callback ordinal到物理KV
-  ordinal的显式映射；feeder layer plan按callback数构造，不盲改物理层数。
-- 无callback的物理层不创建gate；支持多group前仍在store构造前fail-fast。
-- 重复callback幂等；乱序callback立即drain/fail-fast；finalize发现缺失callback
-  时drain并fail-closed，不留下永久gate。
-- step whole-op watcher延迟到全部callback gate发布后启动。
-- Runtime每次只在registry lock内做一次非阻塞gate probe；PENDING时释放lock后
-  再等待，避免长gate wait阻塞progress/signal。
+- callback ordinal 到物理 KV ordinal 的映射只存在于 Worker/KVEngine。
+- 重复/乱序/缺失 callback 在上层处理并 fail-closed，不在 Runtime 中轮询 layer flag。
 
-真实Hy3 TP4 eager A/B及Nsight已通过：B命中6400 tokens并正常退出；每rank
-compute/read/write分别位于stream 19/31/35，read 40、write 80个feeder kernel，
-39/40 read windows同时与compute和write overlap。
+历史Hy3 TP4 eager A/B及Nsight证明了B命中6400 tokens和四 stream 布局。
+READ-PREENQUEUE-16后的新实测显示，stream分离不等于GPU interval
+重叠：read stream 31的40个window在每个GPU上先连续执行，FlashAttention随后才
+开始，read/FlashAttn interval overlap为0；write/FlashAttn只有少量偶发重叠。
+当前H20/580.105.08对“先`cudaStreamWaitEvent`、后`cudaEventRecord`”不提供可用
+future-event依赖；不得把这种调用序列当作K=2 bank fence。保持K=2与完整pre-enqueue
+时，稳定安全的重叠需要全量layer staging或拆分submit-only/CQ-progress ABI。
 
-这里的“step-level”仅表示一次Runtime/DataPath提交和一个arena lease，不表示一次
-GPU kernel发出全部80层I/O。默认`K=2`复用staging bank，host feeder仍分40个
-window依次启动read kernel；每层read完成后的scatter/reshape由vLLM callback在
-当前compute stream 19上发出。因此Nsight中NVMe read kernel位于独立stream 31，
-但read数据搬运kernel会与模型计算共同出现在stream 19。若目标是所有read I/O
-一次性下发并让scatter也脱离compute stream，需要独立的全量read staging或更大的
-K，以及read-copy stream到compute stream的逐层event桥接；当前实现尚未达到该目标。
+single submit与single kernel必须严格区分：Hy3 80个callback在`K=2`下仍是40个
+read window kernel，不是一个kernel发出全部80层I/O。一个submit只减少host端
+operation/descriptor/arena生命周期，不消除有界window调度。
+
+read-copy修复后每rank有四类stream：compute、NVMe read、scatter/copy和NVMe
+write。scatter在独立read-copy stream enqueue；`scatter_done[L]`让compute只等待
+当前层，同时release kernel排在同一copy stream的scatter之后，保证K=2 bank不
+提前覆盖。理论上下一层read/scatter可与`compute[L]`和`write[L-1]`并行，但
+IO-COMPUTE-OVERLAP-17实测的单block CQ-poll feeder与Hy3首层调度没有产生这种
+GPU interval overlap。该路径禁止`event.synchronize()`/`cudaStreamSynchronize()`
+作为正常依赖；若需稳定重叠，下一步应拆分submit-only与poll阶段或引入经验证的
+full-layer staging，而不是只改变stream颜色。
 
 ## 14. 当前状态
 
@@ -692,6 +759,9 @@ K，以及read-copy stream到compute stream的逐层event桥接；当前实现�
 | single-group staged transfer | 已实现 |
 | split read/write bank | 已实现 |
 | local/striped双stream routing | 已实现 |
+| 独立read-copy stream与scatter event桥接 | 已实现并通过真实Hy3/Nsight准入 |
+| read plan 全量 pre-enqueue（K=2 future-event fences） | 已回退；生产路径为 host-window submit，禁止 future wait |
+| 实际 read/compute GPU interval overlap | 未通过；当前H20/580.105.08证据为0，需拆分CQ poll或full-layer staging |
 | host-pinned prebuilt PRP | 已实现并真机命中 |
 | structured completion | 已实现 |
 | partial-commit正确drain/retry | 已实现 |
@@ -704,15 +774,17 @@ K，以及read-copy stream到compute stream的逐层event桥接；当前实现�
 | padded page canonical ABI | 未实现 |
 | GPU PRP fallback清理 | 已实现并通过local/striped真机contract |
 | logical block + driver MDTS切分 | 已实现，256KiB/4MiB真机回归通过 |
-| Runtime窗口自动回压 | 已实现，真实Hy3 K=2 feeder通过 |
+| Runtime窗口自动回压 | 已实现为上层 host/window completion，底层无 feeder |
 | per-stream compact workspace | 设计完成，未实现 |
 | terminal result有界生命周期 | 未实现 |
 | replacement generation原子切换 | 未实现 |
 | rank-local I/O device placement | 已实现并通过Hy3 TP4复验 |
 | scheduler metadata-only role | 已实现，runtime factory 单测为 0 调用 |
 | TP all-rank commit gate | 已实现，任一rank缺失/异代时整chunk fail-closed |
-| step-level feeder | 已实现；synthetic/local/真实Hy3 TP4/Nsight均通过 |
-| feeder callback ordinal map | 已实现；subset/乱序/重复/缺失合同覆盖 |
+| step-level feeder | 已删除；上层逐层/窗口构造普通 `DataPathRequest[]` |
+| callback ordinal map | 已实现于 Worker/KVEngine；subset/乱序/重复/缺失在上层处理 |
+| TP load failure logical consensus | 已实现；按request/chunk传播并在各rank重建离散block ID |
+| async failure semantic rollback | 已实现；non-spec与spec deferred-finalize合同覆盖 |
 
 ## 15. 验收条件
 

@@ -79,7 +79,7 @@ class RingWindow:
             )
         return slot * self.segment_bytes
 
-    def acquire(self, n: int) -> tuple[int, list[int]]:
+    def acquire(self, n: int, *, wait_for_reuse: bool = True) -> tuple[int, list[int]]:
         """领取下一波次的 n 个槽；语义见类契约。"""
         if not _is_int(n) or not 1 <= n <= self._half:
             raise ValueError(f"n 须在 [1, {self._half}] 内，got {n!r}")
@@ -101,7 +101,7 @@ class RingWindow:
             if not occupied.intersection(old_slots):
                 continue
             stale = self._events.pop(old_wave, None)
-            if stale is not None:
+            if stale is not None and wait_for_reuse:
                 stale.wait()
             self._allocations.pop(old_wave, None)
         self._allocations[wave] = slots

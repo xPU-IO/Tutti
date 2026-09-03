@@ -4538,8 +4538,11 @@ int main(int argc, char** argv) {
                       "structured failure kind == RESOLVE_LBA");
                 CHECK(snap.value().detail.first_failed_entry == 0,
                       "structured first_failed_entry == 0");
-                CHECK(snap.value().detail.failure_scope == IoFailureScope::WHOLE_OPERATION,
-                      "structured failure scope is conservative");
+                CHECK(snap.value().detail.failure_scope == IoFailureScope::REQUEST_INDICES,
+                      "structured failure scope identifies requests");
+                CHECK(snap.value().detail.failed_request_indices ==
+                          std::vector<std::uint32_t>{0},
+                      "structured failed request index is exact");
                 printf("  resolve_lba failure: state=%d status=%s bytes=%llu\n",
                        (int)snap.value().state,
                        snap.value().status.message().c_str(),
@@ -5079,6 +5082,12 @@ int main(int argc, char** argv) {
                       "structured first_failed_entry == 0");
                 CHECK(snap.value().detail.raw_cq_status == 0x30000u,
                       "structured raw CQ status preserved");
+                CHECK(snap.value().detail.failure_scope ==
+                          IoFailureScope::REQUEST_INDICES,
+                      "structured CQ failure scope identifies requests");
+                CHECK(snap.value().detail.failed_request_indices ==
+                          std::vector<std::uint32_t>{0},
+                      "structured CQ failed request index is exact");
                 printf("  nvme-error injection: state=%d status=%s bytes=%llu\n",
                        (int)snap.value().state, msg.c_str(),
                        (unsigned long long)snap.value().bytes_transferred);

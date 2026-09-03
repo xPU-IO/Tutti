@@ -303,6 +303,10 @@ def test_auto_routes_read_and_write_to_distinct_streams(tmp_path, monkeypatch):
     monkeypatch.setattr(torch.cuda, "Stream", FakeStream)
     monkeypatch.setattr(torch.cuda, "Event", FakeEvent)
     monkeypatch.setattr(torch.cuda, "stream", FakeStreamContext)
+    compute_stream = FakeStream("cuda:0")
+    monkeypatch.setattr(
+        torch.cuda, "current_stream", lambda device=None: compute_stream
+    )
 
     runtime = FakeRuntime(supports_multi_stream=True, bound_accel_id=0)
     store = TuttiKVStore(
@@ -313,10 +317,18 @@ def test_auto_routes_read_and_write_to_distinct_streams(tmp_path, monkeypatch):
     assert store._stream_mode == "dual"
     assert store._read_stream != store._write_stream
     assert store._read_stream_obj is not store._write_stream_obj
+    assert store._read_copy_stream not in (
+        store._read_stream, store._write_stream
+    )
+    assert store._read_copy_stream_obj not in (
+        store._read_stream_obj, store._write_stream_obj
+    )
     with store.stream_context("read") as selected:
         assert selected is store._read_stream_obj
     with store.stream_context("write") as selected:
         assert selected is store._write_stream_obj
+    with store.stream_context("read_copy") as selected:
+        assert selected is store._read_copy_stream_obj
 
     src = bytearray(b"r" * SEG)
     src_id = store.register_buffer(src, SEG)
@@ -333,13 +345,19 @@ def test_auto_routes_read_and_write_to_distinct_streams(tmp_path, monkeypatch):
     event = FakeEvent()
     store.wait_read_event(event)
     store.wait_write_event(event)
+    store.wait_compute_event(event)
     assert store._read_stream_obj.waited == [event]
     assert store._write_stream_obj.waited == [event]
+    assert compute_stream.waited == [event]
     assert store.record_read_event().recorded_on is store._read_stream_obj
     assert store.record_write_event().recorded_on is store._write_stream_obj
+    assert (store.record_read_copy_event().recorded_on is
+            store._read_copy_stream_obj)
+    assert store.read_copy_stream_handle() == store._read_copy_stream
     store.close()
     assert store._read_stream_obj is None
     assert store._write_stream_obj is None
+    assert store._read_copy_stream_obj is None
 
 
 def test_auto_falls_back_when_caps_reject_multi_stream(tmp_path, monkeypatch):
@@ -401,9 +419,19 @@ def test_auto_rejects_runtime_and_preset_device_mismatch(tmp_path, monkeypatch):
         store.open()
 
 
-def test_explicit_legacy_stream_is_shared_for_both_directions(tmp_path):
+def test_explicit_legacy_stream_shares_io_but_keeps_copy_separate(
+        tmp_path, monkeypatch):
     """An explicit io_stream keeps the pre-existing single-stream contract."""
     import types
+    import torch
+
+    class FakeStream:
+        def __init__(self, device):
+            self.device = types.SimpleNamespace(index=0)
+            self.cuda_stream = 5678
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "Stream", FakeStream)
 
     runtime = FakeRuntime(supports_multi_stream=True)
     store = TuttiKVStore(
@@ -413,6 +441,7 @@ def test_explicit_legacy_stream_is_shared_for_both_directions(tmp_path):
     store.open()
     assert store._stream_mode == "shared"
     assert store._read_stream == store._write_stream == 1234
+    assert store._read_copy_stream == 5678
     event = types.SimpleNamespace(synchronize=lambda: None)
     store.wait_read_event(event)
     store.wait_write_event(event)
@@ -438,6 +467,7 @@ def test_owned_runtime_shutdown_precedes_stream_release(tmp_path, monkeypatch):
         def shutdown(self, timeout_ms):
             assert self.owner._read_stream_obj is not None
             assert self.owner._write_stream_obj is not None
+            assert self.owner._read_copy_stream_obj is not None
             super().shutdown(timeout_ms)
 
     runtime = OwnedRuntime()
@@ -455,6 +485,7 @@ def test_owned_runtime_shutdown_precedes_stream_release(tmp_path, monkeypatch):
     assert store._runtime is None
     assert store._read_stream_obj is None
     assert store._write_stream_obj is None
+    assert store._read_copy_stream_obj is None
 
 
 def test_double_stall_raises(tmp_path):
@@ -650,6 +681,7 @@ def test_completion_wait_uses_runtime_notification_without_polling():
     class BlockingRuntime:
         def __init__(self):
             self.done = threading.Event()
+            self.released_event = threading.Event()
             self.timeouts = []
             self.released = []
 
@@ -662,12 +694,18 @@ def test_completion_wait_uses_runtime_notification_without_polling():
 
         def release_io(self, handle):
             self.released.append(handle)
+            self.released_event.set()
 
     runtime = BlockingRuntime()
     settled = []
     completion = _TuttiCompletion(runtime, [7], settled.append)
     assert completion.query() is False
     runtime.done.set()
+    # The watcher owns terminal handle reclamation; a long layer sequence
+    # must not retain every completed handle until wait_for_save().
+    assert runtime.released_event.wait(1.0)
+    assert settled == []
+    assert runtime.released == [7]
     completion.wait(timeout=1.0)
     assert settled == [True]
     assert runtime.released == [7]
@@ -701,6 +739,28 @@ def test_completion_wait_detail_is_retained_after_release():
     assert runtime.released == [11]
     retained = completion.wait_detail(timeout=0)
     assert retained == result
+
+
+def test_get_batch_auto_releases_terminal_handle(tmp_path):
+    """Pre-enqueued reads cannot retain all handles until layer callbacks."""
+    runtime = FakeRuntime()
+    store = make_store(tmp_path, runtime=runtime)
+    store.open()
+    key = io_key(b"read-auto-free".ljust(16, b"_"), 0)
+    src = bytearray(b"r" * SEG)
+    src_id = store.register_buffer(src, SEG)
+    store.put_batch([(key, src_id, 0)]).wait()
+
+    released_before = len(runtime._released)
+    dst = bytearray(SEG)
+    dst_id = store.register_buffer(dst, SEG)
+    completion = store.get_batch([(key, dst_id, 0)])
+    assert completion._ready.wait(1.0)
+    assert len(runtime._released) == released_before + 1
+    completion.wait(timeout=1.0)
+    assert len(runtime._released) == released_before + 1
+    assert dst == src
+    store.close()
 
 
 # ---------- register_buffer ----------

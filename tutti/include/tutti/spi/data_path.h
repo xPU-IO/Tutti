@@ -91,17 +91,12 @@ struct SpiIdentityMint {
 
 struct DataPathTargetTag {};
 struct DataPathMemoryTag {};
-struct DataPathPagedMemoryTag {};
 struct DataPathOpTag {};
 
 } // namespace detail
 
 using DataPathTarget = detail::OpaqueSpiIdentity<detail::DataPathTargetTag>;
 using DataPathMemory = detail::OpaqueSpiIdentity<detail::DataPathMemoryTag>;
-// Kept distinct from DataPathMemory so flat byte-range requests cannot be
-// accidentally submitted against a block-table-backed cache.
-using DataPathPagedMemory =
-    detail::OpaqueSpiIdentity<detail::DataPathPagedMemoryTag>;
 using DataPathOp     = detail::OpaqueSpiIdentity<detail::DataPathOpTag>;
 
 // -------------------------------------------------------------------------
@@ -148,26 +143,6 @@ struct DataPathMemoryView {
     std::uint64_t io_granularity = 0;
 };
 
-// One layer of a paged cache.  A successful implementation copies this
-// descriptor during registration; the caller need not retain the array.
-struct DataPathPagedLayerView {
-    void* base = nullptr;
-    std::uint64_t size_bytes = 0;
-};
-
-// Physical layout of a paged cache.  Each block is contiguous within one
-// layer; block IDs in DataPathPagedRequest select those physical blocks.  No
-// transport descriptor or on-disk format is exposed by this contract.
-struct DataPathPagedMemoryView {
-    const DataPathPagedLayerView* layers = nullptr;
-    std::size_t layer_count = 0;
-    std::uint64_t block_size_bytes = 0;
-    std::uint32_t tokens_per_block = 0;
-    std::uint64_t bytes_per_token = 0;
-    std::int32_t expected_accel_id = -1;
-    DataPathMemoryKind kind = DataPathMemoryKind::DEVICE;
-};
-
 // Minimal configuration handed to initialize().
 struct DataPathConfig {
     std::string name;
@@ -205,11 +180,6 @@ struct DataPathCapabilities {
     // memory kinds
     bool supports_host_memory = false;
     bool supports_device_memory = false;
-
-    // Block-table-aware paged registration/submit.  This is intentionally
-    // separate from supports_direct: direct contiguous device IO does not
-    // imply that a backend can resolve paged cache addresses.
-    bool supports_paged_memory = false;
 
     // data movement
     bool supports_direct = false;
@@ -275,21 +245,6 @@ struct DataPathRequest {
     IoRequest intent;       // public byte-range intent
     DataPathMemory memory;  // registered memory identity
     DataPathTarget target;  // opened target identity
-};
-
-// One block-table-aware request against a registered paged cache.  The
-// block_ids vector is caller-owned metadata and must be copied by an async
-// implementation before submit_paged() returns.
-struct DataPathPagedRequest {
-    IoDirection direction = IoDirection::READ;
-    DataPathPagedMemory memory;
-    DataPathTarget target;
-    std::uint32_t layer_index = 0;
-    std::vector<std::uint32_t> block_ids;
-    std::uint64_t token_offset = 0;
-    std::uint64_t token_count = 0;
-    std::uint64_t target_offset = 0;
-    std::uint64_t length = 0;
 };
 
 // Per-request initial state, one per input request, in input order.
@@ -366,12 +321,6 @@ struct DataPathSnapshot {
     IoCompletionDetail detail;
 };
 
-enum class FeederLayerState : std::uint8_t {
-    PENDING,
-    READY,
-    FAILED,
-};
-
 // Budget handed to progress(). Both fields are hard caps on one call.
 struct ProgressBudget {
     std::uint64_t max_work_units = 0;  // hard cap on work units consumed
@@ -427,20 +376,6 @@ public:
         const RegistrationDomainKey& domain) = 0;
     virtual Status unregister_memory(DataPathMemory memory) = 0;
 
-    // Optional block-table-aware registration.  The default is fail-closed:
-    // a backend must override both paged hooks and advertise
-    // supports_paged_memory before callers can select this path.
-    virtual Result<DataPathPagedMemory> register_paged_memory(
-        const DataPathPagedMemoryView&, const RegistrationDomainKey&) {
-        return Result<DataPathPagedMemory>::Failure(Status(
-            StatusCode::UNSUPPORTED,
-            "DataPath does not support paged memory registration"));
-    }
-    virtual Status unregister_paged_memory(DataPathPagedMemory) {
-        return Status(StatusCode::UNSUPPORTED,
-                      "DataPath does not support paged memory registration");
-    }
-
     // submit / progress / query / release
     //
     // submit() contract: the `requests` array MAY span multiple distinct
@@ -453,36 +388,10 @@ public:
                                  std::size_t count,
                                  const HostSubmitContext& ctx) = 0;
 
-    // Optional block-table-aware submit.  Implementations must copy each
-    // block_ids vector before returning when the operation is asynchronous.
-    // The default rejects every request and never mints an operation.
-    virtual SubmitOutcome submit_paged(const DataPathPagedRequest*,
-                                        std::size_t count,
-                                        const HostSubmitContext&) {
-        SubmitOutcome out;
-        out.status = Status(StatusCode::UNSUPPORTED,
-                            "DataPath does not support paged IO");
-        out.initial_states.resize(count);
-        for (auto& state : out.initial_states) {
-            state.state = RequestState::REJECTED;
-            state.status = out.status;
-        }
-        return out;
-    }
     virtual Result<ProgressResult> progress(ProgressBudget budget) = 0;
     virtual Result<DataPathSnapshot> query(DataPathOp op) const = 0;
     virtual Status release(DataPathOp op) = 0;
 
-    virtual Result<FeederLayerState> wait_feeder_layer(
-        DataPathOp, std::uint32_t, std::uint64_t) {
-        return Result<FeederLayerState>::Failure(Status(
-            StatusCode::UNSUPPORTED, "DataPath has no step feeder"));
-    }
-    virtual Status signal_feeder_layer(
-        DataPathOp, std::uint32_t, cudaStream_t) {
-        return Status(StatusCode::UNSUPPORTED,
-                      "DataPath has no step feeder");
-    }
 };
 
 } // namespace tutti

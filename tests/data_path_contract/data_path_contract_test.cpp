@@ -124,35 +124,6 @@ int main() {
     }
 
     // ------------------------------------------------------------------
-    // 3b. Paged memory is an explicit optional capability and fails closed
-    //     on the legacy/mock DataPath.  A direct contiguous backend must not
-    //     accidentally accept a block-table request.
-    // ------------------------------------------------------------------
-    {
-        tutti::testing::MockDataPath dp;
-        CHECK(!dp.capabilities().supports_paged_memory);
-
-        tutti::RegistrationDomainKey dom{"domain-0"};
-        auto memory = dp.register_paged_memory(
-            tutti::DataPathPagedMemoryView{}, dom);
-        CHECK(!memory.ok());
-        CHECK(memory.status().code() == tutti::StatusCode::UNSUPPORTED);
-
-        tutti::DataPathPagedRequest request;
-        request.block_ids = {3, 7};
-        auto out = dp.submit_paged(&request, 1, host_ctx());
-        CHECK(!out.status.ok());
-        CHECK(out.status.code() == tutti::StatusCode::UNSUPPORTED);
-        CHECK(!out.op.has_value());
-        CHECK(out.initial_states.size() == 1);
-        CHECK(out.initial_states[0].state == tutti::RequestState::REJECTED);
-        CHECK(out.initial_states[0].status.code() ==
-              tutti::StatusCode::UNSUPPORTED);
-        CHECK(dp.unregister_paged_memory(tutti::DataPathPagedMemory{}).code() ==
-              tutti::StatusCode::UNSUPPORTED);
-    }
-
-    // ------------------------------------------------------------------
     // 4. registration domain key does not leak a controller pointer.
     // ------------------------------------------------------------------
     {

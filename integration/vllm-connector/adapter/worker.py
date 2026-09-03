@@ -10,6 +10,8 @@ import logging
 import os
 import re
 import time
+from dataclasses import dataclass
+from datetime import timedelta
 
 import torch
 from tutti_kv_transfer import (
@@ -28,6 +30,141 @@ _SLOT_CACHE_LIMIT = 1024
 
 #: 层名序号提取（vLLM 层名约定 model.layers.{i}....）。
 _LAYER_NAME_RE = re.compile(r"layers\.(\d+)")
+
+
+@dataclass(frozen=True)
+class _LogicalFailure:
+    request_ordinal: int
+    first_chunk_ordinal: int
+    affected_chunk_count: int
+
+
+@dataclass(frozen=True)
+class _LoadRequestSpan:
+    request_ordinal: int
+    req_id: str
+    first_chunk_ordinal: int
+    flat_chunk_start: int
+    chunk_count: int
+
+
+@dataclass(frozen=True)
+class _FailureConsensus:
+    failed: bool
+    generation: int
+    generation_consistent: bool
+    logical_failures: tuple[_LogicalFailure, ...]
+    latency_ms: float
+
+
+class _TpLoadFailureCoordinator:
+    """Fixed-size numeric collectives on vLLM's existing TP process group."""
+
+    def __init__(self, timeout_s: float = 30.0):
+        if not isinstance(timeout_s, (int, float)) or timeout_s <= 0:
+            raise ValueError("failure collective timeout must be positive")
+        self._timeout_s = float(timeout_s)
+
+    def coordinate(self, generation: int, request_count: int,
+                   local_failures) -> _FailureConsensus:
+        from vllm.distributed.parallel_state import get_tp_group
+
+        group = get_tp_group()
+        failures = {
+            int(item.request_ordinal): item for item in local_failures
+        }
+        if group.world_size <= 1:
+            return _FailureConsensus(
+                bool(failures), generation, True,
+                tuple(failures[key] for key in sorted(failures)), 0.0
+            )
+        values = [generation]
+        for ordinal in range(request_count):
+            failure = failures.get(ordinal)
+            values.extend((
+                ordinal if failure is not None else -1,
+                failure.first_chunk_ordinal if failure is not None else -1,
+                failure.affected_chunk_count if failure is not None else 0,
+            ))
+        local = torch.tensor(values, dtype=torch.int64)
+        gathered = torch.empty(
+            group.world_size * local.numel(), dtype=torch.int64
+        )
+        started = time.monotonic_ns()
+        import torch.distributed as dist
+
+        work = dist.all_gather_into_tensor(
+            gathered, local, group=group.cpu_group, async_op=True
+        )
+        completed = work.wait(timeout=timedelta(seconds=self._timeout_s))
+        if completed is False:
+            raise TimeoutError(
+                f"TP load failure collective timed out after {self._timeout_s}s"
+            )
+        latency_ms = (time.monotonic_ns() - started) / 1_000_000
+        rows = gathered.reshape(group.world_size, local.numel()).tolist()
+        return self.merge_rows(
+            generation, request_count, rows, latency_ms
+        )
+
+    @staticmethod
+    def merge_rows(generation: int, request_count: int, rows,
+                   latency_ms: float = 0.0):
+        """Merge fixed tensor rows; separate for deterministic contracts."""
+        generations = {int(row[0]) for row in rows}
+        generation_consistent = generations == {generation}
+        merged = {}
+        for row in rows:
+            for slot in range(request_count):
+                base = 1 + slot * 3
+                ordinal = int(row[base])
+                first = int(row[base + 1])
+                count = int(row[base + 2])
+                if ordinal < 0 or count <= 0:
+                    continue
+                if ordinal >= request_count or ordinal != slot:
+                    generation_consistent = False
+                    continue
+                end = first + count
+                previous = merged.get(ordinal)
+                merged[ordinal] = (
+                    (first, end) if previous is None
+                    else (min(previous[0], first), max(previous[1], end))
+                )
+        logical = tuple(
+            _LogicalFailure(ordinal, first, end - first)
+            for ordinal, (first, end) in sorted(merged.items())
+        )
+        failed = bool(logical) or not generation_consistent
+        return _FailureConsensus(
+            failed, generation, generation_consistent, logical, latency_ms
+        )
+
+    def drain_barrier(self, generation: int, local_ok: bool) -> bool:
+        """A second fixed collective is entered only after global failure."""
+        from vllm.distributed.parallel_state import get_tp_group
+
+        group = get_tp_group()
+        if group.world_size <= 1:
+            return bool(local_ok)
+        local = torch.tensor([generation, int(bool(local_ok))], dtype=torch.int64)
+        gathered = torch.empty(
+            group.world_size * local.numel(), dtype=torch.int64
+        )
+        import torch.distributed as dist
+
+        work = dist.all_gather_into_tensor(
+            gathered, local, group=group.cpu_group, async_op=True
+        )
+        completed = work.wait(timeout=timedelta(seconds=self._timeout_s))
+        if completed is False:
+            raise TimeoutError(
+                f"TP post-drain barrier timed out after {self._timeout_s}s"
+            )
+        rows = gathered.reshape(group.world_size, local.numel()).tolist()
+        return all(
+            int(row[0]) == generation and int(row[1]) == 1 for row in rows
+        )
 
 #: 运行日志（准入失败等容量配置问题的非静默说明）。
 _LOG = logging.getLogger(__name__)
@@ -151,8 +288,7 @@ class PagedTransferHooks:
                   direction: str) -> None:
         """搬运一层；连续槽位的多个 chunk 合并为一次 kernel。"""
         paged = self._layer_view(layer_idx)
-        if (self._mode == self._KERNEL
-                and len(block_tables) == len(slots)
+        if (len(block_tables) == len(slots)
                 and self._can_batch_slots(slots)):
             mappings = [self._slot_mapping(blocks) for blocks in block_tables]
             if mappings:
@@ -166,9 +302,14 @@ class PagedTransferHooks:
                     .view(self._dtype)
                     .view(len(slots) * self._chunk_tokens, *self._staging_shape[1:])
                 )
-                batched_layer_transfer(
-                    staging_view, paged, slot_mapping, self._fmt, direction
-                )
+                if self._mode == self._INTERLEAVED:
+                    self._transfer_interleaved(
+                        staging_view, paged, slot_mapping, direction
+                    )
+                else:
+                    batched_layer_transfer(
+                        staging_view, paged, slot_mapping, self._fmt, direction
+                    )
                 return
         for blocks, slot in zip(block_tables, slots):
             staging_view = (
@@ -208,7 +349,13 @@ class PagedTransferHooks:
         key = tuple(blocks)
         cached = self._slot_cache.get(key)
         if cached is None:
-            ids = torch.tensor(key, dtype=torch.int64, device=self._device)
+            # Direct CPU-list -> CUDA tensor construction performs a blocking
+            # upload and appears as cudaStreamSynchronize in the layer-0
+            # scatter path. Stage the tiny index vector in pinned host memory
+            # and enqueue its copy on the active read-copy stream instead.
+            host_ids = torch.tensor(key, dtype=torch.int64, pin_memory=True)
+            ids = torch.empty_like(host_ids, device=self._device)
+            ids.copy_(host_ids, non_blocking=True)
             offsets = torch.arange(
                 self._block_size, dtype=torch.int64, device=self._device
             )
@@ -227,9 +374,9 @@ class WorkerImpl:
     - 构造注入引擎与在途句柄上限（max_in_flight_layers，0 = 不限）。
     - 显存对象经两个登记回调进入（单块跨层池或逐层映射，二选一）；
       首个执行回调触发惰性绑定（分配 staging 环窗显存并接入引擎）。
-    - 读取流程：start_load_kv 组批并预取前 K 层；wait_for_layer_load
-      等待当前层后补交第 K 层；末层等待返回即释放读保护。K=1
-      时退化为原有逐层流水。
+    - 读取流程：start_load_kv 构建并提交完整层计划；
+      wait_for_layer_load 只在 compute stream 排入对应 scatter fence。
+      旧的 lookahead helper 仅供兼容测试显式调用。
     - 写入流程：save_kv_layer 逐层发起一批；wait_for_save 等待全部
       完成并结算写入（在途句柄超限时先行等待最旧一批）。
     - 近似视图未遂（读取保护失败）的块经 get_block_ids_with_load_errors
@@ -237,8 +384,10 @@ class WorkerImpl:
     """
 
     def __init__(self, engine, max_in_flight_layers: int | None = None,
-                 lookahead_k: int | None = None):
-        """构造 worker；lookahead_k 为有界读取预取层数。"""
+                 lookahead_k: int | None = None,
+                 failure_coordinator=None,
+                 failure_collective_timeout_s: float = 30.0):
+        """构造 worker；lookahead_k 仅保留为兼容配置别名。"""
         if max_in_flight_layers is None:
             max_in_flight_layers = int(
                 getattr(engine, "max_in_flight_operations", 0) or 0
@@ -260,6 +409,14 @@ class WorkerImpl:
                 f"lookahead_k 须为正整数，got {lookahead_k!r}"
             )
         self._lookahead_k = lookahead_k
+        self._failure_coordinator = (
+            failure_coordinator
+            if failure_coordinator is not None
+            else _TpLoadFailureCoordinator(failure_collective_timeout_s)
+        )
+        self._failure_collective_timeout_s = float(
+            failure_collective_timeout_s
+        )
         # configure 注入
         self._chunk_tokens = 0
         self._chunk_kv_bytes = 0
@@ -280,10 +437,17 @@ class WorkerImpl:
         self._load_keys: list[bytes] = []
         self._load_block_tables: list[list[int]] = []
         self._load_handles: dict[int, object] = {}
-        self._load_step = None
+        self._read_plan = None
+        self._load_fences: dict[int, object] = {}
+        self._load_waited_callbacks: set[int] = set()
+        self._compat_prefetch_active = False
+        self._legacy_eager_active = False
         self._pinned = False
         self._load_failed = False
         self._load_error_blocks: set[int] = set()
+        self._load_logical_failures: dict[int, _LogicalFailure] = {}
+        self._load_request_spans: list[_LoadRequestSpan] = []
+        self._load_error_request_ids: set[str] = set()
         # 无序号层名的学习映射（层名 → 层号，首次出现序；同一步内
         # wait/save 两次调用凭此解析一致）
         self._name_to_idx: dict[str, int] = {}
@@ -291,7 +455,8 @@ class WorkerImpl:
         self._save_generations: list[str] = []
         self._save_block_tables: list[list[int]] = []
         self._save_inflight: list = []
-        self._write_step = None
+        self._save_seen_callbacks: set[int] = set()
+        self._save_error = None
         self._kv_group_layer_names: tuple[str, ...] = ()
         self._callback_to_physical: tuple[int, ...] = ()
         self._callback_by_name: dict[str, int] = {}
@@ -299,6 +464,11 @@ class WorkerImpl:
         self._diag_enabled = os.environ.get("TUTTI_FEEDER_DIAGNOSTICS") == "1"
         self._diag_wait_sequence: list[str] = []
         self._diag_save_sequence: list[str] = []
+        self._external_load_step = False
+        self._load_generation = 0
+        self._failure_collective_done = False
+        self._failure_consensus = None
+        self._failure_collective_poisoned = False
 
     # ---- 配置与登记 ----
 
@@ -384,14 +554,32 @@ class WorkerImpl:
         self._load_failed = False
         self._load_keys = []
         self._load_block_tables = []
+        self._load_logical_failures = {}
+        self._load_request_spans = []
+        self._load_error_request_ids = set()
         self._load_handles = {}
-        self._load_step = None
+        self._save_seen_callbacks = set()
+        self._save_error = None
+        self._load_fences = {}
+        self._load_waited_callbacks = set()
+        self._compat_prefetch_active = False
+        self._legacy_eager_active = False
+        self._read_plan = None
+        self._load_generation += 1
+        self._external_load_step = any(
+            getattr(meta, "load_tokens", 0) > 0
+            for meta in getattr(self._metadata, "requests", []) or []
+        )
+        self._failure_collective_done = False
+        self._failure_consensus = None
+        self._failure_collective_poisoned = False
         self._diag_wait_sequence = []
         self._diag_save_sequence = []
         self._pinned = False
         keys: list[bytes] = []
         block_tables: list[list[int]] = []
-        for meta in getattr(self._metadata, "requests", []) or []:
+        for request_ordinal, meta in enumerate(
+                getattr(self._metadata, "requests", []) or []):
             if meta.load_tokens <= 0:
                 continue
             first_chunk, n_chunks = _load_chunk_span(
@@ -401,18 +589,26 @@ class WorkerImpl:
                 continue
             req_keys, _ = self._engine.hash_keys(meta.token_ids)
             req_keys = req_keys[first_chunk : first_chunk + n_chunks]
+            flat_chunk_start = len(keys)
             try:
                 self._engine.pin(req_keys)
             except KeyError:
                 # 近似视图未遂：该区间块上报重算
-                self._report_load_errors(meta, first_chunk, n_chunks)
+                self._report_load_errors(
+                    request_ordinal, meta, first_chunk, n_chunks
+                )
                 continue
             keys.extend(req_keys)
             block_tables.extend(
                 self._chunk_block_tables(meta, first_chunk + n_chunks)[first_chunk:]
             )
-        if keys:
-            self._load_keys = keys
+            self._load_request_spans.append(_LoadRequestSpan(
+                request_ordinal=request_ordinal,
+                req_id=str(getattr(meta, "req_id", request_ordinal)),
+                first_chunk_ordinal=first_chunk,
+                flat_chunk_start=flat_chunk_start,
+                chunk_count=n_chunks,
+            ))
         if keys:
             self._load_keys = keys
             self._load_block_tables = block_tables
@@ -420,68 +616,127 @@ class WorkerImpl:
             with nvtx_range(
                 f"tutti.request.load|requests="
                 f"{len(getattr(self._metadata, 'requests', []) or [])}"
-                f"|chunks={len(keys)}|K={self._lookahead_k}"
+                f"|chunks={len(keys)}|layers={len(self._callback_to_physical)}"
             ):
                 try:
-                    step_factory = getattr(self._engine, "start_step_io", None)
-                    if (callable(step_factory) and
-                            getattr(self._engine, "supports_step_io", False)):
-                        self._load_step = step_factory(
+                    if (getattr(self._engine, "read_plan_supported", False)
+                            and callable(getattr(
+                                self._engine, "start_read_plan", None))):
+                        depth = max(
+                            1,
+                            self._read_window.num_slots
+                            // max(1, self._max_chunks_per_wave),
+                        )
+                        self._read_plan = self._engine.start_read_plan(
                             self._load_keys, self._load_block_tables,
-                            "read", self._lookahead_k,
-                            physical_layers=self._callback_to_physical,
+                            self._callback_to_physical, depth,
+                            on_failure=self._on_async_read_failure,
                         )
                     else:
-                        self._prefetch_load_layers(0)
+                        # Compatibility engines without the event-plan API
+                        # still receive the complete layer plan in this host
+                        # enqueue stage.  They must expose a recorded fence on
+                        # each returned handle; no callback submission exists.
+                        for callback, physical in enumerate(
+                                self._callback_to_physical):
+                            try:
+                                handle = self._engine.load_layer(
+                                    self._load_keys, physical,
+                                    self._load_block_tables,
+                                    async_reuse=False,
+                                    bridge_compute=False,
+                                )
+                            except TypeError:
+                                handle = self._engine.load_layer(
+                                    self._load_keys, physical,
+                                    self._load_block_tables,
+                                )
+                            self._load_handles[callback] = handle
+                            fence = getattr(handle, "fence_event", None)
+                            if fence is not None:
+                                self._load_fences[callback] = fence
+                        self._legacy_eager_active = True
                 except Exception:
                     self._mark_load_failure()
                     self._abort_step()
                     raise
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        """等待指定层读取完成，并预取下一层。"""
+        """为指定层在 compute stream 排入已完成 scatter fence 的等待。"""
         callback, idx = self._resolve_callback(layer_name)
         self._diag_callback("wait", layer_name, callback, idx)
-        if self._load_step is not None:
-            try:
-                with nvtx_range(f"tutti.request.wait_load|layer={idx}"):
-                    self._load_step.wait_layer(callback, idx)
-            except LoadGateError as exc:
-                self._mark_load_failure(exc)
-                self._abort_step()
-                return
-            if idx == self._num_layers - 1 and self._pinned:
-                self._engine.unpin(self._load_keys)
-                self._pinned = False
+        if callback in self._load_waited_callbacks or self._load_failed:
             return
-        handle = self._load_handles.pop(idx, None)
-        if handle is not None:
-            try:
-                with nvtx_range(f"tutti.request.wait_load|layer={idx}"):
+        if not self._load_keys:
+            return
+        self._load_waited_callbacks.add(callback)
+        if self._compat_prefetch_active:
+            handle = self._load_handles.pop(idx, None)
+            if handle is not None:
+                try:
                     handle.wait()
+                except LoadGateError as exc:
+                    self._mark_load_failure(exc)
+                    return
+                except Exception:
+                    self._abort_step()
+                    raise
+            if self._load_failed:
+                return
+            nxt = idx + self._lookahead_k
+            if (nxt < self._num_layers and self._load_keys
+                    and nxt not in self._load_handles):
+                self._start_load_layer(nxt)
+            return
+        if self._read_plan is not None:
+            try:
+                if self._read_plan.failed is not None:
+                    raise self._read_plan.failed
+                fence_event = self._read_plan.wait_layer(callback)
+                if fence_event is None:
+                    raise RuntimeError(
+                        "read plan did not provide a CUDA fence event"
+                    )
+                store = getattr(self._engine, "_store", None)
+                wait_compute = getattr(store, "wait_compute_event", None)
+                if not callable(wait_compute):
+                    raise RuntimeError(
+                        "read plan compute event bridge is unavailable"
+                    )
+                wait_compute(fence_event)
             except LoadGateError as exc:
                 self._mark_load_failure(exc)
-                self._abort_step()
-                # vLLM's KV load recovery contract is invalid_block_ids, not a
-                # connector exception. The current forward output is discarded
-                # by the scheduler and either failed or recomputed per policy.
                 return
-            except Exception:
-                self._abort_step()
-                raise
-        if self._load_failed:
+            except Exception as exc:
+                self._mark_load_failure(exc)
+                _LOG.error(
+                    "read plan failed closed generation=%d callback=%d: %s",
+                    self._load_generation, callback, exc,
+                )
+                return
             return
-        # 维持固定的 K 层在途窗口：首次调用已提交 [0, K)，每次
-        # 消费一层后只补交尾部一层。按 idx+K 定位可避免重复提交，
-        # 也让乱序/重复回调保持幂等。
-        nxt = idx + self._lookahead_k
-        if (nxt < self._num_layers and self._load_keys
-                and nxt not in self._load_handles):
-            with nvtx_range(f"tutti.request.prefetch_load|layer={nxt}"):
-                self._start_load_layer(nxt)
-        if idx == self._num_layers - 1 and self._pinned:
-            self._engine.unpin(self._load_keys)
-            self._pinned = False
+
+        fence_event = self._load_fences.get(callback)
+        if fence_event is None:
+            if self._legacy_eager_active:
+                handle = self._load_handles.get(callback)
+                if handle is not None:
+                    try:
+                        handle.wait()
+                    except Exception as exc:
+                        self._mark_load_failure(exc)
+                return
+            self._mark_load_failure(
+                RuntimeError("layer load did not provide a recorded fence event")
+            )
+            return
+        wait_compute = getattr(self._engine._store, "wait_compute_event", None)
+        if not callable(wait_compute):
+            self._mark_load_failure(
+                RuntimeError("compute event bridge is unavailable")
+            )
+            return
+        wait_compute(fence_event)
 
     # ---- 写入编排 ----
 
@@ -500,6 +755,9 @@ class WorkerImpl:
         self._ensure_bound()
         callback, idx = self._resolve_callback(layer_name)
         self._diag_callback("save", layer_name, callback, idx)
+        if callback in self._save_seen_callbacks:
+            return
+        self._save_seen_callbacks.add(callback)
         if self._save_keys is None:
             keys: list[bytes] = []
             generations: list[str] = []
@@ -543,68 +801,95 @@ class WorkerImpl:
                 return
             try:
                 self._engine.begin_rank_commit(keys, generations)
-            except Exception:
-                self._abort_step()
+            except Exception as exc:
+                self._save_error = exc
+                self._load_failed = True
                 raise
         if not self._save_keys:
             return
-        if self._write_step is None:
-            step_factory = getattr(self._engine, "start_step_io", None)
-            if (callable(step_factory) and
-                    getattr(self._engine, "supports_step_io", False)):
-                self._write_step = step_factory(
-                    self._save_keys, self._save_block_tables,
-                    "write", self._lookahead_k,
-                    physical_layers=self._callback_to_physical,
-                )
-        if self._write_step is not None:
-            try:
-                with nvtx_range(
-                    f"tutti.request.save|layer={idx}|chunks={len(self._save_keys)}"
-                ):
-                    self._write_step.publish_layer(callback, idx)
-            except Exception:
-                self._abort_step()
-                raise
-            return
         try:
-            # The DataPath counts an operation as in-flight until progress/wait
-            # observes its terminal event. Reap the oldest write before the
-            # next submit reaches the runtime admission boundary. The write
-            # stream itself preserves FIFO execution.
-            if (self._max_in_flight and
-                    len(self._save_inflight) >= self._max_in_flight):
-                self._save_inflight.pop(0).wait()
             with nvtx_range(
                 f"tutti.request.save|layer={idx}|chunks={len(self._save_keys)}"
             ):
                 handle = self._engine.store_layer(
                     self._save_keys, idx, self._save_block_tables
                 )
-        except Exception:
-            self._abort_step()
+        except Exception as exc:
+            # Admission/CQ failures are finalized by wait_for_save; never
+            # block this vLLM callback on an abort drain.
+            self._save_error = exc
+            self._load_failed = True
             raise
         self._save_inflight.append(handle)
 
     def wait_for_save(self) -> None:
         """等待全部写入完成并结算。"""
-        first_error = None
-        if self._write_step is not None:
+        first_error = self._save_error
+        drained = False
+        # Read completions and their scatter fences were enqueued by
+        # start_load_kv.  Drain them before the TP failure consensus so any
+        # runtime/CQ error poisons the whole step instead of being mistaken
+        # for a successful load.
+        if self._load_keys:
             try:
-                self._write_step.wait()
+                self._engine.wait_idle()
+                drained = True
             except Exception as exc:
                 first_error = exc
+                self._mark_load_failure(exc)
+                drained = True
+        consensus = self._synchronize_load_failure()
+        if consensus.failed:
+            self._load_failed = True
+            logical = consensus.logical_failures
+            if not consensus.generation_consistent or not logical:
+                logical = self._all_loaded_request_failures()
+            self._install_logical_failures(logical)
+            _LOG.error(
+                "TP_LOAD_FAILURE_BARRIER generation=%d failed=true "
+                "generation_consistent=%s logical_failures=%s "
+                "local_blocks=%s collective_ms=%.3f",
+                consensus.generation, consensus.generation_consistent,
+                logical, sorted(self._load_error_blocks), consensus.latency_ms,
+            )
+            if self._failure_collective_poisoned:
+                self._abort_step(timeout=self._failure_collective_timeout_s)
+                raise RuntimeError(
+                    "TP load failure collective poisoned the process group; "
+                    "worker/process-group restart is required"
+                )
+            drain_error = self._abort_step(
+                timeout=self._failure_collective_timeout_s
+            )
+            try:
+                all_drained = self._failure_coordinator.drain_barrier(
+                    self._load_generation, drain_error is None
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "TP load failure post-drain barrier failed closed"
+                ) from exc
+            if not all_drained:
+                raise RuntimeError(
+                    "TP load failure drain failed on at least one rank"
+                ) from drain_error
+            _LOG.error(
+                "TP_LOAD_FAILURE_DRAINED generation=%d all_ranks=true",
+                self._load_generation,
+            )
+            return
+        if not drained:
+            try:
+                self._engine.wait_idle()
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
         for handle in self._save_inflight:
             try:
                 handle.wait()
             except Exception as exc:
                 if first_error is None:
                     first_error = exc
-        try:
-            self._engine.wait_idle()
-        except Exception as exc:
-            if first_error is None:
-                first_error = exc
         try:
             self._finalize_load_state()
         except Exception as exc:
@@ -627,12 +912,61 @@ class WorkerImpl:
                     pass
             self._engine.confirm_store(self._save_keys, ok=first_error is None)
         self._save_inflight = []
-        self._write_step = None
+        self._save_seen_callbacks = set()
+        self._save_error = None
         self._save_keys = None
         self._save_generations = []
         self._save_block_tables = []
         if first_error is not None:
             raise first_error
+
+    def _synchronize_load_failure(self) -> _FailureConsensus:
+        if not self._external_load_step:
+            return _FailureConsensus(
+                bool(self._load_failed and self._load_keys),
+                self._load_generation, True,
+                self._all_loaded_request_failures()
+                if self._load_failed and self._load_keys else (),
+                0.0,
+            )
+        if self._failure_collective_done:
+            assert self._failure_consensus is not None
+            return self._failure_consensus
+        self._failure_collective_done = True
+        try:
+            consensus = self._failure_coordinator.coordinate(
+                self._load_generation,
+                len(getattr(self._metadata, "requests", ()) or ()),
+                self._load_logical_failures.values(),
+            )
+        except Exception as exc:
+            # Preserve a deterministic invalid range even if the process-group
+            # operation itself times out or errors.
+            self._install_logical_failures(self._all_loaded_request_failures())
+            self._failure_collective_poisoned = True
+            consensus = _FailureConsensus(
+                True, self._load_generation, False,
+                self._all_loaded_request_failures(),
+                self._failure_collective_timeout_s * 1000,
+            )
+            _LOG.exception(
+                "TP_LOAD_FAILURE_COLLECTIVE generation=%d failed closed: %s",
+                self._load_generation, exc,
+            )
+        self._failure_consensus = consensus
+        if consensus.failed:
+            self._install_logical_failures(consensus.logical_failures)
+        _LOG.warning(
+            "TP_LOAD_FAILURE_COLLECTIVE generation=%d local_failed=%s "
+            "global_failed=%s generation_consistent=%s logical_failures=%s "
+            "local_blocks=%s "
+            "latency_ms=%.3f",
+            self._load_generation, self._load_failed, consensus.failed,
+            consensus.generation_consistent,
+            consensus.logical_failures, sorted(self._load_error_blocks),
+            consensus.latency_ms,
+        )
+        return consensus
 
     # ---- 状态与收尾 ----
 
@@ -653,6 +987,18 @@ class WorkerImpl:
         """上报读取未遂的块集合（读取后清空）。"""
         errors = self._load_error_blocks
         self._load_error_blocks = set()
+        if errors:
+            _LOG.error(
+                "REAL_LOAD_INVALID_BLOCKS count=%d block_ids=%s "
+                "cleared_after_report=true",
+                len(errors), sorted(errors),
+            )
+        return errors
+
+    def get_request_ids_with_load_errors(self) -> set[str]:
+        """Return failed request identities for worker-side sample rollback."""
+        errors = self._load_error_request_ids
+        self._load_error_request_ids = set()
         return errors
 
     def shutdown(self) -> None:
@@ -676,6 +1022,13 @@ class WorkerImpl:
             self._load_keys, layer_idx, self._load_block_tables
         )
 
+    def _on_async_read_failure(self, error) -> None:
+        """Record an asynchronous read failure without blocking callbacks."""
+        if isinstance(error, LoadGateError):
+            self._mark_load_failure(error)
+        else:
+            self._mark_load_failure(error)
+
     def _prefetch_load_layers(self, first_idx: int) -> None:
         """提交从 ``first_idx`` 起的有限层窗口。
 
@@ -683,6 +1036,7 @@ class WorkerImpl:
         因而不会创建无界 async bulk 队列。若环窗容量不足，底层
         ``acquire`` 会在复用前驱槽位时等待其完成，保持既有安全契约。
         """
+        self._compat_prefetch_active = True
         end = min(self._num_layers, first_idx + self._lookahead_k)
         for layer_idx in range(first_idx, end):
             if layer_idx not in self._load_handles:
@@ -693,19 +1047,19 @@ class WorkerImpl:
         first_error = None
         handles = list(self._load_handles.values())
         self._load_handles = {}
+        if self._read_plan is not None:
+            try:
+                self._read_plan.abort()
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+            self._read_plan = None
         for handle in handles:
             try:
                 handle.wait()
             except Exception as exc:
                 if first_error is None:
                     first_error = exc
-        if self._load_step is not None:
-            try:
-                self._load_step.wait_result()
-            except Exception as exc:
-                if first_error is None:
-                    first_error = exc
-            self._load_step = None
         if self._pinned:
             try:
                 self._engine.unpin(self._load_keys)
@@ -718,13 +1072,29 @@ class WorkerImpl:
         if first_error is not None and not suppress_errors:
             raise first_error
 
-    def _abort_step(self) -> None:
+    def _abort_step(self, timeout=None):
         """Best-effort full-direction drain while preserving the first error."""
+        first_error = None
+        if self._read_plan is not None:
+            try:
+                self._read_plan.abort()
+            except Exception as exc:
+                first_error = exc
+            self._read_plan = None
         try:
-            self._engine.abort()
-        except Exception:
-            pass
-        self._finalize_load_state(suppress_errors=True)
+            self._engine.abort(timeout=timeout)
+        except TypeError:
+            try:
+                self._engine.abort()
+            except Exception as exc:
+                first_error = exc
+        except Exception as exc:
+            first_error = exc
+        try:
+            self._finalize_load_state(suppress_errors=False)
+        except Exception as exc:
+            if first_error is None:
+                first_error = exc
         if self._save_keys:
             try:
                 self._engine.abort_rank_commit(
@@ -737,37 +1107,110 @@ class WorkerImpl:
             except Exception:
                 pass
         self._save_inflight = []
-        for step in (self._load_step, self._write_step):
-            if step is not None:
-                try:
-                    step.drain()
-                except Exception:
-                    pass
-        self._load_step = None
-        self._write_step = None
+        self._save_seen_callbacks = set()
+        self._save_error = None
         self._save_keys = None
         self._save_generations = []
         self._save_block_tables = []
+        return first_error
 
     def _mark_load_failure(self, error=None) -> None:
-        """Fail closed: all blocks in the gated load become invalid."""
+        """Record logical request/chunk failures and rebuild local block IDs."""
         self._load_failed = True
-        if isinstance(error, LoadGateError) and error.invalid_block_ids:
-            self._load_error_blocks.update(error.invalid_block_ids)
+        if not self._load_request_spans:
+            # Legacy layer-at-a-time callers do not provide scheduler request
+            # spans. Preserve their fail-closed contract locally; the real
+            # step-feeder path always rebuilds IDs from logical request/chunk
+            # coordinates after TP consensus.
+            self._load_error_blocks = {
+                int(block)
+                for chunk_blocks in self._load_block_tables
+                for block in chunk_blocks
+            }
             return
-        selected = self._load_block_tables
+        failed_flat_chunks = set()
         if (isinstance(error, LoadGateError) and not error.whole_operation
                 and error.failed_batch_indices):
-            selected = [
-                self._load_block_tables[index]
+            failed_flat_chunks.update(
+                index
                 for index in error.failed_batch_indices
                 if 0 <= index < len(self._load_block_tables)
+            )
+        failures = []
+        for span in self._load_request_spans:
+            span_start = span.flat_chunk_start
+            span_end = span_start + span.chunk_count
+            candidates = [
+                index for index in failed_flat_chunks
+                if span_start <= index < span_end
             ]
-        for blocks in selected:
-            if isinstance(blocks, (list, tuple, set)):
-                self._load_error_blocks.update(blocks)
-            elif blocks is not None:
-                self._load_error_blocks.add(blocks)
+            if failed_flat_chunks and not candidates:
+                continue
+            local_offset = min(candidates) - span_start if candidates else 0
+            first_chunk = span.first_chunk_ordinal + local_offset
+            failures.append(_LogicalFailure(
+                span.request_ordinal,
+                first_chunk,
+                span.chunk_count - local_offset,
+            ))
+        if not failures:
+            failures = list(self._all_loaded_request_failures())
+        self._install_logical_failures(failures)
+
+    def _all_loaded_request_failures(self):
+        return tuple(
+            _LogicalFailure(
+                span.request_ordinal,
+                span.first_chunk_ordinal,
+                span.chunk_count,
+            )
+            for span in self._load_request_spans
+        )
+
+    def _install_logical_failures(self, failures) -> None:
+        for failure in failures:
+            existing = self._load_logical_failures.get(
+                failure.request_ordinal
+            )
+            if existing is not None:
+                start = min(
+                    existing.first_chunk_ordinal,
+                    failure.first_chunk_ordinal,
+                )
+                end = max(
+                    existing.first_chunk_ordinal
+                    + existing.affected_chunk_count,
+                    failure.first_chunk_ordinal
+                    + failure.affected_chunk_count,
+                )
+                failure = _LogicalFailure(
+                    failure.request_ordinal, start, end - start
+                )
+            self._load_logical_failures[failure.request_ordinal] = failure
+        self._load_error_blocks = set()
+        self._load_error_request_ids = set()
+        for span in self._load_request_spans:
+            failure = self._load_logical_failures.get(span.request_ordinal)
+            if failure is None:
+                continue
+            local_start = max(
+                0,
+                failure.first_chunk_ordinal - span.first_chunk_ordinal,
+            )
+            local_end = min(
+                span.chunk_count,
+                failure.first_chunk_ordinal
+                + failure.affected_chunk_count
+                - span.first_chunk_ordinal,
+            )
+            if local_start >= local_end:
+                continue
+            self._load_error_request_ids.add(span.req_id)
+            for index in range(
+                    span.flat_chunk_start + local_start,
+                    span.flat_chunk_start + local_end):
+                blocks = self._load_block_tables[index]
+                self._load_error_blocks.update(int(block) for block in blocks)
 
     def _diag_callback(self, direction: str, layer_name: str,
                        callback: int, physical: int) -> None:
@@ -808,7 +1251,8 @@ class WorkerImpl:
             for i in range(count)
         ]
 
-    def _report_load_errors(self, meta, first_chunk: int, n_chunks: int) -> None:
+    def _report_load_errors(self, request_ordinal: int, meta,
+                            first_chunk: int, n_chunks: int) -> None:
         """把读取未遂区间覆盖的块上报为重算。"""
         per_chunk = -(-self._chunk_tokens // self._block_size)
         blocks = meta.block_ids
@@ -816,6 +1260,11 @@ class WorkerImpl:
         end_blk = min((first_chunk + n_chunks) * per_chunk, len(blocks))
         if end_blk > start_blk:
             self._load_error_blocks.update(blocks[start_blk:end_blk])
+        self._load_failed = True
+        self._load_logical_failures[request_ordinal] = _LogicalFailure(
+            request_ordinal, first_chunk, n_chunks
+        )
+        self._load_error_request_ids.add(str(meta.req_id))
 
     def _resolve_layer(self, layer_name: str) -> int:
         """把层名解析为层序号。
@@ -923,8 +1372,8 @@ class WorkerImpl:
         self._configure_callback_map(num_layers)
         segment_bytes = self._chunk_kv_bytes // num_layers
         # 原 staging 总槽数不变，但静态拆为 read/write 两个 bank。
-        # 每个 bank 各容纳 K 个满波；K=1 时同方向下一波在复用前
-        # 等待，K>1 保留有界 lookahead，不扩展为全层预排。
+        # 槽位深度只决定 CUDA event 保护下的复用距离；层计划始终
+        # 在 start_load_kv 的同一 host enqueue 阶段完整提交。
         window_layers = min(self._lookahead_k, num_layers)
         bank_slots = self._max_chunks_per_wave * window_layers
         slots = 2 * bank_slots

@@ -45,11 +45,18 @@ def _generate(
     )
     elapsed = time.perf_counter() - start
     completion_tokens = len(outputs[0].outputs[0].token_ids)
+    token_ids = list(outputs[0].outputs[0].token_ids)
+    finish_reason = outputs[0].outputs[0].finish_reason
     print(
         f"[{request_id}] prompt_tokens={len(outputs[0].prompt_token_ids)} "
-        f"completion_tokens={completion_tokens} wall={elapsed:.3f}s",
+        f"completion_tokens={completion_tokens} finish_reason={finish_reason} "
+        f"token_ids={token_ids} wall={elapsed:.3f}s",
         flush=True,
     )
+    if finish_reason == "error":
+        raise RuntimeError(
+            f"request {request_id} failed explicitly (finish_reason=error)"
+        )
 
 
 def main() -> int:
@@ -76,10 +83,23 @@ def main() -> int:
     parser.add_argument("--reuse-pct", type=int, default=80)
     parser.add_argument("--max-tokens", type=int, default=8)
     parser.add_argument(
+        "--max-in-flight-operations",
+        type=int,
+        default=None,
+        help=(
+            "override the Tutti local-NVMe operation admission limit for "
+            "this profile only"
+        ),
+    )
+    parser.add_argument(
         "--kv-load-failure-policy",
         choices=("recompute", "fail"),
         default="recompute",
         help="vLLM policy after the connector reports invalid block IDs",
+    )
+    parser.add_argument(
+        "--expect-b-failure", action="store_true",
+        help="treat an explicit request-B failure as the expected test result",
     )
     parser.add_argument(
         "--kv-root",
@@ -121,6 +141,26 @@ def main() -> int:
 
     kv_transfer_config = None
     if not args.without_tutti:
+        store_options = {
+            "root": args.kv_root,
+            "num_chunks": 512,
+            "io_stream": "auto",
+            "preset": {
+                "type": "local",
+                "daemon_config": (
+                    "/data/home/ryeqiu/Tutti/"
+                    "config/local/tutti_daemon.yaml"
+                ),
+                "device_id": "{LOCAL_RANK}",
+                "gpu_id": "{LOCAL_RANK}",
+            },
+        }
+        if args.max_in_flight_operations is not None:
+            if args.max_in_flight_operations <= 0:
+                parser.error("--max-in-flight-operations must be positive")
+            store_options["preset"]["max_in_flight_operations"] = (
+                args.max_in_flight_operations
+            )
         kv_transfer_config = KVTransferConfig(
             kv_connector="TuttiConnectorV1",
             kv_connector_module_path="adapter.connector",
@@ -131,20 +171,7 @@ def main() -> int:
                 "max_chunks_per_wave": 512,
                 "store": {
                     "type": "tutti_nvme",
-                    "options": {
-                        "root": args.kv_root,
-                        "num_chunks": 512,
-                        "io_stream": "auto",
-                        "preset": {
-                            "type": "local",
-                            "daemon_config": (
-                                "/data/home/ryeqiu/Tutti/"
-                                "config/local/tutti_daemon.yaml"
-                            ),
-                            "device_id": "{LOCAL_RANK}",
-                            "gpu_id": "{LOCAL_RANK}",
-                        },
-                    },
+                    "options": store_options,
                 },
             },
         )
@@ -182,7 +209,18 @@ def main() -> int:
         if not llm.reset_prefix_cache(reset_connector=False):
             raise RuntimeError("failed to reset vLLM local prefix cache")
         print("local prefix cache reset; Tutti cache retained", flush=True)
-    _generate(llm, request_b, sampling_params, "B-80pct")
+    try:
+        _generate(llm, request_b, sampling_params, "B-80pct")
+    except Exception as exc:
+        if not args.expect_b_failure:
+            raise
+        print(
+            f"[B-80pct] expected_request_failure={type(exc).__name__}: {exc}",
+            flush=True,
+        )
+    else:
+        if args.expect_b_failure:
+            raise RuntimeError("request B unexpectedly succeeded under fail policy")
     print("profile workload complete", flush=True)
     if args.wait_for_exit_file:
         print(

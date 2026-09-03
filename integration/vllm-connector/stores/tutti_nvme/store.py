@@ -1,5 +1,4 @@
 """TuttiKVStore——tutti IO runtime 之上的层盲 KV 存储。
-
 store 对 io_key 是纯映射（私有解读见 layout.py），数据面全部经由
 runtime.submit 的 DMA 请求表达：put = memory→target（write），
 get = target→memory（read）。**批是一等公民**：一次 put/get 对应
@@ -113,57 +112,6 @@ class TuttiBatchResult:
     results: tuple[TuttiTerminalResult, ...]
 
 
-class TuttiStepCompletion:
-    """One Runtime/DataPath feeder operation for an eager model step."""
-
-    def __init__(self, runtime, submitted, completion, layer_count,
-                 staging_depth, direction):
-        self._runtime = runtime
-        self._submitted = submitted
-        self._completion = completion
-        self.layer_count = layer_count
-        self.staging_depth = staging_depth
-        self.direction = direction
-
-    @property
-    def handle(self):
-        return self._submitted.handle
-
-    def wait_layer(self, layer: int, timeout_ms: int = 30000) -> bool:
-        if os.environ.get("TUTTI_FEEDER_DIAGNOSTICS") == "1":
-            _LOG.warning("FEEDER_DIAG store wait t_ns=%d direction=%s handle=%s layer=%d",
-                         time.monotonic_ns(), self.direction, self.handle, layer)
-        state = self._runtime.wait_step_layer(self.handle, layer, timeout_ms)
-        if state == "PENDING":
-            raise TimeoutError(f"等待 feeder layer {layer} 超时")
-        return state == "READY"
-
-    def signal_layer(self, layer: int, stream: int) -> None:
-        if os.environ.get("TUTTI_FEEDER_DIAGNOSTICS") == "1":
-            _LOG.warning("FEEDER_DIAG store signal t_ns=%d direction=%s handle=%s layer=%d stream=%d",
-                         time.monotonic_ns(), self.direction, self.handle, layer,
-                         int(stream))
-        self._runtime.signal_step_layer(self.handle, layer, int(stream))
-
-    def wait(self, timeout=None):
-        return self._completion.wait(timeout)
-
-    def wait_result(self, timeout=None):
-        return self._completion.wait_result(timeout)
-
-    def query(self):
-        return self._completion.query()
-
-    def drain(self, stream: int = 0) -> None:
-        # Release every possible feeder wait. Re-signalling is idempotent.
-        for layer in range(self.layer_count):
-            try:
-                self.signal_layer(layer, stream)
-            except Exception:
-                pass
-        self.wait_result()
-
-
 class _TuttiCompletion:
     """一批 runtime IO 的完成句柄，terminal 详情在 release 后仍保留。"""
 
@@ -182,6 +130,7 @@ class _TuttiCompletion:
         self._terminal: bool | None = None
         self._terminal_results: dict[int, TuttiTerminalResult] = {}
         self._batch_result: TuttiBatchResult | None = None
+        self._handles_released = False
         self._terminal_lock = threading.Lock()
         self._done_callbacks = []
         self._ready = threading.Event()
@@ -311,8 +260,10 @@ class _TuttiCompletion:
             self._mark_terminal(not failures,
                                 self._format_failure(failures[0])
                                 if failures else None)
+            self._release_handles()
         except Exception as exc:
             self._mark_terminal(False, f"tutti IO 等待异常：{exc}")
+            self._release_handles()
 
     def _mark_terminal(self, ok: bool, message: str | None) -> None:
         with self._terminal_lock:
@@ -355,6 +306,19 @@ class _TuttiCompletion:
             results=results,
         )
 
+    def _release_handles(self) -> None:
+        """Release terminal Runtime handles once, without semantic settle."""
+        with self._terminal_lock:
+            if self._handles_released:
+                return
+            self._handles_released = True
+            handles = tuple(self._handles)
+        for handle in handles:
+            try:
+                self._runtime.release_io(handle)
+            except Exception:
+                pass
+
     def _finish(self) -> bool:
         with self._terminal_lock:
             terminal = self._terminal
@@ -365,11 +329,7 @@ class _TuttiCompletion:
             self._settled = True
             self._failed = not terminal
             self._batch_result = self._build_batch_result()
-        for handle in self._handles:
-            try:
-                self._runtime.release_io(handle)
-            except Exception:
-                pass
+        self._release_handles()
         self._on_settled(terminal)
         with self._terminal_lock:
             callbacks = self._done_callbacks
@@ -459,6 +419,7 @@ class TuttiKVStore:
         self._targets: dict[str, _TargetCacheEntry] = {}
         self._inflight_by_chunk: dict[bytes, set[_TuttiCompletion]] = {}
         self._inflight_lock = threading.Lock()
+        self._deferred_completions: list[_TuttiCompletion] = []
         self._keepers: list = []  # 持有 ctypes 视图防 GC
         self._next_buffer_id = 0
         self._accel_id = -1
@@ -470,8 +431,10 @@ class TuttiKVStore:
         # and fence helpers below instead of replacing these values.
         self._read_stream = None
         self._write_stream = None
+        self._read_copy_stream = None
         self._read_stream_obj = None
         self._write_stream_obj = None
+        self._read_copy_stream_obj = None
         self._stream_mode = "host"
         self._stream_accel_id = None
         self._execution = "device"
@@ -572,6 +535,12 @@ class TuttiKVStore:
         else:
             self._configure_shared_stream(self._io_stream)
         self._sync_execution_mode()
+        _LOG.warning(
+            "TUTTI_STREAM_ROUTING rank=%d accel=%s mode=%s read_io=%s "
+            "read_copy=%s write_io=%s",
+            self._rank_id, self._stream_accel_id, self._stream_mode,
+            self._read_stream, self._read_copy_stream, self._write_stream,
+        )
         self._opened = True
 
     def _runtime_supports_multi_stream(self) -> bool:
@@ -618,9 +587,27 @@ class TuttiKVStore:
     def _configure_shared_stream(self, stream) -> None:
         self._read_stream = stream
         self._write_stream = stream
+        self._read_copy_stream = stream
         self._read_stream_obj = None
         self._write_stream_obj = None
+        self._read_copy_stream_obj = None
         self._stream_mode = "shared" if stream is not None else "host"
+        if stream is None:
+            return
+        try:
+            import torch
+
+            if not torch.cuda.is_available():
+                return
+            accel = self._runtime_accel()
+            copy_obj = torch.cuda.Stream(device=f"cuda:{accel}")
+            self._read_copy_stream_obj = copy_obj
+            self._read_copy_stream = int(copy_obj.cuda_stream)
+            self._stream_accel_id = accel
+        except (ImportError, RuntimeError):
+            # Old host/fake runtimes may carry an opaque stream integer without
+            # a usable CUDA device. Their compatibility behavior is unchanged.
+            return
 
     def _resolve_auto_stream(self) -> None:
         """在 runtime 加速器上建方向化 IO 流并取其句柄。
@@ -638,11 +625,17 @@ class TuttiKVStore:
         self._accel_id = accel
         self._stream_accel_id = accel
         read_obj = torch.cuda.Stream(device=f"cuda:{accel}")
+        # Copy/reshape is not a Runtime/DataPath submit stream, so it does not
+        # consume a backend concurrent-stream capability slot. It is always a
+        # separate CUDA stream in auto mode, including a shared-IO fallback.
+        read_copy_obj = torch.cuda.Stream(device=f"cuda:{accel}")
         if not self._runtime_supports_multi_stream():
             self._read_stream_obj = read_obj
             self._write_stream_obj = read_obj
+            self._read_copy_stream_obj = read_copy_obj
             self._read_stream = int(read_obj.cuda_stream)
             self._write_stream = self._read_stream
+            self._read_copy_stream = int(read_copy_obj.cuda_stream)
             self._io_stream = self._read_stream
             self._stream_mode = "shared"
             return
@@ -651,7 +644,7 @@ class TuttiKVStore:
         # Both streams are constructed on the same explicit CUDA device.  A
         # custom torch stream implementation must still expose a compatible
         # device, otherwise fail before any IO is submitted.
-        for stream_obj in (read_obj, write_obj):
+        for stream_obj in (read_obj, write_obj, read_copy_obj):
             device = getattr(stream_obj, "device", None)
             index = getattr(device, "index", None)
             if index is not None and int(index) != accel:
@@ -661,8 +654,10 @@ class TuttiKVStore:
                 )
         self._read_stream_obj = read_obj
         self._write_stream_obj = write_obj
+        self._read_copy_stream_obj = read_copy_obj
         self._read_stream = int(read_obj.cuda_stream)
         self._write_stream = int(write_obj.cuda_stream)
+        self._read_copy_stream = int(read_copy_obj.cuda_stream)
         self._io_stream = None
         self._stream_mode = "dual"
 
@@ -690,12 +685,14 @@ class TuttiKVStore:
             except Exception:
                 pass
             self._runtime = None
-        # Keep both CUDA stream objects alive through runtime shutdown, then
-        # release the pair together so neither handle can outlive its owner.
+        # Keep all CUDA stream objects alive through runtime shutdown, then
+        # release them together so no handle can outlive its owner.
         self._read_stream = None
         self._write_stream = None
+        self._read_copy_stream = None
         self._read_stream_obj = None
         self._write_stream_obj = None
+        self._read_copy_stream_obj = None
         self._stream_mode = "host"
         self._stream_accel_id = None
         self._io_stream = None
@@ -799,6 +796,8 @@ class TuttiKVStore:
     def _stream_for(self, direction: str):
         if direction == "read":
             return self._read_stream, self._read_stream_obj
+        if direction == "read_copy":
+            return self._read_copy_stream, self._read_copy_stream_obj
         if direction == "write":
             return self._write_stream, self._write_stream_obj
         raise ValueError(f"未知 IO 方向：{direction!r}")
@@ -823,18 +822,35 @@ class TuttiKVStore:
             return
         if stream_obj is not None:
             stream_obj.wait_event(event)
-            return
-        synchronize = getattr(event, "synchronize", None)
-        if callable(synchronize):
-            synchronize()
+        # Host/fake stores have no stream to wait on.  Do not turn an event
+        # dependency into a host synchronize; production reuse is guarded by
+        # CUDA stream wait_event above, and completion draining owns host waits.
 
     def wait_read_event(self, event) -> None:
         """Make the read stream wait for a worker producer fence."""
         self._wait_event("read", event)
 
+    def wait_read_copy_event(self, event) -> None:
+        """Make the read-copy stream wait for a read completion fence."""
+        self._wait_event("read_copy", event)
+
     def wait_write_event(self, event) -> None:
         """Make the write stream wait for a worker gather fence."""
         self._wait_event("write", event)
+
+    def drain_deferred_completions(self) -> None:
+        """Drain submit-error handles during engine-level abort/final drain."""
+        pending = self._deferred_completions
+        self._deferred_completions = []
+        first_error = None
+        for completion in pending:
+            try:
+                completion.wait_result()
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
 
     def wait_event(self, event) -> None:
         """Backward-compatible alias for the write-side fence."""
@@ -843,7 +859,9 @@ class TuttiKVStore:
     def _record_event(self, direction: str, event=None):
         _, stream_obj = self._stream_for(direction)
         if stream_obj is None:
-            return event
+            # An event without an owning CUDA stream is not recorded and must
+            # never be handed to a downstream wait_event call.
+            return None
         if event is None:
             import torch
 
@@ -855,9 +873,25 @@ class TuttiKVStore:
         """Record and return a fence on the store-owned read stream."""
         return self._record_event("read", event)
 
+    def record_read_copy_event(self, event=None):
+        """Record and return a fence after scatter on the read-copy stream."""
+        return self._record_event("read_copy", event)
+
     def record_write_event(self, event=None):
         """Record and return a fence on the store-owned write stream."""
         return self._record_event("write", event)
+
+    def wait_compute_event(self, event) -> None:
+        """Enqueue a device-side wait on vLLM's restored current stream."""
+        if event is None:
+            return
+        import torch
+
+        torch.cuda.current_stream(device=self._stream_accel_id).wait_event(event)
+
+    def read_copy_stream_handle(self) -> int:
+        """Return the controlled stream handle used for scatter release fences."""
+        return int(self._read_copy_stream or 0)
 
     def put_batch(self, batch) -> _TuttiCompletion:
         self._require_open()
@@ -913,81 +947,14 @@ class TuttiKVStore:
             )
         with nvtx_range(f"tutti.runtime.submit|op=read|requests={len(requests)}"):
             handles = self._submit_retry(requests, "read")
+        # Read completions are drained by KVEngine.wait_idle at host
+        # completion time.  Do not start a background watcher while
+        # start_load_kv is enqueueing the complete layer plan.
         completion = _TuttiCompletion(
             self._runtime, handles, lambda _ok: None
         )
         self._track_completion(completion, chunk_ids)
         return completion
-
-    def submit_step(self, layer_batches, direction: str,
-                    staging_depth: int) -> TuttiStepCompletion:
-        """Submit all layer/chunk IO as one device feeder operation."""
-        self._require_open()
-        if direction not in ("read", "write"):
-            raise ValueError(f"未知 step IO 方向：{direction!r}")
-        normalized = [
-            self._normalize(batch, require_live=direction == "read")
-            for batch in layer_batches
-        ]
-        flat = [entry for layer in normalized for entry in layer]
-        if not flat:
-            raise ValueError("step feeder batch 不能为空")
-        io_keys = [entry[0] for entry in flat]
-        chunk_ids = tuple(dict.fromkeys(
-            decode_io_key(io_key)[0] for io_key in io_keys
-        ))
-        if direction == "write":
-            self._layout.prepare_put(io_keys, self._num_chunks)
-        try:
-            targets = self._ensure_targets(flat)
-            requests_by_layer = []
-            for entries in normalized:
-                requests = []
-                for io_key, buffer_id, offset in entries:
-                    chunk_id, layer = decode_io_key(io_key)
-                    uri = self._layout.target_uri(chunk_id)
-                    requests.append((
-                        targets[uri], layer * self._segment_bytes,
-                        self._mem_for(buffer_id), offset,
-                        self._segment_bytes, direction,
-                    ))
-                requests_by_layer.append(requests)
-            result = self._runtime.submit_step(
-                requests_by_layer, staging_depth=staging_depth,
-                accel_id=self._accel_id,
-                stream=self._stream_for(direction)[0],
-                execution=self._execution,
-            )
-            if (result.io_handle is None or not result.status_ok or
-                    not all(result.initial_states or [])):
-                raise RuntimeError(
-                    f"tutti step submit 未完整受理：{result.status_msg}"
-                )
-        except Exception:
-            if direction == "write":
-                self._close_cached_targets([
-                    self._layout.target_uri(chunk_id) for chunk_id in chunk_ids
-                ])
-                self._layout.abort_uncommitted(chunk_ids)
-            raise
-        submitted = _SubmittedHandle(
-            int(result.io_handle), tuple(range(len(flat)))
-        )
-        settled = (
-            (lambda ok: self._on_put_settled(ok, io_keys))
-            if direction == "write" else (lambda _ok: None)
-        )
-        # Per-layer feeder callbacks own progress until every callback gate has
-        # been published. A whole-op watcher started here can repeatedly take
-        # Runtime's registry mutex and starve the last wait/signal gate.
-        completion = _TuttiCompletion(
-            self._runtime, [submitted], settled, auto_watch=False
-        )
-        self._track_completion(completion, chunk_ids)
-        return TuttiStepCompletion(
-            self._runtime, submitted, completion, len(normalized),
-            staging_depth, direction,
-        )
 
     def drop(self, keys) -> None:
         self._require_open()
@@ -1218,12 +1185,21 @@ class TuttiKVStore:
                         )
                 else:
                     all_rejected_rounds = 0
+                _LOG.warning(
+                    "TUTTI_PARTIAL_REJECT direction=%s rejected=%s "
+                    "retry_round=%d status=%s",
+                    direction, rejected, all_rejected_rounds,
+                    result.status_msg,
+                )
                 pending = [pending[i] for i in rejected]
         except Exception:
             if handles:
-                _TuttiCompletion(
-                    self._runtime, handles, lambda _ok: None
-                ).wait_result()
+                self._deferred_completions.append(
+                    _TuttiCompletion(
+                        self._runtime, handles, lambda _ok: None,
+                        auto_watch=False,
+                    )
+                )
             raise
         return handles
 

@@ -72,6 +72,10 @@ class TestRegisterMemory:
 
 
 class TestSubmitValidation:
+    def test_read_failure_injection_is_disabled_by_default(self, stub_rt):
+        with pytest.raises(RuntimeError, match="injection is disabled"):
+            stub_rt.testing_inject_next_read_nvme_error(0)
+
     def test_invalid_direction_raises_value_error(self, stub_rt):
         targets = stub_rt.open_batch(["file:///tmp/a.bin"])
         buf = _host_buffer(4096)

@@ -29,26 +29,6 @@ cudaError_t launch_submit_one(
     return err;
 }
 
-cudaError_t launch_step_feeder(
-    const DeviceSubmitEntry* d_entries, EntryCompletionStatus* d_status,
-    const StepFeederLayer* d_layers, std::uint32_t layer_count,
-    std::uint32_t layer_base,
-    volatile std::uint32_t* ready_flags,
-    volatile std::uint32_t* release_flags, std::uint32_t cq_poll_budget,
-    std::uint32_t threads_per_block, std::uint32_t inject_flag, void* stream) {
-    cudaStream_t s = static_cast<cudaStream_t>(stream);
-    step_feeder_kernel<<<1, threads_per_block, 0, s>>>(
-        d_entries, d_status, d_layers, layer_count, layer_base,
-        ready_flags, release_flags, cq_poll_budget, inject_flag);
-    return cudaGetLastError();
-}
-
-cudaError_t launch_feeder_signal(
-    volatile std::uint32_t* flag, void* stream) {
-    feeder_signal_kernel<<<1, 1, 0, static_cast<cudaStream_t>(stream)>>>(flag);
-    return cudaGetLastError();
-}
-
 // Fill kernel: writes val to the first n bytes of buf.
 TUTTI_GLOBAL
 void fill_pattern_kernel(unsigned char* buf, unsigned char val, std::uint64_t n)

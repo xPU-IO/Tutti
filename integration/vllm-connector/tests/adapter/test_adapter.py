@@ -640,10 +640,13 @@ class TestLoadSemantics:
         assert engine.calls == [0, 1, 2]
         worker.wait_for_layer_load("model.layers.0.self_attn")
         assert worker.get_block_ids_with_load_errors() == {10, 11}
-        assert engine.handles[1].abort_count == 1
-        assert engine.handles[2].abort_count == 1
+        assert engine.handles[1].abort_count == 0
+        assert engine.handles[2].abort_count == 0
         worker.wait_for_layer_load("model.layers.1.self_attn")
         assert engine.calls == [0, 1, 2]
+        worker._abort_step()
+        assert engine.handles[1].abort_count == 1
+        assert engine.handles[2].abort_count == 1
         assert engine.unpinned == [(b"k0", b"k1")]
 
     def test_abort_is_idempotent(self):

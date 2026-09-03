@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import pytest
@@ -70,6 +70,64 @@ def test_step_read_failure_never_scatters():
     with pytest.raises(LoadGateError):
         step.wait_layer(0, 0)
     assert engine.scatter_calls == 0
+
+
+def test_step_structured_failure_maps_flat_requests_to_exact_chunks():
+    failure = type("Failure", (), {
+        "state": "FAILED",
+        "failure_scope": "REQUEST_INDICES",
+        "failure_kind": "NVME_CQ_ERROR",
+        "first_failed_entry": 3,
+        "raw_cq_status": 0x30000,
+        "failed_request_indices": (3,),
+    })()
+    result = type("Result", (), {
+        "failed_batch_indices": (3,),
+        "failures": (failure,),
+    })()
+
+    class Inner:
+        staging_depth = 2
+        layer_count = 3
+
+        @staticmethod
+        def wait_layer(layer):
+            return layer == 0
+
+        @staticmethod
+        def signal_layer(_layer, _stream):
+            return None
+
+        @staticmethod
+        def drain(_stream=0):
+            return result
+
+    class Engine:
+        _store = object()
+
+        def __init__(self):
+            self.scatter_calls = 0
+            self._scatter_hook = lambda *_args: setattr(
+                self, "scatter_calls", self.scatter_calls + 1
+            )
+
+    engine = Engine()
+    step = _EngineStepIO(
+        Inner(), engine, [b"a" * 16, b"b" * 16],
+        [[10, 20], [11, 21]], [[0, 1], [2, 3], [0, 1]], "read",
+        [0, 1, 2],
+    )
+    step.wait_layer(0, 0)
+    with pytest.raises(LoadGateError) as excinfo:
+        step.wait_layer(1, 1)
+    assert excinfo.value.whole_operation is True
+    assert excinfo.value.failed_batch_indices == ()
+    assert excinfo.value.invalid_block_ids == (10, 20, 11, 21)
+    assert engine.scatter_calls == 1
+    # Structured request attribution is harvested only at the post-forward
+    # drain boundary, never by blocking the attention callback.
+    drained = step.drain()
+    assert drained.failed_batch_indices == (3,)
 
 
 class _CallbackInner:
@@ -153,6 +211,98 @@ def test_step_missing_callback_fails_and_drains_at_finalize():
     assert inner.drains == 1
 
 
+def test_step_scatter_uses_copy_stream_event_bridge_before_release():
+    order = []
+
+    class Event:
+        def synchronize(self):
+            raise AssertionError("host synchronize must not be called")
+
+    event = Event()
+
+    class Store:
+        @contextmanager
+        def stream_context(self, direction):
+            assert direction == "read_copy"
+            order.append("copy_enter")
+            try:
+                yield
+            finally:
+                order.append("copy_exit")
+
+        @staticmethod
+        def record_read_copy_event(value):
+            assert value is event
+            order.append("scatter_done_record")
+            return value
+
+        @staticmethod
+        def wait_compute_event(value):
+            assert value is event
+            order.append("compute_wait_event")
+
+        @staticmethod
+        def read_copy_stream_handle():
+            return 333
+
+    class Inner(_CallbackInner):
+        def signal_layer(self, callback, stream):
+            order.append(("release_signal", callback, stream))
+            super().signal_layer(callback, stream)
+
+    class Engine:
+        _store = Store()
+        _transfer = None
+
+        @staticmethod
+        def _scatter(_keys, _physical, _blocks, _slots):
+            order.append("scatter_enqueue")
+            return event
+
+        _scatter_hook = _scatter
+
+    inner = Inner(3)
+    step = _EngineStepIO(
+        inner, Engine(), [b"k" * 16], [[7]], [[0], [1], [0]], "read",
+        [0, 1, 2],
+    )
+    step.wait_layer(0, 0)
+    assert order == [
+        "copy_enter",
+        "scatter_enqueue",
+        "scatter_done_record",
+        "copy_exit",
+        "compute_wait_event",
+        ("release_signal", 0, 333),
+    ]
+    assert inner.signals == [0]
+
+
+def test_pre_enqueued_read_failure_releases_future_windows_without_submit():
+    class Inner(_CallbackInner):
+        def __init__(self):
+            super().__init__(4)
+            self.signal_calls = []
+
+        def signal_layer(self, callback, stream):
+            self.signal_calls.append((callback, stream))
+
+    inner = Inner()
+    class Engine:
+        _store = type("Store", (), {
+            "read_copy_stream_handle": staticmethod(lambda: 333),
+        })()
+
+    step = _EngineStepIO(
+        inner, Engine(), [b"k"], [[0]], [[0], [1], [2], [3]],
+        "read", [0, 1, 2, 3],
+    )
+
+    step.release_after_failure(1)
+
+    assert inner.signal_calls == [(1, 333), (2, 333), (3, 333)]
+
+
 class MovingHooks:
     """真实搬运钩子：paged 侧以 dict 模拟，数据经 staging 缓冲中转。"""
 
@@ -183,10 +333,15 @@ class TailEvent:
 
     def __init__(self):
         self.synchronize_count = 0
+        self.wait_count = 0
         self._done = False
 
     def synchronize(self):
         self.synchronize_count += 1
+        self._done = True
+
+    def wait(self):
+        self.wait_count += 1
         self._done = True
 
     def query(self):
@@ -479,6 +634,9 @@ class TestRoundtrip:
         # 第三波复用第一波槽位；acquire 必须等待底层搬运与 scatter 事件。
         engine.load_layer([keys[2]], 0, 0)
         assert len(hooks.events) == 1
+        assert hooks.events[0].wait_count == 1
+        # MemoryKVStore overwrites staging from the host and therefore uses
+        # its explicit compatibility fence; Tutti NVMe never takes this path.
         assert hooks.events[0].synchronize_count == 1
         assert first.query() is True
 
@@ -672,7 +830,7 @@ class TestSplitBankRouting:
             hook_slots["write"] = tuple(slots)
 
         def scatter(keys, layer, blocks, slots):
-            assert store.active_direction == "read"
+            assert store.active_direction == "read_copy"
             hook_slots["read"] = tuple(slots)
 
         engine = KVEngine({"chunk_tokens": CHUNK_TOKENS,
@@ -685,7 +843,9 @@ class TestSplitBankRouting:
         engine.load_layer([key], 0, [[0, 1]]).wait()
         assert set(hook_slots["read"]).issubset(range(0, MAX_WAVE))
         assert set(hook_slots["write"]).issubset(range(MAX_WAVE, 2 * MAX_WAVE))
-        assert store.context_log == [("enter", "read"), ("exit", "read")]
+        assert store.context_log == [
+            ("enter", "read_copy"), ("exit", "read_copy")
+        ]
 
 
 class TestEvictionWiring:

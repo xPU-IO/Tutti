@@ -33,16 +33,6 @@ namespace tutti::data_paths::striped_local_nvme {
 
 namespace {
 
-bool feeder_diag_enabled() {
-    const char* value = std::getenv("TUTTI_FEEDER_DIAGNOSTICS");
-    return value && std::strcmp(value, "1") == 0;
-}
-
-long long feeder_diag_ns() {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-}
-
 struct NvtxIoStyle {
     const char* label;
     std::uint32_t argb;
@@ -173,13 +163,6 @@ StripedDataPath::StripedDataPath(std::vector<DeviceDescriptor> devices,
 
 StripedDataPath::~StripedDataPath() {
     if (initialized_) {
-        for (auto& [tok, op] : ops_) {
-            if (!op.feeder_event_recorded) continue;
-            for (std::uint32_t layer = 0; layer < op.feeder_layer_count; ++layer) {
-                op.h_feeder_ready[layer] = 1u;
-                op.h_feeder_release[layer] = 1u;
-            }
-        }
         const Status stopped = shutdown(1000000000ULL);
         if (!stopped.ok()) {
             // Destruction cannot report TIMEOUT to a caller. Detach all host
@@ -321,66 +304,6 @@ Status StripedDataPath::release(DataPathOp op) {
     Status result = release_impl_(op);
     Status restored = guard.restore();
     return restored.ok() ? result : restored;
-}
-
-Result<FeederLayerState> StripedDataPath::wait_feeder_layer(
-    DataPathOp op, std::uint32_t layer, std::uint64_t timeout_ms) {
-    DeviceGuard guard(static_cast<std::int32_t>(cuda_device_));
-    if (!guard.ok()) return Result<FeederLayerState>::Failure(guard.status());
-    OpEntry* entry = find_op_(op);
-    if (!entry || entry->feeder_layer_count == 0 ||
-        layer >= entry->feeder_layer_count) {
-        return Result<FeederLayerState>::Failure(Status(
-            StatusCode::NOT_FOUND, "step feeder layer not found"));
-    }
-    if (!entry->feeder_is_read && layer < entry->feeder_staging_depth)
-        return FeederLayerState::READY;
-    volatile std::uint32_t* host_flags = entry->feeder_is_read
-        ? entry->h_feeder_ready : entry->h_feeder_release;
-    const std::uint32_t index = entry->feeder_is_read
-        ? layer : layer - entry->feeder_staging_depth;
-    const auto deadline = std::chrono::steady_clock::now() +
-        std::chrono::milliseconds(timeout_ms);
-    std::uint32_t value = host_flags[index];
-    if (feeder_diag_enabled())
-        std::fprintf(stderr, "FEEDER_DIAG cpp wait_begin t_ns=%lld backend=striped direction=%s layer=%u gate_index=%u value=%u\n",
-                     feeder_diag_ns(), entry->feeder_is_read ? "read" : "write",
-                     layer, index, value);
-    while (value == 0) {
-        if (timeout_ms == 0 || std::chrono::steady_clock::now() >= deadline)
-            return FeederLayerState::PENDING;
-        std::this_thread::sleep_for(std::chrono::microseconds(50));
-        value = host_flags[index];
-    }
-    if (feeder_diag_enabled())
-        std::fprintf(stderr, "FEEDER_DIAG cpp wait_consume t_ns=%lld backend=striped direction=%s layer=%u gate_index=%u value=%u\n",
-                     feeder_diag_ns(), entry->feeder_is_read ? "read" : "write",
-                     layer, index, value);
-    if (!entry->feeder_is_read) return FeederLayerState::READY;
-    return value == 1 ? FeederLayerState::READY : FeederLayerState::FAILED;
-}
-
-Status StripedDataPath::signal_feeder_layer(
-    DataPathOp op, std::uint32_t layer, cudaStream_t stream) {
-    DeviceGuard guard(static_cast<std::int32_t>(cuda_device_));
-    if (!guard.ok()) return guard.status();
-    OpEntry* entry = find_op_(op);
-    if (!entry || entry->feeder_layer_count == 0 ||
-        layer >= entry->feeder_layer_count)
-        return Status(StatusCode::NOT_FOUND, "step feeder layer not found");
-    std::uint32_t* flag = entry->feeder_is_read
-        ? entry->d_feeder_release + layer
-        : entry->d_feeder_ready + layer;
-    if (feeder_diag_enabled())
-        std::fprintf(stderr, "FEEDER_DIAG cpp signal_enqueue t_ns=%lld backend=striped direction=%s layer=%u\n",
-                     feeder_diag_ns(), entry->feeder_is_read ? "read" : "write",
-                     layer);
-    const cudaError_t ce = local_nvme::launch_feeder_signal(flag, stream);
-    return ce == cudaSuccess
-        ? Status::Ok()
-        : Status(StatusCode::DEVICE_ERROR,
-                 std::string("signal feeder layer failed: ") +
-                 cudaGetErrorString(ce));
 }
 
 Status StripedDataPath::initialize_impl_(const DataPathConfig& config,
@@ -638,13 +561,6 @@ Status StripedDataPath::shutdown_impl_(std::uint64_t timeout_ns) {
         if (timeout_ns == 0) {
             return Status(StatusCode::TIMEOUT,
                           "shutdown: in-flight operations remain");
-        }
-        for (auto& [tok, op] : ops_) {
-            if (!op.feeder_event_recorded) continue;
-            for (std::uint32_t layer = 0; layer < op.feeder_layer_count; ++layer) {
-                op.h_feeder_ready[layer] = 1u;
-                op.h_feeder_release[layer] = 1u;
-            }
         }
         auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::nanoseconds(timeout_ns);
@@ -1527,12 +1443,6 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
         outcome.initial_states[i].status = Status::Ok();
     }
 
-    const bool step_feeder = ctx.step_layer_count > 0;
-    if (step_feeder && has_rejection) {
-        reject_all(StatusCode::INVALID_ARGUMENT,
-                   "step feeder requires all requests to validate");
-        return outcome;
-    }
     if (h_entries.empty()) {
         outcome.status = Status(first_rejected_code != StatusCode::OK
                                 ? first_rejected_code : StatusCode::INVALID_ARGUMENT,
@@ -1548,41 +1458,6 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
     if (total_bytes > caps_.max_batch_bytes) {
         reject_all(StatusCode::RESOURCE_EXHAUSTED, "batch bytes exceed limit");
         return outcome;
-    }
-
-    std::vector<local_nvme::StepFeederLayer> h_feeder_layers;
-    if (step_feeder) {
-        if (!ctx.step_layer_request_offsets || ctx.step_staging_depth == 0 ||
-            ctx.step_layer_request_offsets[0] != 0 ||
-            ctx.step_layer_request_offsets[ctx.step_layer_count] != count) {
-            reject_all(StatusCode::INVALID_ARGUMENT,
-                       "invalid step feeder layer offsets/depth");
-            return outcome;
-        }
-        h_feeder_layers.resize(ctx.step_layer_count);
-        std::uint32_t cursor = 0;
-        for (std::uint32_t layer = 0; layer < ctx.step_layer_count; ++layer) {
-            const std::uint32_t begin = ctx.step_layer_request_offsets[layer];
-            const std::uint32_t end = ctx.step_layer_request_offsets[layer + 1];
-            if (begin > end || end > count) {
-                reject_all(StatusCode::INVALID_ARGUMENT,
-                           "non-monotonic step feeder offsets");
-                return outcome;
-            }
-            local_nvme::StepFeederLayer plan{cursor, 0};
-            while (cursor + plan.entry_count < entry_request_indices.size()) {
-                const auto owner = entry_request_indices[cursor + plan.entry_count];
-                if (owner < begin || owner >= end) break;
-                ++plan.entry_count;
-            }
-            cursor += plan.entry_count;
-            h_feeder_layers[layer] = plan;
-        }
-        if (cursor != total_entries) {
-            reject_all(StatusCode::INTERNAL,
-                       "step feeder entry coverage mismatch");
-            return outcome;
-        }
     }
 
     // ---- Irreversible resource reservation ----
@@ -1756,69 +1631,19 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
         return outcome;
     }
 
-    local_nvme::StepFeederLayer* d_feeder_layers = nullptr;
-    std::uint32_t* h_feeder_ready = nullptr;
-    std::uint32_t* d_feeder_ready = nullptr;
-    std::uint32_t* h_feeder_release = nullptr;
-    std::uint32_t* d_feeder_release = nullptr;
-    cudaStream_t feeder_poll_stream = nullptr;
-    auto free_feeder = [&]() {
-        if (d_feeder_layers) cudaFree(d_feeder_layers);
-        if (h_feeder_ready) cudaFreeHost(h_feeder_ready);
-        if (h_feeder_release) cudaFreeHost(h_feeder_release);
-        if (feeder_poll_stream) cudaStreamDestroy(feeder_poll_stream);
-        d_feeder_layers = nullptr;
-        h_feeder_ready = d_feeder_ready = nullptr;
-        h_feeder_release = d_feeder_release = nullptr;
-    };
-    if (step_feeder) {
-        const std::size_t plan_bytes = h_feeder_layers.size() *
-            sizeof(local_nvme::StepFeederLayer);
-        const std::size_t flags_bytes = ctx.step_layer_count * sizeof(std::uint32_t);
-        ce = cudaMalloc(reinterpret_cast<void**>(&d_feeder_layers), plan_bytes);
-        if (ce == cudaSuccess)
-            ce = cudaMemcpyAsync(d_feeder_layers, h_feeder_layers.data(),
-                                 plan_bytes, cudaMemcpyHostToDevice, ctx.stream);
-        if (ce == cudaSuccess)
-            ce = cudaHostAlloc(reinterpret_cast<void**>(&h_feeder_ready),
-                               flags_bytes, cudaHostAllocMapped);
-        if (ce == cudaSuccess)
-            ce = cudaHostAlloc(reinterpret_cast<void**>(&h_feeder_release),
-                               flags_bytes, cudaHostAllocMapped);
-        if (ce == cudaSuccess) {
-            std::memset(h_feeder_ready, 0, flags_bytes);
-            std::memset(h_feeder_release, 0, flags_bytes);
-            ce = cudaHostGetDevicePointer(
-                reinterpret_cast<void**>(&d_feeder_ready), h_feeder_ready, 0);
-        }
-        if (ce == cudaSuccess)
-            ce = cudaHostGetDevicePointer(
-                reinterpret_cast<void**>(&d_feeder_release),
-                h_feeder_release, 0);
-        if (ce != cudaSuccess) {
-            free_feeder();
-            release_cache_refs();
-            arena_.release(lease.slot_index);
-            reject_all(StatusCode::DEVICE_ERROR,
-                       "step feeder metadata allocation failed");
-            return outcome;
-        }
-    }
-
     const NvtxIoStyle nvtx_style = nvtx_io_style(requests, count);
     nvtx_push_io(nvtx_style);
     // Keep the legacy exact marker as a nested range for existing report
     // queries; the outer range carries the direction and color.
     nvtxRangePushA("tutti.striped_nvme.io_kernel");
-    cudaError_t launch_err = step_feeder ? cudaSuccess : launch_fused_submit(
-            d_entries, d_status,
-            reinterpret_cast<const DeviceTargetHandle* const*>(lease.d_dev_table),
-            total_entries, total_dev_table, cq_poll_budget_, threads_per_block_,
-            0, ctx.stream);
+    cudaError_t launch_err = launch_fused_submit(
+        d_entries, d_status,
+        reinterpret_cast<const DeviceTargetHandle* const*>(lease.d_dev_table),
+        total_entries, total_dev_table, cq_poll_budget_, threads_per_block_,
+        0, ctx.stream);
     nvtxRangePop();
     nvtxRangePop();
     if (launch_err != cudaSuccess) {
-        free_feeder();
         release_cache_refs();
         arena_.release(lease.slot_index);
         reject_all(StatusCode::DEVICE_ERROR,
@@ -1826,12 +1651,9 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
                    cudaGetErrorString(launch_err));
         return outcome;
     }
-    test_kernel_launch_count_ += step_feeder
-        ? (ctx.step_layer_count + ctx.step_staging_depth - 1) /
-              ctx.step_staging_depth
-        : 1;
+    test_kernel_launch_count_ += 1;
 
-    ce = step_feeder ? cudaSuccess : cudaEventRecord(event, ctx.stream);
+    ce = cudaEventRecord(event, ctx.stream);
     std::uint64_t op_token = next_op_token_++;
     OpEntry op;
     op.total_bytes = total_bytes;
@@ -1845,17 +1667,6 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
     op.prp_buf_refs = std::move(prp_buf_refs);
     op.op_token = op_token;
     op.op_generation = 1;
-    op.d_feeder_layers = d_feeder_layers;
-    op.h_feeder_ready = h_feeder_ready;
-    op.d_feeder_ready = d_feeder_ready;
-    op.h_feeder_release = h_feeder_release;
-    op.d_feeder_release = d_feeder_release;
-    op.feeder_layer_count = ctx.step_layer_count;
-    op.feeder_staging_depth = ctx.step_staging_depth;
-    op.feeder_is_read = step_feeder && h_entries.front().direction == 0;
-    op.feeder_poll_stream = feeder_poll_stream;
-    op.feeder_event_recorded = step_feeder
-        ? std::make_shared<std::atomic<bool>>(false) : nullptr;
     op.target_token = targets_in_batch[0].token;  // Round 16 S4: first target for tracking
     // P0-2 fix: record all accepted requests' memory tokens so
     // memory_has_inflight_ops_() can prevent unregister during in-flight ops.
@@ -1888,76 +1699,7 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
         op.state = OpState::IN_FLIGHT;
         op.status = Status::Ok();
     }
-    auto feeder_recorded = op.feeder_event_recorded;
     ops_[op_token] = std::move(op);
-    if (step_feeder) {
-        const auto layer_count = ctx.step_layer_count;
-        const auto depth = ctx.step_staging_depth;
-        const bool is_read = h_entries.front().direction == 0;
-        const auto device = cuda_device_;
-        const auto poll_budget = cq_poll_budget_;
-        const auto threads = threads_per_block_;
-        const bool diag = feeder_diag_enabled();
-        const auto dev_table = reinterpret_cast<const DeviceTargetHandle* const*>(
-            lease.d_dev_table);
-        std::thread([
-            d_entries, d_status, dev_table, d_feeder_layers, d_feeder_ready,
-            d_feeder_release, h_feeder_ready, h_feeder_release,
-            layer_count, depth, is_read, device, poll_budget, threads,
-            total_dev_table, event, stream = ctx.stream, feeder_recorded, diag
-        ] {
-            cudaSetDevice(device);
-            bool failed = false;
-            for (std::uint32_t base = 0; base < layer_count; base += depth) {
-                const std::uint32_t window = std::min(depth, layer_count - base);
-                volatile std::uint32_t* gates = is_read
-                    ? h_feeder_release : h_feeder_ready;
-                const std::uint32_t gate_base = is_read && base > 0
-                    ? base - depth : base;
-                if (!is_read || base > 0) {
-                    if (diag)
-                        std::fprintf(stderr, "FEEDER_DIAG cpp window_wait_begin t_ns=%lld backend=striped direction=%s base=%u gate_base=%u window=%u\n",
-                                     feeder_diag_ns(), is_read ? "read" : "write",
-                                     base, gate_base, window);
-                    for (;;) {
-                        bool ready = true;
-                        for (std::uint32_t local = 0; local < window; ++local)
-                            ready &= gates[gate_base + local] != 0;
-                        if (ready) break;
-                        std::this_thread::sleep_for(std::chrono::microseconds(50));
-                    }
-                    if (diag)
-                        std::fprintf(stderr, "FEEDER_DIAG cpp window_wait_consume t_ns=%lld backend=striped direction=%s base=%u gate_base=%u window=%u\n",
-                                     feeder_diag_ns(), is_read ? "read" : "write",
-                                     base, gate_base, window);
-                }
-                if (diag)
-                    std::fprintf(stderr, "FEEDER_DIAG cpp window_launch t_ns=%lld backend=striped direction=%s base=%u window=%u\n",
-                                 feeder_diag_ns(), is_read ? "read" : "write",
-                                 base, window);
-                cudaError_t error = launch_striped_step_feeder(
-                    d_entries, d_status, dev_table, d_feeder_layers + base,
-                    window, base, d_feeder_ready, d_feeder_release,
-                    total_dev_table, poll_budget, threads, 0, stream);
-                if (error != cudaSuccess) {
-                    failed = true;
-                    break;
-                }
-            }
-            if (failed) {
-                for (std::uint32_t layer = 0; layer < layer_count; ++layer) {
-                    if (is_read) h_feeder_ready[layer] = 2u;
-                    else h_feeder_release[layer] = 1u;
-                }
-            }
-            (void)cudaEventRecord(event, stream);
-            feeder_recorded->store(true, std::memory_order_release);
-            if (diag)
-                std::fprintf(stderr, "FEEDER_DIAG cpp final_event_recorded t_ns=%lld backend=striped direction=%s failed=%d\n",
-                             feeder_diag_ns(), is_read ? "read" : "write",
-                             failed ? 1 : 0);
-        }).detach();
-    }
 
     if (has_rejection) {
         outcome.status = Status(first_rejected_code != StatusCode::OK
@@ -1996,12 +1738,6 @@ Result<ProgressResult> StripedDataPath::progress_impl_(ProgressBudget budget) {
             break;
         }
         if (op.state != OpState::IN_FLIGHT) continue;
-        if (op.feeder_event_recorded &&
-            !op.feeder_event_recorded->load(std::memory_order_acquire)) {
-            ++result.operations_advanced;
-            ++work_done;
-            continue;
-        }
         if (work_done >= budget.max_work_units) {
             result.more_work_likely = true;
             break;
@@ -2139,11 +1875,6 @@ Status StripedDataPath::release_impl_(DataPathOp op) {
     if (entry->state == OpState::IN_FLIGHT) {
         return Status(StatusCode::BUSY, "release: op is still in flight");
     }
-    if (entry->d_feeder_layers) cudaFree(entry->d_feeder_layers);
-    if (entry->h_feeder_ready) cudaFreeHost(entry->h_feeder_ready);
-    if (entry->h_feeder_release) cudaFreeHost(entry->h_feeder_release);
-    if (entry->feeder_poll_stream)
-        cudaStreamDestroy(static_cast<cudaStream_t>(entry->feeder_poll_stream));
     if (entry->arena_slot != UINT32_MAX) {
         if (entry->has_timeout) {
             arena_.release_with_timeout_leak(entry->arena_slot);

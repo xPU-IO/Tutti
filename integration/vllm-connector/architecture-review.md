@@ -17,6 +17,10 @@
 
 > 2026-08-27 feeder闭环：一次性诊断证明Hy3的物理KV层与callback均为完整顺序0..79；旧的“callback缺层”推断不成立。停滞点是最后read callback 79尚未进入DataPath gate wait，原因是step提交时立即启动的whole-op watcher与per-layer gate竞争Runtime registry lock。当前已建立`KVCacheConfig.kv_cache_groups[*].layer_names`到物理ordinal的显式映射，feeder计划按callback数构造；whole-op watcher延迟到全部callback发布后启动，Runtime gate wait改为lock内单次非阻塞probe。subset/乱序/重复/缺失callback均有fail-safe合同。真实Hy3 TP4 A/B和Nsight通过，B命中6400 tokens并正常退出；compute/read/write为stream 19/31/35，每rank read/write feeder kernel为40/80，无永久gate。仍保持eager，不引入CUDA Graph。
 
+> 2026-08-31 安全阻断：`READ-SEQUENCE-AND-GATHER-FUSION-19` 在实现中发现 device-side future wait、Python signal 依赖和 DataPath 生命周期互相耦合，真实 GPU/NVMe smoke 可复现 stream/process hang。write ready 可能尚未由 Python 发布，read reuse 可能等待后续 compute/scatter；普通 abort 无法取消已排队的 CUDA wait。当前禁止继续执行该高风险真机路径，先恢复普通 submit/host-pinned PRP correctness fallback。近期 reboot 的系统 journal 显示外部 `systemd-logind: Power key pressed` 干净关机，尚未证明 Tutti 直接触发。
+
+> 2026-09-01 A 架构回退：layer/window/gate 语义已从 Tutti C++/CUDA DataPath、Runtime SPI 和 pybind ABI 移除。DataPath 只接收已由 Worker/KVEngine 展开的普通 `DataPathRequest[]`；legacy 三流逐层编排（read(L+1) / compute(L) / write(L-1)）由上层负责。本文中此前关于批量层描述、层等待接口和底层推进 kernel 的段落均为历史记录，不是当前接口。
+
 ## 1. 总体结论
 
 当前重构的**长期分层方向优于历史实现和 InfiniKV**：
@@ -1776,7 +1780,7 @@ unreaped_completion_records # 已提交但 host 尚未回收，只需小状态
 
 ```text
 StepPlan KVEngine.compile_step(StepMetadata metadata)
-LayerFenceSet GpuDagExecutor.submit_step(const StepPlan& plan)
+LayerFenceSet GpuDagExecutor.submit_plan(const StepPlan& plan)
 ```
 
 `StepMetadata` 至少包含：
