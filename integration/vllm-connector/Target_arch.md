@@ -859,7 +859,7 @@ block table 直接生成 byte-range I/O；仅不满足 5.1 准入条件时走现
 | local/striped双stream routing | 已实现 |
 | 独立read-copy stream与scatter event桥接 | 已实现并通过真实Hy3/Nsight准入 |
 | staged read plan 全量 pre-enqueue（K=2 future-event fences） | 已回退；生产路径为 host-window submit，禁止 future wait |
-| direct rolling read orchestration | 设计完成，待把当前 `_ReadPlan._submit_all()` 改为 start-R0/after-layer-Rnext |
+| direct rolling read orchestration | 已实现start-R0/after-layer-Rnext，合同测试通过；待真机Nsight准入 |
 | 实际 read/compute GPU interval overlap | staged 当前实测为0；direct rolling实现后重新验收 |
 | host-pinned prebuilt PRP | 已实现并真机命中 |
 | structured completion | 已实现 |
@@ -929,9 +929,9 @@ block table 直接生成 byte-range I/O；仅不满足 5.1 准入条件时走现
 
 1. 提交已经完成的 single-group cross-layer direct backend、memory unregister、
    `2*num_layers` capacity 和 staged fallback 基线。
-2. 按 `doc/Tutticonnector/README.md` 把 direct read 改为 start-R0、after-layer-Rnext，
-   保留 per-layer event 与整请求 recompute，不修改 Runtime/DataPath。
-3. 用小规模合成测试验证精确 enqueue 顺序，再用真实Hy3 TP4比较 block size
+2. 已按 `doc/Tutticonnector/README.md` 把 direct read 改为start-R0、
+   after-layer-Rnext，保留per-layer event与整请求recompute，未修改Runtime/DataPath。
+3. 已用小规模合成测试验证精确enqueue顺序；下一步用真实Hy3 TP4比较block size
    64/128/256 和 Nsight timeline。
 4. 若且仅若真实 KV pool 基址不能满足 64 KiB 注册约束，再评审“aligned containing
    allocation + logical base offset”的最小 Runtime API；不得在 DataPath 下沉 layer

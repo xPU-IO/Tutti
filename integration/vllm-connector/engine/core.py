@@ -329,6 +329,196 @@ class _ReadPlan:
                 pass
 
 
+class _DirectRollingReadPlan:
+    """Direct-only start-R0/after-layer-Rnext host submission state machine."""
+
+    def __init__(self, engine, keys, block_tables, physical_layers,
+                 on_failure=None):
+        self.engine = engine
+        self.keys = list(keys)
+        self.block_tables = list(block_tables)
+        self.physical_layers = tuple(physical_layers)
+        self.handles = {}
+        self.read_ready_events = {}
+        self.next_read_to_submit = 0
+        self.waited_callbacks = set()
+        self.advanced_callbacks = set()
+        self.terminal_failure = None
+        self.on_failure = on_failure
+        if not self.physical_layers:
+            raise ValueError("direct rolling read plan requires at least one layer")
+        self._submit_layer(0)
+
+    @property
+    def layer_count(self):
+        return len(self.physical_layers)
+
+    @property
+    def failed(self):
+        return self.terminal_failure
+
+    def fence_event(self, callback):
+        return self.read_ready_events.get(callback)
+
+    def wait_layer(self, callback, physical=None):
+        self._validate_callback(callback, physical)
+        event = self.read_ready_events.get(callback)
+        if event is None:
+            error = RuntimeError(
+                f"direct read callback {callback} has no recorded ready event"
+            )
+            self._record_failure(error)
+            raise error
+        if callback in self.waited_callbacks:
+            return event
+        expected = len(self.waited_callbacks)
+        if callback != expected:
+            error = RuntimeError(
+                f"out-of-order direct wait callback: expected {expected}, "
+                f"got {callback}"
+            )
+            self._record_failure(error)
+            raise error
+        self.waited_callbacks.add(callback)
+        return event
+
+    def after_layer(self, callback, physical=None) -> None:
+        self._validate_callback(callback, physical)
+        if callback in self.advanced_callbacks:
+            return
+        expected = len(self.advanced_callbacks)
+        if callback != expected:
+            error = RuntimeError(
+                f"out-of-order direct after-layer callback: expected "
+                f"{expected}, got {callback}"
+            )
+            self._record_failure(error)
+            raise error
+        if callback not in self.waited_callbacks:
+            error = RuntimeError(
+                f"direct after-layer callback {callback} occurred before its "
+                "compute wait"
+            )
+            self._record_failure(error)
+            raise error
+        self.advanced_callbacks.add(callback)
+        next_callback = callback + 1
+        if next_callback < self.layer_count:
+            if self.next_read_to_submit != next_callback:
+                error = RuntimeError(
+                    "direct rolling read state mismatch: "
+                    f"next={self.next_read_to_submit}, "
+                    f"after_callback={callback}"
+                )
+                self._record_failure(error)
+                raise error
+            self._submit_layer(next_callback)
+
+    def require_complete(self) -> None:
+        expected = set(range(self.layer_count))
+        missing_waits = tuple(sorted(expected - self.waited_callbacks))
+        missing_advances = tuple(sorted(expected - self.advanced_callbacks))
+        if (self.next_read_to_submit != self.layer_count
+                or missing_waits or missing_advances):
+            error = RuntimeError(
+                "incomplete direct rolling callbacks: "
+                f"next_read={self.next_read_to_submit}, "
+                f"missing_waits={missing_waits}, "
+                f"missing_after_layers={missing_advances}"
+            )
+            self._record_failure(error)
+            raise error
+
+    def _submit_layer(self, callback) -> None:
+        self._validate_callback(callback, self.physical_layers[callback])
+        if callback in self.handles:
+            return
+        physical = self.physical_layers[callback]
+        fence_event = self._new_fence_event()
+        try:
+            handle = self.engine.load_layer(
+                self.keys,
+                physical,
+                self.block_tables,
+                fence_event=fence_event,
+                bridge_compute=False,
+            )
+        except Exception as exc:
+            self._record_failure(exc)
+            raise
+        if fence_event is None:
+            fence_event = getattr(handle, "fence_event", None)
+        if fence_event is None:
+            error = RuntimeError(
+                f"direct read layer {callback} did not record a ready event"
+            )
+            self._record_failure(error)
+            raise error
+        self.handles[callback] = handle
+        self.read_ready_events[callback] = fence_event
+        self.next_read_to_submit = callback + 1
+        add_terminal = getattr(handle, "add_terminal_callback", None)
+        if not callable(add_terminal):
+            add_terminal = getattr(handle, "add_done_callback", None)
+        if callable(add_terminal):
+            add_terminal(self._on_completion)
+
+    def _on_completion(self, result) -> None:
+        if getattr(result, "ok", True) or self.terminal_failure is not None:
+            return
+        self._record_failure(LoadGateError(
+            "direct read failed; recompute the complete step",
+            whole_operation=True,
+            invalid_block_ids=_flatten_block_ids(self.block_tables),
+        ))
+
+    def _record_failure(self, error) -> None:
+        if self.terminal_failure is not None:
+            return
+        self.terminal_failure = error
+        if callable(self.on_failure):
+            self.on_failure(error)
+
+    def _validate_callback(self, callback, physical=None) -> None:
+        if (not isinstance(callback, int) or isinstance(callback, bool)
+                or not 0 <= callback < self.layer_count):
+            error = RuntimeError(
+                f"direct callback ordinal out of range: {callback}"
+            )
+            self._record_failure(error)
+            raise error
+        expected_physical = self.physical_layers[callback]
+        if physical is not None and physical != expected_physical:
+            error = RuntimeError(
+                f"direct callback {callback} maps to physical "
+                f"{expected_physical}, got {physical}"
+            )
+            self._record_failure(error)
+            raise error
+
+    def _new_fence_event(self):
+        try:
+            import torch
+            if torch.cuda.is_available():
+                return torch.cuda.Event(enable_timing=False)
+        except Exception:
+            pass
+        store = getattr(self.engine, "_store", None)
+        factory = getattr(store, "new_event", None)
+        return factory() if callable(factory) else None
+
+    def abort(self):
+        for handle in self.handles.values():
+            try:
+                abort = getattr(handle, "abort", None)
+                if callable(abort):
+                    abort()
+                else:
+                    handle.wait()
+            except Exception:
+                pass
+
+
 class _EngineStepIO:
     """Compatibility layer callback helper for contract tests.
 
@@ -1150,6 +1340,10 @@ class KVEngine:
                         on_failure=None):
         if not self.read_plan_supported:
             raise RuntimeError("read CUDA event bridge unavailable")
+        if self.direct:
+            return _DirectRollingReadPlan(
+                self, keys, block_tables, physical_layers, on_failure
+            )
         return _ReadPlan(
             self, keys, block_tables, physical_layers, depth, on_failure
         )

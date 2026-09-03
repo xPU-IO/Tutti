@@ -31,9 +31,10 @@ all read -> all/most scatter -> compute
 
 这不是 CUDA stream 依赖错误，而是 compute 的 enqueue 时间太晚。
 
-direct I/O 解决了 staging HBM、gather/scatter 小 kernel 和槽复用问题，但当前
-`_ReadPlan._submit_all()` 仍然在 forward 前逐层调用 Runtime。只把 staged 换成
-direct，不能保证解决 host launch skew。下一步必须同时调整上层 enqueue 顺序。
+direct I/O 解决了 staging HBM、gather/scatter 小 kernel 和槽复用问题。提交
+`DIRECT-ROLLING-ORCH-24` 已把 direct 从 `_ReadPlan._submit_all()` 分离为独立 rolling
+plan；staged 仍保持原计划。该实现已通过 fake-runtime/adapter 合同，尚待真实 Hy3
+和 Nsight Systems 证明 GPU interval overlap。
 
 ## 2. 三份 legacy 证据必须区分
 
@@ -300,15 +301,15 @@ direct read 的不同 layer/page 地址彼此独立，不存在 staging 覆盖�
 |---|---|---|
 | KV 数据路径 | direct page byte-range | 保持 |
 | staging/gather/scatter | direct 已不需要 | 保持为 0 |
-| read 提交位置 | `_ReadPlan._submit_all()`，forward 前全部提交 | start 只提交 R0，after-layer 提交 R(L+1) |
+| read 提交位置 | direct 已实现 start-R0/after-layer-Rnext | 真机确认 host 区间和 GPU overlap |
 | compute wait | per-layer `fence_event` | 保持 |
 | write 依赖 | compute event -> write stream | 保持 |
 | host completion gate | callback 无 wait | 保持 |
 | operation capacity | `2 * num_layers` | 第一版保持；后续再做有界优化 |
 | failure | watcher + step-end recompute | 保持并补 rolling failure 测试 |
 
-因此下一张调度卡应只修改 Worker/KVEngine 的 plan 状态机与测试，不应改 direct 地址
-映射、Runtime/DataPath 或 CUDA I/O kernel。
+该状态机已经实现于 Worker/KVEngine，未修改 direct 地址映射、Runtime/DataPath 或
+CUDA I/O kernel。下一阶段只做真机准入；如 timeline 不符合本文，不得直接修改底层。
 
 ## 8. 状态机约束
 
@@ -364,10 +365,9 @@ completion 日志。
 ## 10. 实施顺序
 
 1. 完成并提交 direct memory lifecycle、地址映射和 `2*N` capacity 基线。
-2. 将 direct `_ReadPlan._submit_all()` 改为 start-R0 + after-layer-Rnext。
-3. 用 fake runtime 测试精确 host enqueue 顺序，禁止 callback host wait。
+2. 已将 direct `_ReadPlan._submit_all()` 改为 start-R0 + after-layer-Rnext。
+3. 已用 fake runtime 测试精确 host enqueue 顺序，并禁止 callback host wait。
 4. 使用小规模合成 CUDA/runtime 测试检查 stream/event，不加载大模型。
 5. 最后只运行一次 Hy3 TP4 A/B 和 Nsight Systems 2026.4.1 准入。
 6. direct 单组通过后，再单独设计 HMA/GDN 多 group；不能用 Qwen HMA 验收本阶段
    single-group direct 调度。
-

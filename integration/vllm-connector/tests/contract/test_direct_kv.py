@@ -6,7 +6,7 @@ import pytest
 
 from adapter import worker as worker_module
 from adapter.worker import WorkerImpl
-from engine.core import KVEngine, _ReadPlan
+from engine.core import KVEngine, _DirectRollingReadPlan, _ReadPlan
 from engine.transfer import (
     DirectTransfer,
     DirectTransferUnavailable,
@@ -532,6 +532,7 @@ class EventBackend:
 class EventStore:
     def __init__(self, log):
         self.log = log
+        self._read_stream_obj = object()
 
     def record_read_event(self, event=None):
         self.log.append(("read_record", event))
@@ -544,6 +545,9 @@ class EventStore:
 
     def wait_write_event(self, event):
         self.log.append(("write_wait", event))
+
+    def wait_compute_event(self, event):
+        self.log.append(("compute_wait", event))
 
 
 def _direct_engine(log):
@@ -558,10 +562,11 @@ def _direct_engine(log):
     engine._transfer = transfer
     engine._store = EventStore(log)
     engine._inflight = []
+    engine._max_in_flight_operations = 0
     return engine
 
 
-def test_direct_read_all_layers_enqueue_before_callback(monkeypatch):
+def test_staged_read_plan_submission_behavior_is_unchanged(monkeypatch):
     log = []
     engine = _direct_engine(log)
     monkeypatch.setattr("torch.cuda.is_available", lambda: True)
@@ -580,21 +585,123 @@ def test_direct_read_all_layers_enqueue_before_callback(monkeypatch):
     assert all(handle.wait_count == 0 for handle in plan._handles.values())
 
 
-def test_direct_read_failure_marks_whole_plan_without_host_wait(monkeypatch):
+def test_direct_rolling_constructor_submits_only_layer_zero(monkeypatch):
+    log = []
+    engine = _direct_engine(log)
+    monkeypatch.setattr("torch.cuda.is_available", lambda: True)
+    monkeypatch.setattr("torch.cuda.Event", lambda enable_timing=False: object())
+    plan = _DirectRollingReadPlan(
+        engine, [b"r" * 16], [[2, 7]], (0, 1, 2)
+    )
+    assert [item[0] for item in log] == ["read_submit", "read_record"]
+    assert log[0] == ("read_submit", 0)
+    assert plan.next_read_to_submit == 1
+    assert set(plan.handles) == {0}
+    assert set(plan.read_ready_events) == {0}
+
+
+def test_engine_selects_rolling_plan_only_for_direct(monkeypatch):
+    log = []
+    engine = _direct_engine(log)
+    monkeypatch.setattr("torch.cuda.is_available", lambda: True)
+    monkeypatch.setattr("torch.cuda.Event", lambda enable_timing=False: object())
+    plan = engine.start_read_plan(
+        [b"q" * 16], [[2, 7]], (0, 1, 2), depth=99
+    )
+    assert isinstance(plan, _DirectRollingReadPlan)
+    assert [item for item in log if item[0] == "read_submit"] == [
+        ("read_submit", 0)
+    ]
+
+
+def test_direct_rolling_wait_is_submit_and_host_wait_free(monkeypatch):
+    log = []
+    engine = _direct_engine(log)
+    monkeypatch.setattr("torch.cuda.is_available", lambda: True)
+    monkeypatch.setattr("torch.cuda.Event", lambda enable_timing=False: object())
+    plan = _DirectRollingReadPlan(
+        engine, [b"s" * 16], [[2, 7]], (0, 1, 2)
+    )
+    before = list(log)
+    assert plan.wait_layer(0, 0) is plan.read_ready_events[0]
+    assert log == before
+    assert plan.handles[0].wait_count == 0
+
+
+def test_direct_rolling_after_layer_is_idempotent_and_bounded(monkeypatch):
+    log = []
+    engine = _direct_engine(log)
+    monkeypatch.setattr("torch.cuda.is_available", lambda: True)
+    monkeypatch.setattr("torch.cuda.Event", lambda enable_timing=False: object())
+    plan = _DirectRollingReadPlan(
+        engine, [b"t" * 16], [[2, 7]], (0, 1, 2)
+    )
+    plan.wait_layer(0, 0)
+    plan.after_layer(0, 0)
+    assert [item for item in log if item[0] == "read_submit"] == [
+        ("read_submit", 0), ("read_submit", 1)
+    ]
+    plan.after_layer(0, 0)
+    assert len([item for item in log if item[0] == "read_submit"]) == 2
+    plan.wait_layer(1, 1)
+    plan.after_layer(1, 1)
+    plan.wait_layer(2, 2)
+    plan.after_layer(2, 2)
+    plan.after_layer(2, 2)
+    assert [item for item in log if item[0] == "read_submit"] == [
+        ("read_submit", 0), ("read_submit", 1), ("read_submit", 2)
+    ]
+    plan.require_complete()
+
+
+def test_direct_rolling_out_of_order_and_missing_callbacks_fail_closed(
+        monkeypatch):
+    log = []
+    engine = _direct_engine(log)
+    monkeypatch.setattr("torch.cuda.is_available", lambda: True)
+    monkeypatch.setattr("torch.cuda.Event", lambda enable_timing=False: object())
+    plan = _DirectRollingReadPlan(
+        engine, [b"u" * 16], [[2, 7]], (0, 1, 2)
+    )
+    with pytest.raises(RuntimeError, match="no recorded ready event"):
+        plan.wait_layer(1, 1)
+    with pytest.raises(RuntimeError, match="before its compute wait"):
+        plan.after_layer(0, 0)
+    with pytest.raises(RuntimeError, match="incomplete direct rolling"):
+        plan.require_complete()
+    assert [item for item in log if item[0] == "read_submit"] == [
+        ("read_submit", 0)
+    ]
+
+
+def test_direct_rolling_rejects_wrong_physical_mapping(monkeypatch):
+    engine = _direct_engine([])
+    monkeypatch.setattr("torch.cuda.is_available", lambda: True)
+    monkeypatch.setattr("torch.cuda.Event", lambda enable_timing=False: object())
+    plan = _DirectRollingReadPlan(
+        engine, [b"p" * 16], [[2, 7]], (2, 4, 6)
+    )
+    with pytest.raises(RuntimeError, match="maps to physical 2, got 0"):
+        plan.wait_layer(0, 0)
+    assert plan.terminal_failure is not None
+
+
+def test_direct_rolling_read_failure_marks_whole_plan_without_host_wait(
+        monkeypatch):
     log = []
     failures = []
     engine = _direct_engine(log)
     monkeypatch.setattr("torch.cuda.is_available", lambda: True)
     monkeypatch.setattr("torch.cuda.Event", lambda enable_timing=False: object())
-    plan = _ReadPlan(
-        engine, [b"h" * 16], [[3, 1]], (0, 1, 2), 1,
+    plan = _DirectRollingReadPlan(
+        engine, [b"h" * 16], [[3, 1]], (0, 1, 2),
         on_failure=failures.append,
     )
-    plan._handles[1].finish(False)
+    plan.handles[0].finish(False)
     assert plan.failed is failures[0]
     assert plan.failed.whole_operation
     assert plan.failed.invalid_block_ids == (3, 1)
-    assert all(handle.wait_count == 0 for handle in plan._handles.values())
+    assert all(handle.wait_count == 0 for handle in plan.handles.values())
 
 
 def test_direct_write_records_compute_then_waits_write_then_submits():
@@ -604,6 +711,66 @@ def test_direct_write_records_compute_then_waits_write_then_submits():
     assert [item[0] for item in log] == [
         "compute_record", "write_wait", "write_submit"
     ]
+
+
+def _rolling_worker(engine, plan, *, save_keys):
+    worker = WorkerImpl(engine)
+    worker._bound = True
+    worker._num_layers = 3
+    worker._callback_to_physical = (0, 1, 2)
+    worker._callback_by_name = {
+        f"model.layers.{layer}.self_attn": layer for layer in range(3)
+    }
+    worker._load_keys = [b"v" * 16]
+    worker._load_block_tables = [[2, 7]]
+    worker._read_plan = plan
+    worker._save_keys = save_keys
+    worker._save_block_tables = [[2, 7]] if save_keys else []
+    worker._save_generations = ["g"] if save_keys else []
+    return worker
+
+
+def test_worker_host_enqueue_order_is_read_compute_read_write(monkeypatch):
+    log = []
+    engine = _direct_engine(log)
+    monkeypatch.setattr("torch.cuda.is_available", lambda: True)
+    monkeypatch.setattr("torch.cuda.Event", lambda enable_timing=False: object())
+    plan = _DirectRollingReadPlan(
+        engine, [b"v" * 16], [[2, 7]], (0, 1, 2)
+    )
+    worker = _rolling_worker(engine, plan, save_keys=[b"w" * 16])
+
+    worker.wait_for_layer_load("model.layers.0.self_attn")
+    log.append(("compute_enqueue", 0))
+    worker.save_kv_layer("model.layers.0.self_attn")
+
+    assert [item[0] for item in log] == [
+        "read_submit", "read_record",
+        "compute_wait", "compute_enqueue",
+        "read_submit", "read_record",
+        "compute_record", "write_wait", "write_submit",
+    ]
+    assert [item for item in log if item[0] == "read_submit"] == [
+        ("read_submit", 0), ("read_submit", 1)
+    ]
+
+
+def test_worker_after_layer_advances_without_save_plan(monkeypatch):
+    log = []
+    engine = _direct_engine(log)
+    monkeypatch.setattr("torch.cuda.is_available", lambda: True)
+    monkeypatch.setattr("torch.cuda.Event", lambda enable_timing=False: object())
+    plan = _DirectRollingReadPlan(
+        engine, [b"x" * 16], [[2, 7]], (0, 1, 2)
+    )
+    worker = _rolling_worker(engine, plan, save_keys=None)
+    worker.wait_for_layer_load("model.layers.0.self_attn")
+    worker.save_kv_layer("model.layers.0.self_attn")
+    worker.save_kv_layer("model.layers.0.self_attn")
+    assert [item for item in log if item[0] == "read_submit"] == [
+        ("read_submit", 0), ("read_submit", 1)
+    ]
+    assert not [item for item in log if item[0] == "write_submit"]
 
 
 def test_worker_direct_bind_allocates_no_staging(monkeypatch):
@@ -639,8 +806,9 @@ def test_worker_direct_compute_callback_only_waits_recorded_fence():
     class Plan:
         failed = None
 
-        def wait_layer(self, callback):
+        def wait_layer(self, callback, physical):
             assert callback == 0
+            assert physical == 0
             return fence
 
     class Store:

@@ -665,7 +665,7 @@ class WorkerImpl:
                     raise
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        """为指定层在 compute stream 排入已完成 scatter fence 的等待。"""
+        """在 compute stream 等待本层 direct-read 或 staged-scatter fence。"""
         callback, idx = self._resolve_callback(layer_name)
         self._diag_callback("wait", layer_name, callback, idx)
         direct = bool(getattr(self._engine, "direct", False))
@@ -675,8 +675,10 @@ class WorkerImpl:
             return
         if not self._load_keys:
             return
-        self._load_waited_callbacks.add(callback)
+        if not direct:
+            self._load_waited_callbacks.add(callback)
         if self._compat_prefetch_active:
+            self._load_waited_callbacks.add(callback)
             handle = self._load_handles.pop(idx, None)
             if handle is not None:
                 try:
@@ -698,7 +700,10 @@ class WorkerImpl:
             try:
                 if self._read_plan.failed is not None and not direct:
                     raise self._read_plan.failed
-                fence_event = self._read_plan.wait_layer(callback)
+                fence_event = (
+                    self._read_plan.wait_layer(callback, idx)
+                    if direct else self._read_plan.wait_layer(callback)
+                )
                 if fence_event is None:
                     raise RuntimeError(
                         "read plan did not provide a CUDA fence event"
@@ -710,6 +715,7 @@ class WorkerImpl:
                         "read plan compute event bridge is unavailable"
                     )
                 wait_compute(fence_event)
+                self._load_waited_callbacks.add(callback)
             except LoadGateError as exc:
                 self._mark_load_failure(exc)
                 return
@@ -743,6 +749,7 @@ class WorkerImpl:
             )
             return
         wait_compute(fence_event)
+        self._load_waited_callbacks.add(callback)
 
     # ---- 写入编排 ----
 
@@ -756,11 +763,27 @@ class WorkerImpl:
         驱逐）时记录运行日志并跳过本批数据面——该路径正常部署
         不可达，出现即容量配置问题。
         """
-        if self._load_failed:
+        direct = bool(getattr(self._engine, "direct", False))
+        if self._load_failed and not direct:
             return
         self._ensure_bound()
         callback, idx = self._resolve_callback(layer_name)
         self._diag_callback("save", layer_name, callback, idx)
+        if direct and self._read_plan is not None:
+            advance = getattr(self._read_plan, "after_layer", None)
+            if callable(advance):
+                try:
+                    advance(callback, idx)
+                except Exception as exc:
+                    self._mark_load_failure(exc)
+                    _LOG.error(
+                        "direct rolling advance failed closed generation=%d "
+                        "callback=%d physical=%d: %s",
+                        self._load_generation, callback, idx, exc,
+                    )
+                    return
+        if self._load_failed:
+            return
         if callback in self._save_seen_callbacks:
             return
         self._save_seen_callbacks.add(callback)
@@ -833,11 +856,19 @@ class WorkerImpl:
         """等待全部写入完成并结算。"""
         first_error = self._save_error
         drained = False
-        # Read completions and their scatter fences were enqueued by
-        # start_load_kv.  Drain them before the TP failure consensus so any
-        # runtime/CQ error poisons the whole step instead of being mistaken
-        # for a successful load.
+        # Direct reads由start_load和after-layer callbacks滚动提交；staged
+        # reads/scatter由start_load计划提交。先drain再做TP failure consensus，
+        # 避免把尚未观察到的runtime/CQ错误误判成成功加载。
         if self._load_keys:
+            require_complete = getattr(
+                self._read_plan, "require_complete", None
+            )
+            if bool(getattr(self._engine, "direct", False)) and callable(
+                    require_complete):
+                try:
+                    require_complete()
+                except Exception as exc:
+                    self._mark_load_failure(exc)
             try:
                 self._engine.wait_idle()
                 drained = True
