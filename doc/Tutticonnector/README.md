@@ -362,6 +362,34 @@ terminal_failure
 验收应同时查询 CUDA kernel `streamId`、各层 event/interval overlap 和 structured
 completion 日志。
 
+### 9.3 `DIRECT-ROLLING-NSYS-26` 实测结果（2026-09-03）
+
+报告：`/data2/ryeqiu/tutti-profile/reports/direct-rolling-26.nsys-rep`
+
+- 四个 TP rank 均出现 `DIRECT_ADMISSION_ACCEPTED`；Hy3 pool shape 为
+  `(2741, 80, 64, 2, 256)`，page 为 64 KiB，pool base 均满足 64 KiB 对齐。
+- B 请求 external hit 为 6400 tokens；A-cold 2.098 s，B 1.322 s；四个 rank
+  均生成 39 chunks、3120 layer markers、39 rank commits。
+- direct NVTX 统计为每 rank 80 个 read layer submit、160 个 write layer submit；
+  read layer 0..79 无缺失/重复，`start_load_kv` 平均约 2.036 ms，layer 1 read
+  在该 host range 之后开始，证明 start-R0/after-layer-Rnext 已生效。
+- CUDA activity 显示 compute=`19/27`、read=`31`、write=`39`；direct read-copy
+  helper/scatter kernel 为 0，写入与 compute 的 kernel interval overlap 为
+  100%（四个 rank）。
+- read 与 compute 的保守区间 overlap 只有 GPU0 `74/80`、GPU1 `65/80`、GPU2
+  `65/80`、GPU3 `18/80`，因此 rolling 顺序已证明，但“所有 rank 稳定 overlap”
+  尚未通过。该统计把 stream 19/27 上的模型通信和计算都算作 compute，不能用来
+  推导精确的 layer-level overlap；下一次需加入 compute layer 标记或按已知 kernel
+  集合重新统计。
+- `nvidia-smi dmon` 本次为空，PCIe/GPU 利用率缺少证据；Nsight stop 报告 no
+  active session 但 report 成功生成，控制流程不够干净。
+- dmesg 新增 NVRM `refcntRequestReference_IMPL` 只发生在 profile workload 前的
+  初始化窗口；没有 Xid、fatal/uncorrected AER 或 snvme 错误。应用退出有
+  EngineCore force-kill 和一个 shared-memory leak warning，不能作为完全干净收尾。
+
+本次结论：direct 数据路径、地址映射、stream 分流、rolling host 编排和 write
+overlap 通过；read/compute 稳定 overlap、系统指标采集和干净退出仍待补验。
+
 ## 10. 实施顺序
 
 1. 完成并提交 direct memory lifecycle、地址映射和 `2*N` capacity 基线。
