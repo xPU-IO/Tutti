@@ -186,6 +186,19 @@ class TuttiDirectBackend:
         self._pool = pool
         self._memory_ticket = int(ticket)
         self._geometry = geometry
+        _LOG.warning(
+            "DIRECT_ADMISSION_ACCEPTED accel=%d pool_base=0x%x "
+            "pool_size=%d num_blocks=%d num_layers=%d block_size=%d "
+            "page_bytes=%d block_stride_bytes=%d layer_stride_bytes=%d "
+            "blocks_per_chunk=%d segment_bytes=%d read_stream=%s "
+            "write_stream=%s",
+            geometry.accel_id, geometry.pool_base, geometry.pool_size,
+            geometry.num_blocks, geometry.num_layers, geometry.block_size,
+            geometry.page_bytes, geometry.block_stride_bytes,
+            geometry.layer_stride_bytes, geometry.blocks_per_chunk,
+            geometry.segment_bytes, self._store._read_stream,
+            self._store._write_stream,
+        )
         return True
 
     @staticmethod
@@ -431,7 +444,8 @@ class TuttiDirectBackend:
                     direction,
                 ))
         with nvtx_range(
-            f"tutti.runtime.submit|op={direction}|direct=1|requests={len(requests)}"
+            f"tutti.runtime.submit|op={direction}|direct=1|layer={layer_idx}"
+            f"|chunks={len(keys)}|requests={len(requests)}"
         ):
             handles = store._submit_retry(requests, direction)
         settled = (

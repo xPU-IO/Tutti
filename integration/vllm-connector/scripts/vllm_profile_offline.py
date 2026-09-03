@@ -65,6 +65,10 @@ def main() -> int:
     parser.add_argument("--load-format", default="auto")
     parser.add_argument("--tensor-parallel-size", type=int, default=4)
     parser.add_argument(
+        "--block-size", type=int, choices=(64, 128, 256), default=64
+    )
+    parser.add_argument("--direct-transfer-strict", action="store_true")
+    parser.add_argument(
         "--without-tutti",
         action="store_true",
         help="run the model workload without a KV connector",
@@ -161,24 +165,30 @@ def main() -> int:
             store_options["preset"]["max_in_flight_operations"] = (
                 args.max_in_flight_operations
             )
+        connector_extra = {
+            "chunk_tokens": 256,
+            "max_chunks_per_wave": 512,
+            "store": {
+                "type": "tutti_nvme",
+                "options": store_options,
+            },
+        }
+        if args.direct_transfer_strict:
+            connector_extra.update({
+                "direct_transfer": True,
+                "direct_transfer_strict": True,
+            })
         kv_transfer_config = KVTransferConfig(
             kv_connector="TuttiConnectorV1",
             kv_connector_module_path="adapter.connector",
             kv_role="kv_both",
             kv_load_failure_policy=args.kv_load_failure_policy,
-            kv_connector_extra_config={
-                "chunk_tokens": 256,
-                "max_chunks_per_wave": 512,
-                "store": {
-                    "type": "tutti_nvme",
-                    "options": store_options,
-                },
-            },
+            kv_connector_extra_config=connector_extra,
         )
     llm = LLM(
         model=args.model,
         tensor_parallel_size=args.tensor_parallel_size,
-        block_size=64,
+        block_size=args.block_size,
         enforce_eager=True,
         max_model_len=args.tokens + args.max_tokens,
         load_format=args.load_format,
