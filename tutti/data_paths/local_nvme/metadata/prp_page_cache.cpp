@@ -33,6 +33,22 @@ bool PrpPageCache::init(const Config& cfg, nvm_ctrl_t* ctrl) {
 #if defined(TUTTI_USE_HOST)
     std::fprintf(stderr, "[prp_cache] init: HOST profile has no pinned-host allocator\n");
     return false;
+#elif defined(TUTTI_USE_MACA)
+    // MACA cudaHostAlloc page can't get user page for its own memory framework
+    int ret = posix_memalign(&pool_host_, 8192, bytes);
+    if (ret != 0) {
+        std::fprintf(stderr,
+                     "[prp_cache] init: posix_memalign(%zu bytes) failed\n", bytes);
+        return false;
+    }
+    cudaError_t ce = cudaHostRegister(pool_host_, bytes, mcHostRegisterDefault);
+    if (ce != cudaSuccess) {
+        std::fprintf(stderr,
+                     "[prp_cache] init: cudaHostRegister(%zu bytes) failed: %s\n",
+                     bytes, cudaGetErrorString(ce));
+        free(pool_host_);
+        return false;
+    }
 #else
     cudaError_t ce = cudaHostAlloc(&pool_host_, bytes, cudaHostAllocDefault);
     if (ce != cudaSuccess || pool_host_ == nullptr) {
@@ -46,9 +62,14 @@ bool PrpPageCache::init(const Config& cfg, nvm_ctrl_t* ctrl) {
     int rc = nvm_dma_map_data_host(&pool_dma_, ctrl, pool_host_, bytes);
     if (rc != 0 || pool_dma_ == nullptr) {
         std::fprintf(stderr,
-                     "[prp_cache] init: nvm_dma_map_data_host failed: rc=%d\n",
-                     rc);
+                     "[prp_cache] init: nvm_dma_map_data_host failed: rc=%d pool=%p\n",
+                     rc, pool_host_);
+#if defined(TUTTI_USE_MACA)
+        cudaHostUnregister(pool_host_);
+        free(pool_host_);
+#else
         cudaFreeHost(pool_host_);
+#endif
         pool_host_ = nullptr;
         return false;
     }
@@ -77,7 +98,12 @@ void PrpPageCache::shutdown() {
         pool_dma_ = nullptr;
     }
     if (pool_host_) {
+#if defined(TUTTI_USE_MACA)
+        cudaHostUnregister(pool_host_);
+        free(pool_host_);
+#else
         cudaFreeHost(pool_host_);
+#endif
         pool_host_ = nullptr;
     }
 

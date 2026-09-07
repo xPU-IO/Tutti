@@ -57,7 +57,9 @@ void ctrl_put(struct ctrl* ctrl)
          * NOT wait for in-flight references to drop.  The actual
          * kfree(ctrl) is deferred to ctrl_cdev_release(), which fires
          * when the last kobject reference to ctrl->cdev.kobj is
-         * released (e.g. after all open file descriptors are closed).
+         * released (e.g. after all open file descriptors are closed)
+         * and which first purges any VFS inode still attached to
+         * ctrl->cdev.list (see the comment there).
          */
     }
 }
@@ -116,13 +118,58 @@ struct ctrl* ctrl_find_by_inode(const struct list* list, const struct inode* ino
  * ALL kobject references to ctrl->cdev are dropped (including those
  * held by still-open file descriptors).  This callback is invoked
  * after cdev_del() + the final kobject_put(), guaranteeing that no
- * thread can access ctrl through the cdev or its kobj anymore.
+ * thread can access ctrl through the cdev or its kobj anymore --
+ * with ONE exception, which is exactly the bug this handler must
+ * defend against:
+ *
+ * VFS char-device inodes cache the cdev pointer in inode->i_cdev
+ * and link themselves onto cdev->list through inode->i_devices
+ * (chrdev_open).  That link is undone at inode eviction time
+ * (cd_forget: list_del_init + i_cdev = NULL), which can run AFTER
+ * the cdev kobject refcount already hit zero -- e.g. __fput does
+ * cdev_put() first and dput() (-> inode eviction -> cd_forget)
+ * afterwards.  kfree()ing ctrl while such an inode is still linked
+ * makes the later cd_forget write into the freed cdev.list, which
+ * shows up as SLUB "Poison overwritten" on the 16 bytes of
+ * cdev.list (observed as ctrl+0xC0 corruption).
+ *
+ * The kernel's own ktype_cdev_default / cdev_dynamic_release
+ * handlers solve this with cdev_purge(): before freeing they walk
+ * cdev->list and detach every inode.  ctrl_chrdev_create() swaps in
+ * this custom ktype, so the stock purge never runs; replicate it
+ * here.  cdev_purge() itself is static and relies on the
+ * unexported cdev_lock; replicating it WITHOUT the lock is safe at
+ * this point because:
+ *   - kobj refcount == 0 means no open file holds this cdev, and
+ *     cdev_del() already unmapped us from cdev_map, so no NEW inode
+ *     can attach (chrdev_open only attaches after a successful
+ *     kobj_lookup);
+ *   - a concurrent cd_forget() on a still-attached inode and our
+ *     list_del_init() both write the same self-pointers, and
+ *     inodes are RCU-freed (destroy_inode -> call_rcu), so any
+ *     inode grabbed in this non-sleeping loop stays valid memory
+ *     until we are done.
  */
 static void ctrl_cdev_release(struct kobject *kobj)
 {
 
     struct ctrl *ctrl = container_of(kobj, struct ctrl, cdev.kobj);
     printk(KERN_INFO "ctrl_cdev_release %s %p\n", ctrl->name, (void *)kobj);
+
+    /*
+     * Replicate cdev_purge(): detach every inode still hanging off
+     * ctrl->cdev.list so its later eviction (cd_forget) cannot
+     * write into the memory we are about to free.  After this loop,
+     * any such inode's i_devices is self-pointing, so a future
+     * list_del_init() only touches the inode itself.
+     */
+    while (!list_empty(&ctrl->cdev.list)) {
+        struct inode *inode = container_of(ctrl->cdev.list.next,
+                                           struct inode, i_devices);
+        list_del_init(&inode->i_devices);
+        inode->i_cdev = NULL;
+    }
+
     kfree(ctrl->user_qid_bitmap);
     ctrl->user_qid_bitmap = NULL;
     mutex_destroy(&ctrl->user_qid_lock);
