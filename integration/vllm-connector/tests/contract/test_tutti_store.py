@@ -16,6 +16,7 @@ import ctypes
 import os
 import shutil
 import tempfile
+import threading
 import weakref
 from collections import namedtuple
 from pathlib import Path
@@ -31,6 +32,33 @@ from stores.tutti_nvme.store import (
 from stores.tutti_nvme.commit import read_rank_commit
 
 SEG = 4096
+
+
+def test_direct_completions_share_one_store_observer():
+    observed = []
+    done = threading.Event()
+
+    class Completion:
+        def wait_result(self):
+            observed.append(threading.current_thread())
+            if len(observed) == 2:
+                done.set()
+
+    store = object.__new__(TuttiKVStore)
+    store._direct_watch_pending = set()
+    store._direct_watch_lock = threading.Lock()
+    store._direct_watch_wakeup = threading.Event()
+    store._direct_watch_stop = threading.Event()
+    store._direct_watch_thread = None
+    store._watch_completion(Completion())
+    store._watch_completion(Completion())
+    assert done.wait(1.0)
+    assert len({id(thread) for thread in observed}) == 1
+    assert observed[0].name == "tutti-direct-completion-observer"
+    store._direct_watch_stop.set()
+    store._direct_watch_wakeup.set()
+    store._direct_watch_thread.join(timeout=1.0)
+    assert not store._direct_watch_thread.is_alive()
 
 
 def io_key(chunk: bytes, layer: int) -> bytes:
@@ -304,8 +332,14 @@ def test_auto_routes_read_and_write_to_distinct_streams(tmp_path, monkeypatch):
     monkeypatch.setattr(torch.cuda, "Event", FakeEvent)
     monkeypatch.setattr(torch.cuda, "stream", FakeStreamContext)
     compute_stream = FakeStream("cuda:0")
+    next_compute_stream = FakeStream("cuda:0")
+    current_compute_stream = [compute_stream]
+    current_stream_calls = []
     monkeypatch.setattr(
-        torch.cuda, "current_stream", lambda device=None: compute_stream
+        torch.cuda, "current_stream",
+        lambda device=None: (
+            current_stream_calls.append(device), current_compute_stream[0]
+        )[1],
     )
 
     runtime = FakeRuntime(supports_multi_stream=True, bound_accel_id=0)
@@ -346,9 +380,15 @@ def test_auto_routes_read_and_write_to_distinct_streams(tmp_path, monkeypatch):
     store.wait_read_event(event)
     store.wait_write_event(event)
     store.wait_compute_event(event)
+    current_compute_stream[0] = next_compute_stream
+    store.wait_compute_event(event)
     assert store._read_stream_obj.waited == [event]
     assert store._write_stream_obj.waited == [event]
     assert compute_stream.waited == [event]
+    assert next_compute_stream.waited == [event]
+    compute_event = store.record_compute_event()
+    assert compute_event.recorded_on is next_compute_stream
+    assert current_stream_calls == [None, None, None]
     assert store.record_read_event().recorded_on is store._read_stream_obj
     assert store.record_write_event().recorded_on is store._write_stream_obj
     assert (store.record_read_copy_event().recorded_on is

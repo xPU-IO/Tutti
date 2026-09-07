@@ -10,10 +10,13 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <nvtx3/nvToolsExt.h>
+
 #include <tutti/presets/local_nvme.h>
 #include <tutti/storage_runtime.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -27,6 +30,27 @@ using tutti::MemoryHandle;
 using tutti::TargetHandle;
 
 namespace {
+
+bool nvtx_enabled() {
+    const char* value = std::getenv("TUTTI_NVTX");
+    return value != nullptr && (std::string(value) == "1" ||
+                                std::string(value) == "true" ||
+                                std::string(value) == "on");
+}
+
+class ScopedNvtx {
+public:
+    explicit ScopedNvtx(const char* name) : active_(nvtx_enabled()) {
+        if (active_) nvtxRangePushA(name);
+    }
+    ~ScopedNvtx() {
+        if (active_) nvtxRangePop();
+    }
+    ScopedNvtx(const ScopedNvtx&) = delete;
+    ScopedNvtx& operator=(const ScopedNvtx&) = delete;
+private:
+    bool active_;
+};
 
 std::string status_code_str(tutti::StatusCode code) {
     switch (code) {
@@ -236,7 +260,11 @@ public:
                 "'");
         }
 
-        std::vector<tutti::IoRequest> reqs = parse_requests_(requests);
+        std::vector<tutti::IoRequest> reqs;
+        {
+            ScopedNvtx range("tutti.pybind.parse");
+            reqs = parse_requests_(requests);
+        }
 
         tutti::HostSubmitContext ctx{};
         ctx.execution_domain = domain;
@@ -246,8 +274,15 @@ public:
             : reinterpret_cast<cudaStream_t>(
                   checked_int<std::uintptr_t>(stream, "stream"));
 
-        tutti::IoSubmitOutcome outcome =
-            rt_->submit(reqs.data(), reqs.size(), ctx);
+        tutti::IoSubmitOutcome outcome;
+        {
+            // Runtime submit does not touch Python objects.  Release the GIL
+            // so the direct read feeder cannot serialize vLLM callbacks while
+            // the Runtime performs admission/queueing work.
+            py::gil_scoped_release release;
+            ScopedNvtx range("tutti.runtime.validation_and_submit");
+            outcome = rt_->submit(reqs.data(), reqs.size(), ctx);
+        }
 
         SubmitResult out;
         out.status_ok = outcome.status.ok();

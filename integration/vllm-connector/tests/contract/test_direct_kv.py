@@ -6,7 +6,7 @@ import pytest
 
 from adapter import worker as worker_module
 from adapter.worker import WorkerImpl
-from engine.core import KVEngine, _DirectRollingReadPlan, _ReadPlan
+from engine.core import KVEngine, _DirectAllLayerReadPlan, _ReadPlan
 from engine.transfer import (
     DirectTransfer,
     DirectTransferUnavailable,
@@ -87,6 +87,7 @@ class FakeRuntime:
         self.register_calls = []
         self.unregister_calls = []
         self.submit_calls = []
+        self.wait_calls = []
         self.release_calls = []
         self._next = 100
 
@@ -123,6 +124,7 @@ class FakeRuntime:
         )
 
     def wait(self, handle, timeout_ms=0):
+        self.wait_calls.append((handle, timeout_ms))
         return ("OK", "FAILED") if self._fail else ("OK", "COMPLETED")
 
     def release_io(self, handle):
@@ -256,6 +258,51 @@ def test_direct_write_is_one_submit_for_multiple_chunks_and_blocks():
     assert store.put_results == [
         (True, tuple(derive_io_key(key, 1) for key in keys))
     ]
+
+
+def test_direct_completion_has_no_watcher_until_request_drain():
+    runtime = FakeRuntime()
+    store = FakeStoreOwner(runtime)
+    backend = TuttiDirectBackend(store)
+    backend.register_paged_caches(
+        FakePool(128), num_layers=3, blocks_per_chunk=2,
+        chunk_tokens=256, segment_bytes=8192, max_chunks_per_wave=2,
+    )
+    completion = backend.put_paged_batch(
+        [b"n" * 16], 1, [[6, 2]]
+    )
+    assert completion._watcher is None
+    assert runtime.wait_calls == []
+    settled = []
+    completion.add_done_callback(settled.append)
+    completion.wait()
+    assert len(runtime.wait_calls) == 1
+    assert len(settled) == 1 and settled[0].ok
+
+
+def test_wait_idle_drains_direct_completion_and_runs_callback():
+    runtime = FakeRuntime()
+    store = FakeStoreOwner(runtime)
+    backend = TuttiDirectBackend(store)
+    transfer = DirectTransfer(
+        backend, FakePool(128), num_layers=3, blocks_per_chunk=2,
+        chunk_tokens=256, segment_bytes=8192, max_chunks_per_wave=2,
+    )
+    completion = transfer.store_layer([b"o" * 16], 1, [[6, 2]])
+    callbacks = []
+    completion.add_done_callback(callbacks.append)
+    engine = object.__new__(KVEngine)
+    engine._transfer = transfer
+    engine._inflight = [completion]
+    engine._active_read_plan = None
+    engine._read_window = None
+    engine._write_window = None
+    engine._write_reuse_event = None
+    engine._store = store
+    assert runtime.wait_calls == []
+    engine.wait_idle()
+    assert len(runtime.wait_calls) == 1
+    assert len(callbacks) == 1 and callbacks[0].ok
 
 
 def test_direct_write_failure_never_confirms_markers():
@@ -566,6 +613,11 @@ def _direct_engine(log):
     return engine
 
 
+def _finish_direct_plan(plan):
+    plan.kick_feeder()
+    plan.join_feeder()
+
+
 def test_staged_read_plan_submission_behavior_is_unchanged(monkeypatch):
     log = []
     engine = _direct_engine(log)
@@ -585,22 +637,106 @@ def test_staged_read_plan_submission_behavior_is_unchanged(monkeypatch):
     assert all(handle.wait_count == 0 for handle in plan._handles.values())
 
 
-def test_direct_rolling_constructor_submits_only_layer_zero(monkeypatch):
+def test_direct_all_layer_constructor_submits_complete_order(monkeypatch):
     log = []
     engine = _direct_engine(log)
     monkeypatch.setattr("torch.cuda.is_available", lambda: True)
     monkeypatch.setattr("torch.cuda.Event", lambda enable_timing=False: object())
-    plan = _DirectRollingReadPlan(
+    plan = _DirectAllLayerReadPlan(
         engine, [b"r" * 16], [[2, 7]], (0, 1, 2)
     )
-    assert [item[0] for item in log] == ["read_submit", "read_record"]
-    assert log[0] == ("read_submit", 0)
-    assert plan.next_read_to_submit == 1
-    assert set(plan.handles) == {0}
-    assert set(plan.read_ready_events) == {0}
+    assert [item for item in log if item[0] == "read_submit"] == [
+        ("read_submit", 0)
+    ]
+    _finish_direct_plan(plan)
+    assert [item for item in log if item[0] == "read_submit"] == [
+        ("read_submit", 0), ("read_submit", 1), ("read_submit", 2)
+    ]
+    assert [item[0] for item in log] == [
+        "read_submit", "read_record",
+        "read_submit", "read_record",
+        "read_submit", "read_record",
+    ]
+    assert plan.next_read_to_submit == 3
+    assert set(plan.handles) == {0, 1, 2}
+    assert set(plan.read_ready_events) == {0, 1, 2}
 
 
-def test_engine_selects_rolling_plan_only_for_direct(monkeypatch):
+def test_direct_feeder_starts_after_explicit_kick_and_is_idempotent(monkeypatch):
+    log = []
+    engine = _direct_engine(log)
+    monkeypatch.setattr("torch.cuda.is_available", lambda: True)
+    monkeypatch.setattr("torch.cuda.Event", lambda enable_timing=False: object())
+    plan = _DirectAllLayerReadPlan(
+        engine, [b"feed" * 4], [[2, 7]], (0, 1, 2)
+    )
+    assert [item for item in log if item[0] == "read_submit"] == [
+        ("read_submit", 0)
+    ]
+    plan.kick_feeder()
+    plan.join_feeder()
+    plan.kick_feeder()
+    plan.join_feeder()
+    assert [item for item in log if item[0] == "read_submit"] == [
+        ("read_submit", 0), ("read_submit", 1), ("read_submit", 2)
+    ]
+    plan.abort()
+
+
+def test_direct_feeder_failure_is_recorded_asynchronously(monkeypatch):
+    log = []
+    engine = _direct_engine(log)
+    original = engine.load_layer
+
+    def fail_second(keys, layer_idx, blocks, **kwargs):
+        if layer_idx == 1:
+            raise RuntimeError("fake feeder admission failure")
+        return original(keys, layer_idx, blocks, **kwargs)
+
+    engine.load_layer = fail_second
+    monkeypatch.setattr("torch.cuda.is_available", lambda: True)
+    monkeypatch.setattr("torch.cuda.Event", lambda enable_timing=False: object())
+    plan = _DirectAllLayerReadPlan(
+        engine, [b"fail" * 4], [[2, 7]], (0, 1, 2)
+    )
+    assert [item for item in log if item[0] == "read_submit"] == [
+        ("read_submit", 0)
+    ]
+    plan.kick_feeder()
+    plan.join_feeder()
+    assert isinstance(plan.failed, RuntimeError)
+    assert "fake feeder admission failure" in str(plan.failed)
+    plan.abort()
+
+
+def test_direct_all_layer_plan_logs_submit_timing(caplog, monkeypatch):
+    log = []
+    engine = _direct_engine(log)
+    monkeypatch.setattr("torch.cuda.is_available", lambda: True)
+    monkeypatch.setattr("torch.cuda.Event", lambda enable_timing=False: object())
+    with caplog.at_level("WARNING", logger="engine.core"):
+        plan = _DirectAllLayerReadPlan(
+            engine, [b"m" * 16], [[2, 7]], (0, 1, 2)
+        )
+        _finish_direct_plan(plan)
+    assert plan._submit_all_total_ms >= 0
+    assert len(plan._layer_submit_ms) == 3
+    assert plan._first_read_submit_completed_ns is not None
+    ready = [
+        record.message for record in caplog.records
+        if record.message.startswith("DIRECT_READ_PLAN_READY")
+    ]
+    layer_records = [
+        record.message for record in caplog.records
+        if record.message.startswith("DIRECT_READ_LAYER_SUBMIT")
+    ]
+    assert len(ready) == 1
+    assert "layers=3" in ready[0]
+    assert "total_ms=" in ready[0] and "max_layer_ms=" in ready[0]
+    assert len(layer_records) == 3
+
+
+def test_engine_selects_all_layer_plan_only_for_direct(monkeypatch):
     log = []
     engine = _direct_engine(log)
     monkeypatch.setattr("torch.cuda.is_available", lambda: True)
@@ -608,41 +744,44 @@ def test_engine_selects_rolling_plan_only_for_direct(monkeypatch):
     plan = engine.start_read_plan(
         [b"q" * 16], [[2, 7]], (0, 1, 2), depth=99
     )
-    assert isinstance(plan, _DirectRollingReadPlan)
+    assert isinstance(plan, _DirectAllLayerReadPlan)
+    assert [item for item in log if item[0] == "read_submit"] == [("read_submit", 0)]
+    _finish_direct_plan(plan)
     assert [item for item in log if item[0] == "read_submit"] == [
-        ("read_submit", 0)
+        ("read_submit", 0), ("read_submit", 1), ("read_submit", 2)
     ]
 
 
-def test_direct_rolling_wait_is_submit_and_host_wait_free(monkeypatch):
+def test_direct_all_layer_wait_is_submit_and_host_wait_free(monkeypatch):
     log = []
     engine = _direct_engine(log)
     monkeypatch.setattr("torch.cuda.is_available", lambda: True)
     monkeypatch.setattr("torch.cuda.Event", lambda enable_timing=False: object())
-    plan = _DirectRollingReadPlan(
+    plan = _DirectAllLayerReadPlan(
         engine, [b"s" * 16], [[2, 7]], (0, 1, 2)
     )
     before = list(log)
     assert plan.wait_layer(0, 0) is plan.read_ready_events[0]
     assert log == before
     assert plan.handles[0].wait_count == 0
+    _finish_direct_plan(plan)
 
 
-def test_direct_rolling_after_layer_is_idempotent_and_bounded(monkeypatch):
+def test_direct_all_layer_after_layer_does_not_submit_or_duplicate(monkeypatch):
     log = []
     engine = _direct_engine(log)
     monkeypatch.setattr("torch.cuda.is_available", lambda: True)
     monkeypatch.setattr("torch.cuda.Event", lambda enable_timing=False: object())
-    plan = _DirectRollingReadPlan(
+    plan = _DirectAllLayerReadPlan(
         engine, [b"t" * 16], [[2, 7]], (0, 1, 2)
     )
+    assert len([item for item in log if item[0] == "read_submit"]) == 1
+    _finish_direct_plan(plan)
+    plan.after_layer(0, 0)
+    assert len([item for item in log if item[0] == "read_submit"]) == 3
+    plan.after_layer(0, 0)
+    assert len([item for item in log if item[0] == "read_submit"]) == 3
     plan.wait_layer(0, 0)
-    plan.after_layer(0, 0)
-    assert [item for item in log if item[0] == "read_submit"] == [
-        ("read_submit", 0), ("read_submit", 1)
-    ]
-    plan.after_layer(0, 0)
-    assert len([item for item in log if item[0] == "read_submit"]) == 2
     plan.wait_layer(1, 1)
     plan.after_layer(1, 1)
     plan.wait_layer(2, 2)
@@ -654,46 +793,44 @@ def test_direct_rolling_after_layer_is_idempotent_and_bounded(monkeypatch):
     plan.require_complete()
 
 
-def test_direct_rolling_out_of_order_and_missing_callbacks_fail_closed(
+def test_direct_all_layer_out_of_order_and_missing_callbacks_fail_closed(
         monkeypatch):
     log = []
     engine = _direct_engine(log)
     monkeypatch.setattr("torch.cuda.is_available", lambda: True)
     monkeypatch.setattr("torch.cuda.Event", lambda enable_timing=False: object())
-    plan = _DirectRollingReadPlan(
+    plan = _DirectAllLayerReadPlan(
         engine, [b"u" * 16], [[2, 7]], (0, 1, 2)
     )
-    with pytest.raises(RuntimeError, match="no recorded ready event"):
+    with pytest.raises(RuntimeError, match="has no recorded ready event"):
         plan.wait_layer(1, 1)
-    with pytest.raises(RuntimeError, match="before its compute wait"):
-        plan.after_layer(0, 0)
-    with pytest.raises(RuntimeError, match="incomplete direct rolling"):
+    plan.after_layer(0, 0)
+    with pytest.raises(RuntimeError, match="incomplete direct all-layer"):
         plan.require_complete()
-    assert [item for item in log if item[0] == "read_submit"] == [
-        ("read_submit", 0)
-    ]
+    assert [item for item in log if item[0] == "read_submit"] == [("read_submit", 0)]
 
 
-def test_direct_rolling_rejects_wrong_physical_mapping(monkeypatch):
+def test_direct_all_layer_rejects_wrong_physical_mapping(monkeypatch):
     engine = _direct_engine([])
     monkeypatch.setattr("torch.cuda.is_available", lambda: True)
     monkeypatch.setattr("torch.cuda.Event", lambda enable_timing=False: object())
-    plan = _DirectRollingReadPlan(
-        engine, [b"p" * 16], [[2, 7]], (2, 4, 6)
+    plan = _DirectAllLayerReadPlan(
+        engine, [b"p" * 16], [[2, 7]], (0, 1, 2)
     )
-    with pytest.raises(RuntimeError, match="maps to physical 2, got 0"):
-        plan.wait_layer(0, 0)
+    with pytest.raises(RuntimeError, match="maps to physical 0, got 99"):
+        plan.wait_layer(0, 99)
     assert plan.terminal_failure is not None
+    plan.abort()
 
 
-def test_direct_rolling_read_failure_marks_whole_plan_without_host_wait(
+def test_direct_all_layer_read_failure_marks_whole_plan_without_host_wait(
         monkeypatch):
     log = []
     failures = []
     engine = _direct_engine(log)
     monkeypatch.setattr("torch.cuda.is_available", lambda: True)
     monkeypatch.setattr("torch.cuda.Event", lambda enable_timing=False: object())
-    plan = _DirectRollingReadPlan(
+    plan = _DirectAllLayerReadPlan(
         engine, [b"h" * 16], [[3, 1]], (0, 1, 2),
         on_failure=failures.append,
     )
@@ -702,6 +839,7 @@ def test_direct_rolling_read_failure_marks_whole_plan_without_host_wait(
     assert plan.failed.whole_operation
     assert plan.failed.invalid_block_ids == (3, 1)
     assert all(handle.wait_count == 0 for handle in plan.handles.values())
+    plan.abort()
 
 
 def test_direct_write_records_compute_then_waits_write_then_submits():
@@ -713,7 +851,7 @@ def test_direct_write_records_compute_then_waits_write_then_submits():
     ]
 
 
-def _rolling_worker(engine, plan, *, save_keys):
+def _all_layer_worker(engine, plan, *, save_keys):
     worker = WorkerImpl(engine)
     worker._bound = True
     worker._num_layers = 3
@@ -730,47 +868,91 @@ def _rolling_worker(engine, plan, *, save_keys):
     return worker
 
 
-def test_worker_host_enqueue_order_is_read_compute_read_write(monkeypatch):
+def test_worker_host_enqueue_order_is_all_read_then_compute_then_write(
+        monkeypatch):
     log = []
     engine = _direct_engine(log)
     monkeypatch.setattr("torch.cuda.is_available", lambda: True)
     monkeypatch.setattr("torch.cuda.Event", lambda enable_timing=False: object())
-    plan = _DirectRollingReadPlan(
+    plan = _DirectAllLayerReadPlan(
         engine, [b"v" * 16], [[2, 7]], (0, 1, 2)
     )
-    worker = _rolling_worker(engine, plan, save_keys=[b"w" * 16])
+    worker = _all_layer_worker(engine, plan, save_keys=[b"w" * 16])
 
     worker.wait_for_layer_load("model.layers.0.self_attn")
     log.append(("compute_enqueue", 0))
     worker.save_kv_layer("model.layers.0.self_attn")
+    plan.join_feeder()
 
-    assert [item[0] for item in log] == [
-        "read_submit", "read_record",
-        "compute_wait", "compute_enqueue",
-        "read_submit", "read_record",
-        "compute_record", "write_wait", "write_submit",
-    ]
+    names = [item[0] for item in log]
+    assert names.index("read_submit") < names.index("compute_wait")
+    assert names.index("compute_wait") < names.index("compute_enqueue")
+    assert names.index("compute_enqueue") < names.index("compute_record")
+    assert names.index("compute_record") < names.index("write_wait") < names.index("write_submit")
     assert [item for item in log if item[0] == "read_submit"] == [
-        ("read_submit", 0), ("read_submit", 1)
+        ("read_submit", 0), ("read_submit", 1), ("read_submit", 2)
     ]
 
 
-def test_worker_after_layer_advances_without_save_plan(monkeypatch):
+def test_worker_save_without_save_plan_does_not_submit_read(monkeypatch):
     log = []
     engine = _direct_engine(log)
     monkeypatch.setattr("torch.cuda.is_available", lambda: True)
     monkeypatch.setattr("torch.cuda.Event", lambda enable_timing=False: object())
-    plan = _DirectRollingReadPlan(
+    plan = _DirectAllLayerReadPlan(
         engine, [b"x" * 16], [[2, 7]], (0, 1, 2)
     )
-    worker = _rolling_worker(engine, plan, save_keys=None)
+    worker = _all_layer_worker(engine, plan, save_keys=None)
     worker.wait_for_layer_load("model.layers.0.self_attn")
     worker.save_kv_layer("model.layers.0.self_attn")
     worker.save_kv_layer("model.layers.0.self_attn")
+    plan.join_feeder()
     assert [item for item in log if item[0] == "read_submit"] == [
-        ("read_submit", 0), ("read_submit", 1)
+        ("read_submit", 0), ("read_submit", 1), ("read_submit", 2)
     ]
     assert not [item for item in log if item[0] == "write_submit"]
+
+
+def test_worker_logs_direct_start_load_return(caplog):
+    class Plan:
+        failed = None
+
+    class Engine:
+        direct = True
+        read_plan_supported = True
+
+        def hash_keys(self, token_ids):
+            return [b"k" * 16], b"parent"
+
+        def pin(self, keys):
+            return None
+
+        def start_read_plan(self, *args, **kwargs):
+            return Plan()
+
+    meta = SimpleNamespace(
+        load_tokens=256,
+        load_start_token=0,
+        token_ids=list(range(256)),
+        req_id="r0",
+        block_ids=[4, 5],
+    )
+    worker = WorkerImpl(Engine())
+    worker._metadata = SimpleNamespace(requests=[meta])
+    worker._chunk_tokens = 256
+    worker._max_chunks_per_wave = 2
+    worker._block_size = 128
+    worker._callback_to_physical = (0, 1, 2)
+    worker._ensure_bound = lambda: None
+    worker._finalize_load_state = lambda: None
+    with caplog.at_level("WARNING", logger="adapter.worker"):
+        worker.start_load_kv(None)
+    messages = [
+        record.message for record in caplog.records
+        if record.message.startswith("DIRECT_START_LOAD_RETURN")
+    ]
+    assert len(messages) == 1
+    assert "total_ms=" in messages[0]
 
 
 def test_worker_direct_bind_allocates_no_staging(monkeypatch):
@@ -834,6 +1016,41 @@ def test_worker_direct_compute_callback_only_waits_recorded_fence():
     worker.wait_for_layer_load("model.layers.0.self_attn")
     worker.wait_for_layer_load("model.layers.0.self_attn")
     assert engine._store.waited == [fence]
+
+
+def test_worker_logs_first_direct_compute_callback(caplog):
+    class Plan:
+        failed = None
+
+        def wait_layer(self, callback, physical):
+            return object()
+
+    class Store:
+        def wait_compute_event(self, event):
+            return None
+
+    class Engine:
+        direct = True
+
+        def __init__(self):
+            self._store = Store()
+
+    worker = WorkerImpl(Engine())
+    worker._num_layers = 1
+    worker._callback_to_physical = (0,)
+    worker._load_keys = [b"j" * 16]
+    worker._read_plan = Plan()
+    worker._direct_start_load_started_ns = 1
+    with caplog.at_level("WARNING", logger="adapter.worker"):
+        worker.wait_for_layer_load("model.layers.0.self_attn")
+        worker.wait_for_layer_load("model.layers.0.self_attn")
+    messages = [
+        record.message for record in caplog.records
+        if record.message.startswith("DIRECT_FIRST_COMPUTE_CALLBACK")
+    ]
+    assert len(messages) == 1
+    assert "callback=0" in messages[0]
+    assert "since_start_ms=" in messages[0]
 
 
 def test_worker_falls_back_before_first_io_for_invalid_direct_plan():

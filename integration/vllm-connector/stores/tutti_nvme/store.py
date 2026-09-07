@@ -191,7 +191,7 @@ class TuttiDirectBackend:
             "pool_size=%d num_blocks=%d num_layers=%d block_size=%d "
             "page_bytes=%d block_stride_bytes=%d layer_stride_bytes=%d "
             "blocks_per_chunk=%d segment_bytes=%d read_stream=%s "
-            "write_stream=%s",
+            "write_stream=%s io_granularity=0",
             geometry.accel_id, geometry.pool_base, geometry.pool_size,
             geometry.num_blocks, geometry.num_layers, geometry.block_size,
             geometry.page_bytes, geometry.block_stride_bytes,
@@ -404,6 +404,7 @@ class TuttiDirectBackend:
     def _submit(self, keys, layer_idx: int, block_tables, direction: str):
         store = self._store
         geometry = self.geometry
+        started_ns = time.perf_counter_ns()
         keys = [bytes(key) for key in keys]
         block_tables = [list(table) for table in block_tables]
         if len(keys) != len(block_tables):
@@ -413,49 +414,69 @@ class TuttiDirectBackend:
             )
         if not 0 <= int(layer_idx) < geometry.num_layers:
             raise ValueError(f"direct layer {layer_idx} is out of range")
-        validated_tables = self.validate_block_tables(block_tables)
+        with nvtx_range(
+            f"tutti.direct.prepare|direction={direction}|layer={layer_idx}"
+        ):
+            validated_tables = self.validate_block_tables(block_tables)
         io_keys = [derive_io_key(key, int(layer_idx)) for key in keys]
         if direction == "write":
             store._layout.prepare_put(io_keys, store._num_chunks)
         elif any(io_key not in store._live for io_key in io_keys):
             missing = next(io_key for io_key in io_keys if io_key not in store._live)
             raise ValueError(f"direct get has non-resident key: {missing!r}")
-        target_entries = [(io_key, 0, 0) for io_key in io_keys]
-        targets = store._ensure_targets(target_entries)
-        requests = []
-        for io_key, table in zip(io_keys, validated_tables):
-            chunk_id, _ = decode_io_key(io_key)
-            target = targets[store._layout.target_uri(chunk_id)]
-            for block_ordinal, block_id in enumerate(table):
-                memory_offset = (
-                    block_id * geometry.block_stride_bytes
-                    + int(layer_idx) * geometry.layer_stride_bytes
-                )
-                target_offset = (
-                    int(layer_idx) * geometry.segment_bytes
-                    + block_ordinal * geometry.page_bytes
-                )
-                requests.append((
-                    target,
-                    target_offset,
-                    self._memory_ticket,
-                    memory_offset,
-                    geometry.page_bytes,
-                    direction,
-                ))
         with nvtx_range(
-            f"tutti.runtime.submit|op={direction}|direct=1|layer={layer_idx}"
+            f"tutti.direct.target_lookup|direction={direction}|layer={layer_idx}"
+        ):
+            target_entries = [(io_key, 0, 0) for io_key in io_keys]
+            targets = store._ensure_targets(target_entries)
+        with nvtx_range(
+            f"tutti.direct.request_build|direction={direction}|layer={layer_idx}"
+        ):
+            requests = []
+            for io_key, table in zip(io_keys, validated_tables):
+                chunk_id, _ = decode_io_key(io_key)
+                target = targets[store._layout.target_uri(chunk_id)]
+                for block_ordinal, block_id in enumerate(table):
+                    memory_offset = (
+                        block_id * geometry.block_stride_bytes
+                        + int(layer_idx) * geometry.layer_stride_bytes
+                    )
+                    target_offset = (
+                        int(layer_idx) * geometry.segment_bytes
+                        + block_ordinal * geometry.page_bytes
+                    )
+                    requests.append((
+                        target,
+                        target_offset,
+                        self._memory_ticket,
+                        memory_offset,
+                        geometry.page_bytes,
+                        direction,
+                    ))
+        submit_started_ns = time.perf_counter_ns()
+        with nvtx_range(
+            f"tutti.direct.runtime_submit|op={direction}|layer={layer_idx}"
             f"|chunks={len(keys)}|requests={len(requests)}"
         ):
             handles = store._submit_retry(requests, direction)
+        _LOG.info(
+            "DIRECT_SUBMIT_TIMING direction=%s layer=%d chunks=%d requests=%d "
+            "python_request_build_ms=%.3f runtime_submit_ms=%.3f",
+            direction, layer_idx, len(keys), len(requests),
+            (submit_started_ns - started_ns) / 1_000_000,
+            (time.perf_counter_ns() - submit_started_ns) / 1_000_000,
+        )
         settled = (
             (lambda ok: store._on_put_settled(ok, io_keys))
             if direction == "write" else (lambda _ok: None)
         )
         completion = _TuttiCompletion(
-            store._runtime, handles, settled, auto_watch=True
+            store._runtime, handles, settled, auto_watch=False
         )
         store._track_completion(completion, keys)
+        watch = getattr(store, "_watch_completion", None)
+        if callable(watch):
+            watch(completion)
         return completion
 
     def close(self) -> None:
@@ -500,6 +521,7 @@ class _TuttiCompletion:
         self._terminal_callbacks = []
         self._ready = threading.Event()
         self._watcher = None
+        self._auto_watch = bool(auto_watch)
         if auto_watch:
             self._start_watcher()
 
@@ -521,7 +543,16 @@ class _TuttiCompletion:
         if self._settled:
             assert self._batch_result is not None
             return self._batch_result
-        self._start_watcher()
+        if self._auto_watch:
+            self._start_watcher()
+        else:
+            observe = False
+            with self._terminal_lock:
+                if self._watcher is None and self._terminal is None:
+                    self._watcher = threading.current_thread()
+                    observe = True
+            if observe:
+                self._watch_runtime()
         with nvtx_range("tutti.runtime.wait"):
             if not self._ready.wait(timeout):
                 raise TimeoutError("等待 tutti IO 批超时")
@@ -799,6 +830,11 @@ class TuttiKVStore:
         self._inflight_by_chunk: dict[bytes, set[_TuttiCompletion]] = {}
         self._inflight_lock = threading.Lock()
         self._deferred_completions: list[_TuttiCompletion] = []
+        self._direct_watch_pending: set[_TuttiCompletion] = set()
+        self._direct_watch_lock = threading.Lock()
+        self._direct_watch_wakeup = threading.Event()
+        self._direct_watch_stop = threading.Event()
+        self._direct_watch_thread = None
         self._keepers: list = []  # 持有 ctypes 视图防 GC
         self._next_buffer_id = 0
         self._accel_id = -1
@@ -892,6 +928,8 @@ class TuttiKVStore:
     def open(self) -> None:
         if self._opened:
             raise RuntimeError("tutti store 已 open")
+        self._direct_watch_stop.clear()
+        self._direct_watch_wakeup.clear()
         if self._runtime is None:
             if self._preset is not None:
                 self._runtime = _build_runtime(self._preset)
@@ -1053,6 +1091,13 @@ class TuttiKVStore:
         finally:
             self._opened = False
         self._live = set()
+        self._direct_watch_stop.set()
+        self._direct_watch_wakeup.set()
+        watcher = self._direct_watch_thread
+        if watcher is not None and watcher is not threading.current_thread():
+            watcher.join()
+        self._direct_watch_thread = None
+        self._direct_watch_pending.clear()
         self._buffers = {}
         self._mem_cache = {}
         self._targets = {}
@@ -1253,7 +1298,7 @@ class TuttiKVStore:
             return None
         import torch
 
-        stream = torch.cuda.current_stream(device=self._stream_accel_id)
+        stream = torch.cuda.current_stream()
         if event is None:
             event = torch.cuda.Event()
         event.record(stream)
@@ -1265,7 +1310,7 @@ class TuttiKVStore:
             return
         import torch
 
-        torch.cuda.current_stream(device=self._stream_accel_id).wait_event(event)
+        torch.cuda.current_stream().wait_event(event)
 
     def read_copy_stream_handle(self) -> int:
         """Return the controlled stream handle used for scatter release fences."""
@@ -1482,6 +1527,34 @@ class TuttiKVStore:
                         self._inflight_by_chunk.pop(chunk_id, None)
 
         completion.add_done_callback(done)
+
+    def _watch_completion(self, completion) -> None:
+        """Observe direct completions through one store-owned worker."""
+        with self._direct_watch_lock:
+            self._direct_watch_pending.add(completion)
+            if self._direct_watch_thread is None:
+                self._direct_watch_thread = threading.Thread(
+                    target=self._watch_direct_completions,
+                    name="tutti-direct-completion-observer",
+                    daemon=True,
+                )
+                self._direct_watch_thread.start()
+        self._direct_watch_wakeup.set()
+
+    def _watch_direct_completions(self) -> None:
+        while not self._direct_watch_stop.is_set():
+            self._direct_watch_wakeup.wait(0.05)
+            self._direct_watch_wakeup.clear()
+            with self._direct_watch_lock:
+                pending = tuple(self._direct_watch_pending)
+            for completion in pending:
+                try:
+                    completion.wait_result()
+                except Exception as exc:
+                    _LOG.error("direct completion observation failed: %s", exc)
+                finally:
+                    with self._direct_watch_lock:
+                        self._direct_watch_pending.discard(completion)
 
     def _wait_chunk_io(self, chunk_ids) -> None:
         with self._inflight_lock:

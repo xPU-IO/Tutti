@@ -20,9 +20,8 @@ fail-fast 的边界，以及后续优化不可破坏的契约。历史设想只�
   direct write stream 等当前层 compute event 后提交 I/O。
 - staging 保留为布局、对齐、padding 或 backend capability 不满足时的兜底路径；
   仅兜底路径分配不同的 read/write staging bank 并执行 scatter/gather。
-- direct read 使用 layer callback 交错 enqueue：`start_load_kv` 只提交第 0 层，
-  layer L 的 compute 已 enqueue 后再提交 read L+1。staged fallback 维持有限
-  `lookahead_k`。两者都要形成：
+- direct read 在 `start_load_kv` 只提交 layer 0，首层 compute wait 入队后由 host feeder
+  连续提交后续层；staged fallback 维持有限 `lookahead_k`。两者都要形成：
 
 ```text
 read/transfer[L+1] || compute[L] || write[L-1]
@@ -419,7 +418,7 @@ for layer L:
 
   save_kv_layer(L)
     record compute fence_event[L]
-    direct: submit read layer L+1 and record its fence, if any
+    direct: read feeder submits subsequent layers asynchronously; save path does not submit read
     direct: write stream waits fence_event[L] -> submit KV page writes
     staged: gather paged KV -> gather event -> write stream waits -> submit writes
 
@@ -446,10 +445,9 @@ staged host gate:
 ```
 
 `fence_event[L]` 只建立 GPU 可见性和 stream 顺序，不表示 NVMe success。direct 中
-每个 `(block_id, layer_id)` 都是独立 KV page，不存在 staging 槽覆盖或复用。为了
-避免全层 Python submit 阻塞首个 compute enqueue，`start_load_kv` 只提交 read 0；
-after-layer callback 执行时 compute L 已 enqueue，再提交 read L+1。这样 read L+1
-的 host preparation/I/O 才能与 compute L overlap。direct read 的 structured failure
+每个 `(block_id, layer_id)` 都是独立 KV page，不存在 staging 槽覆盖或复用。为保持
+read stream 连续执行，`start_load_kv` 在一次 host 调用中提交 read 0..N-1，随后
+compute callback 只等待自己的 read-ready event，不再补交 read。direct read 的 structured failure
 由 completion watcher异步收集，不作为逐层host gate。完整证据和状态机见
 `doc/Tutticonnector/README.md`。失败后：
 
@@ -859,8 +857,8 @@ block table 直接生成 byte-range I/O；仅不满足 5.1 准入条件时走现
 | local/striped双stream routing | 已实现 |
 | 独立read-copy stream与scatter event桥接 | 已实现并通过真实Hy3/Nsight准入 |
 | staged read plan 全量 pre-enqueue（K=2 future-event fences） | 已回退；生产路径为 host-window submit，禁止 future wait |
-| direct rolling read orchestration | 已实现start-R0/after-layer-Rnext，合同测试通过；待真机Nsight准入 |
-| 实际 read/compute GPU interval overlap | staged 当前实测为0；direct rolling实现后重新验收 |
+| direct host read feeder orchestration | 已实现R0同步 + R1..R(N-1) feeder，合同测试通过；待稳定性准入 |
+| 实际 read/compute GPU interval overlap | feeder版本部分通过；GPU间隔与rank一致性仍待优化 |
 | host-pinned prebuilt PRP | 已实现并真机命中 |
 | structured completion | 已实现 |
 | partial-commit正确drain/retry | 已实现 |
@@ -929,8 +927,8 @@ block table 直接生成 byte-range I/O；仅不满足 5.1 准入条件时走现
 
 1. 提交已经完成的 single-group cross-layer direct backend、memory unregister、
    `2*num_layers` capacity 和 staged fallback 基线。
-2. 已按 `doc/Tutticonnector/README.md` 把 direct read 改为start-R0、
-   after-layer-Rnext，保留per-layer event与整请求recompute，未修改Runtime/DataPath。
+2. 已按 `doc/Tutticonnector/README.md` 把 direct read 改为R0同步 + host feeder
+   R1..R(N-1)，保留per-layer event与整请求recompute，未修改Runtime/DataPath。
 3. 已用小规模合成测试验证精确enqueue顺序；下一步用真实Hy3 TP4比较block size
    64/128/256 和 Nsight timeline。
 4. 若且仅若真实 KV pool 基址不能满足 64 KiB 注册约束，再评审“aligned containing

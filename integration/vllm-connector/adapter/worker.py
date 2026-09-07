@@ -443,6 +443,8 @@ class WorkerImpl:
         self._load_waited_callbacks: set[int] = set()
         self._compat_prefetch_active = False
         self._legacy_eager_active = False
+        self._direct_start_load_started_ns = None
+        self._direct_first_callback_logged = False
         self._pinned = False
         self._load_failed = False
         self._load_error_blocks: set[int] = set()
@@ -544,13 +546,16 @@ class WorkerImpl:
     # ---- 读取编排 ----
 
     def start_load_kv(self, forward_context=None, **kwargs) -> None:
-        """组读取批并预取第 0 层。
+        """组读取批并在 direct 模式连续预提交全部物理层。
 
         加载区间 = [load_start_token, load_start_token + load_tokens)：
         vLLM 本地前缀命中的 token 已计入请求 computed，connector 只
         补其后区间——起点非 chunk 边界时首个不完整 chunk 让渡
         （重算兜底），key 与块表按同一 chunk 区间切片。
         """
+        started_ns = time.perf_counter_ns()
+        self._direct_start_load_started_ns = started_ns
+        self._direct_first_callback_logged = False
         self._ensure_bound()
         self._finalize_load_state()
         self._load_failed = False
@@ -625,7 +630,8 @@ class WorkerImpl:
                     if (getattr(self._engine, "read_plan_supported", False)
                             and callable(getattr(
                                 self._engine, "start_read_plan", None))):
-                        depth = 1 if getattr(self._engine, "direct", False) else max(
+                        direct = bool(getattr(self._engine, "direct", False))
+                        depth = 1 if direct else max(
                             1,
                             self._read_window.num_slots
                             // max(1, self._max_chunks_per_wave),
@@ -663,12 +669,31 @@ class WorkerImpl:
                     self._mark_load_failure()
                     self._abort_step()
                     raise
+        if bool(getattr(self._engine, "direct", False)):
+            _LOG.warning(
+                "DIRECT_START_LOAD_RETURN total_ms=%.3f",
+                (time.perf_counter_ns() - started_ns) / 1_000_000,
+            )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """在 compute stream 等待本层 direct-read 或 staged-scatter fence。"""
         callback, idx = self._resolve_callback(layer_name)
         self._diag_callback("wait", layer_name, callback, idx)
         direct = bool(getattr(self._engine, "direct", False))
+        if direct and callback == 0 and not self._direct_first_callback_logged:
+            self._direct_first_callback_logged = True
+            started_ns = self._direct_start_load_started_ns
+            callback_ns = time.perf_counter_ns()
+            elapsed_ms = (
+                (callback_ns - started_ns) / 1_000_000
+                if started_ns is not None else None
+            )
+            _LOG.warning(
+                "DIRECT_FIRST_COMPUTE_CALLBACK callback=0 physical=%d "
+                "t_ns=%d since_start_ms=%s",
+                idx, callback_ns,
+                f"{elapsed_ms:.3f}" if elapsed_ms is not None else "unknown",
+            )
         if callback in self._load_waited_callbacks:
             return
         if self._load_failed and not direct:
@@ -715,6 +740,11 @@ class WorkerImpl:
                         "read plan compute event bridge is unavailable"
                     )
                 wait_compute(fence_event)
+                kick_feeder = getattr(self._read_plan, "kick_feeder", None)
+                if direct and callable(kick_feeder) and callback == 0:
+                    # The callback only queues the compute dependency; the
+                    # feeder performs subsequent Runtime submits independently.
+                    kick_feeder()
                 self._load_waited_callbacks.add(callback)
             except LoadGateError as exc:
                 self._mark_load_failure(exc)
@@ -769,19 +799,6 @@ class WorkerImpl:
         self._ensure_bound()
         callback, idx = self._resolve_callback(layer_name)
         self._diag_callback("save", layer_name, callback, idx)
-        if direct and self._read_plan is not None:
-            advance = getattr(self._read_plan, "after_layer", None)
-            if callable(advance):
-                try:
-                    advance(callback, idx)
-                except Exception as exc:
-                    self._mark_load_failure(exc)
-                    _LOG.error(
-                        "direct rolling advance failed closed generation=%d "
-                        "callback=%d physical=%d: %s",
-                        self._load_generation, callback, idx, exc,
-                    )
-                    return
         if self._load_failed:
             return
         if callback in self._save_seen_callbacks:
@@ -856,9 +873,9 @@ class WorkerImpl:
         """等待全部写入完成并结算。"""
         first_error = self._save_error
         drained = False
-        # Direct reads由start_load和after-layer callbacks滚动提交；staged
-        # reads/scatter由start_load计划提交。先drain再做TP failure consensus，
-        # 避免把尚未观察到的runtime/CQ错误误判成成功加载。
+        # Direct reads are fully pre-enqueued by start_load; staged
+        # reads/scatter follow their existing plan.  Drain before TP failure
+        # consensus so runtime/CQ errors cannot be mistaken for success.
         if self._load_keys:
             require_complete = getattr(
                 self._read_plan, "require_complete", None

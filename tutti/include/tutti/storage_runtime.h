@@ -1470,8 +1470,10 @@ private:
         return Status::Ok();
     }
 
-    Result<DataPathMemory> registration_for_(MemoryEntry& memory,
-                                              const TargetEntry& target) {
+    Result<DataPathMemory> registration_for_(
+        MemoryEntry& memory,
+        const TargetEntry& target,
+        std::int32_t data_path_accel_id) {
         for (const auto& registration : memory.data_path_registrations) {
             if (registration.data_path == target.data_path &&
                 registration.domain == target.registration_domain) {
@@ -1486,12 +1488,16 @@ private:
             : DataPathMemoryKind::HOST;
         DataPathMemoryView view{memory.address, memory.size, memory.accel_id,
                                 kind, memory.io_granularity};
-        auto registration = call_data_path_result_<DataPathMemory>(
-            *target.data_path,
-            [&] {
-                return target.data_path->register_memory(
-                    view, target.registration_domain);
-            });
+        DeviceGuard guard(data_path_accel_id);
+        if (!guard.ok()) {
+            return Result<DataPathMemory>::Failure(guard.status());
+        }
+        auto registration = target.data_path->register_memory(
+            view, target.registration_domain);
+        Status restored = guard.restore();
+        if (!restored.ok()) {
+            return Result<DataPathMemory>::Failure(std::move(restored));
+        }
         if (!registration.ok()) {
             return Result<DataPathMemory>::Failure(registration.status());
         }
@@ -1563,15 +1569,10 @@ private:
 #endif
     }
 
-    Status validate_component_request_(const IoRequest& request,
-                                       const TargetEntry& target,
-                                       const MemoryEntry& memory,
-                                       const HostSubmitContext& context) const {
-        const DataPathCapabilities& caps = target.data_path->capabilities();
-        // HOST_EXECUTION has no accelerator ownership.  Preserve the
-        // historical host contract where callers may leave a legacy ordinal
-        // in this field; it is ignored when this Runtime itself is host-only.
-        // Accelerator Runtimes still reject an explicit mismatching ordinal.
+    Status validate_submit_context_(const HostSubmitContext& context) const {
+        // These fields are invariant across every request in one submit.
+        // Validate them once so a wide byte-range batch does not issue one
+        // cudaStreamGetDevice call per request.
         if (context.accel_id >= 0 && config_.accel_id >= 0 &&
             context.accel_id != config_.accel_id) {
             return Status(StatusCode::INVALID_ARGUMENT,
@@ -1582,51 +1583,60 @@ private:
             return Status(StatusCode::INVALID_ARGUMENT,
                           "submit accelerator does not match Runtime");
         }
+        if (context.execution_domain != ExecutionDomain::DEVICE_EXECUTION) {
+            return Status::Ok();
+        }
+        const std::int32_t effective_accel_id = context.accel_id >= 0
+            ? context.accel_id : config_.accel_id;
+        if (config_.accel_id < 0 || effective_accel_id != config_.accel_id) {
+            return Status(StatusCode::INVALID_ARGUMENT,
+                          "submit accelerator does not match Runtime");
+        }
+        if (context.stream == nullptr) {
+            return Status(StatusCode::INVALID_ARGUMENT,
+                          "DEVICE_EXECUTION requires a non-null stream");
+        }
+#if defined(TUTTI_USE_CUDA)
+        int stream_accel_id = -1;
+        const cudaError_t stream_error =
+            cudaStreamGetDevice(context.stream, &stream_accel_id);
+        if (stream_error != cudaSuccess) {
+            return Status(StatusCode::DEVICE_ERROR,
+                          "stream accelerator ownership query failed: " +
+                          std::string(cudaGetErrorString(stream_error)));
+        }
+        if (stream_accel_id != config_.accel_id) {
+            return Status(StatusCode::INVALID_ARGUMENT,
+                          "stream belongs to a different Runtime accelerator");
+        }
+#endif
+        return Status::Ok();
+    }
+
+    Status validate_data_path_context_(
+        const DataPathCapabilities& caps,
+        const HostSubmitContext& context) const {
         if (context.execution_domain == ExecutionDomain::HOST_EXECUTION &&
             !caps.supports_host_execution) {
             return Status(StatusCode::UNSUPPORTED,
                           "DataPath does not support HOST_EXECUTION");
         }
-        if (context.execution_domain == ExecutionDomain::DEVICE_EXECUTION) {
-            const std::int32_t effective_accel_id = context.accel_id >= 0
-                ? context.accel_id : config_.accel_id;
-            if (config_.accel_id < 0 || effective_accel_id != config_.accel_id) {
-                return Status(StatusCode::INVALID_ARGUMENT,
-                              "submit accelerator does not match Runtime");
-            }
-            if (memory.kind == MemoryKind::DEVICE ||
-                memory.kind == MemoryKind::MANAGED) {
-                if (memory.accel_id >= 0 && memory.accel_id != config_.accel_id) {
-                    return Status(StatusCode::INVALID_ARGUMENT,
-                                  "device memory accelerator does not match Runtime");
-                }
-            }
-            if (!caps.supports_device_execution) {
-                return Status(StatusCode::UNSUPPORTED,
-                              "DataPath does not support DEVICE_EXECUTION");
-            }
-            if (context.stream == nullptr) {
-                return Status(StatusCode::INVALID_ARGUMENT,
-                              "DEVICE_EXECUTION requires a non-null stream");
-            }
-#if defined(TUTTI_USE_CUDA)
-            int stream_accel_id = -1;
-            const cudaError_t stream_error =
-                cudaStreamGetDevice(context.stream, &stream_accel_id);
-            if (stream_error != cudaSuccess) {
-                return Status(StatusCode::DEVICE_ERROR,
-                              "stream accelerator ownership query failed: " +
-                              std::string(cudaGetErrorString(stream_error)));
-            }
-            if (stream_accel_id != config_.accel_id) {
-                return Status(StatusCode::INVALID_ARGUMENT,
-                              "stream belongs to a different Runtime accelerator");
-            }
-#else
-            // MUSA/MACA shims currently have no portable stream-owner query;
-            // callers must create/pass the stream on the Runtime accelerator.
-            // Pointer ownership remains fail-closed where the shim exposes it.
-#endif
+        if (context.execution_domain == ExecutionDomain::DEVICE_EXECUTION &&
+            !caps.supports_device_execution) {
+            return Status(StatusCode::UNSUPPORTED,
+                          "DataPath does not support DEVICE_EXECUTION");
+        }
+        return Status::Ok();
+    }
+
+    Status validate_component_memory_(
+        const MemoryEntry& memory,
+        const DataPathCapabilities& caps) const {
+        if ((memory.kind == MemoryKind::DEVICE ||
+             memory.kind == MemoryKind::MANAGED) &&
+            memory.accel_id >= 0 && memory.accel_id != config_.accel_id) {
+            return Status(StatusCode::INVALID_ARGUMENT,
+                          "device memory accelerator does not match Runtime");
         }
         Status pointer_status = validate_pointer_accel_(
             memory.address, memory.kind, memory.accel_id);
@@ -1638,6 +1648,12 @@ private:
             return Status(StatusCode::UNSUPPORTED,
                           "DataPath does not support the request memory kind");
         }
+        return Status::Ok();
+    }
+
+    Status validate_component_request_(
+        const IoRequest& request,
+        const DataPathCapabilities& caps) const {
         if ((request.direction == IoDirection::READ && !caps.supports_read) ||
             (request.direction == IoDirection::WRITE && !caps.supports_write)) {
             return Status(StatusCode::UNSUPPORTED,
@@ -1686,6 +1702,11 @@ private:
             reject_all(Status(StatusCode::INVALID_ARGUMENT, "null requests"));
             return outcome;
         }
+        Status context_status = validate_submit_context_(context);
+        if (!context_status.ok()) {
+            reject_all(std::move(context_status));
+            return outcome;
+        }
         if (terminal_result_count_ >= config_.max_terminal_results) {
             reject_all(Status(StatusCode::RESOURCE_EXHAUSTED,
                               "terminal result limit reached"));
@@ -1698,10 +1719,23 @@ private:
         // target). See spi/data_path.h for the SPI contract.
         struct PendingGroup {
             DataPath* data_path = nullptr;
+            std::int32_t data_path_accel_id = -1;
             std::vector<std::size_t> indices;
             std::vector<DataPathRequest> requests;
         };
         std::vector<PendingGroup> groups;
+        struct DataPathValidation {
+            DataPath* data_path = nullptr;
+            const DataPathCapabilities* capabilities = nullptr;
+            Status status;
+        };
+        struct MemoryValidation {
+            DataPath* data_path = nullptr;
+            std::uint32_t memory_slot = 0;
+            Status status;
+        };
+        std::vector<DataPathValidation> data_path_validations;
+        std::vector<MemoryValidation> memory_validations;
         Status first_rejection(StatusCode::INVALID_ARGUMENT,
                                "all requests rejected");
         bool have_rejection = false;
@@ -1729,12 +1763,53 @@ private:
                                          "target has no DataPath"));
                 continue;
             }
-            status = validate_component_request_(request, target, memory, context);
+            auto data_path_validation = std::find_if(
+                data_path_validations.begin(), data_path_validations.end(),
+                [&](const DataPathValidation& cached) {
+                    return cached.data_path == target.data_path;
+            });
+            if (data_path_validation == data_path_validations.end()) {
+                const DataPathCapabilities& capabilities =
+                    target.data_path->capabilities();
+                data_path_validations.push_back(DataPathValidation{
+                    target.data_path,
+                    &capabilities,
+                    validate_data_path_context_(capabilities, context)});
+                data_path_validation = std::prev(data_path_validations.end());
+            }
+            if (!data_path_validation->status.ok()) {
+                reject_one(index, data_path_validation->status);
+                continue;
+            }
+            auto memory_validation = std::find_if(
+                memory_validations.begin(), memory_validations.end(),
+                [&](const MemoryValidation& cached) {
+                    return cached.data_path == target.data_path &&
+                           cached.memory_slot == request.memory.slot_;
+                });
+            if (memory_validation == memory_validations.end()) {
+                memory_validations.push_back(MemoryValidation{
+                    target.data_path, request.memory.slot_,
+                    validate_component_memory_(
+                        memory, *data_path_validation->capabilities)});
+                memory_validation = std::prev(memory_validations.end());
+            }
+            if (!memory_validation->status.ok()) {
+                reject_one(index, memory_validation->status);
+                continue;
+            }
+            status = validate_component_request_(
+                request, *data_path_validation->capabilities);
             if (!status.ok()) {
                 reject_one(index, std::move(status));
                 continue;
             }
-            auto registration = registration_for_(memory, target);
+            const std::int32_t data_path_accel_id =
+                data_path_validation->capabilities->bound_accel_id >= 0
+                ? data_path_validation->capabilities->bound_accel_id
+                : config_.accel_id;
+            auto registration = registration_for_(
+                memory, target, data_path_accel_id);
             if (!registration.ok()) {
                 reject_one(index, registration.status());
                 continue;
@@ -1751,6 +1826,7 @@ private:
                 groups.push_back(PendingGroup{});
                 group = &groups.back();
                 group->data_path = target.data_path;
+                group->data_path_accel_id = data_path_accel_id;
             }
             group->indices.push_back(index);
             group->requests.push_back(DataPathRequest{
@@ -1819,7 +1895,7 @@ private:
             SubmitOutcome submitted;
             Status guard_status = Status::Ok();
             {
-                DeviceGuard guard(data_path_accel_id_(*group.data_path));
+                DeviceGuard guard(group.data_path_accel_id);
                 if (!guard.ok()) {
                     guard_status = guard.status();
                 } else if (gate_ptr) {
@@ -2413,6 +2489,7 @@ struct StorageRuntimeTestAccess {
                                              std::move(io_status),
                                              std::move(detail));
     }
+
 };
 
 } // namespace testing

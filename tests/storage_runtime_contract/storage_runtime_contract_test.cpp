@@ -88,6 +88,16 @@ public:
 // RuntimeFakeDataPath, we provide a type alias.
 using RuntimeFakeDataPath = tutti::testing::MockDataPath;
 
+class CountingCapabilitiesDataPath : public RuntimeFakeDataPath {
+public:
+    const tutti::DataPathCapabilities& capabilities() const override {
+        ++capabilities_calls;
+        return caps;
+    }
+
+    mutable std::uint64_t capabilities_calls = 0;
+};
+
 // =====================================================================
 // Helpers
 // =====================================================================
@@ -1001,7 +1011,7 @@ static int test_component_runtime_unknown_scheme() {
 // IoHandle.
 static int test_component_runtime_groups_by_datapath() {
     RuntimeFakeResolver resolver;
-    RuntimeFakeDataPath data_path;
+    CountingCapabilitiesDataPath data_path;
     tutti::RuntimeComponents components;
     components.resolvers.push_back({"fake", &resolver});
     components.data_paths.push_back(
@@ -1022,8 +1032,10 @@ static int test_component_runtime_groups_by_datapath() {
     };
     const tutti::HostSubmitContext context{
         tutti::ExecutionDomain::HOST_EXECUTION, -1, nullptr};
+    const std::uint64_t capabilities_before = data_path.capabilities_calls;
     auto submitted = runtime->submit(requests, 2, context);
     if (!submitted.status.ok() || !submitted.io.has_value()) return 1;
+    if (data_path.capabilities_calls - capabilities_before != 1) return 1;
     if (data_path.submit_calls != 1 || data_path.register_calls != 1) return 1;
     if (data_path.last_requests.size() != 2) return 1;
 

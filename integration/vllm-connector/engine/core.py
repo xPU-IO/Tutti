@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 import logging
 import os
+import threading
 import time
 from typing import Sequence
 
@@ -329,8 +330,14 @@ class _ReadPlan:
                 pass
 
 
-class _DirectRollingReadPlan:
-    """Direct-only start-R0/after-layer-Rnext host submission state machine."""
+class _DirectAllLayerReadPlan:
+    """Direct-only all-layer read plan.
+
+    Layer zero is submitted synchronously so ``start_load_kv`` can return
+    without waiting for the complete plan. Remaining layers are submitted by
+    an independent host feeder after the first callback has queued its compute
+    wait. The callback never invokes Runtime I/O itself.
+    """
 
     def __init__(self, engine, keys, block_tables, physical_layers,
                  on_failure=None):
@@ -345,9 +352,25 @@ class _DirectRollingReadPlan:
         self.advanced_callbacks = set()
         self.terminal_failure = None
         self.on_failure = on_failure
+        self._layer_submit_ms = {}
+        self._layer_submit_completed_ns = {}
+        self._submit_all_total_ms = 0.0
+        self._first_read_submit_completed_ns = None
+        self._state_lock = threading.RLock()
+        self._feeder_kick = threading.Event()
+        self._feeder_stop = threading.Event()
+        self._feeder_done = threading.Event()
+        self._feeder_thread = None
         if not self.physical_layers:
-            raise ValueError("direct rolling read plan requires at least one layer")
+            raise ValueError("direct all-layer read plan requires at least one layer")
         self._submit_layer(0)
+        if self.layer_count > 1:
+            self._feeder_thread = threading.Thread(
+                target=self._run_feeder,
+                name="tutti-direct-read-feeder",
+                daemon=True,
+            )
+            self._feeder_thread.start()
 
     @property
     def layer_count(self):
@@ -383,6 +406,7 @@ class _DirectRollingReadPlan:
         return event
 
     def after_layer(self, callback, physical=None) -> None:
+        """Validate a legacy after-layer notification without submitting I/O."""
         self._validate_callback(callback, physical)
         if callback in self.advanced_callbacks:
             return
@@ -394,58 +418,51 @@ class _DirectRollingReadPlan:
             )
             self._record_failure(error)
             raise error
-        if callback not in self.waited_callbacks:
-            error = RuntimeError(
-                f"direct after-layer callback {callback} occurred before its "
-                "compute wait"
-            )
-            self._record_failure(error)
-            raise error
         self.advanced_callbacks.add(callback)
-        next_callback = callback + 1
-        if next_callback < self.layer_count:
-            if self.next_read_to_submit != next_callback:
-                error = RuntimeError(
-                    "direct rolling read state mismatch: "
-                    f"next={self.next_read_to_submit}, "
-                    f"after_callback={callback}"
-                )
-                self._record_failure(error)
-                raise error
-            self._submit_layer(next_callback)
 
     def require_complete(self) -> None:
+        self._feeder_kick.set()
+        self.join_feeder()
         expected = set(range(self.layer_count))
         missing_waits = tuple(sorted(expected - self.waited_callbacks))
-        missing_advances = tuple(sorted(expected - self.advanced_callbacks))
-        if (self.next_read_to_submit != self.layer_count
-                or missing_waits or missing_advances):
+        if self.next_read_to_submit != self.layer_count or missing_waits:
             error = RuntimeError(
-                "incomplete direct rolling callbacks: "
+                "incomplete direct all-layer callbacks: "
                 f"next_read={self.next_read_to_submit}, "
-                f"missing_waits={missing_waits}, "
-                f"missing_after_layers={missing_advances}"
+                f"missing_waits={missing_waits}"
             )
             self._record_failure(error)
             raise error
 
-    def _submit_layer(self, callback) -> None:
-        self._validate_callback(callback, self.physical_layers[callback])
-        if callback in self.handles:
-            return
+    def _submit_layer(self, callback: int) -> None:
         physical = self.physical_layers[callback]
+        with self._state_lock:
+            if callback in self.handles or self._feeder_stop.is_set():
+                return
         fence_event = self._new_fence_event()
+        layer_started_ns = time.perf_counter_ns()
         try:
-            handle = self.engine.load_layer(
-                self.keys,
-                physical,
-                self.block_tables,
-                fence_event=fence_event,
-                bridge_compute=False,
-            )
+            with self._state_lock:
+                if callback in self.handles or self._feeder_stop.is_set():
+                    return
+                submit_lock = getattr(
+                    self.engine, "_direct_submit_lock", self._state_lock
+                )
+                with submit_lock:
+                    handle = self.engine.load_layer(
+                        self.keys,
+                        physical,
+                        self.block_tables,
+                        fence_event=fence_event,
+                        bridge_compute=False,
+                    )
         except Exception as exc:
             self._record_failure(exc)
-            raise
+            self._feeder_stop.set()
+            if callback == 0:
+                self._abort_submitted()
+                raise
+            return
         if fence_event is None:
             fence_event = getattr(handle, "fence_event", None)
         if fence_event is None:
@@ -453,15 +470,70 @@ class _DirectRollingReadPlan:
                 f"direct read layer {callback} did not record a ready event"
             )
             self._record_failure(error)
-            raise error
-        self.handles[callback] = handle
-        self.read_ready_events[callback] = fence_event
-        self.next_read_to_submit = callback + 1
+            self._feeder_stop.set()
+            if callback == 0:
+                self._abort_submitted()
+                raise error
+            return
+        completed_ns = time.perf_counter_ns()
+        elapsed_ms = (completed_ns - layer_started_ns) / 1_000_000
+        with self._state_lock:
+            self.handles[callback] = handle
+            self.read_ready_events[callback] = fence_event
+            self.next_read_to_submit = max(
+                self.next_read_to_submit, callback + 1
+            )
+            self._layer_submit_ms[callback] = elapsed_ms
+            self._layer_submit_completed_ns[callback] = completed_ns
+            if callback == 0:
+                self._first_read_submit_completed_ns = completed_ns
+        _LOG.warning(
+            "DIRECT_READ_LAYER_SUBMIT layer=%d physical=%d "
+            "elapsed_ms=%.3f completed_ns=%d",
+            callback, physical, elapsed_ms, completed_ns,
+        )
         add_terminal = getattr(handle, "add_terminal_callback", None)
         if not callable(add_terminal):
             add_terminal = getattr(handle, "add_done_callback", None)
         if callable(add_terminal):
             add_terminal(self._on_completion)
+
+    def _run_feeder(self) -> None:
+        try:
+            self._feeder_kick.wait()
+            started_ns = time.perf_counter_ns()
+            for callback in range(1, self.layer_count):
+                if self._feeder_stop.is_set() or self.terminal_failure is not None:
+                    break
+                self._submit_layer(callback)
+        except Exception as exc:
+            self._record_failure(exc)
+            self._feeder_stop.set()
+        finally:
+            started_ns = locals().get("started_ns", time.perf_counter_ns())
+            self._submit_all_total_ms = (
+                time.perf_counter_ns() - started_ns
+            ) / 1_000_000
+            max_layer_ms = max(self._layer_submit_ms.values(), default=0.0)
+            _LOG.warning(
+                "DIRECT_READ_PLAN_READY layers=%d total_ms=%.3f "
+                "max_layer_ms=%.3f first_read_submit_completed_ns=%s",
+                self.layer_count,
+                self._submit_all_total_ms,
+                max_layer_ms,
+                self._first_read_submit_completed_ns,
+            )
+            self._feeder_done.set()
+
+    def kick_feeder(self) -> None:
+        """Release the feeder after the first compute dependency is queued."""
+        self._feeder_kick.set()
+
+    def join_feeder(self) -> None:
+        thread = self._feeder_thread
+        if thread is None or thread is threading.current_thread():
+            return
+        thread.join()
 
     def _on_completion(self, result) -> None:
         if getattr(result, "ok", True) or self.terminal_failure is not None:
@@ -508,6 +580,12 @@ class _DirectRollingReadPlan:
         return factory() if callable(factory) else None
 
     def abort(self):
+        self._feeder_stop.set()
+        self._feeder_kick.set()
+        self.join_feeder()
+        self._abort_submitted()
+
+    def _abort_submitted(self):
         for handle in self.handles.values():
             try:
                 abort = getattr(handle, "abort", None)
@@ -915,6 +993,8 @@ class KVEngine:
         self._inflight: list = []
         self._planned_store_keys: set[bytes] = set()
         self._write_reuse_event = None
+        self._direct_submit_lock = threading.RLock()
+        self._active_read_plan = None
 
     @property
     def max_in_flight_operations(self) -> int:
@@ -1218,19 +1298,30 @@ class KVEngine:
         """
         keys = self._prepare_layer_call(keys, layer_idx)
         if isinstance(self._transfer, DirectTransfer):
-            completion = self._transfer.load_layer(
-                keys, layer_idx, dst_first_blocks
-            )
-            record_read = getattr(self._store, "record_read_event", None)
-            if fence_event is not None and not callable(record_read):
-                raise RuntimeError("direct read event recorder is unavailable")
-            if callable(record_read):
-                recorded = record_read(fence_event)
-                if fence_event is not None and recorded is None:
-                    raise RuntimeError("direct read fence was not recorded")
-                completion.fence_event = recorded
-            self._inflight.append(completion)
-            return completion
+            direct_lock = getattr(self, "_direct_submit_lock", None)
+            with (direct_lock if direct_lock is not None else nullcontext()):
+                completion = self._transfer.load_layer(
+                    keys, layer_idx, dst_first_blocks
+                )
+                record_read = getattr(self._store, "record_read_event", None)
+                if fence_event is not None and not callable(record_read):
+                    raise RuntimeError("direct read event recorder is unavailable")
+                if callable(record_read):
+                    fence_started_ns = time.perf_counter_ns()
+                    with nvtx_range(
+                        f"tutti.direct.record_fence|direction=read|layer={layer_idx}"
+                    ):
+                        recorded = record_read(fence_event)
+                    _LOG.info(
+                        "DIRECT_EVENT_RECORD direction=read layer=%d elapsed_ms=%.3f",
+                        layer_idx,
+                        (time.perf_counter_ns() - fence_started_ns) / 1_000_000,
+                    )
+                    if fence_event is not None and recorded is None:
+                        raise RuntimeError("direct read fence was not recorded")
+                    completion.fence_event = recorded
+                self._inflight.append(completion)
+                return completion
         handles = []
         reuse_fence = reuse_event
         for start in range(0, len(keys), self._max_chunks_per_wave):
@@ -1341,9 +1432,11 @@ class KVEngine:
         if not self.read_plan_supported:
             raise RuntimeError("read CUDA event bridge unavailable")
         if self.direct:
-            return _DirectRollingReadPlan(
+            plan = _DirectAllLayerReadPlan(
                 self, keys, block_tables, physical_layers, on_failure
             )
+            self._active_read_plan = plan
+            return plan
         return _ReadPlan(
             self, keys, block_tables, physical_layers, depth, on_failure
         )
@@ -1356,25 +1449,36 @@ class KVEngine:
         """
         keys = self._prepare_layer_call(keys, layer_idx)
         if isinstance(self._transfer, DirectTransfer):
-            record_compute = getattr(self._store, "record_compute_event", None)
-            wait_write = getattr(self._store, "wait_write_event", None)
-            if not callable(record_compute) and not callable(wait_write):
+            direct_lock = getattr(self, "_direct_submit_lock", None)
+            with (direct_lock if direct_lock is not None else nullcontext()):
+                record_compute = getattr(self._store, "record_compute_event", None)
+                wait_write = getattr(self._store, "wait_write_event", None)
+                if not callable(record_compute) and not callable(wait_write):
+                    completion = self._transfer.store_layer(
+                        keys, layer_idx, src_first_blocks
+                    )
+                    self._inflight.append(completion)
+                    return completion
+                if not callable(record_compute) or not callable(wait_write):
+                    raise RuntimeError("direct compute-to-write event bridge unavailable")
+                fence_started_ns = time.perf_counter_ns()
+                with nvtx_range(
+                    f"tutti.direct.record_fence|direction=write|layer={layer_idx}"
+                ):
+                    compute_done = record_compute()
+                _LOG.info(
+                    "DIRECT_EVENT_RECORD direction=write layer=%d elapsed_ms=%.3f",
+                    layer_idx,
+                    (time.perf_counter_ns() - fence_started_ns) / 1_000_000,
+                )
+                if compute_done is None:
+                    raise RuntimeError("direct compute fence was not recorded")
+                wait_write(compute_done)
                 completion = self._transfer.store_layer(
                     keys, layer_idx, src_first_blocks
                 )
                 self._inflight.append(completion)
                 return completion
-            if not callable(record_compute) or not callable(wait_write):
-                raise RuntimeError("direct compute-to-write event bridge unavailable")
-            compute_done = record_compute()
-            if compute_done is None:
-                raise RuntimeError("direct compute fence was not recorded")
-            wait_write(compute_done)
-            completion = self._transfer.store_layer(
-                keys, layer_idx, src_first_blocks
-            )
-            self._inflight.append(completion)
-            return completion
         handles = []
         reuse_event = self._write_reuse_event
         for start in range(0, len(keys), self._max_chunks_per_wave):
@@ -1461,6 +1565,10 @@ class KVEngine:
 
     def wait_idle(self) -> None:
         """等待全部在途批次并 drain read/write 两个 bank。"""
+        active_plan = getattr(self, "_active_read_plan", None)
+        if active_plan is not None:
+            active_plan.kick_feeder()
+            active_plan.join_feeder()
         inflight = self._inflight
         self._inflight = []
         first_error = None
@@ -1489,6 +1597,10 @@ class KVEngine:
 
     def abort(self, timeout=None) -> None:
         """安全中间态 abort：不取消底层 DMA，drain 两边后再返回。"""
+        active_plan = getattr(self, "_active_read_plan", None)
+        if active_plan is not None:
+            active_plan.abort()
+            self._active_read_plan = None
         inflight = self._inflight
         self._inflight = []
         first_error = None
@@ -1527,6 +1639,7 @@ class KVEngine:
         try:
             self.wait_idle()
         finally:
+            self._active_read_plan = None
             if isinstance(self._transfer, DirectTransfer):
                 self._transfer.close()
             self._store.close()
