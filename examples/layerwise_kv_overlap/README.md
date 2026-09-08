@@ -30,23 +30,28 @@ GPU tensor——无 scratch buffer、无 D2D bounce。
 ## 前置环境
 
 **严格顺序**：snvme 内核模块（已签名加载）→ `tutti_daemon` 运行中 → 记下
-daemon 发布的 view 目录：
+daemon 发布的 view 目录。设 `TUTTI_BUILD` 为按
+[`doc/getting-started.md`](../../doc/getting-started.md) 配置的 CUDA module build
+目录后，可查询实际发布路径：
 
 ```bash
 lsmod | grep snvme                                    # snvme + snvme_core
-build/cuda-module/bin/nvmeservice_client \
+"$TUTTI_BUILD/bin/nvmeservice_client" \
   --endpoint 127.0.0.1:50051 --list-only              # 查 view_root 与 chrdev
-# daemon 默认配置发布为 /mnt/gpu<N>/ssnvme<M>
+# 不要从 device_id 或 /dev 编号猜测 view 路径
 ```
 
 ## 编译
 
+本目标依赖 `TUTTI_BUILD_HARDWARE_TESTS=ON`。完整的 vcpkg 预检、CMake configure 和
+module 编译步骤见 [`doc/getting-started.md`](../../doc/getting-started.md) 第 6、7 节；
+完成 configure 后执行：
+
 ```bash
-cmake --preset cuda-module --fresh -DTUTTI_BUILD_HARDWARE_TESTS=ON
-cmake --build --preset cuda-module --target tutti_layerwise_kv_overlap --parallel 8
+cmake --build "$TUTTI_BUILD" --target tutti_layerwise_kv_overlap --parallel "$JOBS"
 ```
 
-产物：`build/cuda-module/bin/tutti_layerwise_kv_overlap`
+产物：`$TUTTI_BUILD/bin/tutti_layerwise_kv_overlap`
 
 ## 运行
 
@@ -55,7 +60,7 @@ cmake --build --preset cuda-module --target tutti_layerwise_kv_overlap --paralle
 `--directory` 顺序须与 YAML 的 `device_ids` 一致：
 
 ```bash
-sudo ./build/cuda-module/bin/tutti_layerwise_kv_overlap --striped \
+sudo "$TUTTI_BUILD/bin/tutti_layerwise_kv_overlap" --striped \
   --directory /mnt/gpu0/ssnvme0 \
   --directory /mnt/gpu0/ssnvme1 \
   --directory /mnt/gpu0/ssnvme2 \
@@ -65,7 +70,7 @@ sudo ./build/cuda-module/bin/tutti_layerwise_kv_overlap --striped \
 ### 单盘
 
 ```bash
-sudo ./build/cuda-module/bin/tutti_layerwise_kv_overlap --single \
+sudo "$TUTTI_BUILD/bin/tutti_layerwise_kv_overlap" --single \
   --config examples/layerwise_kv_overlap/tutti_layerwise_local.yaml \
   --directory /mnt/gpu0/ssnvme0
 ```
@@ -118,10 +123,8 @@ sudo ./build/cuda-module/bin/tutti_layerwise_kv_overlap --single \
   并行队列本身支持多线程同队列提交；不会报错）
 - `stripe_unit` = 工作负载 tensor 大小（`--tensor-kb` × 1024）
 
-## 作为 ctest 运行
+## 手动硬件 workload
 
-```bash
-ctest -R tutti_layerwise_kv_overlap
-```
-
-Labels: `hardware;local_nvme;layerwise_overlap`
+该程序需要 daemon 实际发布的一个或多个 `--directory`，因此不是无参数 CTest。
+按上面的命令在完成模块、daemon 和挂载 bring-up 后手动运行；普通回归仍使用
+`ctest --test-dir "$TUTTI_BUILD" -LE hardware`。

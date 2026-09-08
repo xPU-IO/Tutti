@@ -26,12 +26,11 @@
     {
       "name": "cuda-module-local",
       "displayName": "CUDA module | local kernel",
-      "description": "Build the NVIDIA SNVMe backend. An empty SNVME_P2P_INCLUDE_DIR auto-detects nv-p2p.h; set it to the directory containing nv-p2p.h only when an explicit driver-header version is required.",
+      "description": "Build the NVIDIA SNVMe backend. Leave SNVME_KERNEL_VERSION unset so the unified module Makefile selects the running kernel; an empty SNVME_P2P_INCLUDE_DIR auto-detects nv-p2p.h.",
       "inherits": "cuda-module",
       "binaryDir": "${sourceDir}/build/cuda-module-local",
       "cacheVariables": {
         "TUTTI_P2P_BACKEND": { "type": "STRING", "value": "nvidia" },
-        "SNVME_KERNEL_VERSION": { "type": "STRING", "value": "5.15.0-public" },
         "SNVME_P2P_INCLUDE_DIR": { "type": "PATH", "value": "" }
       }
     },

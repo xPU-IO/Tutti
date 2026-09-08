@@ -75,11 +75,3 @@ set_target_properties(tutti_daemon PROPERTIES
     INSTALL_RPATH "$ORIGIN:$ORIGIN/../lib"
 )
 install(TARGETS tutti_daemon DESTINATION "bin")
-
-# Copy the canonical sys_config.yaml from the repo root next to the
-# binaries so users can run them without figuring out a path.
-if(EXISTS "${TUTTI_REPOSITORY_ROOT}/sys_config.yaml")
-    configure_file("${TUTTI_REPOSITORY_ROOT}/sys_config.yaml"
-                   "${CMAKE_BINARY_DIR}/bin/sys_config.yaml"
-                   COPYONLY)
-endif()

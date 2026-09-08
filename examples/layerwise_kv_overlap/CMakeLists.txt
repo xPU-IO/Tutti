@@ -10,8 +10,9 @@
 # daemon-published accelerator view directories (--directory). The default
 # config below matches the 4-device striped YAML shipped next to this file.
 #
-# Hardware test: needs GPU + snvme + libnvm + a running tutti_daemon.
-# Gated by TUTTI_BUILD_HARDWARE_TESTS + TUTTI_FEATURE_LOCAL_NVME.
+# Manual hardware workload: needs GPU + snvme + libnvm + a running tutti_daemon.
+# Gated by TUTTI_BUILD_HARDWARE_TESTS + TUTTI_FEATURE_LOCAL_NVME. It is not a
+# CTest case because each invocation needs daemon-published --directory paths.
 
 cmake_minimum_required(VERSION 3.18)
 
@@ -39,11 +40,4 @@ target_compile_options(tutti_layerwise_kv_overlap PRIVATE
     -Wall -Wextra
 )
 
-add_test(NAME tutti_layerwise_kv_overlap
-         COMMAND tutti_layerwise_kv_overlap)
-
-set_tests_properties(tutti_layerwise_kv_overlap PROPERTIES
-    LABELS "hardware;local_nvme;layerwise_overlap"
-)
-
-message(STATUS "Configured tutti_layerwise_kv_overlap (hardware;local_nvme;layerwise_overlap)")
+message(STATUS "Configured tutti_layerwise_kv_overlap (manual hardware workload)")

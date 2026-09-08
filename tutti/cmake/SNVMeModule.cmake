@@ -46,10 +46,16 @@ set(_snvme_root_dir
 set(_snvme_unified_dir "${_snvme_root_dir}/snvme")
 if(EXISTS "${_snvme_unified_dir}/Makefile.in")
     set(module_root "${_snvme_unified_dir}")
-    if(NOT SNVME_KERNEL_VERSION)
-        set(SNVME_KERNEL_VERSION "unified")
+    if(SNVME_KERNEL_VERSION AND NOT SNVME_KERNEL_VERSION STREQUAL "unified")
+        message(WARNING
+            "SNVME_KERNEL_VERSION='${SNVME_KERNEL_VERSION}' is ignored by the "
+            "unified snvme tree. Leave it unset; Makefile.in selects the "
+            "running-kernel baseline."
+        )
     endif()
-    set(_snvme_tags "unified(5.4-tlinux4|5.15|6.8, auto-selected by Makefile.in)")
+    set(SNVME_KERNEL_VERSION "unified" CACHE STRING
+        "snvme source layout selected for the module build" FORCE)
+    set(_snvme_tags "unified(5.4-tlinux4|5.10|5.15|6.8, auto-selected by Makefile.in)")
 else()
 file(GLOB _snvme_candidates RELATIVE "${_snvme_root_dir}"
     "${_snvme_root_dir}/snvme-*")

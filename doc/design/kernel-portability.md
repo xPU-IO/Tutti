@@ -4,19 +4,23 @@
 > and GPU vendors, and the userspace/kernel contract that keeps the pair
 > in lockstep.
 
-## 1. Two maintained kernel trees
+## 1. Unified kernel tree
 
 ```text
 tutti/device_manager/nvme/kernel_modules/
-├── snvme-5.4.241-1-tlinux4-0017/   # tlinux4 production lineage
-└── snvme-5.15.0-public/            # upstream-ish public baseline
+├── snvme/                           # active unified module tree
+│   ├── baseline/5.4-tlinux4/
+│   ├── baseline/5.10/
+│   ├── baseline/5.15/
+│   └── baseline/6.8/
+└── snvme-*/                         # deprecated historical trees
 ```
 
-Both trees are built from this repository; `third_pkgs/` holds the
-read-only upstream mirror for reference/diffing. Shared logic lives in
-identical files across the two trees (`map.c`, `peer_memory/`,
-`compat.c`); version/vendor differences are isolated into exactly two
-units per tree:
+CMake builds the active `snvme/` tree. Its Kbuild `Makefile.in` selects a
+baseline from the running kernel; the versioned `snvme-*` trees remain only as
+historical references. `third_pkgs/` is a read-only upstream mirror. Shared
+logic lives once in `snvme/` (`map.c`, `peer_memory/`, `compat/`); kernel
+version and vendor differences are isolated into two units:
 
 | Unit | Sole owner of | Isolates |
 |------|---------------|----------|
@@ -51,9 +55,10 @@ The ioctl UAPI is versioned (`tutti/include/uapi/tutti_snvme.h`):
   the library's minimum is **rejected fail-closed** (`ENODEV`) — never a
   silent fallback to mismatched layouts.
 - Consequence: swapping kernel modules requires rebuilding userspace
-  (`libnvm`, `tutti_daemon`) against the matching headers. The root
-  production build (`cmake --build --preset cuda-module --target libnvm
-  tutti_daemon modules`) produces the matched set together.
+  (`libnvm`, `tutti_daemon`) against the matching headers. After configuring
+  `MODULE_BUILD` with [`../getting-started.md`](../getting-started.md), run
+  `cmake --build "$MODULE_BUILD" --target libnvm tutti_daemon modules` to
+  produce the matched set together.
 - UAPI structs are plain-C layout-stable; `libnvm` compiles its device
   headers under both nvcc and plain C via layout-identical fallbacks for
   the GPU-side atomic fields.
@@ -82,9 +87,11 @@ a deliberate semantic: GPU-consumed ≠ spurious.
 
 ## 6. Build & test entry points
 
-- Production matched set: `cmake --build --preset cuda-module --target
-  libnvm tutti_daemon modules` produces
-  `build/cuda-module/module/snvme{,-core}.ko` plus the CUDA userspace targets.
+- Production matched set: configure `MODULE_BUILD` through
+  [`../getting-started.md`](../getting-started.md), then run
+  `cmake --build "$MODULE_BUILD" --target libnvm tutti_daemon modules`.
+  It produces `$MODULE_BUILD/module/snvme{,-core}.ko` and the matching CUDA
+  userspace targets.
 - Baseline matrix: each tree compiles against its own headers;
   cross-compiling a tree against a different lineage's headers is a
   known-incompatible configuration (NVMe core API drift), not a compat

@@ -9,9 +9,14 @@ This document has two parts:
 
 All paths are relative to the project root unless stated otherwise.
 
+> **手动构建唯一入口：**请先执行 [`getting-started.md`](getting-started.md)。该文档
+> 使用显式的 `cmake -S/-B` 命令和现有 vcpkg 安装，不依赖也不修改本机 preset。
+> 本文第 1 部分仅保留给已经运行 `scripts/prepare_env.sh` 后的 **generated preset**
+> 工作流；不要把两套构建目录或命令混用。
+
 ---
 
-# Part 1 — Build
+# Part 1 — Generated preset workflow（非手动构建入口）
 
 ## 1.1 Prepare the environment
 
@@ -94,45 +99,36 @@ is gitignored and automatically inherits from `CMakePresets.json`. Start from
 `CMakeUserPresets.json.example`; its examples cover HOST, CUDA, CUDA+module,
 MUSA, and MACA without modifying the generated presets.
 
-### CMake parameters used by the build
+### CMake parameters used by the generated-preset workflow
 
-The generated presets provide the normal build configuration. The following cache parameters are the ones that may need a host-specific value:
+The following parameters matter when using the **legacy generated preset**
+workflow. For normal manual configuration, do not reproduce this table's
+commands; use [`getting-started.md`](getting-started.md) instead.
 
 | CMake parameter | When it is needed | Effect | Example value |
 | --- | --- | --- | --- |
-| `TUTTI_BUILD_KERNEL_MODULE` | Set to `ON` when the snvme module is part of the build | Enables kernel-specific `modules`, `insmod`, and `rmmod` targets and adds `modules` to the default build; default `OFF` so normal HOST/CUDA builds are independent of the running kernel | `ON` |
-| `TUTTI_P2P_BACKEND` | When selecting the GPU peer-memory implementation compiled into `snvme.ko` | Selects exactly one backend source; defaults to `nvidia` for CUDA and `metax` for MUSA/MACA | `nvidia` |
-| `SNVME_P2P_INCLUDE_DIR` | When the selected backend header is outside the default SDK/driver search paths | Directory containing `nv-p2p.h` or `metax_p2p.h` | `/usr/src/nvidia-570.124.06/nvidia-peermem` |
-| `SNVME_KERNEL_VERSION` | Required when the running kernel name cannot be matched automatically | Selects `tutti/device_manager/nvme/kernel_modules/snvme-<tag>/` as the kernel-module source baseline | `5.15.0-public` |
-| `CMAKE_TOOLCHAIN_FILE` | Supplied automatically by a vcpkg-backed preset; only set it manually when configuring without that preset | Makes CMake resolve C++ dependencies through vcpkg | `/path/to/Tutti/third_pkgs/vcpkg/scripts/buildsystems/vcpkg.cmake` |
-| `CMAKE_BUILD_TYPE` | Supplied automatically by a preset; set it when configuring manually | Selects optimization/debug settings | `RelWithDebInfo` |
-| `CMAKE_CUDA_COMPILER` | Optional, when multiple CUDA installations exist | Selects the `nvcc` compiler during the initial configuration | `/usr/local/cuda-12.8/bin/nvcc` |
-| `CUDAToolkit_ROOT` | Optional, when multiple CUDA installations exist | Directs `find_package(CUDAToolkit)` to the matching headers and libraries | `/usr/local/cuda-12.8` |
+| `TUTTI_BUILD_KERNEL_MODULE` | Set to `ON` when the snvme module is part of the build | Enables `modules`, `insmod`, and `rmmod`; default `OFF` keeps ordinary HOST/CUDA builds independent of the running kernel | `ON` |
+| `TUTTI_P2P_BACKEND` | When selecting the peer-memory implementation compiled into `snvme.ko` | Selects `nvidia` or `metax`; defaults from the accelerator profile | `nvidia` |
+| `SNVME_P2P_INCLUDE_DIR` | When the selected backend header is outside the default search paths | Directory containing `nv-p2p.h` or `metax_p2p.h` | `/usr/src/nvidia-570.124.06/nvidia` |
+| `SNVME_KERNEL_VERSION` | **Do not set for the active unified `snvme/` tree** | Historical variable; the unified Kbuild selects its baseline from the running kernel and CMake warns if a legacy value is supplied | leave unset |
+| `CMAKE_TOOLCHAIN_FILE` | Only when configuring without a preset | Resolves C++ dependencies through vcpkg | `third_pkgs/vcpkg/scripts/buildsystems/vcpkg.cmake` |
+| `CMAKE_BUILD_TYPE` | When configuring manually | Selects optimization/debug settings | `RelWithDebInfo` |
+| `CMAKE_CUDA_COMPILER` | Optional, when multiple CUDA installations exist | Selects `nvcc` during initial configuration | `/usr/local/cuda/bin/nvcc` |
+| `CUDAToolkit_ROOT` | Optional, when multiple CUDA installations exist | Directs `find_package(CUDAToolkit)` | `/usr/local/cuda` |
 
-Pass an override after the preset name. `--fresh` is recommended when changing dependency or kernel selections so a stale cache cannot retain the old value:
+A generated-preset override must not set `SNVME_KERNEL_VERSION`:
 
 ```bash
 cmake --preset cuda-module --fresh \
   -DTUTTI_P2P_BACKEND=nvidia \
-  -DSNVME_KERNEL_VERSION=5.15.0-public \
-  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc \
-  -DCUDAToolkit_ROOT=/usr/local/cuda-12.8
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
+  -DCUDAToolkit_ROOT=/usr/local/cuda
 cmake --build --preset cuda-module --parallel 8
 ```
 
-When configuring without presets, the equivalent vcpkg example is:
-
-```bash
-cmake -S . -B build --fresh \
-  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-  -DTUTTI_BUILD_KERNEL_MODULE=ON \
-  -DTUTTI_P2P_BACKEND=nvidia \
-  -DSNVME_KERNEL_VERSION=5.15.0-public \
-  -DCMAKE_TOOLCHAIN_FILE="$PWD/third_pkgs/vcpkg/scripts/buildsystems/vcpkg.cmake"
-cmake --build build --parallel 8
-```
-
-The values above are examples for a host with an Ubuntu 5.15 generic kernel and CUDA 12.8; inspect the current machine before copying them.
+Use a new build directory or `--fresh` after changing a compiler, dependency
+provider, or accelerator profile. The explicit vcpkg `cmake -S/-B` equivalent
+is intentionally centralized in [`getting-started.md`](getting-started.md).
 
 For a Metax userspace profile, enable the same module target with the Metax
 kernel P2P backend. `metax_p2p.h` must currently be supplied by the vendor
@@ -148,34 +144,40 @@ cmake --build --preset musa --target modules --parallel 8
 
 ### snvme baseline auto-selection
 
-The snvme kernel module is maintained per kernel baseline under `tutti/device_manager/nvme/kernel_modules/snvme-<tag>/`, e.g.:
+The active module source is the unified
+`tutti/device_manager/nvme/kernel_modules/snvme/` tree. CMake reports its
+layout as `unified`; its generated Kbuild Makefile selects one baseline from
+the running kernel:
 
-- `snvme-5.15.0-public` — upstream 5.15.0
-- `snvme-6.8.0-public` — Linux 6.8
+| Running kernel | Selected baseline |
+| --- | --- |
+| 5.4.x | `5.4-tlinux4` |
+| 5.10.x | `5.10` |
+| 5.11–5.19 | `5.15` |
+| 6.x | `6.8` |
 
-CMake matches the numeric baseline prefix against `uname -r` by default and
-ignores the descriptive `-public` suffix. For example, both
-`6.8.0-90-generic` and upstream `6.8.0` select `6.8.0-public`. Set the value
-explicitly only when auto-selection is ambiguous or when cross-building:
+Leave `SNVME_KERNEL_VERSION` unset. It is a legacy versioned-tree selector,
+not an override for the unified tree; CMake warns and ignores a supplied
+legacy tag. To inspect available baselines:
 
 ```bash
-cmake --preset cuda-module --fresh \
-  -DSNVME_KERNEL_VERSION=6.8.0-public
+find tutti/device_manager/nvme/kernel_modules/snvme/baseline \
+  -mindepth 1 -maxdepth 1 -type d -printf '%f\n'
 ```
 
-To see the available values, list the baseline directories:
-
-```bash
-find tutti/device_manager/nvme/kernel_modules -maxdepth 1 \
-  -type d -name 'snvme-*' -printf '%f\n'
-```
+`make SNVME_BASELINE=<tag>` is only a controlled Kbuild diagnostic override;
+it is not the normal host build path and must not be used to paper over an
+unsupported kernel.
 
 ## 1.3 Install the snvme kernel module
 
-Build artifacts land in `build/cuda-module/module/` (`snvme-core.ko` + `snvme.ko`). Install from the build directory:
+After following [`getting-started.md`](getting-started.md), manual-build
+artifacts are `$MODULE_BUILD/module/snvme-core.ko` and
+`$MODULE_BUILD/module/snvme.ko`. Loading them changes the running kernel and
+is deliberately separate from compilation:
 
 ```bash
-cmake --build --preset cuda-module --target insmod
+cmake --build "$MODULE_BUILD" --target insmod
 ```
 
 Check that it installed cleanly:
@@ -186,7 +188,9 @@ snvme                 217088  0
 snvme_core            106496  1 snvme
 ```
 
-To unload, use `make rmmod`. To reload, use `make insmod` (or your site's signed-module install flow).
+To unload, use `cmake --build "$MODULE_BUILD" --target rmmod`. To reload,
+use `cmake --build "$MODULE_BUILD" --target insmod` (or your site's signed-module
+install flow).
 
 ## 1.4 Build the test code
 
@@ -216,8 +220,11 @@ Testing climbs a ladder of 6 binaries, **safest → most destructive**. Golden r
 
 ## Step 0 — Pre-flight
 
+Set `MODULE_BUILD` as in [`getting-started.md`](getting-started.md), then
+verify the module loaded for the **actual running kernel**:
+
 ```bash
-uname -r                                                  # 5.15.x → matches the snvme-5.15.0-public baseline
+uname -r                                                  # unified Kbuild selects the matching baseline
 grep CONFIG_MODULE_SIG_FORCE /boot/config-$(uname -r)     # "not set" → unsigned .ko loads fine
 lsmod | grep snvme                                        # snvme + snvme_core loaded
 ls -l /dev/snvm_control                                   # exists, mode 0666
@@ -229,12 +236,12 @@ If all four pass you can skip straight to [Step 3](#Step-3--Build-the-test-binar
 
 ## Step 1 — (Re)build the module (only after editing driver code)
 
-The `.ko`s were built in Part 1 under `build/cuda-module/module/`. After changing driver code, rebuild:
+The `.ko`s are in `$MODULE_BUILD/module/`. After changing driver code, rebuild:
 
 ```bash
-cmake --build --preset cuda-module --target modules
-# or by hand:
-cd build/cuda-module/module && make
+cmake --build "$MODULE_BUILD" --target modules
+# Kbuild-only diagnostic rebuild:
+make -C "$MODULE_BUILD/module"
 ```
 
 ## Step 2 — Rebuild / reload the module (only after editing driver code)
@@ -246,8 +253,8 @@ Before rmmod, unbind all snvme-owned controllers and stop any process holding `/
 ```bash
 sudo bash scripts/unbind.sh          # unbind all snvme controllers (idempotent)
 lsof /dev/snvm_control /dev/ssnvme* /dev/snvme*n* 2>/dev/null   # should print nothing
-cmake --build --preset cuda-module --target rmmod     # sudo rmmod snvme snvme_core
-cmake --build --preset cuda-module --target insmod    # reload
+cmake --build "$MODULE_BUILD" --target rmmod     # sudo rmmod snvme snvme_core
+cmake --build "$MODULE_BUILD" --target insmod    # reload
 ```
 
 > **Queue depth**: there is no `io_queue_depth` module parameter — snvme always
@@ -388,6 +395,8 @@ sudo ./snvme_ubind $TGT
 echo $TGT | sudo tee /sys/bus/pci/drivers/nvme/bind 2>/dev/null
 ```
 
-A full reset is `scripts/unbind.sh` + `make rmmod` + `make insmod` (see Step 2).
+A full reset is `scripts/unbind.sh` +
+`cmake --build "$MODULE_BUILD" --target rmmod` +
+`cmake --build "$MODULE_BUILD" --target insmod` (see Step 2).
 
 ---

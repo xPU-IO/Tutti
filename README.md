@@ -58,32 +58,28 @@ vendor shim → kernel primitive macros) covers every layer above the kernel —
 CUDA proven, MUSA/MACA profiles in place; the kernel P2P layer is split into
 symmetric per-vendor backends (nvidia done, metax symmetric).
 
-**Environment (tested)**
+**Environment requirements and module verification**
 
-- OS: Linux, kernel 6.8.x (`snvme-6.8.0-public`) or 5.15.x (`snvme-5.15.0-public`); a 5.4.241 (tlinux4) module lineage is also maintained
-- Accelerator: NVIDIA GPU + CUDA toolkit (`nvcc`); bare metal with IOMMU in passthrough mode. MUSA/MACA build profiles configure-checked only (no hardware validation yet)
-- Runtime: daemon-only — `tutti_daemon` bring-up creates `/dev/snvme*`; queue depth always takes the controller maximum (NVMe CAP.MQES + 1)
-- Host deps: CMake, protobuf / gRPC / uuid / yaml-cpp — one-shot setup via `scripts/prepare_env.sh`
-- All file I/O is opened with `O_DIRECT` (project policy)
+- OS: Linux. The unified `snvme/` tree selects `5.4-tlinux4`, `5.10`, `5.15`, or `6.8` from the running kernel. see [`PORTING.md`](tutti/device_manager/nvme/kernel_modules/PORTING.md) for the matrix.
+- Accelerator: NVIDIA GPU + CUDA toolkit (`nvcc`); bare metal with IOMMU in passthrough mode. MUSA/MACA build profiles configure-checked only (no hardware validation yet).
+- Runtime: daemon-only — `tutti_daemon` bring-up creates devices and views; queue depth always takes the controller maximum (NVMe CAP.MQES + 1).
+- Host deps: CMake, protobuf / gRPC / uuid / yaml-cpp. Manual builds use the existing vcpkg tree; `scripts/prepare_env.sh` is only a bootstrap path for missing dependencies.
+- All file I/O is opened with `O_DIRECT` (project policy).
 
-## Running the KV Cache Example
+## Build and run the KV Cache workload
 
-```bash
-cmake --preset cuda-module --fresh -DTUTTI_BUILD_HARDWARE_TESTS=ON
-cmake --build --preset cuda-module \
-  --target tutti_layerwise_kv_overlap modules tutti_daemon --parallel 8
-sudo ./build/cuda-module/bin/tutti_layerwise_kv_overlap --striped \
-  --directory /mnt/gpu0/ssnvme0 --directory /mnt/gpu0/ssnvme1 \
-  --directory /mnt/gpu0/ssnvme2 --directory /mnt/gpu0/ssnvme3
-```
+The canonical manual build flow is [doc/getting-started.md](doc/getting-started.md).
+It uses explicit `cmake -S/-B` commands with the existing vcpkg toolchain, so it
+works independently of machine-local generated presets and does not modify
+`third_pkgs/vcpkg`.
 
 `layerwise_kv_overlap` is Tutti's standard KV-cache reference workload
-(80 layers, 512 KiB K/V tensors, read∥compute∥write overlap). Prerequisites
-in **strict order**: load the `snvme` kernel modules → start `tutti_daemon`
-→ mount — the block devices only exist after daemon bring-up. Full setup,
-parameters, expected output (~25 GB/s READ on 4 drives) and clean-up:
+(80 layers, 512 KiB K/V tensors, read∥compute∥write overlap). It is a manual
+hardware workload, not a parameter-free CTest: it requires daemon-published
+`--directory` paths. Its prerequisites are strict: load the `snvme` modules →
+start `tutti_daemon` → mount. For the deployment-specific run command,
+parameters, expected output (~25 GB/s READ on 4 drives), and cleanup, see
 [examples/layerwise_kv_overlap/README.md](examples/layerwise_kv_overlap/README.md).
-Also runnable as a gated test: `ctest -R tutti_layerwise_kv_overlap`.
 
 ## Configuration
 
@@ -108,7 +104,7 @@ standalone project entries. Runtime is daemon-only.
 
 ## Deep Dive
 
-- [Getting Started](doc/getting-started.md) — bilingual (中英对照) onboarding: hardware, deps, build, run the example, profile with nsys
+- [Getting Started](doc/getting-started.md) — Linux/CUDA 手动 configure、build、非硬件测试与可选 SNVMe 模块编译
 - [System Architecture](doc/architecture/system-architecture.md) — the as-implemented layers, IO walkthrough, and deployment topology
 - [Key Designs](doc/architecture/key-designs.md) — the five performance designs behind the GPU-centric data path, with measured numbers
 - [Backend SPI](doc/design/backend-spi.md) — the DataPath / Resolver / Binding semantic contracts

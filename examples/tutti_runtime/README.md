@@ -45,49 +45,54 @@ The scratch file is deleted after the run. Pass `--keep-file` to retain it.
 
 ## Build
 
-From the repository root:
+先按 [`doc/getting-started.md`](../../doc/getting-started.md) 第 6 节完成 CUDA module
+build，并复用该目录：
 
 ```bash
-cmake --preset cuda-module
-cmake --build --preset cuda-module --parallel 8 \
+export TUTTI_BUILD="$ROOT/build/manual-cuda-module"
+cmake --build "$TUTTI_BUILD" --parallel "$JOBS" \
   --target tutti_daemon tutti_runtime_example \
   tutti_runtime_multi_accelerator_example
 ```
 
 ## Start the daemon
 
-The host-local configuration used on this machine owns devices 0 and 1. The
-example YAML explicitly acquires device 0 for accelerator 0.
+Create a host-local canonical daemon configuration as described in
+[`doc/tutti_daemon.md`](../../doc/tutti_daemon.md); do not rely on the removed
+`config/local/daemon_2disk.yaml` example.
 
 ```bash
-sudo  env TUTTI_VERBOSE=1 \
-  build/cuda-module/tutti/device_manager/nvme/nvmeservice/examples/tutti_daemon \
-  --config config/local/daemon_2disk.yaml 
+mkdir -p config/local
+cp config/local_nvme_config.yaml config/local/tutti_daemon.yaml
+# Edit PCI BDFs, accel_id values, view_root and backing_mount_path for this host.
+sudo env TUTTI_VERBOSE=1 \
+  "$TUTTI_BUILD/bin/tutti_daemon" \
+  --config config/local/tutti_daemon.yaml
 ```
 
-Wait for the `tutti_daemon listening` line. Query the daemon and record the
-accelerator `view_root` and owner-returned `chrdev` basename rather than
-deriving either value from `device_id`:
+Wait for the `tutti_daemon listening` line, then query the daemon. Its returned
+view paths are authoritative; do not construct paths from `device_id` or a
+`/dev` ordinal.
 
 ```bash
-build/cuda-module/tutti/device_manager/nvme/nvmeservice/examples/nvmeservice_client \
+"$TUTTI_BUILD/bin/nvmeservice_client" \
   --endpoint 127.0.0.1:50051 --list-only
-```
 
-The daemon publishes each usable directory as
-`<view_root>/<chrdev-basename>`. With the local configuration and device 0 on
-this machine, the returned values are `/mnt/snvme/gpu0` and `/dev/ssnvme0`, so
-the published directory is `/mnt/snvme/gpu0/ssnvme0`.
+# Paste the returned view paths for the resources used below.
+export VIEW_ACCEL0_DEVICE0='<daemon-published view path>'
+export VIEW_ACCEL0_DEVICE1='<daemon-published view path>'
+export VIEW_ACCEL1_DEVICE0='<daemon-published view path>'
+export VIEW_ACCEL1_DEVICE1='<daemon-published view path>'
+```
 
 ## Run single-device I/O
 
-Pass the actual accelerator view directory published for device 0. For
-example, if the daemon published `/mnt/snvme/gpu0/ssnvme0`:
+Pass the daemon-published accelerator view for device 0:
 
 ```bash
-sudo  build/cuda-module/bin/tutti_runtime_example \
+sudo "$TUTTI_BUILD/bin/tutti_runtime_example" \
   --config examples/tutti_runtime/tutti_local_nvme.yaml \
-  --directory /mnt/snvme/gpu0/ssnvme0 
+  --directory "$VIEW_ACCEL0_DEVICE0"
 ```
 
 `sudo` is needed with the daemon's default root-owned accelerator view
@@ -107,10 +112,10 @@ Pass both directories in the same order as `device_ids` in
 `tutti_striped.yaml`:
 
 ```bash
-sudo  build/cuda-module/bin/tutti_runtime_example \
+sudo "$TUTTI_BUILD/bin/tutti_runtime_example" \
   --config examples/tutti_runtime/tutti_striped.yaml \
-  --directory /mnt/snvme/gpu0/ssnvme0 \
-  --directory /mnt/snvme/gpu0/ssnvme1 
+  --directory "$VIEW_ACCEL0_DEVICE0" \
+  --directory "$VIEW_ACCEL0_DEVICE1"
 ```
 
 The example creates one shard below each view's `striped/` directory. The
@@ -135,11 +140,11 @@ daemon allocation. Both YAML files select device 0, while their
 published below each accelerator root:
 
 ```bash
-sudo  build/cuda-module/bin/tutti_runtime_multi_accelerator_example \
+sudo "$TUTTI_BUILD/bin/tutti_runtime_multi_accelerator_example" \
   --config-0 examples/tutti_runtime/tutti_multi_accelerator_0.yaml \
-  --directory-0 /mnt/snvme/gpu0/ssnvme0 \
+  --directory-0 "$VIEW_ACCEL0_DEVICE0" \
   --config-1 examples/tutti_runtime/tutti_multi_accelerator_1.yaml \
-  --directory-1 /mnt/snvme/gpu1/ssnvme0 
+  --directory-1 "$VIEW_ACCEL1_DEVICE0"
 ```
 
 The two YAML paths are compiled-in defaults, so `--config-0` and `--config-1`
@@ -167,11 +172,11 @@ config must use that accelerator's view and the selected device's `chrdev`
 basename:
 
 ```bash
-sudo  build/cuda-module/bin/tutti_runtime_multi_accelerator_example \
+sudo "$TUTTI_BUILD/bin/tutti_runtime_multi_accelerator_example" \
   --config-0 examples/tutti_runtime/tutti_cross_accelerator_0_device_1.yaml \
-  --directory-0 /mnt/snvme/gpu0/ssnvme1 \
+  --directory-0 "$VIEW_ACCEL0_DEVICE1" \
   --config-1 examples/tutti_runtime/tutti_cross_accelerator_1_device_0.yaml \
-  --directory-1 /mnt/snvme/gpu1/ssnvme0 
+  --directory-1 "$VIEW_ACCEL1_DEVICE0"
 ```
 
 The expected summary is:
@@ -188,13 +193,13 @@ The two workers use different logical filenames, so each Runtime creates its
 own shard on each disk:
 
 ```bash
-sudo  build/cuda-module/bin/tutti_runtime_multi_accelerator_example \
+sudo "$TUTTI_BUILD/bin/tutti_runtime_multi_accelerator_example" \
   --config-0 examples/tutti_runtime/tutti_multi_accelerator_striped_0.yaml \
-  --directory-0 /mnt/snvme/gpu0/ssnvme0 \
-  --directory-0 /mnt/snvme/gpu0/ssnvme1 \
+  --directory-0 "$VIEW_ACCEL0_DEVICE0" \
+  --directory-0 "$VIEW_ACCEL0_DEVICE1" \
   --config-1 examples/tutti_runtime/tutti_multi_accelerator_striped_1.yaml \
-  --directory-1 /mnt/snvme/gpu1/ssnvme0 \
-  --directory-1 /mnt/snvme/gpu1/ssnvme1 
+  --directory-1 "$VIEW_ACCEL1_DEVICE0" \
+  --directory-1 "$VIEW_ACCEL1_DEVICE1"
 ```
 
 With the default 4 MiB request and 64 KiB stripe unit, each logical file
