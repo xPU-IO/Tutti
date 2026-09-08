@@ -65,15 +65,27 @@ class FakePool:
 
 
 class FakeLayout:
-    def __init__(self):
+    def __init__(self, events=None):
         self.prepared = []
+        self.events = events if events is not None else []
+        self.generations = {}
 
     def prepare_put(self, io_keys, capacity):
         self.prepared.append((tuple(io_keys), capacity))
+        self.events.append("prepare_put")
+        for io_key in io_keys:
+            self.generations.setdefault(bytes(io_key[:16]), 1)
 
     @staticmethod
     def target_uri(chunk_id):
         return f"file:///{bytes(chunk_id).hex()}"
+
+    @staticmethod
+    def target_size(chunk_id):
+        return 3 * 8192
+
+    def target_generation(self, chunk_id):
+        return self.generations.get(bytes(chunk_id), 1)
 
 
 class FakeRuntime:
@@ -89,6 +101,9 @@ class FakeRuntime:
         self.submit_calls = []
         self.wait_calls = []
         self.release_calls = []
+        self.open_batch_calls = []
+        self.close_batch_calls = []
+        self.events = []
         self._next = 100
 
     def caps(self):
@@ -110,9 +125,11 @@ class FakeRuntime:
     def unregister_memory(self, ticket):
         if self._unregister_error is not None:
             raise self._unregister_error
+        self.events.append("unregister_memory")
         self.unregister_calls.append(ticket)
 
     def submit(self, requests, **kwargs):
+        self.events.append("submit")
         self.submit_calls.append((tuple(requests), kwargs))
         self._next += 1
         return SimpleNamespace(
@@ -124,11 +141,24 @@ class FakeRuntime:
         )
 
     def wait(self, handle, timeout_ms=0):
+        self.events.append("wait")
         self.wait_calls.append((handle, timeout_ms))
         return ("OK", "FAILED") if self._fail else ("OK", "COMPLETED")
 
     def release_io(self, handle):
+        self.events.append("release_io")
         self.release_calls.append(handle)
+
+    def open_batch(self, uris):
+        uris = tuple(uris)
+        self.events.append("open_batch")
+        self.open_batch_calls.append(uris)
+        return [1000 + len(self.open_batch_calls) * 100 + index
+                for index in range(len(uris))]
+
+    def close_batch(self, tickets):
+        self.events.append("close_batch")
+        self.close_batch_calls.append(tuple(tickets))
 
 
 class FakeStoreOwner:
@@ -138,10 +168,12 @@ class FakeStoreOwner:
         self._write_stream = 22
         self._accel_id = 0
         self._execution = "device"
-        self._layout = FakeLayout()
+        self._layout = FakeLayout(runtime.events)
         self._num_chunks = 16
         self._live = set()
+        self._targets = {}
         self.put_results = []
+        self.ensure_targets_calls = 0
 
     def _runtime_supports_multi_stream(self):
         return True
@@ -153,10 +185,19 @@ class FakeStoreOwner:
         return {"read": 11, "write": 22}[direction], None
 
     def _ensure_targets(self, entries):
-        return {
-            self._layout.target_uri(io_key[:16]): index + 1000
-            for index, (io_key, _, _) in enumerate(entries)
-        }
+        self.ensure_targets_calls += 1
+        uris = tuple(dict.fromkeys(
+            self._layout.target_uri(io_key[:16])
+            for io_key, _, _ in entries
+        ))
+        missing = [uri for uri in uris if uri not in self._targets]
+        if missing:
+            tickets = self._runtime.open_batch(missing)
+            for uri, ticket in zip(missing, tickets):
+                self._targets[uri] = SimpleNamespace(
+                    ticket=ticket, size=3 * 8192, generation=1,
+                )
+        return {uri: self._targets[uri].ticket for uri in uris}
 
     def _submit_retry(self, requests, direction):
         return TuttiKVStore._submit_retry(self, requests, direction)
@@ -166,6 +207,9 @@ class FakeStoreOwner:
 
     def _track_completion(self, completion, chunk_ids):
         return None
+
+    def _close_cached_targets(self, uris):
+        return TuttiKVStore._close_cached_targets(self, uris)
 
 
 class FakeEngineStore(FakeStoreOwner):
@@ -260,6 +304,215 @@ def test_direct_write_is_one_submit_for_multiple_chunks_and_blocks():
     ]
 
 
+def test_direct_target_plan_is_built_once_per_direction():
+    runtime = FakeRuntime()
+    store = FakeStoreOwner(runtime)
+    backend = TuttiDirectBackend(store)
+    backend.register_paged_caches(
+        FakePool(128), num_layers=3, blocks_per_chunk=2,
+        chunk_tokens=256, segment_bytes=8192, max_chunks_per_wave=2,
+    )
+    keys = [b"a" * 16, b"b" * 16]
+    store._live.update(
+        derive_io_key(key, layer) for key in keys for layer in range(3)
+    )
+    backend.get_paged_batch(keys, 0, [[3, 1], [7, 0]])
+    backend.get_paged_batch(keys, 1, [[3, 1], [7, 0]])
+    backend.get_paged_batch(keys, 2, [[3, 1], [7, 0]])
+    assert store.ensure_targets_calls == 1
+    assert backend._target_plans["read"].plan_token == 1
+    backend.end_target_plan("read")
+    backend.put_paged_batch(keys, 0, [[3, 1], [7, 0]])
+    backend.put_paged_batch(keys, 1, [[3, 1], [7, 0]])
+    assert store.ensure_targets_calls == 2
+    assert backend._target_plans["write"].plan_token == 2
+    backend.close()
+
+
+def test_direct_target_plan_rejects_chunk_not_in_immutable_plan():
+    runtime = FakeRuntime()
+    store = FakeStoreOwner(runtime)
+    backend = TuttiDirectBackend(store)
+    backend.register_paged_caches(
+        FakePool(128), num_layers=3, blocks_per_chunk=2,
+        chunk_tokens=256, segment_bytes=8192, max_chunks_per_wave=2,
+    )
+    key = b"c" * 16
+    store._live.update(derive_io_key(key, layer) for layer in range(3))
+    store._live.update(derive_io_key(b"d" * 16, layer) for layer in range(3))
+    backend.begin_target_plan([key], "read")
+    with pytest.raises(RuntimeError, match="target plan lacks chunk"):
+        backend.get_paged_batch([b"d" * 16], 0, [[3, 1]])
+    backend.close()
+
+
+def test_direct_write_plan_prepares_before_open_and_reuses_generation():
+    runtime = FakeRuntime()
+    store = FakeStoreOwner(runtime)
+    backend = TuttiDirectBackend(store)
+    backend.register_paged_caches(
+        FakePool(128), num_layers=3, blocks_per_chunk=2,
+        chunk_tokens=256, segment_bytes=8192, max_chunks_per_wave=2,
+    )
+    keys = [b"w" * 16, b"x" * 16]
+    first = backend.put_paged_batch(keys, 0, [[3, 1], [7, 0]])
+    second = backend.put_paged_batch(keys, 1, [[3, 1], [7, 0]])
+    assert runtime.events[:3] == ["prepare_put", "open_batch", "submit"]
+    assert store._layout.prepared == [
+        (tuple(derive_io_key(key, 2) for key in keys), store._num_chunks)
+    ]
+    assert len(runtime.open_batch_calls) == 1
+    assert len(runtime.submit_calls) == 2
+    assert first._watcher is None and second._watcher is None
+    backend.close()
+
+
+def test_direct_target_plan_generation_change_fails_closed():
+    runtime = FakeRuntime()
+    store = FakeStoreOwner(runtime)
+    backend = TuttiDirectBackend(store)
+    backend.register_paged_caches(
+        FakePool(128), num_layers=3, blocks_per_chunk=2,
+        chunk_tokens=256, segment_bytes=8192, max_chunks_per_wave=2,
+    )
+    key = b"g" * 16
+    store._live.update(derive_io_key(key, layer) for layer in range(3))
+    completion = backend.get_paged_batch([key], 0, [[3, 1]])
+    uri = store._layout.target_uri(key)
+    store._targets[uri].generation += 1
+    with pytest.raises(RuntimeError, match="generation mismatch"):
+        backend.get_paged_batch([key], 1, [[3, 1]])
+    completion.wait()
+    backend.close()
+
+
+def test_direct_read_write_plans_are_isolated():
+    runtime = FakeRuntime()
+    store = FakeStoreOwner(runtime)
+    backend = TuttiDirectBackend(store)
+    backend.register_paged_caches(
+        FakePool(128), num_layers=3, blocks_per_chunk=2,
+        chunk_tokens=256, segment_bytes=8192, max_chunks_per_wave=2,
+    )
+    read_key = b"r" * 16
+    write_key = b"s" * 16
+    store._live.update(
+        derive_io_key(read_key, layer) for layer in range(3)
+    )
+    store._live.update(
+        derive_io_key(write_key, layer) for layer in range(3)
+    )
+    backend.begin_target_plan([read_key], "read")
+    backend.prepare_write_targets([write_key])
+    backend.begin_target_plan([write_key], "write")
+    read_plan = backend._target_plans["read"]
+    write_plan = backend._target_plans["write"]
+    assert read_plan.plan_token != write_plan.plan_token
+    with pytest.raises(RuntimeError, match="target plan lacks chunk"):
+        backend.get_paged_batch([write_key], 0, [[3, 1]])
+    backend.end_target_plan("read")
+    assert "write" in backend._target_plans
+    backend.close()
+
+
+def test_direct_target_plan_scales_to_eighty_layers():
+    runtime = FakeRuntime(layers=80, in_flight=160)
+    store = FakeStoreOwner(runtime)
+    backend = TuttiDirectBackend(store)
+    backend.register_paged_caches(
+        FakePool(128, layers=80), num_layers=80, blocks_per_chunk=2,
+        chunk_tokens=256, segment_bytes=8192, max_chunks_per_wave=2,
+    )
+    keys = [b"8" * 16, b"9" * 16]
+    store._live.update(
+        derive_io_key(key, layer) for key in keys for layer in range(80)
+    )
+    for layer in range(80):
+        backend.get_paged_batch(keys, layer, [[3, 1], [7, 0]])
+    assert store.ensure_targets_calls == 1
+    assert len(runtime.open_batch_calls) == 1
+    backend.close()
+
+
+def test_direct_clean_root_first_write_materializes_target(tmp_path):
+    runtime = FakeRuntime()
+    store = TuttiKVStore(
+        root=tmp_path / "clean-root", num_chunks=2, segment_bytes=8192,
+        runtime=runtime, allocator_enabled=False,
+    )
+    store.open()
+    store._read_stream = 11
+    store._write_stream = 22
+    store.set_layer_span(3)
+    backend = TuttiDirectBackend(store)
+    backend.register_paged_caches(
+        FakePool(128), num_layers=3, blocks_per_chunk=2,
+        chunk_tokens=256, segment_bytes=8192, max_chunks_per_wave=2,
+    )
+    key = b"clean-root-key!".ljust(16, b"_")
+    completion = backend.put_paged_batch([key], 0, [[3, 1]])
+    uri = store._layout.target_uri(key)
+    target_path = store._layout.chunk_file(key)
+    assert target_path.exists()
+    assert target_path.stat().st_size == 3 * 8192
+    assert len(runtime.open_batch_calls) == 1
+    assert completion._watcher is None
+    completion.wait()
+    backend.close()
+    store.close()
+
+
+def test_direct_real_store_failure_rolls_back_live_and_layout(tmp_path):
+    runtime = FakeRuntime(fail=True)
+    store = TuttiKVStore(
+        root=tmp_path / "failed-write", num_chunks=2, segment_bytes=8192,
+        runtime=runtime, allocator_enabled=False,
+    )
+    store.open()
+    store._read_stream = 11
+    store._write_stream = 22
+    store.set_layer_span(3)
+    backend = TuttiDirectBackend(store)
+    backend.register_paged_caches(
+        FakePool(128), num_layers=3, blocks_per_chunk=2,
+        chunk_tokens=256, segment_bytes=8192, max_chunks_per_wave=2,
+    )
+    key = b"failed-write-key"[:16]
+    completion = backend.put_paged_batch([key], 0, [[3, 1]])
+    with pytest.raises(RuntimeError, match="失败"):
+        completion.wait()
+    assert store._live == set()
+    assert store._targets == {}
+    assert not store._layout.chunk_file(key).exists()
+    assert "write" not in backend._target_plans
+    backend.close()
+    store.close()
+
+
+def test_engine_plan_store_prepares_direct_write_before_first_layer():
+    runtime = FakeRuntime()
+    store = FakeEngineStore(runtime)
+    engine = KVEngine(
+        {
+            "chunk_tokens": 256,
+            "chunk_kv_bytes": 3 * 8192,
+            "max_chunks_per_wave": 2,
+            "num_layers": 3,
+        },
+        store,
+    )
+    assert engine.try_bind_direct(FakePool(128), 3, 2)
+    key = b"plan-store-key!".ljust(16, b"_")
+    plan = engine.plan_store([key])
+    assert plan is not None and plan.new_keys == [key]
+    assert runtime.events == ["prepare_put"]
+    engine.store_layer([key], 0, [[3, 1]])
+    assert runtime.events[:3] == ["prepare_put", "open_batch", "submit"]
+    engine.wait_idle()
+    engine.confirm_store([key])
+    engine.close()
+
+
 def test_direct_completion_has_no_watcher_until_request_drain():
     runtime = FakeRuntime()
     store = FakeStoreOwner(runtime)
@@ -303,6 +556,27 @@ def test_wait_idle_drains_direct_completion_and_runs_callback():
     engine.wait_idle()
     assert len(runtime.wait_calls) == 1
     assert len(callbacks) == 1 and callbacks[0].ok
+
+
+def test_direct_completion_failure_drain_is_idempotent():
+    runtime = FakeRuntime(fail=True)
+    store = FakeStoreOwner(runtime)
+    backend = TuttiDirectBackend(store)
+    backend.register_paged_caches(
+        FakePool(128), num_layers=3, blocks_per_chunk=2,
+        chunk_tokens=256, segment_bytes=8192, max_chunks_per_wave=2,
+    )
+    completion = backend.put_paged_batch([b"f" * 16], 0, [[3, 1]])
+    with pytest.raises(RuntimeError, match="失败"):
+        completion.wait()
+    assert len(runtime.wait_calls) == 1
+    assert runtime.release_calls == [101]
+    with pytest.raises(RuntimeError, match="失败"):
+        completion.wait()
+    assert len(runtime.wait_calls) == 1
+    assert runtime.release_calls == [101]
+    assert completion.drain_stats["failed"] is True
+    backend.close()
 
 
 def test_direct_write_failure_never_confirms_markers():
@@ -454,6 +728,28 @@ def test_engine_direct_bind_and_close_have_no_staging_lifecycle():
     engine.close()
     assert runtime.unregister_calls == [41]
     assert store.closed
+
+
+def test_direct_engine_close_drains_before_target_and_memory_close():
+    runtime = FakeRuntime()
+    store = FakeEngineStore(runtime)
+    engine = KVEngine(
+        {
+            "chunk_tokens": 256,
+            "chunk_kv_bytes": 3 * 8192,
+            "max_chunks_per_wave": 2,
+            "num_layers": 3,
+        },
+        store,
+    )
+    assert engine.try_bind_direct(FakePool(128), 3, 2)
+    completion = engine.store_layer([b"t" * 16], 0, [[3, 1]])
+    assert runtime.wait_calls == []
+    engine.close()
+    assert runtime.wait_calls == [(101, 1000)]
+    assert runtime.release_calls == [101]
+    assert runtime.events.index("release_io") < runtime.events.index("close_batch")
+    assert runtime.events.index("close_batch") < runtime.events.index("unregister_memory")
 
 
 def test_engine_direct_strict_preserves_admission_reason():

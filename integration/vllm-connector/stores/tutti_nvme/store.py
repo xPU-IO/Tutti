@@ -19,7 +19,7 @@ import os
 import time
 import threading
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .layout import Layout, decode_io_key
@@ -90,6 +90,41 @@ class _TargetCacheEntry:
 
 
 @dataclass(frozen=True)
+class DirectTargetPlanEntry:
+    chunk_id: bytes
+    target_ticket: int
+    target_uri: str
+    target_size: int
+    target_generation: int
+
+
+@dataclass(frozen=True)
+class DirectTargetPlan:
+    direction: str
+    memory_ticket: int
+    plan_token: int
+    entries: tuple[DirectTargetPlanEntry, ...]
+    _entry_by_chunk: dict[bytes, DirectTargetPlanEntry] = field(
+        init=False, repr=False, compare=False
+    )
+
+    def __post_init__(self) -> None:
+        entry_by_chunk = {entry.chunk_id: entry for entry in self.entries}
+        if len(entry_by_chunk) != len(self.entries):
+            raise ValueError("direct target plan contains duplicate chunks")
+        object.__setattr__(self, "_entry_by_chunk", entry_by_chunk)
+
+    def entry_for(self, chunk_id: bytes) -> DirectTargetPlanEntry:
+        chunk_id = bytes(chunk_id)
+        try:
+            return self._entry_by_chunk[chunk_id]
+        except KeyError as exc:
+            raise RuntimeError(
+                f"direct {self.direction} target plan lacks chunk {chunk_id!r}"
+            ) from exc
+
+
+@dataclass(frozen=True)
 class TuttiTerminalResult:
     handle: int
     observation: str
@@ -142,6 +177,13 @@ class TuttiDirectBackend:
         self._memory_ticket = None
         self._geometry: DirectPoolGeometry | None = None
         self._closed = False
+        self._target_plans: dict[str, DirectTargetPlan] = {}
+        self._prepared_write_chunks: tuple[bytes, ...] | None = None
+        self._invalid_plan_tokens: set[int] = set()
+        self._next_plan_token = 0
+        # Target-cache invalidation is the generation-change signal used by
+        # layer submit. It avoids filesystem/object-pool queries on that path.
+        self._store._direct_backend = self
 
     @property
     def geometry(self) -> DirectPoolGeometry:
@@ -359,6 +401,139 @@ class TuttiDirectBackend:
     def put_paged_batch(self, keys, layer_idx: int, block_tables):
         return self._submit(keys, layer_idx, block_tables, "write")
 
+    @staticmethod
+    def _chunk_ids(keys) -> tuple[bytes, ...]:
+        return tuple(dict.fromkeys(
+            decode_io_key(derive_io_key(bytes(key), 0))[0] for key in keys
+        ))
+
+    def prepare_write_targets(self, keys) -> None:
+        """Allocate every write target before Runtime tickets are opened."""
+        chunk_ids = self._chunk_ids(keys)
+        active = self._target_plans.get("write")
+        if active is not None:
+            planned = tuple(entry.chunk_id for entry in active.entries)
+            if planned != chunk_ids:
+                raise RuntimeError(
+                    "direct write target preparation changed within one step"
+                )
+            return
+        if self._prepared_write_chunks is not None:
+            if self._prepared_write_chunks != chunk_ids:
+                raise RuntimeError(
+                    "direct write target preparation changed within one step"
+                )
+            return
+        # The highest layer is sufficient to request the complete configured
+        # object. Object-pool allocation materializes the full file/extent and
+        # fixes its generation before begin_target_plan calls open_batch.
+        last_layer = self.geometry.num_layers - 1
+        io_keys = [derive_io_key(chunk_id, last_layer)
+                   for chunk_id in chunk_ids]
+        self._store._layout.prepare_put(io_keys, self._store._num_chunks)
+        self._prepared_write_chunks = chunk_ids
+
+    def begin_target_plan(self, keys, direction: str) -> DirectTargetPlan:
+        if direction not in ("read", "write"):
+            raise ValueError(f"invalid direct target plan direction: {direction}")
+        if direction in self._target_plans:
+            raise RuntimeError(f"direct {direction} target plan already exists")
+        if self._memory_ticket is None:
+            raise RuntimeError("direct target plan requires registered memory")
+        chunk_ids = self._chunk_ids(keys)
+        if (direction == "write"
+                and self._prepared_write_chunks != chunk_ids):
+            raise RuntimeError(
+                "direct write target plan requires prepare_write_targets"
+            )
+        entries = [(chunk_id + (0).to_bytes(2, "little"), 0, 0)
+                   for chunk_id in chunk_ids]
+        with nvtx_range(
+            f"tutti.direct.target_plan_build|direction={direction}"
+        ):
+            target_tickets = self._store._ensure_targets(entries)
+        plan_entries = []
+        for chunk_id in chunk_ids:
+            uri = self._store._layout.target_uri(chunk_id)
+            cached = getattr(self._store, "_targets", {}).get(uri)
+            target_size = getattr(cached, "size", None)
+            target_generation = getattr(cached, "generation", None)
+            if target_size is None:
+                size = getattr(self._store._layout, "target_size", None)
+                target_size = int(size(chunk_id)) if callable(size) else 0
+            if target_generation is None:
+                generation = getattr(
+                    self._store._layout, "target_generation", None
+                )
+                target_generation = (
+                    int(generation(chunk_id)) if callable(generation) else 0
+                )
+            plan_entries.append(DirectTargetPlanEntry(
+                chunk_id=chunk_id,
+                target_ticket=int(target_tickets[uri]),
+                target_uri=uri,
+                target_size=int(target_size),
+                target_generation=int(target_generation),
+            ))
+        self._next_plan_token += 1
+        plan = DirectTargetPlan(
+            direction=direction,
+            memory_ticket=int(self._memory_ticket),
+            plan_token=self._next_plan_token,
+            entries=tuple(plan_entries),
+        )
+        self._target_plans[direction] = plan
+        _LOG.warning(
+            "DIRECT_TARGET_PLAN_BUILD direction=%s chunks=%d token=%d",
+            direction, len(plan.entries), plan.plan_token,
+        )
+        return plan
+
+    def end_target_plan(self, direction: str) -> None:
+        plan = self._target_plans.pop(direction, None)
+        if plan is not None:
+            self._invalid_plan_tokens.discard(plan.plan_token)
+        if direction == "write":
+            self._prepared_write_chunks = None
+
+    def _invalidate_target_uris(self, uris) -> None:
+        invalid = set(uris)
+        if not invalid:
+            return
+        for plan in self._target_plans.values():
+            if any(entry.target_uri in invalid for entry in plan.entries):
+                self._invalid_plan_tokens.add(plan.plan_token)
+
+    def _validate_target_plan(self, plan: DirectTargetPlan) -> None:
+        """Validate the plan token without per-layer target metadata lookup."""
+        if plan.memory_ticket != self._memory_ticket:
+            raise RuntimeError(
+                f"direct {plan.direction} target plan memory ticket is stale"
+            )
+        if plan.plan_token in self._invalid_plan_tokens:
+            raise RuntimeError(
+                f"direct {plan.direction} target generation mismatch; "
+                f"plan token {plan.plan_token} is invalid"
+            )
+
+    def _validate_plan_entry(self, entry: DirectTargetPlanEntry) -> None:
+        """Check the current cache record for one submitted chunk."""
+        cached = getattr(self._store, "_targets", {}).get(entry.target_uri)
+        if cached is None:
+            raise RuntimeError(
+                f"direct {entry.chunk_id!r} target ticket is no longer cached"
+            )
+        if int(getattr(cached, "ticket", -1)) != entry.target_ticket:
+            raise RuntimeError(
+                f"direct target ticket invalid for chunk {entry.chunk_id!r}"
+            )
+        if (int(getattr(cached, "size", entry.target_size)) != entry.target_size
+                or int(getattr(cached, "generation", entry.target_generation))
+                != entry.target_generation):
+            raise RuntimeError(
+                f"direct target generation mismatch for chunk {entry.chunk_id!r}"
+            )
+
     def validate_block_tables(self, block_tables):
         geometry = self.geometry
         validated_tables = []
@@ -419,23 +594,24 @@ class TuttiDirectBackend:
         ):
             validated_tables = self.validate_block_tables(block_tables)
         io_keys = [derive_io_key(key, int(layer_idx)) for key in keys]
-        if direction == "write":
-            store._layout.prepare_put(io_keys, store._num_chunks)
-        elif any(io_key not in store._live for io_key in io_keys):
+        if direction == "read" and any(io_key not in store._live for io_key in io_keys):
             missing = next(io_key for io_key in io_keys if io_key not in store._live)
             raise ValueError(f"direct get has non-resident key: {missing!r}")
-        with nvtx_range(
-            f"tutti.direct.target_lookup|direction={direction}|layer={layer_idx}"
-        ):
-            target_entries = [(io_key, 0, 0) for io_key in io_keys]
-            targets = store._ensure_targets(target_entries)
+        plan = self._target_plans.get(direction)
+        if plan is None:
+            if direction == "write":
+                self.prepare_write_targets(keys)
+            plan = self.begin_target_plan(keys, direction)
+        self._validate_target_plan(plan)
         with nvtx_range(
             f"tutti.direct.request_build|direction={direction}|layer={layer_idx}"
         ):
             requests = []
             for io_key, table in zip(io_keys, validated_tables):
                 chunk_id, _ = decode_io_key(io_key)
-                target = targets[store._layout.target_uri(chunk_id)]
+                plan_entry = plan.entry_for(chunk_id)
+                self._validate_plan_entry(plan_entry)
+                target = plan_entry.target_ticket
                 for block_ordinal, block_id in enumerate(table):
                     memory_offset = (
                         block_id * geometry.block_stride_bytes
@@ -448,7 +624,7 @@ class TuttiDirectBackend:
                     requests.append((
                         target,
                         target_offset,
-                        self._memory_ticket,
+                        plan.memory_ticket,
                         memory_offset,
                         geometry.page_bytes,
                         direction,
@@ -466,17 +642,23 @@ class TuttiDirectBackend:
             (submit_started_ns - started_ns) / 1_000_000,
             (time.perf_counter_ns() - submit_started_ns) / 1_000_000,
         )
-        settled = (
-            (lambda ok: store._on_put_settled(ok, io_keys))
-            if direction == "write" else (lambda _ok: None)
-        )
+        completion_holder = {}
+        if direction == "write":
+            direct_settle = getattr(store, "_on_direct_put_settled", None)
+            if callable(direct_settle):
+                settled = lambda ok: direct_settle(
+                    ok, io_keys, completion_holder.get("completion")
+                )
+            else:
+                settled = lambda ok: store._on_put_settled(ok, io_keys)
+        else:
+            settled = lambda _ok: None
         completion = _TuttiCompletion(
-            store._runtime, handles, settled, auto_watch=False
+            store._runtime, handles, settled,
+            auto_watch=False, direction=direction,
         )
+        completion_holder["completion"] = completion
         store._track_completion(completion, keys)
-        watch = getattr(store, "_watch_completion", None)
-        if callable(watch):
-            watch(completion)
         return completion
 
     def close(self) -> None:
@@ -484,6 +666,30 @@ class TuttiDirectBackend:
             return
         ticket = self._memory_ticket
         unregister = getattr(self._store._runtime, "unregister_memory", None)
+        first_error = None
+        wait_chunk_io = getattr(self._store, "_wait_chunk_io", None)
+        if callable(wait_chunk_io):
+            try:
+                wait_chunk_io(set(self._store._inflight_by_chunk))
+            except Exception as exc:
+                first_error = exc
+        for direction in tuple(self._target_plans):
+            self.end_target_plan(direction)
+        finalize_failures = getattr(
+            self._store, "finalize_direct_failures", None
+        )
+        if callable(finalize_failures):
+            try:
+                finalize_failures()
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+        close_targets = getattr(self._store, "_close_cached_targets", None)
+        if callable(close_targets):
+            try:
+                close_targets(list(self._store._targets))
+            except Exception as exc:
+                raise first_error or exc
         if ticket is not None:
             if not callable(unregister):
                 raise RuntimeError(
@@ -495,12 +701,15 @@ class TuttiDirectBackend:
         self._memory_ticket = None
         self._pool = None
         self._closed = True
+        if first_error is not None:
+            raise first_error
 
 
 class _TuttiCompletion:
     """一批 runtime IO 的完成句柄，terminal 详情在 release 后仍保留。"""
 
-    def __init__(self, runtime, handles, on_settled, *, auto_watch: bool = True):
+    def __init__(self, runtime, handles, on_settled, *, auto_watch: bool = True,
+                 direction: str | None = None):
         self._runtime = runtime
         self._submitted = [
             item if isinstance(item, _SubmittedHandle)
@@ -517,17 +726,23 @@ class _TuttiCompletion:
         self._batch_result: TuttiBatchResult | None = None
         self._handles_released = False
         self._terminal_lock = threading.Lock()
+        self._drain_lock = threading.Lock()
         self._done_callbacks = []
         self._terminal_callbacks = []
         self._ready = threading.Event()
         self._watcher = None
         self._auto_watch = bool(auto_watch)
+        self._direction = direction
+        self._runtime_wait_calls = 0
+        self._release_io_calls = 0
         if auto_watch:
             self._start_watcher()
 
     def query(self) -> bool:
         if self._settled:
             return not self._failed
+        if not self._auto_watch:
+            return self._finish() if self._ready.is_set() else False
         if not self._ready.is_set():
             self._probe_runtime()
         if not self._ready.is_set():
@@ -546,13 +761,12 @@ class _TuttiCompletion:
         if self._auto_watch:
             self._start_watcher()
         else:
-            observe = False
-            with self._terminal_lock:
-                if self._watcher is None and self._terminal is None:
-                    self._watcher = threading.current_thread()
-                    observe = True
-            if observe:
-                self._watch_runtime()
+            # Direct completions are deliberately drained synchronously by
+            # KVEngine finalization. Keep ``_watcher`` unset: auto_watch=False
+            # must never create an observer, including a pseudo-watcher marker.
+            with self._drain_lock:
+                if self._terminal is None:
+                    self._watch_runtime()
         with nvtx_range("tutti.runtime.wait"):
             if not self._ready.wait(timeout):
                 raise TimeoutError("等待 tutti IO 批超时")
@@ -594,6 +808,7 @@ class _TuttiCompletion:
 
     def _observe(self, submitted: _SubmittedHandle,
                  timeout_ms: int) -> TuttiTerminalResult:
+        self._runtime_wait_calls += 1
         structured_wait = getattr(self._runtime, "wait_result", None)
         if callable(structured_wait):
             raw = structured_wait(submitted.handle, timeout_ms)
@@ -725,6 +940,7 @@ class _TuttiCompletion:
             handles = tuple(self._handles)
         for handle in handles:
             try:
+                self._release_io_calls += 1
                 self._runtime.release_io(handle)
             except Exception:
                 pass
@@ -748,6 +964,15 @@ class _TuttiCompletion:
         for callback in callbacks:
             callback(result)
         return terminal
+
+    @property
+    def drain_stats(self) -> dict:
+        return {
+            "direction": self._direction or "unknown",
+            "wait_result_calls": self._runtime_wait_calls,
+            "release_io_calls": self._release_io_calls,
+            "failed": bool(self._settled and self._failed),
+        }
 
     def _settle(self, ok: bool) -> None:
         self._mark_terminal(ok, None)
@@ -830,11 +1055,8 @@ class TuttiKVStore:
         self._inflight_by_chunk: dict[bytes, set[_TuttiCompletion]] = {}
         self._inflight_lock = threading.Lock()
         self._deferred_completions: list[_TuttiCompletion] = []
-        self._direct_watch_pending: set[_TuttiCompletion] = set()
-        self._direct_watch_lock = threading.Lock()
-        self._direct_watch_wakeup = threading.Event()
-        self._direct_watch_stop = threading.Event()
-        self._direct_watch_thread = None
+        self._direct_backend = None
+        self._direct_failed_chunks: set[bytes] = set()
         self._keepers: list = []  # 持有 ctypes 视图防 GC
         self._next_buffer_id = 0
         self._accel_id = -1
@@ -928,8 +1150,6 @@ class TuttiKVStore:
     def open(self) -> None:
         if self._opened:
             raise RuntimeError("tutti store 已 open")
-        self._direct_watch_stop.clear()
-        self._direct_watch_wakeup.clear()
         if self._runtime is None:
             if self._preset is not None:
                 self._runtime = _build_runtime(self._preset)
@@ -1081,27 +1301,34 @@ class TuttiKVStore:
     def close(self) -> None:
         if not self._opened:
             return
-        self._layout.close_object_pool()
+        backend_error = None
+        backend = self._direct_backend
+        if backend is not None and not backend._closed:
+            try:
+                backend.close()
+            except Exception as exc:
+                if not backend._closed:
+                    raise
+                backend_error = exc
         try:
             self._wait_chunk_io(set(self._inflight_by_chunk))
         except Exception:
             _LOG.exception("等待对象池 target IO 完成失败；继续关闭句柄")
         try:
+            self._layout.close_object_pool()
+        except Exception:
+            _LOG.exception("关闭对象池失败；继续关闭 target 句柄")
+        try:
             self._close_cached_targets(list(self._targets))
         finally:
             self._opened = False
         self._live = set()
-        self._direct_watch_stop.set()
-        self._direct_watch_wakeup.set()
-        watcher = self._direct_watch_thread
-        if watcher is not None and watcher is not threading.current_thread():
-            watcher.join()
-        self._direct_watch_thread = None
-        self._direct_watch_pending.clear()
         self._buffers = {}
         self._mem_cache = {}
         self._targets = {}
         self._inflight_by_chunk = {}
+        self._direct_backend = None
+        self._direct_failed_chunks = set()
         self._keepers = []
         if self._own_runtime and self._runtime is not None:
             try:
@@ -1121,6 +1348,8 @@ class TuttiKVStore:
         self._stream_accel_id = None
         self._io_stream = None
         self._own_runtime = self._runtime is None
+        if backend_error is not None:
+            raise backend_error
 
     def _sync_execution_mode(self) -> None:
         """推导 submit 执行模式：无 io_stream → host 路径；有则按 runtime
@@ -1495,6 +1724,9 @@ class TuttiKVStore:
                    if uri in self._targets]
         if not records:
             return
+        invalidate = getattr(self._direct_backend, "_invalidate_target_uris", None)
+        if callable(invalidate):
+            invalidate(uri for uri, _ in records)
         tickets = [record.ticket for _, record in records]
         close_batch = getattr(self._runtime, "close_batch", None)
         if callable(close_batch):
@@ -1528,34 +1760,6 @@ class TuttiKVStore:
 
         completion.add_done_callback(done)
 
-    def _watch_completion(self, completion) -> None:
-        """Observe direct completions through one store-owned worker."""
-        with self._direct_watch_lock:
-            self._direct_watch_pending.add(completion)
-            if self._direct_watch_thread is None:
-                self._direct_watch_thread = threading.Thread(
-                    target=self._watch_direct_completions,
-                    name="tutti-direct-completion-observer",
-                    daemon=True,
-                )
-                self._direct_watch_thread.start()
-        self._direct_watch_wakeup.set()
-
-    def _watch_direct_completions(self) -> None:
-        while not self._direct_watch_stop.is_set():
-            self._direct_watch_wakeup.wait(0.05)
-            self._direct_watch_wakeup.clear()
-            with self._direct_watch_lock:
-                pending = tuple(self._direct_watch_pending)
-            for completion in pending:
-                try:
-                    completion.wait_result()
-                except Exception as exc:
-                    _LOG.error("direct completion observation failed: %s", exc)
-                finally:
-                    with self._direct_watch_lock:
-                        self._direct_watch_pending.discard(completion)
-
     def _wait_chunk_io(self, chunk_ids) -> None:
         with self._inflight_lock:
             completions = {
@@ -1583,6 +1787,60 @@ class TuttiKVStore:
             self._layout.target_uri(chunk_id) for chunk_id in chunk_ids
         ])
         self._layout.abort_uncommitted(chunk_ids)
+
+    def _on_direct_put_settled(self, ok: bool, io_keys, completion) -> None:
+        """Settle direct writes without closing targets mid-drain."""
+        if ok:
+            self._on_put_settled(True, io_keys)
+            return
+        chunk_ids = tuple(dict.fromkeys(
+            decode_io_key(io_key)[0] for io_key in io_keys
+        ))
+        self._direct_failed_chunks.update(chunk_ids)
+        if completion is None:
+            return
+        with self._inflight_lock:
+            active = {
+                item
+                for chunk_id in chunk_ids
+                for item in self._inflight_by_chunk.get(chunk_id, ())
+            }
+        # A lone direct completion can be settled immediately. When another
+        # layer still uses the target, defer recycle/close until engine drain.
+        if active == {completion}:
+            with self._inflight_lock:
+                active_writes = {
+                    item
+                    for pending in self._inflight_by_chunk.values()
+                    for item in pending
+                    if getattr(item, "_direction", None) == "write"
+                }
+            if active_writes != {completion}:
+                return
+            backend = self._direct_backend
+            end_plan = getattr(backend, "end_target_plan", None)
+            if callable(end_plan):
+                end_plan("write")
+            self.finalize_direct_failures()
+
+    def finalize_direct_failures(self) -> None:
+        """Close failed write targets after all direct completions drain."""
+        chunks = tuple(self._direct_failed_chunks)
+        if not chunks:
+            return
+        self._direct_failed_chunks.difference_update(chunks)
+        try:
+            self._close_cached_targets([
+                self._layout.target_uri(chunk_id) for chunk_id in chunks
+            ])
+            self._layout.abort_uncommitted(chunks)
+            self._live = {
+                io_key for io_key in self._live
+                if decode_io_key(io_key)[0] not in chunks
+            }
+        except Exception:
+            self._direct_failed_chunks.update(chunks)
+            raise
 
     def _submit_retry(self, requests, direction: str):
         """提交整批；partial-commit 的被拒请求窗口重发。

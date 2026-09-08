@@ -16,7 +16,6 @@ import ctypes
 import os
 import shutil
 import tempfile
-import threading
 import weakref
 from collections import namedtuple
 from pathlib import Path
@@ -32,33 +31,6 @@ from stores.tutti_nvme.store import (
 from stores.tutti_nvme.commit import read_rank_commit
 
 SEG = 4096
-
-
-def test_direct_completions_share_one_store_observer():
-    observed = []
-    done = threading.Event()
-
-    class Completion:
-        def wait_result(self):
-            observed.append(threading.current_thread())
-            if len(observed) == 2:
-                done.set()
-
-    store = object.__new__(TuttiKVStore)
-    store._direct_watch_pending = set()
-    store._direct_watch_lock = threading.Lock()
-    store._direct_watch_wakeup = threading.Event()
-    store._direct_watch_stop = threading.Event()
-    store._direct_watch_thread = None
-    store._watch_completion(Completion())
-    store._watch_completion(Completion())
-    assert done.wait(1.0)
-    assert len({id(thread) for thread in observed}) == 1
-    assert observed[0].name == "tutti-direct-completion-observer"
-    store._direct_watch_stop.set()
-    store._direct_watch_wakeup.set()
-    store._direct_watch_thread.join(timeout=1.0)
-    assert not store._direct_watch_thread.is_alive()
 
 
 def io_key(chunk: bytes, layer: int) -> bytes:

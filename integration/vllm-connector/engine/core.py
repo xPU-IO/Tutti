@@ -1028,12 +1028,29 @@ class KVEngine:
         驱逐善后由层数定案后的权威进程结算。
         """
         self._require_open()
+        keys = list(keys)
         plan = self._index.plan_store(keys)
         if plan is None:
             return None
         self._planned_store_keys.update(plan.new_keys)
         if plan.evicted_keys and self._num_layers is not None:
             self._store.drop(_expand_io_keys(plan.evicted_keys, self._num_layers))
+        if keys and self.direct:
+            backend = getattr(self._transfer, "_backend", None)
+            prepare = getattr(backend, "prepare_write_targets", None)
+            if callable(prepare):
+                try:
+                    prepare(keys)
+                except Exception:
+                    abort_chunks = getattr(self._store, "abort_chunks", None)
+                    if callable(abort_chunks):
+                        try:
+                            abort_chunks(plan.new_keys)
+                        except Exception:
+                            pass
+                    self._index.confirm_store(plan.new_keys, ok=False)
+                    self._planned_store_keys.difference_update(plan.new_keys)
+                    raise
         return plan
 
     def confirm_store(self, keys, ok: bool = True) -> None:
@@ -1432,6 +1449,10 @@ class KVEngine:
         if not self.read_plan_supported:
             raise RuntimeError("read CUDA event bridge unavailable")
         if self.direct:
+            backend = getattr(self._transfer, "_backend", None)
+            begin_plan = getattr(backend, "begin_target_plan", None)
+            if callable(begin_plan):
+                begin_plan(keys, "read")
             plan = _DirectAllLayerReadPlan(
                 self, keys, block_tables, physical_layers, on_failure
             )
@@ -1451,6 +1472,18 @@ class KVEngine:
         if isinstance(self._transfer, DirectTransfer):
             direct_lock = getattr(self, "_direct_submit_lock", None)
             with (direct_lock if direct_lock is not None else nullcontext()):
+                backend = getattr(self._transfer, "_backend", None)
+                plans = getattr(backend, "_target_plans", {})
+                if "write" not in plans:
+                    prepare = getattr(backend, "prepare_write_targets", None)
+                    begin = getattr(backend, "begin_target_plan", None)
+                    if callable(prepare) != callable(begin):
+                        raise RuntimeError(
+                            "direct backend lacks write target planning"
+                        )
+                    if callable(prepare):
+                        prepare(keys)
+                        begin(keys, "write")
                 record_compute = getattr(self._store, "record_compute_event", None)
                 wait_write = getattr(self._store, "wait_write_event", None)
                 if not callable(record_compute) and not callable(wait_write):
@@ -1572,12 +1605,35 @@ class KVEngine:
         inflight = self._inflight
         self._inflight = []
         first_error = None
-        for completion in inflight:
-            try:
-                completion.wait()
-            except Exception as exc:
-                if first_error is None:
-                    first_error = exc
+        drain_started_ns = time.perf_counter_ns()
+        context = (
+            nvtx_range(
+                f"tutti.direct.completion_drain|completions={len(inflight)}"
+            ) if self.direct else nullcontext()
+        )
+        with context:
+            for completion in inflight:
+                try:
+                    completion.wait()
+                except Exception as exc:
+                    if first_error is None:
+                        first_error = exc
+        if self.direct and inflight:
+            stats = [
+                getattr(completion, "drain_stats", {})
+                for completion in inflight
+            ]
+            _LOG.warning(
+                "DIRECT_COMPLETION_DRAIN completions=%d wait_result_calls=%d "
+                "release_io_calls=%d failed=%d read=%d write=%d elapsed_ms=%.3f",
+                len(inflight),
+                sum(item.get("wait_result_calls", 0) for item in stats),
+                sum(item.get("release_io_calls", 0) for item in stats),
+                sum(bool(item.get("failed")) for item in stats),
+                sum(item.get("direction") == "read" for item in stats),
+                sum(item.get("direction") == "write" for item in stats),
+                (time.perf_counter_ns() - drain_started_ns) / 1_000_000,
+            )
         for window in self._unique_windows():
             try:
                 window.drain()
@@ -1588,6 +1644,14 @@ class KVEngine:
         if callable(drain_deferred):
             try:
                 drain_deferred()
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+        self._end_direct_target_plans()
+        finalize_failures = getattr(self._store, "finalize_direct_failures", None)
+        if callable(finalize_failures):
+            try:
+                finalize_failures()
             except Exception as exc:
                 if first_error is None:
                     first_error = exc
@@ -1604,16 +1668,22 @@ class KVEngine:
         inflight = self._inflight
         self._inflight = []
         first_error = None
-        for completion in inflight:
-            abort = getattr(completion, "abort", None)
-            try:
-                if callable(abort):
-                    abort()
-                else:
-                    completion.wait()
-            except Exception as exc:
-                if first_error is None:
-                    first_error = exc
+        context = (
+            nvtx_range(
+                f"tutti.direct.abort_drain|completions={len(inflight)}"
+            ) if self.direct else nullcontext()
+        )
+        with context:
+            for completion in inflight:
+                abort = getattr(completion, "abort", None)
+                try:
+                    if callable(abort):
+                        abort()
+                    else:
+                        completion.wait()
+                except Exception as exc:
+                    if first_error is None:
+                        first_error = exc
         for window in self._unique_windows():
             try:
                 window.drain()
@@ -1627,6 +1697,14 @@ class KVEngine:
             except Exception as exc:
                 if first_error is None:
                     first_error = exc
+        self._end_direct_target_plans()
+        finalize_failures = getattr(self._store, "finalize_direct_failures", None)
+        if callable(finalize_failures):
+            try:
+                finalize_failures()
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
         self._write_reuse_event = None
         if first_error is not None:
             raise first_error
@@ -1635,14 +1713,35 @@ class KVEngine:
         """收尾：等待在途批次并关闭 store；幂等。"""
         if self._closed:
             return
-        self._closed = True
+        first_error = None
         try:
             self.wait_idle()
-        finally:
-            self._active_read_plan = None
-            if isinstance(self._transfer, DirectTransfer):
+        except Exception as exc:
+            first_error = exc
+        self._active_read_plan = None
+        if isinstance(self._transfer, DirectTransfer):
+            try:
                 self._transfer.close()
-            self._store.close()
+            except Exception as exc:
+                backend = getattr(self._transfer, "_backend", None)
+                if not bool(getattr(backend, "_closed", False)):
+                    raise
+                if first_error is None:
+                    first_error = exc
+        self._store.close()
+        self._closed = True
+        if first_error is not None:
+            raise first_error
+
+    def _end_direct_target_plans(self) -> None:
+        backend = getattr(self._transfer, "_backend", None)
+        end_plan = getattr(backend, "end_target_plan", None)
+        plans = getattr(backend, "_target_plans", {})
+        if callable(end_plan):
+            for direction in tuple(plans):
+                end_plan(direction)
+            if getattr(backend, "_prepared_write_chunks", None) is not None:
+                end_plan("write")
 
     # ---- 内部 ----
 
