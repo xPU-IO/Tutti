@@ -13,7 +13,9 @@ requires-python = ">=3.10"
 dependencies = []
 
 [tool.setuptools.packages.find]
-# PEP 420 命名空间包：adapter/ 与 engine/ 无 __init__.py（纯目录即包）。
+# adapter/index/stores 为 PEP 420 命名空间包（纯目录即包）；engine/ 必须带
+# __init__.py 成为常规包——命名空间包会被任何同名顶层模块抢占（曾实发于
+# mooncake 的 site-packages 顶层 engine.so，已卸载；保留作防御）。
 include = ["adapter*", "engine*", "index*", "stores*"]
 namespaces = true
 

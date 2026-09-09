@@ -18,7 +18,7 @@ import sys
 import time
 import urllib.request
 
-TRACE = "/data2/traces/codex_swebenchpro/requests_hy3.jsonl"
+TRACE = "/mnt/nvme4/datasets/codex_swebenchpro/requests_hy3.jsonl"
 
 
 def _load_turns(trial_id: int, turns: int) -> list[dict]:

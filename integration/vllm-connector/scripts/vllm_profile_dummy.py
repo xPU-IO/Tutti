@@ -73,7 +73,7 @@ def _request(port: int, prompt: list[int], request_id: str, max_tokens: int) -> 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="/data2/tencent/Hy3-FP8")
+    parser.add_argument("--model", default="/mnt/nvme4/models/Hy3-FP8")
     parser.add_argument("--port", type=int, default=8192)
     # Leave room for the requested completion inside max_model_len=131072.
     parser.add_argument("--tokens", type=int, default=65528)

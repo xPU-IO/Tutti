@@ -83,6 +83,11 @@ def main() -> int:
         action="store_true",
         help="enable verbose per-Module NVTX tracing",
     )
+    parser.add_argument(
+        "--disable-flashinfer-autotune",
+        action="store_true",
+        help="skip FlashInfer autotuning during vLLM startup",
+    )
     parser.add_argument("--tokens", type=int, default=65528)
     parser.add_argument("--reuse-pct", type=int, default=80)
     parser.add_argument("--max-tokens", type=int, default=8)
@@ -194,6 +199,7 @@ def main() -> int:
         load_format=args.load_format,
         enable_prefix_caching=True,
         enable_layerwise_nvtx_tracing=args.layerwise_nvtx,
+        enable_flashinfer_autotune=not args.disable_flashinfer_autotune,
         profiler_config={"profiler": "cuda"},
         kv_transfer_config=kv_transfer_config,
     )

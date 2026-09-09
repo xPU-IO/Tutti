@@ -8,7 +8,7 @@
 #                    three levels up from this file, i.e. the repo root)
 #   TUTTI_BUILD_DIR  existing tutti CMake build directory that contains
 #                    tutti/presets/libtutti_presets.a (default: probe
-#                    $TUTTI_ROOT/build/cuda-module then $TUTTI_ROOT/build)
+#                    $TUTTI_ROOT/build)
 #
 # Prerequisite check (per task card): if libtutti_presets.a cannot be found,
 # fail with a clear message instead of building tutti.
@@ -40,28 +40,43 @@ def resolve_build_dir(tutti_root):
     env = os.environ.get("TUTTI_BUILD_DIR")
     if env:
         return os.path.abspath(env)
-    for cand in ("build/cuda-module", "build"):
-        p = os.path.join(tutti_root, cand)
-        if os.path.exists(os.path.join(p, "tutti", "presets", "libtutti_presets.a")):
-            return p
+    p = os.path.join(tutti_root, "build")
+    if os.path.exists(os.path.join(p, "tutti", "presets", "libtutti_presets.a")):
+        return p
+    return None
+
+
+def cmake_cache_value(build_dir, name):
+    cache = os.path.join(build_dir, "CMakeCache.txt")
+    if not os.path.exists(cache):
+        return None
+    prefix = name + ":"
+    with open(cache) as f:
+        for line in f:
+            if line.startswith(prefix):
+                return line.split("=", 1)[1].strip()
     return None
 
 
 def resolve_cuda_root(build_dir):
     """Prefer the exact toolkit used by the tutti build (from CMakeCache)."""
-    cache = os.path.join(build_dir, "CMakeCache.txt")
-    if os.path.exists(cache):
-        with open(cache) as f:
-            for line in f:
-                if line.startswith("CUDAToolkit_ROOT:PATH="):
-                    v = line.split("=", 1)[1].strip()
-                    if v:
-                        return v
-                if line.startswith("CMAKE_CUDA_COMPILER:FILEPATH="):
-                    v = line.split("=", 1)[1].strip()
-                    if v:
-                        return os.path.abspath(os.path.join(v, "..", ".."))
+    toolkit_root = cmake_cache_value(build_dir, "CUDAToolkit_ROOT")
+    if toolkit_root:
+        return toolkit_root
+    compiler = cmake_cache_value(build_dir, "CMAKE_CUDA_COMPILER")
+    if compiler:
+        return os.path.abspath(os.path.join(compiler, "..", ".."))
     return "/usr/local/cuda"
+
+
+def resolve_accelerator_profile(build_dir):
+    profile = cmake_cache_value(build_dir, "TUTTI_ACCELERATOR")
+    if profile not in {"CUDA", "MUSA", "MACA"}:
+        die(
+            "unsupported or missing TUTTI_ACCELERATOR in %s/CMakeCache.txt: %r"
+            % (build_dir, profile)
+        )
+    return profile
 
 
 TUTTI_ROOT = resolve_tutti_root()
@@ -83,6 +98,7 @@ if not os.path.exists(PRESETS_LIB):
     )
 
 CUDA_ROOT = resolve_cuda_root(TUTTI_BUILD_DIR)
+ACCELERATOR_PROFILE = resolve_accelerator_profile(TUTTI_BUILD_DIR)
 TUTTI_INCLUDE = os.path.join(TUTTI_ROOT, "tutti", "include")
 
 CCCL_DIRS = sorted(
@@ -120,7 +136,12 @@ ext = Pybind11Extension(
     "tutti_runtime._core",
     sources=["src/_core.cpp"],
     include_dirs=[TUTTI_INCLUDE, os.path.join(CUDA_ROOT, "include")] + CCCL_DIRS,
-    extra_compile_args=["-std=c++17", "-DTUTTI_USE_CUDA"],
+    extra_compile_args=[
+        "-std=c++17",
+        "-DTUTTI_USE_%s=1" % ACCELERATOR_PROFILE,
+        '-DTUTTI_COMPILED_ACCELERATOR_PROFILE="%s"' % ACCELERATOR_PROFILE,
+        "-DTUTTI_DEFAULT_ACCEL_ID=0",
+    ],
     extra_objects=STATIC_LIBS,
     libraries=(["nvm"] if os.path.isdir(LIBNVM_DIR) else []) + ["cudart"],
     library_dirs=RUNTIME_LIB_DIRS,

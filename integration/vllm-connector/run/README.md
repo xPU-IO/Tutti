@@ -173,15 +173,14 @@ spin-until-deadline loop generated more than 147 million `cudaEventQuery`
 calls in one 64K capture. The one-query implementation reduced the same report
 from 4.4 GiB to 145 MiB while preserving request latency and overlap evidence.
 
-Before capturing C++ IO NVTX, configure and build `MODULE_BUILD` through
+Before capturing C++ IO NVTX, build Tutti with
 [`doc/getting-started.md`](../../../doc/getting-started.md), then re-link the
-Python binding against those current static libraries and verify both marker
-strings:
+Python binding against `build/` and verify both marker strings:
 
 ```bash
 cd integration/vllm-connector/bindings/python
-TUTTI_ROOT="$ROOT" \
-TUTTI_BUILD_DIR="$MODULE_BUILD" \
+TUTTI_ROOT=/data/home/ryeqiu/Tutti \
+TUTTI_BUILD_DIR=/data/home/ryeqiu/Tutti/build \
   python setup.py build_ext --inplace --force
 strings src/tutti_runtime/_core*.so | \
   grep -E 'tutti\.(local|striped)_nvme\.io_kernel'

@@ -4,7 +4,7 @@
 set -euo pipefail
 
 CONNECTOR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
-MODEL=/data2/tencent/Hy3-FP8
+MODEL=/mnt/nvme4/models/Hy3-FP8
 PORT=8192
 
 export PYTHONPATH="$CONNECTOR:$PYTHONPATH"
