@@ -8,6 +8,8 @@ build_layer2/*
 # In-tree CMake build dir under the Layer 2 tests (configured artifacts only).
 tutti/device_manager/tests/build/
 build_snvme_module/
+# In-source cmake debris (accidental `cmake .` at the repo root).
+CMakeFiles/
 
 # Third-party packages directory
 third_pkgs/
@@ -42,7 +44,6 @@ kv_cache_e2e_stress.log
 # CMake user presets are per-developer (toolchain/CUDA paths etc.).
 # Commit CMakePresets.json deliberately if you ever need a shared baseline.
 CMakeUserPresets.json
-CMakePresets.json
 build_dependencies.tsv
 
 # Smoke-test binaries built in-tree by the test/Makefile.  The .c/.cu

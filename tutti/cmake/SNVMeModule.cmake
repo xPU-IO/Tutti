@@ -1,5 +1,5 @@
-# Optional snvme kernel-module targets. This is intentionally opt-in because
-# it is tied to the running kernel and a GPU-vendor P2P API.
+# snvme kernel-module targets for the default hardware build. They are tied to
+# the running kernel and the NVIDIA P2P API.
 
 set(TUTTI_P2P_BACKEND "" CACHE STRING
     "SNVMe peer-memory backend: nvidia|metax (empty selects from TUTTI_ACCELERATOR)")
@@ -192,11 +192,11 @@ add_custom_target(clean_modules
     WORKING_DIRECTORY "${module_output}"
     ${_snvme_jobserver_args})
 add_custom_target(insmod
-    COMMAND sudo ${_snvme_make_command} TUTTI_P2P_BACKEND=${TUTTI_P2P_BACKEND} insmod
+    COMMAND ${_snvme_make_command} TUTTI_P2P_BACKEND=${TUTTI_P2P_BACKEND} insmod
     WORKING_DIRECTORY "${module_output}"
     ${_snvme_jobserver_args})
 add_custom_target(rmmod
-    COMMAND sudo ${_snvme_make_command} TUTTI_P2P_BACKEND=${TUTTI_P2P_BACKEND} rmmod
+    COMMAND ${_snvme_make_command} TUTTI_P2P_BACKEND=${TUTTI_P2P_BACKEND} rmmod
     WORKING_DIRECTORY "${module_output}"
     ${_snvme_jobserver_args})
 

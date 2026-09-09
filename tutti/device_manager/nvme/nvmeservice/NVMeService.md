@@ -77,8 +77,8 @@ Build targets (CMake):
 | Target                          | What it is                          |
 |---------------------------------|--------------------------------------|
 | `nvmeservice`                   | shared library: proto + state + server + client lib |
-| `nvmeservice_daemon_example`    | legacy daemon diagnostic binary (`$TUTTI_BUILD/bin/nvmeservice_daemon`) |
-| `nvmeservice_client_example`    | reference client (`$TUTTI_BUILD/bin/nvmeservice_client`) |
+| `nvmeservice_daemon_example`    | legacy daemon diagnostic binary (`build/bin/nvmeservice_daemon`) |
+| `nvmeservice_client_example`    | reference client (`build/bin/nvmeservice_client`) |
 
 ---
 
@@ -87,13 +87,13 @@ Build targets (CMake):
 This historical protocol document intentionally has no runnable quick start.
 For a current deployment:
 
-1. Compile with [`doc/getting-started.md`](../../../../doc/getting-started.md)
-   and retain the resulting `MODULE_BUILD` directory.
+1. Compile with [`doc/getting-started.md`](../../../../doc/getting-started.md);
+   the resulting output directory is `build/`.
 2. Follow [`doc/tutti_daemon.md`](../../../../doc/tutti_daemon.md) to create
    canonical YAML from `config/local_nvme_config.yaml`, load a signed module,
-   and start `$MODULE_BUILD/bin/tutti_daemon`.
-3. Use `$MODULE_BUILD/bin/nvmeservice_client --list-only` to inspect
-   daemon-published resources and view paths.
+   and start `build/bin/tutti_daemon`.
+3. Use `build/bin/nvmeservice_client --list-only` to inspect daemon-published
+   resources and view paths.
 
 The protocol sections below retain historical compatibility details only. Do
 not run their `nvmeservice_daemon`, `sys_config.yaml`, legacy ACL, or fixed

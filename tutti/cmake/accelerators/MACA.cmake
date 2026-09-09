@@ -7,19 +7,9 @@
 #   - TUTTI_BUILD_HARDWARE_STACK default ON
 #   - tutti_configure_cuda_like() function (MACA variant)
 
-# example for cu-bridge build with MACA SDK (Metax) and SNVMe kernel module
-# #build_ko & insmod/rmmod
-# cmake_maca --preset=maca-module --fresh -DSNVME_KERNEL_VERSION=5.15.0-public -DTUTTI_BUILD_HARDWARE_TESTS=ON
-# cmake_maca --build build/maca-module --preset=maca-module --target modules
-# cmake --build build/maca-module --target insmod
-# cmake --build build/maca-module --target rmmod
-#
-# #build daemon
-# cmake_maca --build build/maca-module/ --preset maca-module --target tutti_daemon -j8
-#
-# #build_lib
-# cmake_maca --preset maca -DTUTTI_BUILD_HARDWARE_TESTS=ON -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
-# cmake_maca  --build build/maca/ --preset maca --target tutti_layerwise_kv_overlap  -j8
+# MACA users configure the shared `default` preset through the vendor wrapper
+# and override TUTTI_ACCELERATOR/MACA_ROOT in a fresh build directory. See
+# doc/advanced-build.md; no MACA-specific shared preset is maintained.
 
 set(TUTTI_BUILD_HARDWARE_STACK ON CACHE BOOL
     "Build hardware stack (accel/device_manager/backends/io_engine)")

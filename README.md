@@ -61,26 +61,19 @@ symmetric per-vendor backends (nvidia done, metax symmetric).
 
 **Environment requirements and module verification**
 
-- OS: Linux. The unified `snvme/` tree selects `5.4-tlinux4`, `5.10`, `5.15`, or `6.8` from the running kernel. see [`PORTING.md`](tutti/device_manager/nvme/kernel_modules/PORTING.md) for the matrix.
-- Accelerator: NVIDIA GPU + CUDA toolkit (`nvcc`); bare metal with IOMMU in passthrough mode. MUSA/MACA build profiles configure-checked only (no hardware validation yet).
+- OS: Linux. The unified `snvme/` tree selects `5.4-tlinux4`, `5.10`, `5.15`, or `6.8` from the running kernel. See [`PORTING.md`](tutti/device_manager/nvme/kernel_modules/PORTING.md) for the matrix.
+- Accelerator: NVIDIA GPU + CUDA toolkit (`nvcc`); bare metal with IOMMU in passthrough mode.
 - Runtime: daemon-only — `tutti_daemon` bring-up creates devices and views; queue depth always takes the controller maximum (NVMe CAP.MQES + 1).
-- Host deps: CMake, protobuf / gRPC / uuid / yaml-cpp. Manual builds use the existing vcpkg tree; `scripts/prepare_env.sh` is only a bootstrap path for missing dependencies.
+- Host deps: CMake, protobuf / gRPC / uuid / yaml-cpp. CMake discovers system packages by default; an existing vcpkg tree is an optional fallback.
 - All file I/O is opened with `O_DIRECT` (project policy).
 
 ## Build and run the KV Cache workload
 
-The canonical manual build flow is [doc/getting-started.md](doc/getting-started.md).
-It uses explicit `cmake -S/-B` commands with the existing vcpkg toolchain, so it
-works independently of machine-local generated presets and does not modify
-`third_pkgs/vcpkg`.
+The canonical build flow is [doc/getting-started.md](doc/getting-started.md).
 
-`layerwise_kv_overlap` is Tutti's standard KV-cache reference workload
-(80 layers, 512 KiB K/V tensors, read∥compute∥write overlap). It is a manual
-hardware workload, not a parameter-free CTest: it requires daemon-published
-`--directory` paths. Its prerequisites are strict: load the `snvme` modules →
-start `tutti_daemon` → mount. For the deployment-specific run command,
-parameters, expected output (~25 GB/s READ on 4 drives), and cleanup, see
-[examples/layerwise_kv_overlap/README.md](examples/layerwise_kv_overlap/README.md).
+`layerwise_kv_overlap` is a manual workload that requires daemon-published
+`--directory` paths; its source header contains the run commands and `--help`
+lists all runtime options.
 
 ## Configuration
 
@@ -105,15 +98,15 @@ standalone project entries. Runtime is daemon-only.
 
 ## Deep Dive
 
-- [Getting Started](doc/getting-started.md) — Linux/CUDA 手动 configure、build、非硬件测试与可选 SNVMe 模块编译
+- [Getting Started](doc/getting-started.md) — 唯一默认硬件 build：CUDA、SNVMe 模块与 daemon
 - [System Architecture](doc/architecture/system-architecture.md) — the as-implemented layers, IO walkthrough, and deployment topology
 - [Key Designs](doc/architecture/key-designs.md) — the five performance designs behind the GPU-centric data path, with measured numbers
 - [Backend SPI](doc/design/backend-spi.md) — the DataPath / Resolver / Binding semantic contracts
 - [GPU Porting Guide](doc/gpu-porting-guide.md) — the `cuda_like` three-layer framework, primitive semantic contracts, and Metax integration steps
 - [Kernel Portability](doc/design/kernel-portability.md) — the snvme module across kernel versions and GPU vendors
 - [snvme Design Rationale](doc/architecture/snvme-design-rationale.md) — why a custom NVMe driver is required (no mainline facility exposes user-owned NVMe queues; RDMA user-doorbell analogy)
-- [Extending Tutti](doc/extending_tutti.md) — adding resolvers, bindings, and data paths behind the SPI
-- [Build & SNVMe Testing](doc/build_and_test.md) — environment setup, build, module install, and the smoke-test ladder
+- [Extending Tutti](doc/extending_tutti.md) — adding resolvers, bindings, data paths, and SNVMe smoke tests
+- [Advanced Build](doc/advanced-build.md) — driver rebuild, reload, Kbuild, and baseline maintenance
 - [Contributing](CONTRIBUTING.md) — install, test, and contribution rules
 
 ## Cite

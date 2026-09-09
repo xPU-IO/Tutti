@@ -174,11 +174,11 @@ stream semantics.
   127.0.0.1:50051).
 - **Devices**: daemon-published block and view paths are authoritative;
   striped targets span multiple backing mounts when configured.
-- **Build profiles**: CUDA (production), HOST (contract tests without a
-  GPU SDK); hardware workloads are gated by `-DTUTTI_BUILD_HARDWARE_TESTS=ON`.
-- **Contract suites**: hardware-independent SPI/API contracts plus hardware
-  gates (datapath / runtime E2E / striped / resolver). Build and test commands
-  are centralized in [../getting-started.md](../getting-started.md).
+- **Build**: one default CUDA hardware build includes the module, daemon,
+  local-NVMe targets, and hardware tests in `build/`.
+- **Contract suites**: SPI/API contracts plus hardware gates (datapath /
+  runtime E2E / striped / resolver). Build and test commands are centralized
+  in [../getting-started.md](../getting-started.md).
 
 ## 5. Source map
 

@@ -55,9 +55,8 @@ The ioctl UAPI is versioned (`tutti/include/uapi/tutti_snvme.h`):
   the library's minimum is **rejected fail-closed** (`ENODEV`) — never a
   silent fallback to mismatched layouts.
 - Consequence: swapping kernel modules requires rebuilding userspace
-  (`libnvm`, `tutti_daemon`) against the matching headers. After configuring
-  `MODULE_BUILD` with [`../getting-started.md`](../getting-started.md), run
-  `cmake --build "$MODULE_BUILD" --target libnvm tutti_daemon modules` to
+  (`libnvm`, `tutti_daemon`) against the matching headers. Run
+  `cmake --build --preset default --target libnvm tutti_daemon modules` to
   produce the matched set together.
 - UAPI structs are plain-C layout-stable; `libnvm` compiles its device
   headers under both nvcc and plain C via layout-identical fallbacks for
@@ -87,11 +86,10 @@ a deliberate semantic: GPU-consumed ≠ spurious.
 
 ## 6. Build & test entry points
 
-- Production matched set: configure `MODULE_BUILD` through
-  [`../getting-started.md`](../getting-started.md), then run
-  `cmake --build "$MODULE_BUILD" --target libnvm tutti_daemon modules`.
-  It produces `$MODULE_BUILD/module/snvme{,-core}.ko` and the matching CUDA
-  userspace targets.
+- Production matched set: run
+  `cmake --build --preset default --target libnvm tutti_daemon modules`.
+  It produces `build/module/snvme{,-core}.ko` and the matching CUDA userspace
+  targets.
 - Baseline matrix: each tree compiles against its own headers;
   cross-compiling a tree against a different lineage's headers is a
   known-incompatible configuration (NVMe core API drift), not a compat

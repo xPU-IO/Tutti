@@ -11,8 +11,8 @@
 # config below matches the 4-device striped YAML shipped next to this file.
 #
 # Manual hardware workload: needs GPU + snvme + libnvm + a running tutti_daemon.
-# Gated by TUTTI_BUILD_HARDWARE_TESTS + TUTTI_FEATURE_LOCAL_NVME. It is not a
-# CTest case because each invocation needs daemon-published --directory paths.
+# The default build includes this target. It is not a CTest case because each
+# invocation needs daemon-published --directory paths.
 
 cmake_minimum_required(VERSION 3.18)
 

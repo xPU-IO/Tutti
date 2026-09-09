@@ -31,15 +31,13 @@
 
 ## 2. 构建 Tutti C++（一次）
 
-先按 [`../getting-started.md`](../getting-started.md) 第 6 节完成 CUDA module build，
-并在后续命令中使用同一个目录：
+按 [`../getting-started.md`](../getting-started.md) 完成唯一默认硬件构建：
 
 ```bash
-export MODULE_BUILD=/data/home/ryeqiu/Tutti/build/manual-cuda-module
-cmake --build "$MODULE_BUILD" --parallel "${JOBS:-$(nproc)}"
+cd /data/home/ryeqiu/Tutti
+cmake --preset default
+cmake --build --preset default --parallel 8
 ```
-
-不要复用未说明 toolchain、CUDA 架构和 cache 状态的历史 `build/` 目录。
 
 ## 3. snvme 内核模块 + tutti_daemon bring-up
 
@@ -49,7 +47,7 @@ cmake --build "$MODULE_BUILD" --parallel "${JOBS:-$(nproc)}"
 # 1) 内核模块（snvme.ko）：按 doc/getting-started.md 编译，并按站点流程签名/加载。
 # 2) tutti_daemon（controller bring-up + mount）：
 sudo env TUTTI_VERBOSE=1 nohup \
-  "$MODULE_BUILD/bin/tutti_daemon" \
+  /data/home/ryeqiu/Tutti/build/bin/tutti_daemon \
   --config config/local/tutti_daemon.yaml \
   > /data/home/ryeqiu/log/tutti_daemon.log 2>&1 &
 # 3) 验证：
@@ -178,7 +176,7 @@ LocalStoreBackend 真实建池（GB 级）→ GPU-direct 写 pattern → 读回�
 
 | 更新了什么 | 操作 |
 |---|---|
-| tutti C++ | `cmake --build "$MODULE_BUILD" --parallel "${JOBS:-$(nproc)}"` → 重装 tutti_runtime（pip install -e 幂等） |
+| tutti C++ | `cmake --build --preset default --parallel 8` → 重装 tutti_runtime（pip install -e 幂等） |
 | connector 适配层 | 无需重编，直接重启 vllm |
 | engine/kernels | 重装对应包（pip install -e） |
 | vllm C++/rust | 重跑 §6（增量，rust 缓存有效） |

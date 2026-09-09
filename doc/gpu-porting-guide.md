@@ -273,21 +273,17 @@ the API differences internally; `map.c` is not modified.
 
 A vendor port is complete when:
 
-1. **CUDA profile**: after configuring `CUDA_BUILD` with
-   [`getting-started.md`](getting-started.md),
-   `ctest --test-dir "$CUDA_BUILD" --output-on-failure -LE hardware` passes.
-2. **HOST profile**: `ctest --test-dir "$HOST_BUILD" --output-on-failure`
-   passes after the same guide's HOST configuration.
-3. **Vendor profile**: configure a fresh vendor-specific build directory from
+1. **Default hardware build**: after following
+   [`getting-started.md`](getting-started.md), `ctest --preset default` passes.
+2. **Vendor profile**: configure a fresh vendor-specific build directory from
    the repository root with its SDK/toolchain and
    `-DTUTTI_ACCELERATOR=<VENDOR>`; the stub-removal `#error`s in
    `<vendor>.h` must no longer fire.
-4. **Vendor's device compiler** compiles the `__CUDACC__`-guarded section
+3. **Vendor's device compiler** compiles the `__CUDACC__`-guarded section
    of `submit_one.cuh` / `fused_submit_kernel.cuh` /
    `nvme_submit_primitives.cuh` (these are the device code entry points).
-5. **Hardware smoke**: configure `MODULE_BUILD` with
-   `TUTTI_BUILD_HARDWARE_TESTS=ON` as described in `getting-started.md`, then
-   manually run `tutti_layerwise_kv_overlap` with daemon-published
+4. **Hardware smoke**: the default build already includes the workload;
+   manually run `build/bin/tutti_layerwise_kv_overlap` with daemon-published
    `--directory` paths. It is not a parameter-free CTest.
 
 ## Reference: `host.h` as the canonical shim
@@ -331,10 +327,9 @@ Metax 选一种：
 
 ### 验证步骤
 
-1. 先按 [`getting-started.md`](getting-started.md) 建立并通过 `HOST_BUILD` 与
-   `CUDA_BUILD`，保留其作为 CUDA 回归基线。
+1. 先按 [`getting-started.md`](getting-started.md) 建立并通过默认硬件 build，
+   保留它作为 CUDA 回归基线。
 2. 在新的 vendor build 目录中以 `-DTUTTI_ACCELERATOR=MUSA` 及 MUSA SDK 路径配置；
    configure 成功且不触发 stub `#error` 是最低门槛。
-3. 只有在 vendor 的 module build 也通过、daemon 已启动并能获取实际 view 路径后，才以
-   `TUTTI_BUILD_HARDWARE_TESTS=ON` 构建并手动运行
-   `tutti_layerwise_kv_overlap`；不要从普通 CUDA preset 构建该目标。
+3. 只有在 vendor build 也通过、daemon 已启动并能获取实际 view 路径后，才手动运行
+   `tutti_layerwise_kv_overlap`。

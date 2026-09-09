@@ -10,7 +10,13 @@ cmake_minimum_required(VERSION 3.18)
 # =============================================================================
 
 find_package(gRPC CONFIG REQUIRED)
-find_package(Protobuf REQUIRED)
+if(NOT TARGET protobuf::protoc)
+    find_package(Protobuf CONFIG QUIET)
+    if(NOT Protobuf_FOUND)
+        tutti_enable_vcpkg_fallback()
+        find_package(Protobuf CONFIG REQUIRED)
+    endif()
+endif()
 
 # Determine protoc executable
 if(TARGET protobuf::protoc)

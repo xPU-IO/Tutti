@@ -1,18 +1,30 @@
-// layerwise_kv_overlap.cpp -- TuttiRuntime port of the layerwise KV-cache
-// overlap workload.
+// layerwise_kv_overlap.cpp -- Tutti's layerwise KV-cache reference workload.
 //
-// HY3-shaped 128K-context request (80 layers, 512 x 256-token chunks,
-// 90% prefix hit) with 3-stream layerwise pipeline:
+// It simulates a HY3-shaped 128K-context request (80 layers, 512 x 256-token
+// chunks, 90% prefix hit) with a three-stream pipeline:
 //   read(L+1) || SGEMM compute(L) || write(L-1)
 //
-// TuttiRuntime mode: the runtime (devices, queues, datapaths) is assembled
-// from a Tutti YAML (--config); the daemon owns all deployment facts. The
-// user only passes the daemon-published accelerator view directories
-// (--directory), never PCI BDFs, chrdev paths, or mount points.
+// TuttiRuntime assembles devices, queues, and DataPaths from --config. The
+// daemon owns deployment details; callers supply only daemon-published
+// accelerator view directories through --directory. Each 512 KiB K/V tensor
+// is registered independently, so NVMe DMA directly reads and writes GPU
+// tensors without a scratch buffer or D2D bounce.
 //
-// MEMORY ARCHITECTURE: per-chunk K/V tensors (tensor_size, 512 KiB default)
-// are registered individually with the DataPath. NVMe DMA goes directly
-// to/from tensors -- no scratch buffer, no D2D bounce.
+// Run from the repository root after `build/bin/nvmeservice_client --endpoint
+// 127.0.0.1:50051 --list-only` returns the accelerator view paths.
+//
+// Four-drive striped mode requires --directory values in the same order as
+// tutti_layerwise_striped.yaml's device_ids:
+//   sudo build/bin/tutti_layerwise_kv_overlap --striped \
+//     --directory <view-0> --directory <view-1> \
+//     --directory <view-2> --directory <view-3>
+//
+// Single-drive mode:
+//   sudo build/bin/tutti_layerwise_kv_overlap --single \
+//     --config examples/layerwise_kv_overlap/tutti_layerwise_local.yaml \
+//     --directory <view-0>
+//
+// Use `build/bin/tutti_layerwise_kv_overlap --help` for all runtime options.
 
 #include <tutti/tutti_runtime.h>
 

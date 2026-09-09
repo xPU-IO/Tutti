@@ -90,9 +90,11 @@ all:
 	$(MAKE) -C $(KERNEL_SRC) M=$(CURDIR) modules
 # Queue depth: no module parameter -- snvme always takes the controller
 # maximum (NVMe CAP.MQES + 1).
+# Root loads directly; non-root users retain the normal sudo path.
+MODULE_PRIVILEGE := $(if $(filter 0,$(shell id -u)),,sudo)
 insmod:
-	sudo insmod snvme-core.ko && sudo insmod snvme.ko
+	$(MODULE_PRIVILEGE) insmod snvme-core.ko && $(MODULE_PRIVILEGE) insmod snvme.ko
 rmmod:
-	sudo rmmod snvme && sudo rmmod snvme_core
+	$(MODULE_PRIVILEGE) rmmod snvme && $(MODULE_PRIVILEGE) rmmod snvme_core
 clean:
 	rm -fr *.o *.ko *.mod* .*.cmd .*.d baseline/*/*.o peer_memory/*.o compat/*.o

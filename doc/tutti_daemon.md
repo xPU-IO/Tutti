@@ -1,9 +1,8 @@
 # tutti_daemon 启动与部署指南
 
 本文说明在 CUDA 主机上配置和启动已经编译好的 `tutti_daemon`。编译统一遵循
-[`getting-started.md`](getting-started.md) 的显式手动 CMake 流程；本文不再把
-`cuda-module` preset 当作前置条件。示例使用一个 GPU 和一个 NVMe namespace，重点
-说明以下对象之间的关系：
+[`getting-started.md`](getting-started.md) 的唯一 `default` preset。示例使用一个 GPU
+和一个 NVMe namespace，重点说明以下对象之间的关系：
 
 - 物理 NVMe 的 PCI 地址，例如 `0000:31:00.0`；
 - daemon bring-up 后生成的 SNVMe 字符设备和块设备；
@@ -69,14 +68,14 @@ cd /path/to/Tutti
 
 需要以下基础环境：
 
-- 已按 [`getting-started.md`](getting-started.md) 成功编译的 CUDA module build；
+- 已按 [`getting-started.md`](getting-started.md) 成功编译的默认硬件 build；
 - 与目标 GPU 驱动匹配的 CUDA toolkit；
 - 当前内核对应的 headers/devel 包；
 - `lspci`、`lsblk`、`findmnt`、`blkid`；
 - 可选的 `nvme-cli`，用于查看 NVMe 型号、序列号和 namespace；
 - `e2fsprogs`，仅在需要执行 `mkfs.ext4` 时使用。
 
-手动流程要求 CMake 3.18 以上；仅 generated preset 工作流要求 CMake 3.21 以上。
+默认 preset 工作流要求 CMake 3.21 以上。
 
 ## 3. 查找目标 NVMe 及其 PCI 地址
 
@@ -166,21 +165,18 @@ sudo mkfs.ext4 -F -L tutti-nvme0 /dev/nvme0n1
 
 ## 5. 已构建模块与 daemon 前置条件
 
-使用 [`getting-started.md`](getting-started.md) 第 6 节的 `MODULE_BUILD` 完成编译后，
-设部署命令使用同一个构建目录：
+按 [`getting-started.md`](getting-started.md) 完成默认构建后，产物固定在 `build/`：
 
 ```bash
 cd /path/to/Tutti
-export ROOT="$PWD"
-export TUTTI_BUILD="$ROOT/build/manual-cuda-module"
-ls -lh "$TUTTI_BUILD/module/snvme-core.ko" "$TUTTI_BUILD/module/snvme.ko"
-test -x "$TUTTI_BUILD/bin/tutti_daemon"
+ls -lh build/module/snvme-core.ko build/module/snvme.ko
+test -x build/bin/tutti_daemon
 ```
 
 启动 daemon 前，模块必须已经按站点签名和加载流程安装，且
 `/dev/snvm_control` 已存在。`insmod`、`rmmod`、NVMe 接管和 reload 会改变运行中
-内核状态，因此不属于普通构建命令；需要修改 driver 时，再阅读
-[`build_and_test.md`](build_and_test.md) 的 smoke-test 阶梯。
+内核状态，因此不属于普通构建命令；需要修改 driver 时，阅读
+[`advanced-build.md`](advanced-build.md)。
 
 ## 6. 创建本机 YAML 配置
 
@@ -220,7 +216,7 @@ cp config/local_nvme_config.yaml config/local/tutti_daemon.yaml
 
 ```bash
 sudo env TUTTI_VERBOSE=1 \
-  "$TUTTI_BUILD/bin/tutti_daemon" \
+  build/bin/tutti_daemon \
   --config config/local/tutti_daemon.yaml
 ```
 
@@ -295,7 +291,7 @@ size、physical block size 或 controller-wide 属性，并且无需在 YAML 中
 
 ```bash
 ls -l /dev/snvm_control
-"$TUTTI_BUILD/bin/nvmeservice_client" \
+build/bin/nvmeservice_client \
   --endpoint 127.0.0.1:50051 --list-only
 ss -ltn | grep ':50051'
 ```
