@@ -120,18 +120,6 @@ def test_nonfailed_rank_collects_before_it_drains_or_enters_next_step():
     assert order == ["collective", ("abort", 30.0), "drain_barrier"]
 
 
-def test_load_failure_forbids_rank_commit_and_resident_publication():
-    consensus = _FailureConsensus(
-        True, 9, True, (_LogicalFailure(0, 0, 1),), 0.1
-    )
-    worker, engine, _ = _worker(consensus)
-    worker._save_keys = [b"chunk"]
-    worker._save_generations = ["g9"]
-    worker.wait_for_save()
-    assert engine.rank_abort_calls == [((b"chunk",), ("g9",))]
-    assert engine.confirm_calls == [((b"chunk",), False)]
-
-
 def test_multiple_rank_failures_merge_conservatively():
     consensus = _TpLoadFailureCoordinator.merge_rows(12, 2, [
         [12, -1, -1, 0, -1, -1, 0],

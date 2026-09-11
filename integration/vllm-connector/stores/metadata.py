@@ -12,7 +12,7 @@ import logging
 
 from .tutti_nvme.layout import Layout
 from .tutti_nvme.striped_layout import StripedLayout
-from .tutti_nvme.commit import remove_rank_commit, scan_rank_commits
+
 
 _LOG = logging.getLogger(__name__)
 
@@ -135,7 +135,6 @@ class TuttiMetadataStore:
                         rank, layout.root,
                     )
         self._opened = True
-        self._cleanup_incomplete_commits()
 
     def close(self) -> None:
         self._opened = False
@@ -163,38 +162,29 @@ class TuttiMetadataStore:
             raise RuntimeError("metadata store is not open")
 
     def _valid_all_rank_chunks(self, marker_sets) -> set[bytes]:
-        commits = {
-            rank: scan_rank_commits(layout.root)
-            for rank, layout in self._layouts.items()
-        }
-        candidates = set().union(*(set(items) for items in commits.values()))
+        """全 rank 层标记齐备、且池 manifest 认可归属的 chunk。
+
+        运行时驻留由内存权威索引门禁（worker→scheduler 的
+        TuttiWorkerMetadata），盘上只保留两样东西：层标记（数据完整性）
+        与池 manifest（槽位归属 + 几何 + 命名空间）。此前的 rank 提交
+        凭证（commits/*.commit.json）与 manifest 信息高度重叠且每文件
+        fsync，已整体删除。
+        """
+        candidates: set[bytes] = set()
+        for rank in range(self._tp_size):
+            for io_key in marker_sets[rank]:
+                if len(io_key) == 18:
+                    candidates.add(bytes(io_key[:16]))
+        num_layers = self._layout.layer_span
+        if not num_layers:
+            return set()
+        expected_layers = set(range(num_layers))
+        slot_bytes = num_layers * self._segment_bytes
         valid = set()
-        namespace = "" if self._key_namespace is None else self._key_namespace.hex()
         for chunk_key in candidates:
-            records = [commits[rank].get(chunk_key) for rank in range(self._tp_size)]
-            if any(record is None for record in records):
-                continue
-            generations = {record.generation for record in records}
-            if len(generations) != 1:
-                continue
-            first = records[0]
-            expected_layers = set(range(first.num_layers))
-            if first.slot_bytes != first.num_layers * self._segment_bytes:
-                continue
             accepted = True
-            for rank, record in enumerate(records):
-                if (
-                    record.namespace != namespace
-                    or record.chunk_key != chunk_key.hex()
-                    or record.rank_id != rank
-                    or record.num_layers != first.num_layers
-                    or record.slot_bytes != first.slot_bytes
-                    or not record.marker_generation
-                    or not self._pool_manifest_matches(
-                        rank, chunk_key, record.pool_generation,
-                        record.num_layers, record.slot_bytes,
-                    )
-                ):
+            for rank in range(self._tp_size):
+                if not self._pool_manifest_matches(rank, chunk_key, slot_bytes):
                     accepted = False
                     break
                 layers = {
@@ -210,11 +200,11 @@ class TuttiMetadataStore:
         return valid
 
     def _record_num_layers(self, chunk_key: bytes) -> int:
-        record = scan_rank_commits(self._layouts[0].root).get(chunk_key)
-        return 0 if record is None else record.num_layers
+        del chunk_key
+        return self._layout.layer_span
 
-    def _pool_manifest_matches(self, rank, chunk_key, pool_generation,
-                               num_layers, slot_bytes) -> bool:
+    def _pool_manifest_matches(self, rank, chunk_key, slot_bytes) -> bool:
+        """池 manifest 是否认可该 chunk 的归属与几何。"""
         path = self._layouts[rank].pool_manifest_path()
         try:
             manifest = json.loads(path.read_text("utf-8"))
@@ -223,27 +213,12 @@ class TuttiMetadataStore:
             return (
                 manifest.get("namespace") == self._key_namespace.hex()
                 and int(manifest.get("slot_bytes", -1)) == slot_bytes
-                and int(geometry.get("num_layers", -1)) == num_layers
-                and int(geometry.get("slot_bytes", -1)) == slot_bytes
-                and int(allocation.get("generation", -1)) == pool_generation
+                and int(geometry.get("num_layers", -1)) * self._segment_bytes
+                == slot_bytes
+                and int(allocation.get("generation", -1)) > 0
             )
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
             return False
-
-    def _cleanup_incomplete_commits(self) -> None:
-        """Restart cleanup removes commit records only, never rank payload."""
-        marker_sets = {
-            rank: set(layout.scan()) for rank, layout in self._layouts.items()
-        }
-        valid = self._valid_all_rank_chunks(marker_sets)
-        commits = {
-            rank: scan_rank_commits(layout.root)
-            for rank, layout in self._layouts.items()
-        }
-        candidates = set().union(*(set(items) for items in commits.values()))
-        for chunk_key in candidates - valid:
-            for layout in self._layouts.values():
-                remove_rank_commit(layout.root, chunk_key)
 
 
 def create_metadata_store(type_name: str, options: dict):

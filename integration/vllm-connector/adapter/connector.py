@@ -18,6 +18,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.logger import init_logger
 
+from adapter.worker_meta import TuttiWorkerMetadata
+
 # 模块以 adapter.* 顶层包导入，logger 名须落在 vllm 命名空间下
 # 才能继承 vllm 根 logger 的 handler（否则输出被静默吞掉）。
 logger = init_logger("vllm.tutti.connector")
@@ -425,6 +427,11 @@ class TuttiConnectorV1(KVConnectorBase_V1):
         self._chunk_tokens = extra["chunk_tokens"]
         self._min_retrieve_tokens = extra.get("min_retrieve_tokens", 0)
         self._max_tokens_per_load = extra.get("max_tokens_per_load", 0)
+        # 内存权威索引的发布门禁：全部 TP rank 报告持久化成功才驻留。
+        self._tp_size = int(getattr(
+            getattr(vllm_config, "parallel_config", None),
+            "tensor_parallel_size", 1,
+        ) or 1)
         self._block_size = getattr(
             getattr(vllm_config, "cache_config", None), "block_size", 16
         )
@@ -518,6 +525,10 @@ class TuttiConnectorV1(KVConnectorBase_V1):
         """上报读取未遂的块（由上层重算兜底）。"""
         return self._require_worker().get_block_ids_with_load_errors()
 
+    def build_connector_worker_meta(self):
+        """交出本 rank 本步的索引增量（worker → scheduler）。"""
+        return self._require_worker().build_connector_worker_meta()
+
     def get_request_ids_with_load_errors(self) -> set[str]:
         """Return request IDs whose sampled output must be discarded."""
         return self._require_worker().get_request_ids_with_load_errors()
@@ -542,10 +553,11 @@ class TuttiConnectorV1(KVConnectorBase_V1):
         返回值：超出 num_computed_tokens 的可加载 token 数（chunk 对齐、
         受最小检索量与单步加载上限约束），读取为步内同步完成。
 
-        查询前先对账持久层（多副本部署下命中查询方与落盘方
-        可能分属不同进程，索引以持久层标记为准增量同步）。
+        索引以调度进程内存为权威：驻留由 worker 落盘成功后经
+        update_connector_output 增量发布，冷启动时才从盘上层标记
+        重建。本回调不做任何持久层扫描——扫盘是 O(marker 数) 的
+        Python 工作，放在调度热路径会直接变成调度空窗。
         """
-        self._engine.sync_from_store()
         tokens = list(getattr(request, "prompt_token_ids", None) or [])
         tokens += list(getattr(request, "output_token_ids", None) or [])
         hit = self._engine.lookup_prefix(tokens)
@@ -670,6 +682,21 @@ class TuttiConnectorV1(KVConnectorBase_V1):
                             generation_by_key[key] for key in keys
                         ]
         return TuttiConnectorMetadata(requests=requests)
+
+    def update_connector_output(self, connector_output) -> None:
+        """应用 worker 回传的持久化增量（内存权威索引的推进口）。
+
+        vLLM 每步在 scheduler 侧调用一次，携带 KVOutputAggregator
+        跨 TP rank 聚合后的 worker metadata。全部 rank 报告成功的
+        chunk 才发布驻留；任一 rank 失败即 fail-closed 回收预留。
+        """
+        meta = getattr(connector_output, "kv_connector_worker_meta", None)
+        if not isinstance(meta, TuttiWorkerMetadata):
+            return
+        apply_commits = getattr(self._engine, "apply_worker_commits", None)
+        if not callable(apply_commits):
+            return
+        apply_commits(meta.committed, meta.failed, self._tp_size)
 
     def request_finished(self, request, block_ids: list[int]) -> tuple[bool, dict[str, Any] | None]:
         """请求终结：清理记账；块由上层同步释放（无跨步异步占用）。"""

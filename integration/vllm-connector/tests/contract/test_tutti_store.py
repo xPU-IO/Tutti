@@ -28,7 +28,7 @@ from stores.tutti_nvme.store import (
     _TuttiCompletion,
     _derive_device_fields,
 )
-from stores.tutti_nvme.commit import read_rank_commit
+import json
 
 SEG = 4096
 
@@ -643,7 +643,13 @@ def test_marker_only_after_completion(tmp_path):
     assert store.scan() == [key]
 
 
-def test_rank_commit_contains_generation_geometry_and_marker_token(tmp_path):
+def test_write_publishes_markers_and_pool_manifest_only(tmp_path):
+    """写入只留下两样盘上痕迹：层标记 + 池 manifest 归属。
+
+    rank 提交凭证（commits/*.commit.json）已整体删除：运行时驻留由
+    内存权威索引（worker→scheduler 的 TuttiWorkerMetadata）门禁，其
+    字段与池 manifest 高度重叠，且每文件 fsync 压在计算下发路径上。
+    """
     root = tmp_path / "pool"
     namespace = b"all-rank-commit-test"
     store = TuttiKVStore(
@@ -663,26 +669,25 @@ def test_rank_commit_contains_generation_geometry_and_marker_token(tmp_path):
     store.open()
     store.set_layer_span(2)
     chunk = b"rank-commit-key!"
-    generation = "scheduler-generation-a"
-    store.begin_rank_commit([chunk], [generation])
     src = bytearray(2 * SEG)
     src_id = store.register_buffer(src, SEG)
     store.put_batch([
         (io_key(chunk, 0), src_id, 0),
         (io_key(chunk, 1), src_id, SEG),
     ]).wait()
-    store.commit_rank_chunks([chunk], [generation])
 
-    record = read_rank_commit(root, chunk)
-    assert record is not None
-    assert record.namespace == namespace.hex()
-    assert record.chunk_key == chunk.hex()
-    assert record.generation == generation
-    assert record.num_layers == 2
-    assert record.slot_bytes == 2 * SEG
-    assert record.rank_id == 2
-    assert record.marker_generation
-    assert record.pool_generation > 0
+    layout = store._layout
+    # 层标记：每层一个 .ok（数据完整性）
+    assert layout.pool_chunk_complete(chunk, 2)
+    # 池 manifest：chunk → slot 归属 + 几何（冷启动恢复的唯一归属依据）
+    manifest = json.loads(layout.pool_manifest_path().read_text("utf-8"))
+    assert manifest["namespace"] == namespace.hex()
+    assert manifest["slot_bytes"] == 2 * SEG
+    assert manifest["rank_geometry"]["num_layers"] == 2
+    allocation = manifest["allocated"][chunk.hex()]
+    assert int(allocation["generation"]) > 0
+    # 提交凭证目录不再产生
+    assert not (root / "commits").exists()
     store.close()
 
 

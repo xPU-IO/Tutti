@@ -8,11 +8,6 @@ from types import SimpleNamespace
 from adapter.connector import TuttiConnectorV1
 from engine.metadata import SchedulerMetadataIndex
 from stores.tutti_nvme.layout import Layout
-from stores.tutti_nvme.commit import (
-    RankCommitRecord,
-    commit_path,
-    write_rank_commit,
-)
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 
 
@@ -92,18 +87,9 @@ def _publish_rank(tmp_path, namespace, keys, rank, generation,
         "max_slots": 64,
         "allocated": allocated,
     }), encoding="utf-8")
-    for key in keys:
-        write_rank_commit(root, RankCommitRecord(
-            version=1,
-            namespace=namespace.hex(),
-            chunk_key=key.hex(),
-            generation=generation,
-            num_layers=NUM_LAYERS,
-            slot_bytes=NUM_LAYERS * SEGMENT_BYTES,
-            rank_id=rank,
-            marker_generation=layout.marker_generation(),
-            pool_generation=pool_generation,
-        ))
+    # 提交凭证已删除：冷启动可见性只由池 manifest（上面的 allocated 段）
+    # 与层标记决定，运行时驻留由内存权威索引门禁。
+    del keys, generation, pool_generation
     return layout
 
 
@@ -141,102 +127,3 @@ def test_scheduler_never_calls_worker_or_runtime_factory(tmp_path, monkeypatch):
         connector.shutdown()
 
 
-def test_all_rank_commit_gates_6400_and_marker_loss(tmp_path):
-    connector = TuttiConnectorV1(
-        _config(_root_template(tmp_path)), KVConnectorRole.SCHEDULER, object()
-    )
-    tokens = list(range(25 * CHUNK_TOKENS))
-    keys, _ = connector._engine.hash_keys(tokens)
-    namespace = connector._engine._index.namespace
-
-    for rank in range(3):
-        _publish_rank(tmp_path, namespace, keys, rank, "generation-a")
-    connector._engine.sync_from_store()
-    assert connector._engine.lookup_prefix(tokens) == 0
-
-    _publish_rank(tmp_path, namespace, keys, 3, "generation-a")
-    connector._engine.sync_from_store()
-    assert connector._engine.lookup_prefix(tokens) == 6400
-
-    rank2 = Layout(_rank_root(tmp_path, 2), SEGMENT_BYTES)
-    rank2.marker_file(keys[0] + b"\x00\x00").unlink()
-    connector._engine.sync_from_store()
-    assert connector._engine.lookup_prefix(tokens) == 0
-    connector.shutdown()
-
-
-def test_generation_mismatch_fails_closed(tmp_path):
-    connector = TuttiConnectorV1(
-        _config(_root_template(tmp_path)), KVConnectorRole.SCHEDULER, object()
-    )
-    tokens = list(range(CHUNK_TOKENS))
-    keys, _ = connector._engine.hash_keys(tokens)
-    namespace = connector._engine._index.namespace
-    for rank in range(3):
-        _publish_rank(tmp_path, namespace, keys, rank, "generation-a")
-    _publish_rank(tmp_path, namespace, keys, 3, "generation-b")
-    connector._engine.sync_from_store()
-    assert connector._engine.lookup_prefix(tokens) == 0
-    connector.shutdown()
-
-    restarted = TuttiConnectorV1(
-        _config(_root_template(tmp_path)), KVConnectorRole.SCHEDULER, object()
-    )
-    assert all(
-        not commit_path(_rank_root(tmp_path, rank), keys[0]).exists()
-        for rank in range(4)
-    )
-    # Restart cleanup removes only visibility records, not layer markers.
-    assert Layout(_rank_root(tmp_path, 0), SEGMENT_BYTES).marker_file(
-        keys[0] + b"\x00\x00"
-    ).exists()
-    restarted.shutdown()
-
-
-def test_restart_cleans_partial_commit_only(tmp_path):
-    cfg = _config(_root_template(tmp_path))
-    connector = TuttiConnectorV1(cfg, KVConnectorRole.SCHEDULER, object())
-    tokens = list(range(CHUNK_TOKENS))
-    keys, _ = connector._engine.hash_keys(tokens)
-    namespace = connector._engine._index.namespace
-    layout = _publish_rank(tmp_path, namespace, keys, 0, "partial")
-    payload = layout.chunk_file(keys[0])
-    payload.parent.mkdir(parents=True, exist_ok=True)
-    payload.write_bytes(b"valid-rank-data")
-    marker = layout.marker_file(keys[0] + b"\x00\x00")
-    connector.shutdown()
-
-    restarted = TuttiConnectorV1(
-        _config(_root_template(tmp_path)), KVConnectorRole.SCHEDULER, object()
-    )
-    assert not commit_path(_rank_root(tmp_path, 0), keys[0]).exists()
-    assert payload.read_bytes() == b"valid-rank-data"
-    assert marker.exists()
-    restarted.shutdown()
-
-
-def test_scheduler_lru_does_not_remove_worker_owned_pool_object(tmp_path):
-    connector = TuttiConnectorV1(
-        _config(_root_template(tmp_path), num_chunks=1),
-        KVConnectorRole.SCHEDULER, object(),
-    )
-    tokens = list(range(2 * CHUNK_TOKENS))
-    keys, _ = connector._engine.hash_keys(tokens)
-    old_key, new_key = keys
-    namespace = connector._engine._index.namespace
-    for rank in range(4):
-        _publish_rank(tmp_path, namespace, [old_key], rank, "generation-a")
-    connector._engine.sync_from_store()
-    layout = Layout(_rank_root(tmp_path, 0), SEGMENT_BYTES)
-    chunk_file = layout.chunk_file(old_key)
-    chunk_file.parent.mkdir(parents=True, exist_ok=True)
-    chunk_file.write_bytes(b"x" * (NUM_LAYERS * SEGMENT_BYTES))
-    markers = [
-        old_key + layer.to_bytes(2, "little")
-        for layer in range(NUM_LAYERS)
-    ]
-    plan = connector._engine.plan_store([new_key])
-    assert plan is not None and plan.evicted_keys == [old_key]
-    assert chunk_file.exists()
-    assert all(layout.marker_file(key).exists() for key in markers)
-    connector.shutdown()

@@ -24,6 +24,7 @@ from tutti_kv_transfer import (
 from engine.staging import RingWindow
 from engine.core import LoadGateError
 from engine.nvtx import range as nvtx_range
+from adapter.worker_meta import TuttiWorkerMetadata
 
 #: 单步内块表缓存上限（超出即整体重建，防无界增长）。
 _SLOT_CACHE_LIMIT = 1024
@@ -263,6 +264,13 @@ class PagedTransferHooks:
                     raise ValueError("token 行字节不能按 K/V 两份整分")
                 self._staging_shape = (chunk_tokens, 2, row_bytes // (2 * element))
         self._slot_cache: dict[tuple[int, ...], torch.Tensor] = {}
+        # 可复用的 pinned 暂存（槽号索引向量的 H2D 源）。每次
+        # torch.tensor(..., pin_memory=True) 都会走一次 cudaHostAlloc
+        # （pin/unpin 页表），实测每 chunk 约 0.5ms——39 chunk 的首个
+        # 写入波次因此有约 20ms 的 pthread_create/join 抖动，正好压在
+        # 层 0→1 的计算下发路径上。调用点在前向线程上串行，单缓冲
+        # 复用即可。
+        self._slot_host: torch.Tensor | None = None
 
     def gather(self, keys, layer_idx: int, block_tables, slots):
         """源侧搬运：paged 池一层段 → staging 槽（写入批发起前调用）。"""
@@ -353,7 +361,16 @@ class PagedTransferHooks:
             # upload and appears as cudaStreamSynchronize in the layer-0
             # scatter path. Stage the tiny index vector in pinned host memory
             # and enqueue its copy on the active read-copy stream instead.
-            host_ids = torch.tensor(key, dtype=torch.int64, pin_memory=True)
+            # The pinned buffer is reused across calls: a fresh
+            # pin_memory=True tensor per call costs a cudaHostAlloc each time.
+            host = self._slot_host
+            if host is None or host.numel() < len(key):
+                host = torch.empty(
+                    max(len(key), 1), dtype=torch.int64, pin_memory=True
+                )
+                self._slot_host = host
+            host_ids = host[:len(key)]
+            host_ids.copy_(torch.tensor(key, dtype=torch.int64))
             ids = torch.empty_like(host_ids, device=self._device)
             ids.copy_(host_ids, non_blocking=True)
             offsets = torch.arange(
@@ -457,6 +474,12 @@ class WorkerImpl:
         self._save_keys: list[bytes] | None = None
         self._save_generations: list[str] = []
         self._save_block_tables: list[list[int]] = []
+        # 内存权威索引的增量发布缓冲（build_connector_worker_meta 取走）
+        self._store_committed: dict[bytes, int] = {}
+        self._store_failed: set[bytes] = set()
+        self._committed_this_step: set[bytes] = set()
+        # 本步写入批是否已准备（每步在 start_load_kv 复位）
+        self._write_batch_prepared = False
         self._save_inflight: list = []
         self._save_seen_callbacks: set[int] = set()
         self._save_error = None
@@ -566,6 +589,10 @@ class WorkerImpl:
         self._load_error_request_ids = set()
         self._load_handles = {}
         self._save_seen_callbacks = set()
+        # 写入批的"本步已准备"标记必须每步复位：无写入工作的步（decode）
+        # 会把 _save_keys 留成空列表，而 vLLM 不会为这些步调用
+        # wait_for_save，一旦用它当守卫，后续步的写入批就再也准备不出来。
+        self._write_batch_prepared = False
         self._save_error = None
         self._load_fences = {}
         self._load_waited_callbacks = set()
@@ -669,6 +696,11 @@ class WorkerImpl:
                     self._mark_load_failure()
                     self._abort_step()
                     raise
+        # 写批准备（哈希/准入/对象池分配）在读计划预提交之后立即完成：
+        # 此时读已在飞、计算未开始，这些 host 开销不与层 0→1 的计算
+        # 下发争用前向线程。save_kv_layer 的首层路径保留幂等兜底。
+        if not self._load_failed:
+            self._prepare_write_batch()
         if bool(getattr(self._engine, "direct", False)):
             _LOG.warning(
                 "DIRECT_START_LOAD_RETURN total_ms=%.3f",
@@ -783,15 +815,72 @@ class WorkerImpl:
 
     # ---- 写入编排 ----
 
+    def _prepare_write_batch(self) -> None:
+        """组写入批并完成准入与目标预置（每步一次，幂等）。
+
+        由 start_load_kv 在读计划预提交后立即调用；save_kv_layer 的
+        首层路径兜底调用（未走 start_load_kv 的引擎实现）。
+
+        提前的理由：本方法内的哈希、容量准入（plan_store 可能触发驱逐
+        与对象池回收）与对象池分配（prepare_write_targets 含 manifest
+        落盘）都是 host 侧同步工作。留在首个写入层执行时，它们与层
+        0→1 的计算下发同拍争用前向线程，实测形成约 19ms 的 GPU 空转。
+
+        准入未被受理（容量不足且无可驱逐）时记录运行日志并留空批——
+        该路径正常部署不可达，出现即容量配置问题。
+        """
+        if self._write_batch_prepared:
+            return
+        self._write_batch_prepared = True
+        keys: list[bytes] = []
+        generations: list[str] = []
+        block_tables: list[list[int]] = []
+        for meta in getattr(self._metadata, "requests", []) or []:
+            if meta.save_chunk_count <= 0:
+                continue
+            req_keys, _ = self._engine.hash_keys(meta.token_ids)
+            start = meta.save_chunk_start
+            end = start + meta.save_chunk_count
+            keys.extend(req_keys[start:end])
+            meta_generations = list(
+                getattr(meta, "save_generations", None) or []
+            )
+            if meta_generations and len(meta_generations) != end - start:
+                raise RuntimeError(
+                    "scheduler save generation count does not match chunks"
+                )
+            generations.extend(meta_generations or [""] * (end - start))
+            block_tables.extend(self._chunk_block_tables(meta, end)[start:end])
+        if keys:
+            self._validate_direct_or_fallback(block_tables)
+            plan = self._engine.plan_store(keys)
+            if plan is None:
+                pending = getattr(self._engine, "store_plan_pending", None)
+                if not callable(pending) or not pending(keys):
+                    _LOG.warning(
+                        "写入计划未被受理（容量 %d 不足以容纳本批 %d "
+                        "chunk 且无可驱逐驻留）——容量配置问题，跳过"
+                        "本批数据面写入",
+                        self._engine.capacity_chunks, len(keys),
+                    )
+                    keys = []
+                    generations = []
+                    block_tables = []
+        if keys:
+            # 对象池分配 + 目标票据就绪；与 store_layer 内的首层惰性
+            # 调用等价（幂等），提前到这里以避开计算下发关键路径。
+            self._engine.prepare_write_targets(keys)
+        self._save_keys = keys
+        self._save_generations = generations
+        self._save_block_tables = block_tables
+
     def save_kv_layer(self, layer_name: str, kv_layer=None, attn_metadata=None, **kwargs) -> None:
-        """发起指定层的写入批（本步首个写入层时组批）。
+        """发起指定层的写入批（组批由 _prepare_write_batch 完成）。
 
         组批时执行写入准入（plan_store）：为腾容量驱逐的 chunk 由
         engine 展开全层 io_key 实际删除（盘与权威索引）。数据面写
         全批（不按受理子集切片）；resident 只在所有层 save completion
-        成功后发布，失败则回收 pending 预留。准入未被受理（容量不足且无可
-        驱逐）时记录运行日志并跳过本批数据面——该路径正常部署
-        不可达，出现即容量配置问题。
+        成功后发布，失败则回收 pending 预留。
         """
         direct = bool(getattr(self._engine, "direct", False))
         if self._load_failed and not direct:
@@ -805,53 +894,9 @@ class WorkerImpl:
             return
         self._save_seen_callbacks.add(callback)
         if self._save_keys is None:
-            keys: list[bytes] = []
-            generations: list[str] = []
-            block_tables: list[list[int]] = []
-            for meta in getattr(self._metadata, "requests", []) or []:
-                if meta.save_chunk_count <= 0:
-                    continue
-                req_keys, _ = self._engine.hash_keys(meta.token_ids)
-                start = meta.save_chunk_start
-                end = start + meta.save_chunk_count
-                keys.extend(req_keys[start:end])
-                meta_generations = list(
-                    getattr(meta, "save_generations", None) or []
-                )
-                if meta_generations and len(meta_generations) != end - start:
-                    raise RuntimeError(
-                        "scheduler save generation count does not match chunks"
-                    )
-                generations.extend(
-                    meta_generations or [""] * (end - start)
-                )
-                block_tables.extend(self._chunk_block_tables(meta, end)[start:end])
-            if keys:
-                self._validate_direct_or_fallback(block_tables)
-                plan = self._engine.plan_store(keys)
-                if plan is None:
-                    pending = getattr(self._engine, "store_plan_pending", None)
-                    if not callable(pending) or not pending(keys):
-                        _LOG.warning(
-                            "写入计划未被受理（容量 %d 不足以容纳本批 %d "
-                            "chunk 且无可驱逐驻留）——容量配置问题，跳过"
-                            "本批数据面写入",
-                            self._engine.capacity_chunks, len(keys),
-                        )
-                        keys = []
-                        generations = []
-                        block_tables = []
-            self._save_keys = keys
-            self._save_generations = generations
-            self._save_block_tables = block_tables
-            if not keys:
+            self._prepare_write_batch()
+            if not self._save_keys:
                 return
-            try:
-                self._engine.begin_rank_commit(keys, generations)
-            except Exception as exc:
-                self._save_error = exc
-                self._load_failed = True
-                raise
         if not self._save_keys:
             return
         try:
@@ -951,21 +996,13 @@ class WorkerImpl:
             if first_error is None:
                 first_error = exc
         if self._save_keys:
-            if first_error is None:
-                try:
-                    self._engine.commit_rank_chunks(
-                        self._save_keys, self._save_generations
-                    )
-                except Exception as exc:
-                    first_error = exc
-            if first_error is not None:
-                try:
-                    self._engine.abort_rank_commit(
-                        self._save_keys, self._save_generations
-                    )
-                except Exception:
-                    pass
             self._engine.confirm_store(self._save_keys, ok=first_error is None)
+            # 内存权威索引：本 rank 的持久化结局在此发布给调度侧
+            # （build_connector_worker_meta 取走）。盘上标记只留作
+            # 冷启动恢复，查询热路径不再扫盘。
+            self._record_store_outcome(
+                self._save_keys, ok=first_error is None
+            )
         self._save_inflight = []
         self._save_seen_callbacks = set()
         self._save_error = None
@@ -1067,6 +1104,66 @@ class WorkerImpl:
         """请求失败收尾：drain 双 bank、回滚写计划并释放读 pin。"""
         self._abort_step()
 
+    # ---- 内存权威索引：worker → scheduler 增量发布 ----
+
+    def _record_store_outcome(self, keys, ok: bool) -> None:
+        """记录本步本 rank 的持久化结局，待 worker meta 取走。
+
+        同一 key 在一步内至多计一次（rank 内去重），聚合后的计数即
+        "报告成功的 rank 数"；失败集合优先——任一 rank 失败即整批
+        在调度侧 fail-closed 回收预留。
+        """
+        for key in keys:
+            key = bytes(key)
+            if ok:
+                if key in self._committed_this_step:
+                    continue
+                self._committed_this_step.add(key)
+                self._store_committed[key] = 1
+            else:
+                self._store_failed.add(key)
+                self._store_committed.pop(key, None)
+
+    def _settle_unreported_plans(self) -> None:
+        """把本步"调度侧已预留但本 rank 未结算"的 key 报为失败。
+
+        调度侧的容量预留（plan_store）此前靠扫盘对账释放；内存权威
+        索引下必须由 worker 显式回报，否则 load 失败 / 计划被拒 /
+        提前返回等路径会让预留永久泄漏。只覆盖 scheduler 确实做过
+        预留的批（save_generations 非空），幂等。
+        """
+        for meta in getattr(self._metadata, "requests", []) or []:
+            if meta.save_chunk_count <= 0:
+                continue
+            if not getattr(meta, "save_generations", None):
+                # scheduler 判定全部已驻留或未受理，没有预留可释放
+                continue
+            try:
+                req_keys, _ = self._engine.hash_keys(meta.token_ids)
+            except Exception:
+                continue
+            start = meta.save_chunk_start
+            for key in req_keys[start:start + meta.save_chunk_count]:
+                key = bytes(key)
+                if key in self._committed_this_step:
+                    continue
+                self._store_failed.add(key)
+
+    def build_connector_worker_meta(self):
+        """交出本步索引增量（vLLM 每步调用一次，调用即清空）。"""
+        self._settle_unreported_plans()
+        if not self._store_committed and not self._store_failed:
+            self._committed_this_step.clear()
+            return None
+        meta = TuttiWorkerMetadata(
+            committed=dict(self._store_committed),
+            failed=set(self._store_failed),
+        )
+        self._store_committed = {}
+        self._store_failed = set()
+        self._committed_this_step = set()
+        return meta
+
     # ---- 内部 ----
 
     def _start_load_layer(self, layer_idx: int) -> None:
@@ -1152,15 +1249,10 @@ class WorkerImpl:
                 first_error = exc
         if self._save_keys:
             try:
-                self._engine.abort_rank_commit(
-                    self._save_keys, self._save_generations
-                )
-            except Exception:
-                pass
-            try:
                 self._engine.confirm_store(self._save_keys, ok=False)
             except Exception:
                 pass
+            self._record_store_outcome(self._save_keys, ok=False)
         self._save_inflight = []
         self._save_seen_callbacks = set()
         self._save_error = None

@@ -4,12 +4,55 @@
 from __future__ import annotations
 
 import argparse
+import os
 import time
 from pathlib import Path
 
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 from vllm.config.kv_transfer import KVTransferConfig
+
+
+# Per-request NVTX colors chosen for max contrast in nsys timelines.
+# A-COLD = warm orange (write/store association), B-80pct = cool cyan
+# (read/load association), so the "reuse" boundary reads as a color flip.
+_REQUEST_COLORS = {
+    "A-cold": 0xFFFF8C00,  # ARGB warm orange
+    "B-80pct": 0xFF00B8D9,  # ARGB cool cyan
+}
+
+
+def _make_request_annotate(request_id: str):
+    """Return a context manager that opens a top-level NVTX range for one
+    request, in domain "tutti.request" (this is what nsys --nvtx-capture
+    matches against). Falls back to a no-op when NVTX is unavailable or
+    the env flag is off. TUTTI_NVTX is also the flag Tutti's own call
+    sites read, so toggling it here lights up both layers at once."""
+    if os.environ.get("TUTTI_NVTX", "0").lower() not in {"1", "true", "yes", "on"}:
+        return _NullAnnotate()
+    try:
+        import nvtx
+    except Exception:
+        return _NullAnnotate()
+    color = _REQUEST_COLORS.get(request_id, 0xFF5B8FF9)
+    # Use the connector's "tutti" domain (already populated by engine.nvtx.range
+    # in 24+ call sites). Each request gets a top-level range with a clear
+    # string prefix so it shows up as a separate band on the NVTX row.
+    return nvtx.annotate(
+        message=f"tutti.request|{request_id}",
+        color=color,
+        domain="tutti",
+    )
+
+
+class _NullAnnotate:
+    """No-op stand-in so callers can always use ``with _make_request_annotate(...)``."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
 
 
 def _tokens(model: str, length: int, reuse_pct: int) -> tuple[list[int], list[int]]:
@@ -31,32 +74,59 @@ def _tokens(model: str, length: int, reuse_pct: int) -> tuple[list[int], list[in
     return request_a, request_a[:shared] + suffix_b
 
 
+def _distinct_pair(base_a: list[int], base_b: list[int], round_idx: int,
+                   vocab_floor: int = 1000) -> tuple[list[int], list[int]]:
+    """Derive a round-specific (A, B) pair with identical shapes.
+
+    Rounds must not hit each other's KV entries, otherwise round N>0 would
+    read round 0's cache and stop being a fresh cold/warm pair. Perturbing
+    the first token is enough: the chunk key chain is prefix-derived, so a
+    different first token invalidates every downstream chunk key while the
+    tensor shapes (and therefore every GEMM/kernel shape) stay identical.
+    """
+    if round_idx == 0:
+        return list(base_a), list(base_b)
+    marker = vocab_floor + round_idx
+    a = list(base_a)
+    b = list(base_b)
+    a[0] = marker
+    b[0] = marker
+    return a, b
+
+
 def _generate(
     llm: LLM,
     prompt_token_ids: list[int],
     sampling_params: SamplingParams,
     request_id: str,
-) -> None:
+) -> float:
+    # Per-request NVTX: each call gets a top-level "tutti.request" range so
+    # the report shows a clear request boundary (start/end wall, sub-trees
+    # for compute vs transfer). Domain "tutti.request" is what the nsys
+    # --nvtx-capture filter matches on; other vLLM NVTX is filtered out.
     start = time.perf_counter()
-    outputs = llm.generate(
-        [{"prompt_token_ids": prompt_token_ids}],
-        sampling_params,
-        use_tqdm=False,
-    )
-    elapsed = time.perf_counter() - start
-    completion_tokens = len(outputs[0].outputs[0].token_ids)
-    token_ids = list(outputs[0].outputs[0].token_ids)
-    finish_reason = outputs[0].outputs[0].finish_reason
-    print(
-        f"[{request_id}] prompt_tokens={len(outputs[0].prompt_token_ids)} "
-        f"completion_tokens={completion_tokens} finish_reason={finish_reason} "
-        f"token_ids={token_ids} wall={elapsed:.3f}s",
-        flush=True,
-    )
-    if finish_reason == "error":
-        raise RuntimeError(
-            f"request {request_id} failed explicitly (finish_reason=error)"
+    _annotate_request = _make_request_annotate(request_id)
+    with _annotate_request:
+        outputs = llm.generate(
+            [{"prompt_token_ids": prompt_token_ids}],
+            sampling_params,
+            use_tqdm=False,
         )
+        elapsed = time.perf_counter() - start
+        completion_tokens = len(outputs[0].outputs[0].token_ids)
+        token_ids = list(outputs[0].outputs[0].token_ids)
+        finish_reason = outputs[0].outputs[0].finish_reason
+        print(
+            f"[{request_id}] prompt_tokens={len(outputs[0].prompt_token_ids)} "
+            f"completion_tokens={completion_tokens} finish_reason={finish_reason} "
+            f"token_ids={token_ids} wall={elapsed:.3f}s",
+            flush=True,
+        )
+        if finish_reason == "error":
+            raise RuntimeError(
+                f"request {request_id} failed explicitly (finish_reason=error)"
+            )
+    return elapsed
 
 
 def main() -> int:
@@ -91,6 +161,21 @@ def main() -> int:
     parser.add_argument("--tokens", type=int, default=65528)
     parser.add_argument("--reuse-pct", type=int, default=80)
     parser.add_argument("--max-tokens", type=int, default=8)
+    parser.add_argument(
+        "--rounds",
+        type=int,
+        default=1,
+        help=(
+            "repeat the (A-cold, B-80pct) pair N times with identical tensor "
+            "shapes but distinct KV keys; separates one-off first-shape host "
+            "costs (cuBLAS algo selection, kernel image load) from steady state"
+        ),
+    )
+    parser.add_argument(
+        "--reset-local-prefix-between-rounds",
+        action="store_true",
+        help="clear vLLM's local prefix cache between rounds as well",
+    )
     parser.add_argument(
         "--max-in-flight-operations",
         type=int,
@@ -144,15 +229,28 @@ def main() -> int:
     shared = args.tokens * args.reuse_pct // 100
     print(
         f"profile workload: tokens={args.tokens} shared={shared} "
-        f"reuse={args.reuse_pct}% requests=2",
+        f"reuse={args.reuse_pct}% rounds={args.rounds} "
+        f"requests={2 * args.rounds}",
         flush=True,
     )
 
     kv_transfer_config = None
     if not args.without_tutti:
+        # 对象池初始 slot 数必须覆盖单请求一整波 chunk（否则
+        # PoolResourceExhausted：默认 initial_slots=32 < tokens/256）。
+        chunk_tokens = 256
+        per_request_chunks = -(-(args.tokens + args.max_tokens) // chunk_tokens)
+        # 池容量（槽位上限）：测试规模 1w 槽位。槽位文件是稳定身份，
+        # 复用不重跑 resolve（open+fstat+fsync+FIEMAP）。
+        num_chunks = max(10000, per_request_chunks * 2 * args.rounds + 16)
+        # 预建槽位数只覆盖单请求工作集：全量预建 1w × 20MiB ≈ 200GiB
+        # 的实零写入会把 bind 变成分钟级；其余由后台分配器按水位扩展
+        # （这正是动态扩展路径要验证的部分）。
+        initial_slots = min(num_chunks, per_request_chunks + 8)
         store_options = {
             "root": args.kv_root,
-            "num_chunks": 512,
+            "num_chunks": num_chunks,
+            "initial_slots": initial_slots,
             "io_stream": "auto",
             "preset": {
                 "type": "local",
@@ -220,23 +318,59 @@ def main() -> int:
 
     # Start profiling in all TP workers once. Nsight is stopped externally.
     llm.start_profile()
-    _generate(llm, request_a, sampling_params, "A-cold")
-    if args.reset_local_prefix_between_requests:
-        if not llm.reset_prefix_cache(reset_connector=False):
-            raise RuntimeError("failed to reset vLLM local prefix cache")
-        print("local prefix cache reset; Tutti cache retained", flush=True)
-    try:
-        _generate(llm, request_b, sampling_params, "B-80pct")
-    except Exception as exc:
-        if not args.expect_b_failure:
-            raise
-        print(
-            f"[B-80pct] expected_request_failure={type(exc).__name__}: {exc}",
-            flush=True,
+    walls_a: list[float] = []
+    walls_b: list[float] = []
+    for round_idx in range(args.rounds):
+        tokens_a, tokens_b = _distinct_pair(request_a, request_b, round_idx)
+        suffix = "" if args.rounds == 1 else f"|r{round_idx}"
+        walls_a.append(
+            _generate(llm, tokens_a, sampling_params, f"A-cold{suffix}")
         )
-    else:
-        if args.expect_b_failure:
-            raise RuntimeError("request B unexpectedly succeeded under fail policy")
+        if args.reset_local_prefix_between_requests:
+            if not llm.reset_prefix_cache(reset_connector=False):
+                raise RuntimeError("failed to reset vLLM local prefix cache")
+            print("local prefix cache reset; Tutti cache retained", flush=True)
+        try:
+            walls_b.append(
+                _generate(llm, tokens_b, sampling_params, f"B-80pct{suffix}")
+            )
+        except Exception as exc:
+            if not args.expect_b_failure:
+                raise
+            print(
+                f"[B-80pct{suffix}] expected_request_failure="
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+        else:
+            if args.expect_b_failure:
+                raise RuntimeError(
+                    "request B unexpectedly succeeded under fail policy"
+                )
+        if args.reset_local_prefix_between_rounds and round_idx + 1 < args.rounds:
+            # Keep每轮 A 处于"vLLM 本地无前缀命中"状态，否则轮间本地
+            # prefix cache 会让后续 A 不再是 cold（外部命中亦不触发）。
+            if not llm.reset_prefix_cache(reset_connector=False):
+                raise RuntimeError("failed to reset vLLM local prefix cache")
+
+    if args.rounds > 1:
+        def _stats(name: str, walls: list[float]) -> None:
+            if not walls:
+                return
+            first = walls[0]
+            rest = walls[1:]
+            body = (
+                f" steady_mean={sum(rest)/len(rest):.3f}s "
+                f"steady_min={min(rest):.3f}s steady_max={max(rest):.3f}s"
+                if rest else ""
+            )
+            print(
+                f"[SUMMARY {name}] rounds={len(walls)} first={first:.3f}s"
+                f"{body} all={[round(w, 3) for w in walls]}",
+                flush=True,
+            )
+        _stats("A-cold", walls_a)
+        _stats("B-80pct", walls_b)
     print("profile workload complete", flush=True)
     if args.wait_for_exit_file:
         print(

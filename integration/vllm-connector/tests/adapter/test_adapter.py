@@ -709,7 +709,6 @@ class TestLoadSemantics:
         assert engine.wait_idle_count == 1
         assert engine.confirm_calls == [((b"k",), False)]
         assert engine.rank_commit_calls == []
-        assert engine.rank_abort_calls == [((b"k",), ())]
         assert worker._save_keys is None
         assert worker._save_inflight == []
 

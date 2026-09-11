@@ -27,7 +27,7 @@ import threading
 import time
 from pathlib import Path
 
-from .commit import marker_generation, remove_rank_commit
+from .marker_generation import marker_generation
 
 #: chunk_key 的固定字节长度。
 CHUNK_PREFIX_BYTES = 16
@@ -114,6 +114,18 @@ class Layout:
     # ---------- 命名 ----------
 
     def chunk_file(self, chunk_id: bytes) -> Path:
+        """chunk 数据文件路径。
+
+        对象池模式下返回其**槽位文件**路径：槽位是稳定身份，分配/回收
+        只改内存映射与 manifest、不改名，从而让上层按路径缓存的目标
+        票据与底层按 extent 缓存的 handle 在槽位复用后依然命中（否则
+        每次复用都要重跑 resolve：open+fstat+fsync+FIEMAP）。
+        """
+        pool = self._object_pool
+        if pool is not None and pool.configured:
+            slot = pool.slot_of(chunk_id)
+            if slot is not None:
+                return self.pool_slot_paths(slot)[0]
         return self._chunks_dir / (chunk_id.hex() + _DATA_SUFFIX)
 
     def target_uri(self, chunk_id: bytes) -> str:
@@ -132,9 +144,6 @@ class Layout:
 
     def marker_generation(self) -> str:
         return marker_generation(self._meta_dir)
-
-    def remove_rank_commit(self, chunk_id: bytes) -> None:
-        remove_rank_commit(self.root, chunk_id)
 
     # ---------- 生命周期 ----------
 
@@ -201,12 +210,26 @@ class Layout:
             if grouped.get(chunk_id, 0) < layer + 1:
                 grouped[chunk_id] = layer + 1
 
-        new_chunks = sum(
-            1 for chunk_id in grouped if not self.chunk_file(chunk_id).exists()
+        pool_active = (
+            self._object_pool is not None and self._object_pool.configured
         )
-        if self.chunk_file_count() + new_chunks > capacity_chunks:
+        if pool_active:
+            # 池模式下数据文件以槽位为单位（chunks/ 目录不再承载），
+            # 已占用数由池给出，容量即槽位上限。
+            held = self._object_pool.allocation_count()
+            new_chunks = sum(
+                1 for chunk_id in grouped
+                if self._object_pool.slot_of(chunk_id) is None
+            )
+        else:
+            held = self.chunk_file_count()
+            new_chunks = sum(
+                1 for chunk_id in grouped
+                if not self.chunk_file(chunk_id).exists()
+            )
+        if held + new_chunks > capacity_chunks:
             raise ValueError(
-                f"chunk 容量不足：现有 {self.chunk_file_count()} + 新增 "
+                f"chunk 容量不足：现有 {held} + 新增 "
                 f"{new_chunks} > 上限 {capacity_chunks}"
             )
 
@@ -254,8 +277,6 @@ class Layout:
         else:
             for chunk_id in released:
                 self.chunk_file(chunk_id).unlink(missing_ok=True)
-        for chunk_id in released:
-            self.remove_rank_commit(chunk_id)
         _bump_scan_generation(self._meta_dir)
         self._scan_signature = None
 
@@ -278,10 +299,39 @@ class Layout:
         return released
 
     def target_generation(self, chunk_id: bytes) -> int:
+        """目标票据的失效判定世代 = 槽位**物理**世代。
+
+        只在槽位文件被重建时变化；分配 / 回收 / 就地零化都不变。稳定
+        槽位路径下，同一槽位的票据因此可跨"回收→再分配"持续命中——
+        推理路径不再重跑 open（resolve + 句柄构建）。
+        """
+        if self._object_pool is None or not self._object_pool.configured:
+            return 0
+        generation = self._object_pool.chunk_slot_generation(chunk_id)
+        return -1 if generation is None else generation
+
+    def allocation_generation(self, chunk_id: bytes) -> int:
+        """chunk 的**分配**世代（每次绑定递增）——提交记录校验用。"""
         if self._object_pool is None or not self._object_pool.configured:
             return 0
         generation = self._object_pool.generation(chunk_id)
         return -1 if generation is None else generation
+
+    def pool_slot_uri(self, slot: int) -> str:
+        """槽位文件的运行时目标 URI（启动期批量预开用）。"""
+        return "file://" + str(self.pool_slot_paths(slot)[0].resolve())
+
+    def pool_slot_size(self, slot: int) -> int:
+        try:
+            return self.pool_slot_paths(slot)[0].stat().st_size
+        except OSError:
+            return 0
+
+    def pool_slot_generation(self, slot: int) -> int:
+        """槽位物理世代（启动期预开时登记，与 target_generation 同源）。"""
+        if self._object_pool is None or not self._object_pool.configured:
+            return 0
+        return self._object_pool.slot_generation(slot)
 
     def abort_uncommitted(self, chunk_ids) -> None:
         if self._object_pool is not None and self._object_pool.configured:
@@ -314,8 +364,16 @@ class Layout:
     def pool_slot_paths(self, slot: int) -> tuple[Path]:
         return (self._free_dir / f"{slot:08d}{_DATA_SUFFIX}",)
 
-    def pool_chunk_paths(self, chunk_id: bytes) -> tuple[Path]:
-        return (self.chunk_file(chunk_id),)
+    def pool_bound_paths(self, chunk_id: bytes, slot: int) -> tuple[Path]:
+        """chunk 绑定到槽位后其数据文件的路径。
+
+        file_per_chunk 声明**稳定槽位路径**：绑定不改名，槽位文件就地
+        复用。这样上层按路径缓存的目标票据（store._targets）与底层按
+        extent 缓存的 handle（HandleWorkspaceCache）在槽位复用后继续
+        命中；一旦改名，两者都会失效并重跑 resolve（open+fstat+fsync+
+        FIEMAP），这正是首个写入波次那 ~19ms 的主要来源。
+        """
+        return self.pool_slot_paths(slot)
 
     def pool_create_slot(self, slot: int, slot_bytes: int) -> None:
         path = self.pool_slot_paths(slot)[0]
@@ -337,17 +395,6 @@ class Layout:
                 continue
         return slots
 
-    def pool_discover_chunks(self) -> set[bytes]:
-        chunks = set()
-        if not self._chunks_dir.is_dir():
-            return chunks
-        for path in self._chunks_dir.glob("*" + _DATA_SUFFIX):
-            try:
-                chunks.add(bytes.fromhex(path.name[:-len(_DATA_SUFFIX)]))
-            except ValueError:
-                continue
-        return chunks
-
     def pool_chunk_complete(self, chunk_id: bytes,
                             num_layers: int | None = None) -> bool:
         layers = self.layer_span if num_layers is None else num_layers
@@ -364,19 +411,27 @@ class Layout:
             bytes(chunk_id).hex() + "*" + _MARKER_SUFFIX
         ):
             path.unlink(missing_ok=True)
-        self.remove_rank_commit(chunk_id)
 
     @staticmethod
     def pool_rename_group(sources, destinations) -> None:
+        # 稳定槽位路径下 source 与 destination 相同（绑定/回收都不需要
+        # 移动文件），此时整组退化为空操作。
+        pending = [
+            (source, destination)
+            for source, destination in zip(sources, destinations)
+            if source != destination
+        ]
+        if not pending:
+            return
         if len(sources) != len(destinations):
             raise RuntimeError("object-pool rename group shape mismatch")
-        if not all(path.exists() for path in sources):
+        if not all(path.exists() for path, _ in pending):
             raise RuntimeError("object-pool source group is incomplete")
-        if any(path.exists() for path in destinations):
+        if any(destination.exists() for _, destination in pending):
             raise RuntimeError("object-pool destination already exists")
         completed = []
         try:
-            for source, destination in zip(sources, destinations):
+            for source, destination in pending:
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(source, destination)
                 completed.append((source, destination))

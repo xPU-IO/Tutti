@@ -25,7 +25,7 @@ from .layout import (
     _rewrite_real_zeros,
     decode_io_key,
 )
-from .commit import marker_generation, remove_rank_commit
+from .marker_generation import marker_generation
 
 _IO_PAGE_BYTES = 4096
 _MARKER_SUFFIX = ".ok"
@@ -104,8 +104,7 @@ class StripedLayout:
     def marker_generation(self) -> str:
         return marker_generation(self._meta_dir)
 
-    def remove_rank_commit(self, chunk_id: bytes) -> None:
-        remove_rank_commit(self.root, chunk_id)
+
 
     def shard_rotation(self, chunk_id: bytes) -> int:
         return int.from_bytes(bytes(chunk_id)[:4], "little") % self.num_shards
@@ -269,8 +268,6 @@ class StripedLayout:
             for chunk_id in released:
                 for shard in range(self.num_shards):
                     self.shard_file(chunk_id, shard).unlink(missing_ok=True)
-        for chunk_id in released:
-            self.remove_rank_commit(chunk_id)
         _bump_scan_generation(self._meta_dir)
         self._scan_signature = None
 
@@ -339,7 +336,13 @@ class StripedLayout:
             for shard, mount in enumerate(self.mounts)
         )
 
-    def pool_chunk_paths(self, chunk_id: bytes) -> tuple[Path, ...]:
+    def pool_bound_paths(self, chunk_id: bytes, slot: int) -> tuple[Path, ...]:
+        """chunk 绑定到槽位后其分片文件的路径。
+
+        striped 的分片文件名由目标 URI 的 name 派生（striped://<name>），
+        因此绑定必须把槽位文件改名到 chunk 路径——不像 file_per_chunk
+        那样可以用稳定槽位路径。
+        """
         return tuple(
             self.shard_file(chunk_id, shard)
             for shard in range(self.num_shards)
@@ -382,20 +385,6 @@ class StripedLayout:
             slot for slot, shards in found.items()
             if len(shards) == self.num_shards
         }
-
-    def pool_discover_chunks(self) -> set[bytes]:
-        chunks = set()
-        for shard, mount in enumerate(self.mounts):
-            directory = Path(mount) / "striped"
-            if not directory.is_dir():
-                continue
-            for path in directory.glob("*" + _SHARD_SEPARATOR + str(shard)):
-                name = path.name[:-len(_SHARD_SEPARATOR + str(shard))]
-                try:
-                    chunks.add(bytes.fromhex(name))
-                except ValueError:
-                    continue
-        return chunks
 
     def pool_chunk_complete(self, chunk_id: bytes,
                             num_layers: int | None = None) -> bool:

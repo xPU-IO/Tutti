@@ -1067,21 +1067,6 @@ class KVEngine:
         """Return whether every key is already reserved by this engine's plan."""
         return all(bytes(key) in self._planned_store_keys for key in keys)
 
-    def begin_rank_commit(self, keys, generations) -> None:
-        begin = getattr(self._store, "begin_rank_commit", None)
-        if callable(begin):
-            begin(keys, generations)
-
-    def commit_rank_chunks(self, keys, generations) -> None:
-        commit = getattr(self._store, "commit_rank_chunks", None)
-        if callable(commit):
-            commit(keys, generations)
-
-    def abort_rank_commit(self, keys, generations=None) -> None:
-        abort = getattr(self._store, "abort_rank_commit", None)
-        if callable(abort):
-            abort(keys, generations)
-
     def pin(self, keys) -> None:
         """对一批 chunk key 加读保护；任一未驻留 → KeyError。"""
         self._require_open()
@@ -1461,6 +1446,24 @@ class KVEngine:
         return _ReadPlan(
             self, keys, block_tables, physical_layers, depth, on_failure
         )
+
+    def prepare_write_targets(self, keys) -> None:
+        """预置写入目标（对象池分配 + 票据就绪）。
+
+        与 store_layer 内部的首层惰性调用等价且幂等（重复调用直接
+        返回）。提前调用的意义是把对象池分配/manifest 落盘从"首个
+        写入层"挪到 start_load_kv——那里读计划已预提交、计算尚未
+        开始，开销不与层 0→1 的计算下发争用前向线程。
+        """
+        if not isinstance(self._transfer, DirectTransfer):
+            return
+        backend = getattr(self._transfer, "_backend", None)
+        prepare = getattr(backend, "prepare_write_targets", None)
+        if not callable(prepare):
+            return
+        direct_lock = getattr(self, "_direct_submit_lock", None)
+        with (direct_lock if direct_lock is not None else nullcontext()):
+            prepare(keys)
 
     def store_layer(self, keys, layer_idx: int, src_first_blocks):
         """发起一批写入：一层 × N chunk，源侧 → staging 槽 → 持久化。

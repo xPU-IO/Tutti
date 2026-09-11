@@ -131,7 +131,14 @@ def test_32_missing_targets_use_one_open_batch(tmp_path):
     store.close()
 
 
-def test_eviction_closes_targets_before_rename(tmp_path):
+def test_eviction_keeps_slot_target(tmp_path):
+    """池模式下票据是槽位级：解绑/回收不得关闭它。
+
+    槽位路径稳定、文件不随解绑消失（回收只是就地零化），关闭票据会让
+    下一次使用该槽位时重跑 open（resolve + 句柄构建 + 每 URI 一个
+    线程）——那正是推理路径上要消除的开销。旧契约（"改名之前先关票据"）
+    在稳定槽位路径下已无意义：绑定/回收都不再改名。
+    """
     runtime = _Runtime()
     store = TuttiKVStore(
         tmp_path, 1, SEG, runtime=runtime,
@@ -139,18 +146,21 @@ def test_eviction_closes_targets_before_rename(tmp_path):
     )
     store.open()
     store.set_layer_span(1)
+    pool = store._object_pool
+    ready = pool.gpu_files()
+    assert ready and all(f.ticket for f in ready), "槽位应在 set_layer_span 时就绪化"
+    tickets_before = {f.slot: f.ticket for f in ready}
     buffer_id = store.register_buffer(bytearray(SEG), SEG)
     key = _key(7)
     store.put_batch([(key, buffer_id, 0)]).wait()
-    events = []
-    original = store._layout.pool_rename_group
-    store._layout.pool_rename_group = lambda src, dst: (
-        events.append("rename"), original(src, dst)
-    )[1]
+    closed = []
     original_close = runtime.close_batch
-    runtime.close_batch = lambda tickets: (events.append("close"), original_close(tickets))[1]
+    runtime.close_batch = lambda tickets: (
+        closed.append(tickets), original_close(tickets)
+    )[1]
     store.drop([key])
-    assert events.index("close") < events.index("rename")
+    assert closed == [], "解绑不得关闭槽位句柄"
+    assert {f.slot: f.ticket for f in pool.gpu_files()} == tickets_before
     store.close()
 
 
@@ -228,6 +238,70 @@ def test_pool_exhaustion_is_structured_and_bounded(tmp_path):
         pool.allocate([bytes([11]) * 16])
     assert exc.value.code == "RESOURCE_EXHAUSTED"
     pool.close()
+
+
+def test_slot_path_is_stable_identity_across_reallocation(tmp_path):
+    """槽位路径跨"回收→再分配"保持不变——目标缓存持续命中的前提。
+
+    改名前每次槽位复用都会换路径，上层按路径缓存的目标票据与底层按
+    extent 缓存的 handle 双双失效，必须重跑 resolve（open+fstat+fsync
+    +FIEMAP）；稳定路径让同一张票据跨复用有效。
+    """
+    layout, pool = _configured_pool(
+        tmp_path, initial=1, low=0, high=1, maximum=1,
+        allocator_enabled=True,
+    )
+    slot_path = layout.pool_slot_paths(0)[0]
+    inode = slot_path.stat().st_ino
+
+    first = bytes([30]) * 16
+    layout.prepare_put([first + b"\x00\x00"], 1)
+    uri_first = layout.target_uri(first)
+    assert layout.chunk_file(first) == slot_path
+
+    layout.commit_layers([first + b"\x00\x00", first + b"\x01\x00"])
+    layout.drop([first + b"\x00\x00", first + b"\x01\x00"])
+    deadline = time.monotonic() + 2.0
+    while pool.free_count < 1 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert pool.free_count == 1
+
+    second = bytes([31]) * 16
+    layout.prepare_put([second + b"\x00\x00"], 1)
+    assert layout.target_uri(second) == uri_first
+    assert layout.chunk_file(second) == slot_path
+    assert slot_path.stat().st_ino == inode
+    pool.close()
+
+
+def test_restart_recovers_allocated_slot_from_manifest(tmp_path):
+    """重启后归属由 manifest 裁决：已分配槽位不得被误判为自由槽位。
+
+    稳定路径下已分配文件与自由槽位同处 free/，目录扫描无法区分，
+    因此 manifest 是唯一的归属依据（文件系统只裁决存在与完整）。
+    """
+    layout, pool = _configured_pool(
+        tmp_path, initial=1, low=0, high=1, maximum=1,
+    )
+    key = bytes([13]) * 16
+    io_keys = [key + b"\x00\x00", key + b"\x01\x00"]
+    layout.prepare_put([io_keys[0]], 1)
+    layout.commit_layers(io_keys)
+    assert pool.slot_of(key) == 0
+    pool.close()
+
+    layout2 = Layout(tmp_path, SEG)
+    pool2 = ObjectPool(
+        layout2, PoolConfig(1, 0, 1, 1), allocator_enabled=False
+    )
+    layout2.attach_object_pool(pool2)
+    layout2.ensure_dirs()
+    layout2.set_layer_span(2)
+    assert pool2.allocation_count() == 1
+    assert pool2.free_count == 0
+    assert pool2.slot_of(key) == 0
+    assert layout2.chunk_file(key).exists()
+    pool2.close()
 
 
 def test_restart_reclaims_orphan_without_markers(tmp_path):

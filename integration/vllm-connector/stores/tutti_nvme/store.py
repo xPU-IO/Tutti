@@ -24,7 +24,7 @@ from pathlib import Path
 
 from .layout import Layout, decode_io_key
 from .object_pool import ObjectPool, PoolConfig
-from .commit import RankCommitRecord, remove_rank_commit, write_rank_commit
+
 from .striped_layout import StripedLayout
 from engine.nvtx import range as nvtx_range
 from engine.transfer import DirectTransferUnavailable
@@ -517,7 +517,16 @@ class TuttiDirectBackend:
             )
 
     def _validate_plan_entry(self, entry: DirectTargetPlanEntry) -> None:
-        """Check the current cache record for one submitted chunk."""
+        """Check the current cache record for one submitted chunk.
+
+        对象池模式下句柄随槽位常驻（GpuFile），不在 `_targets` 里；
+        校验改看池中的就绪句柄是否仍与计划一致。
+        """
+        pool = getattr(self._store, "_object_pool", None)
+        if pool is not None and pool.configured:
+            slot = pool.slot_of(entry.chunk_id)
+            if slot is not None and pool.ticket_of_slot(slot) == entry.target_ticket:
+                return
         cached = getattr(self._store, "_targets", {}).get(entry.target_uri)
         if cached is None:
             raise RuntimeError(
@@ -1052,6 +1061,11 @@ class TuttiKVStore:
         self._buffers: dict[int, tuple[int, int]] = {}
         self._mem_cache: dict[tuple[int, int], int] = {}
         self._targets: dict[str, _TargetCacheEntry] = {}
+        # _targets 由两个线程访问：请求线程（_ensure_targets 按需补开）
+        # 与对象池的初始化/后台线程（槽位创建钩子批量预开）。Python
+        # dict 的"检查再写"不是原子操作，无锁时并发会丢条目——实测
+        # 会让预开的票据凭空消失，写路径反而退化成逐个 open。
+        self._targets_lock = threading.Lock()
         self._inflight_by_chunk: dict[bytes, set[_TuttiCompletion]] = {}
         self._inflight_lock = threading.Lock()
         self._deferred_completions: list[_TuttiCompletion] = []
@@ -1075,59 +1089,6 @@ class TuttiKVStore:
         self._stream_mode = "host"
         self._stream_accel_id = None
         self._execution = "device"
-
-    def begin_rank_commit(self, keys, generations) -> None:
-        """Invalidate this rank's old visibility before overwriting payload."""
-        self._require_open()
-        keys = [bytes(key) for key in keys]
-        if len(keys) != len(list(generations)):
-            raise ValueError("rank commit keys/generations length mismatch")
-        for key in keys:
-            remove_rank_commit(self._root, key)
-
-    def commit_rank_chunks(self, keys, generations) -> None:
-        """Publish one rank record only after all local layer writes succeed."""
-        self._require_open()
-        keys = [bytes(key) for key in keys]
-        generations = list(generations)
-        if len(keys) != len(generations):
-            raise ValueError("rank commit keys/generations length mismatch")
-        if self._key_namespace is None:
-            raise RuntimeError("rank commit requires a key namespace")
-        num_layers = self._layout.layer_span
-        if not num_layers:
-            raise RuntimeError("rank commit requires complete layer geometry")
-        slot_bytes = num_layers * self._segment_bytes
-        marker_token = self._layout.marker_generation()
-        if not marker_token:
-            raise RuntimeError("rank commit requires a marker generation")
-        for key, generation in zip(keys, generations):
-            if not self._layout.pool_chunk_complete(key, num_layers):
-                raise RuntimeError(
-                    f"rank {self._rank_id} chunk {key.hex()} lacks complete markers"
-                )
-            pool_generation = self._layout.target_generation(key)
-            if pool_generation <= 0:
-                raise RuntimeError(
-                    f"rank {self._rank_id} chunk {key.hex()} lacks pool generation"
-                )
-            record = RankCommitRecord(
-                version=1,
-                namespace=self._key_namespace.hex(),
-                chunk_key=key.hex(),
-                generation=str(generation),
-                num_layers=num_layers,
-                slot_bytes=slot_bytes,
-                rank_id=self._rank_id,
-                marker_generation=marker_token,
-                pool_generation=pool_generation,
-            )
-            write_rank_commit(self._root, record)
-
-    def abort_rank_commit(self, keys, generations=None) -> None:
-        """Fail closed for this rank without deleting payload or peer data."""
-        for key in keys:
-            remove_rank_commit(self._root, bytes(key))
 
     # ---------- 生命周期 ----------
 
@@ -1618,9 +1579,7 @@ class TuttiKVStore:
             chunk_ids.add(chunk_id)
         released = self._layout.releasable_chunks(io_keys)
         self._wait_chunk_io(released)
-        self._close_cached_targets(
-            [self._layout.target_uri(chunk_id) for chunk_id in released]
-        )
+        self._close_cached_targets(self._chunk_target_uris_to_close(released))
         self._layout.drop(io_keys)
         self._live.difference_update(io_keys)
 
@@ -1647,8 +1606,26 @@ class TuttiKVStore:
         self._key_namespace = bytes(namespace)
 
     def set_layer_span(self, num_layers: int) -> None:
-        """Bind rank-local geometry and synchronously create initial slots."""
+        """Bind rank-local geometry and synchronously create initial slots.
+
+        池在此刻才完成 configure（初始槽位同步建出，并完成 GpuFile 就绪
+        化），因此"就绪化回调"也必须在这里注册——store 的 open() 早于
+        本调用，那时还没有槽位。本调用发生在 worker 初始化期，不在请求
+        路径上。
+        """
         self._layout.set_layer_span(num_layers)
+        pool = self._object_pool
+        if pool is not None and pool.configured:
+            pool.set_gpu_file_opener(self._open_gpu_files)
+            pool.set_gpu_file_closer(self._close_cached_targets)
+            pool.mark_gpu_files_ready()
+
+    def _open_gpu_files(self, uris) -> list[int]:
+        """GpuFile 就绪化：把槽位文件打开成运行时句柄。
+
+        仅由池在初始化/后台分配器线程调用；请求路径不再 open。
+        """
+        return [int(t) for t in self._runtime.open_batch(list(uris))]
 
     def object_pool_snapshot(self) -> dict | None:
         return self._layout.object_pool_snapshot()
@@ -1686,7 +1663,40 @@ class TuttiKVStore:
             entries.append((bytes(io_key), buffer_id, offset))
         return entries
 
+    def _preopen_pool_targets(self) -> None:
+        """启动期把对象池已有槽位的目标票据一次性开好。
+
+        推理路径的 `_ensure_targets` 是"首次接触某 chunk 才 open"，而
+        open 的成本是 resolve（open+fstat+fsync+FIEMAP）加句柄构建
+        （cudaMalloc 192B + H2D + D2H），且 `open_batch` 会为每个 URI
+        现建一个线程——实测首个写入波次 39 个 chunk 因此付出约 30ms
+        的前向线程停顿，正压在层 0→1 的计算下发路径上。
+
+        槽位路径稳定（分配不改名），所以这些票据可以在启动时一次开
+        好；运行时 `_ensure_targets` 只做内存查找。池后续由后台分配
+        器扩展出的新槽位走按需 open 兜底（水位机制保证它们不在请求
+        关键路径上出现）。
+
+        失败不致命：记录告警后回退到按需 open 的老路径。
+        """
+        pool = self._object_pool
+        if pool is None or not pool.configured:
+            return
+        if not callable(getattr(self._runtime, "open_batch", None)):
+            return
+        pool.mark_gpu_files_ready()
+
     def _ensure_targets(self, entries) -> dict[str, int]:
+        """解析一批 io_key 的运行时目标句柄。
+
+        对象池模式下的快速路径：chunk 已绑定槽位且该槽位已有就绪
+        GpuFile 时，句柄是**纯内存**取用（槽位路径稳定，句柄随槽位
+        常驻）。只有池未覆盖的路径（无池、槽位未就绪）才回落到按需
+        open。
+        """
+        pool = self._object_pool
+        pool_mode = pool is not None and pool.configured
+        ready: dict[str, int] = {}
         descriptors = []
         seen = set()
         stale = []
@@ -1696,6 +1706,13 @@ class TuttiKVStore:
             if uri in seen:
                 continue
             seen.add(uri)
+            if pool_mode:
+                slot = pool.slot_of(chunk_id)
+                if slot is not None:
+                    ticket = pool.ticket_of_slot(slot)
+                    if ticket:
+                        ready[uri] = ticket
+                        continue
             size = self._layout.target_size(chunk_id)
             generation = self._layout.target_generation(chunk_id)
             cached = self._targets.get(uri)
@@ -1707,17 +1724,36 @@ class TuttiKVStore:
             descriptors.append((uri, size, generation))
         if stale:
             self._close_cached_targets(stale)
-        missing = [item for item in descriptors if item[0] not in self._targets]
+        with self._targets_lock:
+            missing = [item for item in descriptors if item[0] not in self._targets]
         if missing:
             uris = [uri for uri, _, _ in missing]
             tickets = self._runtime.open_batch(uris)
             if len(tickets) != len(uris):
                 raise RuntimeError("Runtime.open_batch returned wrong handle count")
-            for (uri, size, generation), ticket in zip(missing, tickets):
-                self._targets[uri] = _TargetCacheEntry(
-                    int(ticket), int(size), int(generation)
-                )
-        return {uri: self._targets[uri].ticket for uri, _, _ in descriptors}
+            with self._targets_lock:
+                for (uri, size, generation), ticket in zip(missing, tickets):
+                    self._targets.setdefault(
+                        uri,
+                        _TargetCacheEntry(int(ticket), int(size), int(generation)),
+                    )
+        with self._targets_lock:
+            resolved = {uri: self._targets[uri].ticket for uri, _, _ in descriptors}
+        resolved.update(ready)
+        return resolved
+
+    def _chunk_target_uris_to_close(self, chunk_ids) -> list[str]:
+        """解绑/中止/失败时应当关闭票据的 chunk 目标 URI。
+
+        对象池模式下票据是**槽位级**的：槽位路径稳定、文件不随解绑消失
+        （回收只是就地零化，extent 不变），因此解绑不应关闭票据——否则
+        每次回收后再次使用都要重跑 open（resolve + 句柄构建 + 每 URI 一
+        个线程），正是推理路径上要消除的开销。槽位文件真被重建时，
+        `target_generation` 会在 `_ensure_targets` 里判定失效并关闭。
+        """
+        if self._object_pool is not None and self._object_pool.configured:
+            return []
+        return [self._layout.target_uri(chunk_id) for chunk_id in chunk_ids]
 
     def _close_cached_targets(self, uris) -> None:
         records = [(uri, self._targets[uri]) for uri in dict.fromkeys(uris)
@@ -1783,9 +1819,7 @@ class TuttiKVStore:
         chunk_ids = tuple(dict.fromkeys(
             decode_io_key(io_key)[0] for io_key in io_keys
         ))
-        self._close_cached_targets([
-            self._layout.target_uri(chunk_id) for chunk_id in chunk_ids
-        ])
+        self._close_cached_targets(self._chunk_target_uris_to_close(chunk_ids))
         self._layout.abort_uncommitted(chunk_ids)
 
     def _on_direct_put_settled(self, ok: bool, io_keys, completion) -> None:
@@ -1830,9 +1864,9 @@ class TuttiKVStore:
             return
         self._direct_failed_chunks.difference_update(chunks)
         try:
-            self._close_cached_targets([
-                self._layout.target_uri(chunk_id) for chunk_id in chunks
-            ])
+            self._close_cached_targets(
+                self._chunk_target_uris_to_close(chunks)
+            )
             self._layout.abort_uncommitted(chunks)
             self._live = {
                 io_key for io_key in self._live

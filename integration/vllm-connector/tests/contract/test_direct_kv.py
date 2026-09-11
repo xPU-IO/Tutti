@@ -472,6 +472,10 @@ def test_direct_real_store_failure_rolls_back_live_and_layout(tmp_path):
     store._read_stream = 11
     store._write_stream = 22
     store.set_layer_span(3)
+    # 槽位目标在启动期（set_layer_span）预开，失败写入不得再新增票据：
+    # 槽位是稳定身份，失败的是该 chunk 的绑定而非槽位文件本身。
+    ready = store._object_pool.gpu_files()
+    assert ready and all(f.ticket for f in ready), "槽位应在 set_layer_span 时就绪化"
     backend = TuttiDirectBackend(store)
     backend.register_paged_caches(
         FakePool(128), num_layers=3, blocks_per_chunk=2,
@@ -482,7 +486,8 @@ def test_direct_real_store_failure_rolls_back_live_and_layout(tmp_path):
     with pytest.raises(RuntimeError, match="失败"):
         completion.wait()
     assert store._live == set()
-    assert store._targets == {}
+    # 就绪 GpuFile 不得因一次失败的写入而变化（槽位句柄随槽位常驻）
+    assert store._object_pool.gpu_files() == ready
     assert not store._layout.chunk_file(key).exists()
     assert "write" not in backend._target_plans
     backend.close()
@@ -1232,6 +1237,9 @@ def test_worker_logs_direct_start_load_return(caplog):
         token_ids=list(range(256)),
         req_id="r0",
         block_ids=[4, 5],
+        # start_load_kv 现在同时准备写批（写侧字段是元数据契约的一部分）。
+        save_chunk_start=0,
+        save_chunk_count=0,
     )
     worker = WorkerImpl(Engine())
     worker._metadata = SimpleNamespace(requests=[meta])
