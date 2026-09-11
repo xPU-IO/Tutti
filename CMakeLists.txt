@@ -50,7 +50,7 @@ endif()
 
 # CTest must be enabled at the repository root so `ctest --test-dir <build>`
 # discovers tests registered by the tutti subdirectory.
-option(BUILD_TESTING "Build Tutti tests" OFF)
+option(BUILD_TESTING "Build Tutti tests" ON)
 if(BUILD_TESTING)
     include(CTest)
 endif()

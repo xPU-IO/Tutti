@@ -92,77 +92,7 @@ bool StripedArena::init(const Config& cfg, const std::vector<nvm_ctrl_t*>& ctrls
     }
     ++alloc_counts_.cuda_malloc;
 
-    // 4. Allocate PRP-list pool: 64 KiB-aligned GPU buffer, DMA-mapped ONCE
-    //    PER DEVICE CONTROLLER (N mappings of the same GPU buffer).
-    prp_pages_per_slot_ = cfg_.max_entries_per_slot;
-    std::size_t total_prp_pages = static_cast<std::size_t>(cfg_.num_slots) *
-                                  prp_pages_per_slot_;
-    std::size_t prp_user_bytes = total_prp_pages * cfg_.page_size;
-
-    prp_aligned_bytes_ = (prp_user_bytes + 65535) & ~static_cast<std::size_t>(65535);
-    if (prp_aligned_bytes_ == 0) prp_aligned_bytes_ = 65536;
-
-    ce = cudaMalloc(&prp_raw_, prp_aligned_bytes_ + 65536);
-    if (ce != cudaSuccess) {
-        cudaFree(d_status_pool_);
-        d_status_pool_ = nullptr;
-        ++alloc_counts_.cuda_free;
-        cudaFree(d_entries_pool_);
-        d_entries_pool_ = nullptr;
-        ++alloc_counts_.cuda_free;
-        for (auto& ev : events_) {
-            cudaEventDestroy(static_cast<cudaEvent_t>(ev));
-            ++alloc_counts_.cuda_event_destroy;
-        }
-        events_.clear();
-        cudaSetDevice(prev_dev);
-        return false;
-    }
-    ++alloc_counts_.cuda_malloc;
-
-    std::uintptr_t raw_addr = reinterpret_cast<std::uintptr_t>(prp_raw_);
-    std::uintptr_t aligned_addr = (raw_addr + 65535) & ~static_cast<std::uintptr_t>(65535);
-    prp_aligned_ = reinterpret_cast<void*>(aligned_addr);
-
-    // DMA-map the PRP pool once per device controller.
-    prp_dmas_.assign(ctrls_.size(), nullptr);
-    bool map_ok = true;
-    for (std::size_t d = 0; d < ctrls_.size(); ++d) {
-        int rc = nvm_dma_map_data_device(&prp_dmas_[d], ctrls_[d], prp_aligned_,
-                                         prp_aligned_bytes_);
-        if (rc != 0 || prp_dmas_[d] == nullptr) {
-            map_ok = false;
-            break;
-        }
-        ++alloc_counts_.nvm_dma_map;
-    }
-    if (!map_ok) {
-        for (auto* dma : prp_dmas_) {
-            if (dma) {
-                nvm_dma_unmap(dma);
-                ++alloc_counts_.nvm_dma_unmap;
-            }
-        }
-        prp_dmas_.clear();
-        cudaFree(prp_raw_);
-        prp_raw_ = nullptr;
-        ++alloc_counts_.cuda_free;
-        cudaFree(d_status_pool_);
-        d_status_pool_ = nullptr;
-        ++alloc_counts_.cuda_free;
-        cudaFree(d_entries_pool_);
-        d_entries_pool_ = nullptr;
-        ++alloc_counts_.cuda_free;
-        for (auto& ev : events_) {
-            cudaEventDestroy(static_cast<cudaEvent_t>(ev));
-            ++alloc_counts_.cuda_event_destroy;
-        }
-        events_.clear();
-        cudaSetDevice(prev_dev);
-        return false;
-    }
-
-    // 5. Allocate device-table pool (contiguous GPU buffer for all slots).
+    // 4. Allocate device-table pool (contiguous GPU buffer for all slots).
     //    Each slot holds up to dev_table_capacity_per_slot DeviceTargetHandle*
     //    pointers; the kernel indexes it by entry.dev_idx.
     std::size_t dev_table_pool_bytes = static_cast<std::size_t>(cfg_.num_slots) *
@@ -170,13 +100,6 @@ bool StripedArena::init(const Config& cfg, const std::vector<nvm_ctrl_t*>& ctrls
                                        sizeof(void*);
     ce = cudaMalloc(reinterpret_cast<void**>(&d_dev_table_pool_), dev_table_pool_bytes);
     if (ce != cudaSuccess) {
-        for (auto* dma : prp_dmas_) {
-            if (dma) { nvm_dma_unmap(dma); ++alloc_counts_.nvm_dma_unmap; }
-        }
-        prp_dmas_.clear();
-        cudaFree(prp_raw_);
-        prp_raw_ = nullptr;
-        ++alloc_counts_.cuda_free;
         cudaFree(d_status_pool_);
         d_status_pool_ = nullptr;
         ++alloc_counts_.cuda_free;
@@ -193,7 +116,7 @@ bool StripedArena::init(const Config& cfg, const std::vector<nvm_ctrl_t*>& ctrls
     }
     ++alloc_counts_.cuda_malloc;
 
-    // 6. Round 16 S6 (REQUIRED 0): descriptor pool for dynamic-path entries.
+    // 5. GPU AddressDescriptor pool for dynamic-path entries.
     std::size_t desc_pool_bytes = static_cast<std::size_t>(cfg_.num_slots) *
                                    cfg_.max_entries_per_slot *
                                    sizeof(tutti::data_paths::local_nvme::AddressDescriptor);
@@ -201,13 +124,6 @@ bool StripedArena::init(const Config& cfg, const std::vector<nvm_ctrl_t*>& ctrls
     if (ce != cudaSuccess) {
         cudaFree(d_dev_table_pool_);
         d_dev_table_pool_ = nullptr;
-        ++alloc_counts_.cuda_free;
-        for (auto* dma : prp_dmas_) {
-            if (dma) { nvm_dma_unmap(dma); ++alloc_counts_.nvm_dma_unmap; }
-        }
-        prp_dmas_.clear();
-        cudaFree(prp_raw_);
-        prp_raw_ = nullptr;
         ++alloc_counts_.cuda_free;
         cudaFree(d_status_pool_);
         d_status_pool_ = nullptr;
@@ -242,20 +158,7 @@ void StripedArena::shutdown(bool skip_prp) {
     cudaGetDevice(&prev_dev);
     cudaSetDevice(cfg_.cuda_device);
 
-    if (!skip_prp) {
-        for (auto* dma : prp_dmas_) {
-            if (dma) {
-                nvm_dma_unmap(dma);
-                ++alloc_counts_.nvm_dma_unmap;
-            }
-        }
-        prp_dmas_.clear();
-        if (prp_raw_) {
-            cudaFree(prp_raw_);
-            prp_raw_ = nullptr;
-            ++alloc_counts_.cuda_free;
-        }
-    }
+    (void)skip_prp;
     if (d_status_pool_) {
         cudaFree(d_status_pool_);
         d_status_pool_ = nullptr;
@@ -287,9 +190,6 @@ void StripedArena::shutdown(bool skip_prp) {
     cudaSetDevice(prev_dev);
 
     free_list_.clear();
-    prp_aligned_ = nullptr;
-    prp_aligned_bytes_ = 0;
-    prp_pages_per_slot_ = 0;
     ctrls_.clear();
     initialized_ = false;
 }
@@ -307,10 +207,6 @@ bool StripedArena::acquire(Lease& out) {
     out.event = events_[slot];
     out.d_entries = d_entries_pool_ + static_cast<std::size_t>(slot) * cfg_.max_entries_per_slot;
     out.d_status = d_status_pool_ + static_cast<std::size_t>(slot) * cfg_.max_entries_per_slot;
-    out.prp_pages_devptr = static_cast<char*>(prp_aligned_) +
-                           static_cast<std::size_t>(slot) * prp_pages_per_slot_ * cfg_.page_size;
-    out.prp_ioaddrs_base = slot * prp_pages_per_slot_;
-    out.prp_page_capacity = prp_pages_per_slot_;
     out.d_dev_table = reinterpret_cast<const void**>(d_dev_table_pool_) +
                       static_cast<std::size_t>(slot) * cfg_.dev_table_capacity_per_slot;
     out.dev_table_capacity = cfg_.dev_table_capacity_per_slot;
@@ -326,9 +222,8 @@ void StripedArena::release(std::uint32_t slot_index) {
 }
 
 void StripedArena::release_with_timeout_leak(std::uint32_t slot_index) {
-    // Intentionally do NOT return the slot to the free list — same
-    // conservative-retention semantics as MetadataArena.
-    (void)slot_index;
+    // Host-pinned PRP leases live outside the GPU metadata arena.
+    release(slot_index);
 }
 
 std::uint32_t StripedArena::available() const {

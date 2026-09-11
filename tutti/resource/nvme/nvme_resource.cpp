@@ -213,10 +213,6 @@ Status NvmeResource::validate_allocation_metadata_() const {
             return error(StatusCode::INVALID_ARGUMENT,
                          "NVMe allocation slice has invalid logical block size");
         }
-        if (slice.bar0_size == 0) {
-            return error(StatusCode::INVALID_ARGUMENT,
-                         "NVMe allocation slice has invalid BAR0 size");
-        }
         if (slice.max_data_size == 0) {
             return error(StatusCode::INVALID_ARGUMENT,
                          "NVMe allocation slice has invalid max data size");
@@ -425,7 +421,6 @@ Result<NvmeDataPathResourceView> NvmeResource::datapath_view() const {
             slice.chrdev_path,
             slice.namespace_id,
             slice.logical_block_size,
-            slice.bar0_size,
             slice.max_data_size,
             slice.granted_queues,
         });

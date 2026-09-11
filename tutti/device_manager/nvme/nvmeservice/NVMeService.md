@@ -1,5 +1,11 @@
 # NVMeService
 
+> **状态：历史低层协议参考，不是当前部署入口。**手动构建请使用
+> [`doc/getting-started.md`](../../../../doc/getting-started.md)，生产 daemon 配置与启动请使用
+> [`doc/tutti_daemon.md`](../../../../doc/tutti_daemon.md) 和
+> `config/local_nvme_config.yaml`。下文保留旧 `nvmeservice_daemon` / `Connect` 协议的
+> 设计与诊断背景，不应复制其旧 `sys_config.yaml`、preset 或输出路径命令。
+>
 > Session broker for SNVMe (post L1 Commit 4b).
 >
 > Daemon owns the chrdev / bind / GPU-view symlinks; clients drive
@@ -71,98 +77,35 @@ Build targets (CMake):
 | Target                          | What it is                          |
 |---------------------------------|--------------------------------------|
 | `nvmeservice`                   | shared library: proto + state + server + client lib |
-| `nvmeservice_daemon_example`    | the daemon binary (`build/<preset>/tutti/device_manager/nvme/nvmeservice/examples/nvmeservice_daemon`) |
-| `nvmeservice_client_example`    | the reference client (`build/<preset>/tutti/device_manager/nvme/nvmeservice/examples/nvmeservice_client`) |
+| `nvmeservice_daemon_example`    | legacy daemon diagnostic binary (`build/bin/nvmeservice_daemon`) |
+| `nvmeservice_client_example`    | reference client (`build/bin/nvmeservice_client`) |
 
 ---
 
-## Quick start
+## Current deployment entry point
 
-Prerequisites:
+This historical protocol document intentionally has no runnable quick start.
+For a current deployment:
 
-- snvme kernel module loaded (`/dev/snvm_control` exists).
-- Target NVMe is **NOT** mounted as a regular filesystem and not in
-  use by `nvme0n1` etc. – snvme will rebind it.
-- A working CUDA toolchain + at least one GPU.
-- `/mnt/gpu0`, `/mnt/nvme0` writable (daemon installs symlinks here;
-  paths are configurable in `sys_config.yaml`).
+1. Compile with [`doc/getting-started.md`](../../../../doc/getting-started.md);
+   the resulting output directory is `build/`.
+2. Follow [`doc/tutti_daemon.md`](../../../../doc/tutti_daemon.md) to create
+   canonical YAML from `config/local_nvme_config.yaml`, load a signed module,
+   and start `build/bin/tutti_daemon`.
+3. Use `build/bin/nvmeservice_client --list-only` to inspect daemon-published
+   resources and view paths.
 
-Build:
-
-```bash
-cd /path/to/Tutti
-cmake --preset cuda-module
-cmake --build --preset cuda-module \
-    --target nvmeservice_daemon_example nvmeservice_client_example --parallel 8
-```
-
-Edit `build/cuda-module/bin/sys_config.yaml` (copied from the repository root
-during configuration) so
-`nvmes[].pci_addr` matches your card and `nvmes[].allowed_gpus`
-lists the GPUs you intend to test from.
-
-Terminal A (daemon):
-
-```bash
-sudo ./build/cuda-module/tutti/device_manager/nvme/nvmeservice/examples/nvmeservice_daemon \
-    --config ./build/cuda-module/bin/sys_config.yaml
-```
-
-Expected lines (excerpt):
-
-```
-nvmeservice: device=0 pci=0000:08:00.0 snvme=/dev/ssnvme0 ns=1 qdepth=64
-             max_user_qid=135 max_q_per_grp=32 allowed_gpus={0}
-NVMeService daemon listening on 127.0.0.1:50051 (port 50051)
-Registered devices:
-  device_id=0 ... max_user_qid=135 max_q/grp=32
-      allowed: cuda_device=0 mount=/mnt/gpu0/ssnvme0
-lease: heartbeat=10s timeout=30s
-queue_pool: default=4 max=32
-```
-
-Terminal B (client):
-
-```bash
-./build/cuda-module/tutti/device_manager/nvme/nvmeservice/examples/nvmeservice_client \
-    --list-only                                  # enumerate
-./build/cuda-module/tutti/device_manager/nvme/nvmeservice/examples/nvmeservice_client \
-    --device 0 --cuda 0 --count 4
-```
-
-Expected client output (8-step IO smoke):
-
-```
-[ OK ] step=1   cudaSetDevice(0)
-[ OK ] step=2   nvm_ctrl_attach_client /dev/ssnvme0 page=4096
-[ OK ] step=3   nvm_create_group gid=1 max_queues=32 granted=4
-[ OK ] step=4   mapped SQ/CQ + wbuf/rbuf
-[ OK ] step=5   nvm_add_user_queue qid=33 sq_db=0x1108 cq_db=0x110c
-[ OK ] step=6   Write+Read+verify x 4 IOs at LBA [2621440..2621443]
-[ OK ] step=7   nvm_destroy_group gid=1 (rings cascade)
-[ OK ] step=8   nvm_ctrl_free_client (no unbind, no chrdev_remove)
-```
-
-Expected `dmesg`:
-
-```
-snvme: NVM_SET_KERNEL_IOQ_CAP cap=32
-snvme: capping kernel-side IOQ count from 135 to 32 (user pool gets [33..135])
-snvme: user QID pool initialised: [33..135] (103 QIDs)
-snvme: NVM_ADD_USER_QUEUE group=1 created 1 queue(s) (qids 33..33)
-snvme: destroy_qgroup id=1 drained 1 user queue(s)
-snvme: destroy_qgroup id=1 drained 2 map(s)
-```
-
-> ⚠️ `--device 0 --cuda 0` is **destructive**: writes 4 KiB blocks at
-> LBA 2621440..2621443 (10 GiB offset).  Use `--skip-io` for any
-> non-scratch device.  See *CLI* below.
+The protocol sections below retain historical compatibility details only. Do
+not run their `nvmeservice_daemon`, `sys_config.yaml`, legacy ACL, or fixed
+`/dev` path examples against a current deployment.
 
 ---
 
-## YAML schema
+## Legacy YAML schema
 
-Authoritative source: `nvmeservice_config.{h,cpp}` + `sys_config.yaml`.
+> 当前唯一 canonical schema 是 `config/local_nvme_config.yaml`；字段使用
+> `accelerators[].accel_id`、`view_root`、`nvmes[].device_id`、
+> `backing_mount_path` 和 `allowed_accel_ids`。不要根据以下历史 schema 新建部署配置。
 
 ```yaml
 grpc:
@@ -341,12 +284,10 @@ auto sess = client.connect(/*device_id=*/0,
                            /*num_queues=*/4);
 if (!sess) { /* see stderr */ return -1; }
 
-// sess->{snvme_dev_path, bar0_size, granted_queues, …}
+// sess->{snvme_dev_path, granted_queues, …}
 // drive libnvm yourself:
 nvm_ctrl_t* ctrl = nullptr;
-int rc = nvm_ctrl_attach_client(&ctrl,
-                                sess->snvme_dev_path.c_str(),
-                                (uint32_t)sess->bar0_size);
+int rc = nvm_ctrl_attach_client(&ctrl, sess->snvme_dev_path.c_str());
 
 uint32_t group_id = 0, max_q = 0;
 nvm_create_group(ctrl, &group_id, &max_q);

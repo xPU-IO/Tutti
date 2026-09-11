@@ -89,7 +89,7 @@ cudaError_t launch_submit_one(
 // GPU kernel writes are visible to NVMe DMA; cudaMemsetAsync may not be
 // due to L2 cache coherency.  Defined in submit_one.cu.
 void launch_fill_pattern(void* buf, unsigned char val, std::uint64_t n,
-                          void* stream);
+    void* stream);
 
 } // namespace tutti::data_paths::local_nvme
 

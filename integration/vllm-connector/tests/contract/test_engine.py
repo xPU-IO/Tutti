@@ -1,447 +1,1105 @@
-"""TuttiEngine 测试（T-116）：计划态 + 执行态 + 环形窗口 + 零依赖。"""
+"""engine 契约测试：多层往返、波次与覆盖保护、驱逐接线、bind 与生命周期。"""
 
-import ctypes
+from __future__ import annotations
+
+import subprocess
 import sys
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import pytest
 
-_CONNECTOR_ROOT = Path(__file__).resolve().parents[2]
+from engine.core import KVEngine, LoadGateError, _EngineStepIO, _PostCompletion
+from engine.staging import RingWindow
+from engine.transfer import DirectTransferUnavailable
+from index.chunk_index import chunk_key_of, derive_io_key, layer_of
+from stores.memory import MemoryKVStore
 
-import engine.core as eng_mod
-from engine.chunk_index import hash_chunk
-from engine.core import LoadPlan, StorePlan, TuttiEngine
-
-CS = 4  # chunk_tokens
-NL = 2  # num_layers
-SEG = 16  # segment_bytes
-CB = SEG * NL  # chunk_kv_bytes
-NC = 4  # capacity: 4 chunks
-MCW = 2  # max_chunks_per_wave
-
-
-def make_config(**over):
-    cfg = dict(
-        backend="memory",
-        chunk_tokens=CS,
-        chunk_kv_bytes=CB,
-        capacity_bytes=NC * CB,
-        max_chunks_per_wave=MCW,
-    )
-    cfg.update(over)
-    return cfg
+SEG = 4096            # 单层段字节数
+NUM_LAYERS = 3
+CHUNK_TOKENS = 4
+MAX_WAVE = 2          # 单波最大 chunk 数
+NUM_SLOTS = 2 * MAX_WAVE
+NUM_CHUNKS = 8
 
 
-def chain_keys(n: int, base: int = 0) -> "list[bytes]":
-    """链式 keys（D-007）：H_i = blake2b(H_{i-1} ‖ tokens_i)。"""
-    parent = b""
-    keys = []
-    for i in range(n):
-        parent = hash_chunk(
-            tuple(range(base + i * CS, base + (i + 1) * CS)), parent=parent
-        )
-        keys.append(parent)
+def _tokens(base: int, n_chunks: int) -> list[int]:
+    """生成 base 序列前 n_chunks 个 chunk 的 token 列表。"""
+    return [base * 1000 + i for i in range(n_chunks * CHUNK_TOKENS)]
+
+
+def _chunk_keys(engine: KVEngine, base: int, n_chunks: int) -> list[bytes]:
+    keys, _ = engine.hash_keys(_tokens(base, n_chunks))
     return keys
 
 
-def tokens_for(n: int, base: int = 0) -> "list[int]":
-    return list(range(base, base + n * CS))
+def _segment_bytes(chunk_i: int, layer: int) -> bytes:
+    """每个 (chunk, layer) 的层段内容：首字节作标记，其余填充。"""
+    marker = (chunk_i * 37 + layer * 11) & 0xFF
+    return bytes([marker]) + bytes([marker ^ 0xFF]) * (SEG - 1)
 
 
-def fill_stored(engine: TuttiEngine, keys) -> None:
-    plan = engine.plan_store(keys)
-    assert plan is not None
-    engine.complete_store(plan)
+def test_step_read_failure_never_scatters():
+    class Inner:
+        staging_depth = 2
+        layer_count = 3
+
+        @staticmethod
+        def wait_layer(_layer):
+            return False
+
+        @staticmethod
+        def drain(_stream=0):
+            return None
+
+    class Engine:
+        def __init__(self):
+            self.scatter_calls = 0
+            self._store = object()
+
+            def scatter(*_args):
+                self.scatter_calls += 1
+
+            self._scatter_hook = scatter
+
+    engine = Engine()
+    step = _EngineStepIO(
+        Inner(), engine, [b"k" * 16], [[0]], [[0], [1], [0]], "read",
+        [0, 1, 2],
+    )
+    with pytest.raises(LoadGateError):
+        step.wait_layer(0, 0)
+    assert engine.scatter_calls == 0
 
 
-def make_bound_engine(**over) -> TuttiEngine:
-    e = TuttiEngine(make_config(**over))
-    e.bind({"l0": object(), "l1": object()}, NL, blocks_per_chunk=1)
-    return e
+def test_step_structured_failure_maps_flat_requests_to_exact_chunks():
+    failure = type("Failure", (), {
+        "state": "FAILED",
+        "failure_scope": "REQUEST_INDICES",
+        "failure_kind": "NVME_CQ_ERROR",
+        "first_failed_entry": 3,
+        "raw_cq_status": 0x30000,
+        "failed_request_indices": (3,),
+    })()
+    result = type("Result", (), {
+        "failed_batch_indices": (3,),
+        "failures": (failure,),
+    })()
+
+    class Inner:
+        staging_depth = 2
+        layer_count = 3
+
+        @staticmethod
+        def wait_layer(layer):
+            return layer == 0
+
+        @staticmethod
+        def signal_layer(_layer, _stream):
+            return None
+
+        @staticmethod
+        def drain(_stream=0):
+            return result
+
+    class Engine:
+        _store = object()
+
+        def __init__(self):
+            self.scatter_calls = 0
+            self._scatter_hook = lambda *_args: setattr(
+                self, "scatter_calls", self.scatter_calls + 1
+            )
+
+    engine = Engine()
+    step = _EngineStepIO(
+        Inner(), engine, [b"a" * 16, b"b" * 16],
+        [[10, 20], [11, 21]], [[0, 1], [2, 3], [0, 1]], "read",
+        [0, 1, 2],
+    )
+    step.wait_layer(0, 0)
+    with pytest.raises(LoadGateError) as excinfo:
+        step.wait_layer(1, 1)
+    assert excinfo.value.whole_operation is True
+    assert excinfo.value.failed_batch_indices == ()
+    assert excinfo.value.invalid_block_ids == (10, 20, 11, 21)
+    assert engine.scatter_calls == 1
+    # Structured request attribution is harvested only at the post-forward
+    # drain boundary, never by blocking the attention callback.
+    drained = step.drain()
+    assert drained.failed_batch_indices == (3,)
 
 
-# ---------- 构造 / 配置 ----------
+class _CallbackInner:
+    staging_depth = 2
+
+    def __init__(self, layer_count):
+        self.layer_count = layer_count
+        self.waits = []
+        self.signals = []
+        self.drains = 0
+        self.whole_waits = 0
+
+    def wait_layer(self, callback):
+        self.waits.append(callback)
+        return True
+
+    def signal_layer(self, callback, stream):
+        self.signals.append(callback)
+
+    def drain(self, stream=0):
+        self.drains += 1
+
+    def wait(self):
+        self.whole_waits += 1
+
+    def wait_result(self):
+        self.whole_waits += 1
 
 
-def test_config_validation():
-    with pytest.raises(KeyError):
-        TuttiEngine({k: v for k, v in make_config().items() if k != "chunk_tokens"})
-    with pytest.raises(ValueError):
-        TuttiEngine(make_config(backend="unknown"))  # 未知实现名
-    with pytest.raises(ValueError):
-        TuttiEngine(make_config(chunk_tokens=0))
-    with pytest.raises(ValueError):
-        TuttiEngine(make_config(capacity_bytes=CB - 1))  # 装不下一个 chunk
-    with pytest.raises(ValueError):
-        TuttiEngine(make_config(max_chunks_per_wave=0))
-    with pytest.raises(TypeError):
-        TuttiEngine(make_config(backend=123))
+class _CallbackEngine:
+    def __init__(self):
+        self.scatter = []
+        self._transfer = None
+        self._scatter_hook = self._scatter
+
+    def _scatter(self, keys, physical, block_tables, slots):
+        self.scatter.append((physical, tuple(slots)))
 
 
-def test_memory_backend_selected_and_path_pool():
-    e = TuttiEngine(make_config())
-    assert e.capacity_chunks == NC
-    assert e.index.free == [f"mem://slot/{i}" for i in range(NC)]
+def _callback_step(physical_layers):
+    inner = _CallbackInner(len(physical_layers))
+    engine = _CallbackEngine()
+    slots = [[callback] for callback in range(len(physical_layers))]
+    step = _EngineStepIO(
+        inner, engine, [b"k" * 16], [[0]], slots, "read",
+        physical_layers,
+    )
+    return step, inner, engine
 
 
-# ---------- 计划态 ----------
+def test_step_callback_subset_maps_to_physical_ordinals():
+    step, inner, engine = _callback_step([1, 3])
+    step.wait_layer(0, 1)
+    step.wait_layer(1, 3)
+    step.wait()
+    assert [item[0] for item in engine.scatter] == [1, 3]
+    assert inner.waits == [0, 1]
+    assert step.pending_callbacks == ()
 
 
-def test_lookup_prefix_chain_hits():
-    e = TuttiEngine(make_config())
-    keys = chain_keys(3)
-    fill_stored(e, keys[:3])
-    # 存 3 chunk 后查 5-chunk 序列 → 3 × chunk_tokens
-    assert e.lookup_prefix(tokens_for(5)) == 3 * CS
+def test_step_duplicate_callback_is_idempotent():
+    step, inner, engine = _callback_step([2])
+    step.wait_layer(0, 2)
+    step.wait_layer(0, 2)
+    assert inner.waits == [0]
+    assert len(engine.scatter) == 1
 
 
-def test_lookup_prefix_stops_at_gap_and_ignores_pending():
-    e = TuttiEngine(make_config())
-    keys = chain_keys(3)
-    # 只存 chunk0 与 chunk2（跳过 chunk1）→ 断在中间
-    plan = e.plan_store([keys[0], keys[2]])
-    assert plan is not None
-    assert len(plan.keys) == 2
-    e.complete_store(plan)
-    assert e.lookup_prefix(tokens_for(3)) == CS
-
-    e2 = TuttiEngine(make_config())
-    p = e2.plan_store(chain_keys(1))  # pending，未 complete → 不命中
-    assert p is not None
-    assert e2.lookup_prefix(tokens_for(1)) == 0
-    e2.complete_store(p, success=False)
-    assert e2.lookup_prefix(tokens_for(1)) == 0
+def test_step_out_of_order_callback_fails_and_drains():
+    step, inner, _engine = _callback_step([0, 1, 2])
+    with pytest.raises(RuntimeError, match="out-of-order callback"):
+        step.wait_layer(1, 1)
+    assert inner.drains == 1
 
 
-def test_plan_load_pins_and_missing_raises():
-    e = TuttiEngine(make_config())
-    keys = chain_keys(2)
-    fill_stored(e, keys)
-    plan = e.plan_load(keys)
-    assert isinstance(plan, LoadPlan)
-    assert plan.keys == tuple(keys)
-    assert plan.chunk_ids == tuple(e.index.stored[k] for k in keys)
-    assert plan.dst_first_blocks == ()
-    # 已 pin：容量耗尽时不可驱逐
-    assert set(e.index.pinned.keys()) == set(plan.chunk_ids)
-    # miss → KeyError
-    with pytest.raises(KeyError):
-        e.plan_load([keys[0], b"\x00" * 16])
-    e.complete_load(plan)
-    assert e.index.pinned == {}
+def test_step_missing_callback_fails_and_drains_at_finalize():
+    step, inner, _engine = _callback_step([0, 1])
+    step.wait_layer(0, 0)
+    with pytest.raises(RuntimeError, match="missing feeder callbacks"):
+        step.wait()
+    assert inner.drains == 1
 
 
-def test_plan_store_dedup_and_existing_skipped():
-    e = TuttiEngine(make_config())
-    keys = chain_keys(2)
-    fill_stored(e, keys)
-    plan = e.plan_store(keys)  # 全已存在
-    assert plan == StorePlan(keys=(), chunk_ids=(), src_first_blocks=(), evicted=())
-    # 混合：1 已存在 + 1 新
-    k2 = chain_keys(3)[2]
-    plan = e.plan_store([keys[0], k2])
-    assert plan.keys == (k2,)
-    assert len(plan.chunk_ids) == 1
-    assert plan.evicted == ()
-    e.complete_store(plan)
+def test_step_scatter_uses_copy_stream_event_bridge_before_release():
+    order = []
+
+    class Event:
+        def synchronize(self):
+            raise AssertionError("host synchronize must not be called")
+
+    event = Event()
+
+    class Store:
+        @contextmanager
+        def stream_context(self, direction):
+            assert direction == "read_copy"
+            order.append("copy_enter")
+            try:
+                yield
+            finally:
+                order.append("copy_exit")
+
+        @staticmethod
+        def record_read_copy_event(value):
+            assert value is event
+            order.append("scatter_done_record")
+            return value
+
+        @staticmethod
+        def wait_compute_event(value):
+            assert value is event
+            order.append("compute_wait_event")
+
+        @staticmethod
+        def read_copy_stream_handle():
+            return 333
+
+    class Inner(_CallbackInner):
+        def signal_layer(self, callback, stream):
+            order.append(("release_signal", callback, stream))
+            super().signal_layer(callback, stream)
+
+    class Engine:
+        _store = Store()
+        _transfer = None
+
+        @staticmethod
+        def _scatter(_keys, _physical, _blocks, _slots):
+            order.append("scatter_enqueue")
+            return event
+
+        _scatter_hook = _scatter
+
+    inner = Inner(3)
+    step = _EngineStepIO(
+        inner, Engine(), [b"k" * 16], [[7]], [[0], [1], [0]], "read",
+        [0, 1, 2],
+    )
+    step.wait_layer(0, 0)
+    assert order == [
+        "copy_enter",
+        "scatter_enqueue",
+        "scatter_done_record",
+        "copy_exit",
+        "compute_wait_event",
+        ("release_signal", 0, 333),
+    ]
+    assert inner.signals == [0]
 
 
-def test_plan_store_evicts_lru_when_full():
-    e = TuttiEngine(make_config())  # NC=4
-    keys = chain_keys(4)
-    fill_stored(e, keys)
-    k4 = chain_keys(5)[4]
-    plan = e.plan_store([k4])
-    assert plan is not None
-    assert plan.evicted == (keys[0],)  # LRU 头驱逐
-    assert keys[0] not in e.index.stored
-    e.complete_store(plan)
-    assert e.lookup_prefix(tokens_for(5)) == 0  # k0 已被驱逐
+def test_pre_enqueued_read_failure_releases_future_windows_without_submit():
+    class Inner(_CallbackInner):
+        def __init__(self):
+            super().__init__(4)
+            self.signal_calls = []
+
+        def signal_layer(self, callback, stream):
+            self.signal_calls.append((callback, stream))
+
+    inner = Inner()
+    class Engine:
+        _store = type("Store", (), {
+            "read_copy_stream_handle": staticmethod(lambda: 333),
+        })()
+
+    step = _EngineStepIO(
+        inner, Engine(), [b"k"], [[0]], [[0], [1], [2], [3]],
+        "read", [0, 1, 2, 3],
+    )
+
+    step.release_after_failure(1)
+
+    assert inner.signal_calls == [(1, 333), (2, 333), (3, 333)]
 
 
-def test_plan_store_pinned_not_evicted_then_none():
-    e = TuttiEngine(make_config())  # NC=4
-    keys = chain_keys(4)
-    fill_stored(e, keys)
-    lp = e.plan_load([keys[0]])  # pin k0
-    k4 = chain_keys(5)[4]
-    # k0 pinned → 只能驱逐 k1/k2/k3，仍够 1 个
-    plan = e.plan_store([k4])
-    assert plan is not None
-    assert plan.evicted == (keys[1],)
-    e.complete_store(plan)
-    e.complete_load(lp)
-    # 再压满后 pin 全部 → 无可驱逐 → None
-    e2 = TuttiEngine(make_config(max_chunks_per_wave=MCW))
-    ks = chain_keys(4)
-    fill_stored(e2, ks)
-    lp2 = e2.plan_load(ks)  # 全 pin
-    assert e2.plan_store([chain_keys(5)[4]]) is None
-    e2.complete_load(lp2)
+class MovingHooks:
+    """真实搬运钩子：paged 侧以 dict 模拟，数据经 staging 缓冲中转。"""
+
+    def __init__(self, buffer=None, seg: int = SEG):
+        self._view = memoryview(buffer) if buffer is not None else None
+        self._seg = seg
+        self.source: dict[tuple[bytes, int], bytes] = {}
+        self.sink: dict[tuple[bytes, int], bytes] = {}
+        self.log: list[tuple] = []
+
+    def gather(self, keys, layer_idx, first_blocks, slots):
+        """store 方向：把源侧层段写入 staging 槽。"""
+        self.log.append(("gather", tuple(keys), layer_idx, tuple(slots), first_blocks))
+        for k, s in zip(keys, slots):
+            self._view[s * self._seg:(s + 1) * self._seg] = self.source[(k, layer_idx)]
+
+    def scatter(self, keys, layer_idx, first_blocks, slots):
+        """load 方向：把 staging 槽内容读出到目的侧。"""
+        self.log.append(("scatter", tuple(keys), layer_idx, tuple(slots), first_blocks))
+        for k, s in zip(keys, slots):
+            self.sink[(k, layer_idx)] = bytes(
+                self._view[s * self._seg:(s + 1) * self._seg]
+            )
 
 
-def test_complete_store_failure_recycles_path():
-    e = TuttiEngine(make_config())  # NC=4
-    keys = chain_keys(4)
-    fill_stored(e, keys)
-    k4 = chain_keys(5)[4]
-    plan = e.plan_store([k4])
-    assert plan.evicted == (keys[0],)
-    path = plan.chunk_ids[0]
-    e.complete_store(plan, success=False)
-    # 失败回收：路径回 free，k4 不可见
-    assert k4 not in e.index.stored and k4 not in e.index.pending_store
-    assert path in e.index.free
-    assert e.lookup_prefix(tokens_for(5)) == 0
-    # 回收的路径可被再次分配
-    plan2 = e.plan_store([k4])
-    assert plan2 is not None
-    assert plan2.chunk_ids[0] == path
-    e.complete_store(plan2)
-    # k4 已可命中（链式前缀因 k0 被驱逐而从 0 断开，用索引层断言）
-    assert e.index.stored[k4] == path
-    assert e.lookup_prefix(tokens_for(5)) == 0  # k0 已驱逐：链断在首个 chunk
-
-
-def test_reset_clears_all():
-    e = TuttiEngine(make_config())
-    keys = chain_keys(2)
-    fill_stored(e, keys)
-    e.plan_load(keys)  # pin 中
-    e.reset()
-    assert e.index.stored == {} and e.index.pinned == {}
-    assert e.index.pending_store == {}
-    assert e.index.free == [f"mem://slot/{i}" for i in range(NC)]
-    assert e.lookup_prefix(tokens_for(2)) == 0
-    # reset 后可继续正常使用
-    fill_stored(e, keys)
-    assert e.lookup_prefix(tokens_for(2)) == 2 * CS
-
-
-# ---------- 执行态：bind ----------
-
-
-def test_bind_validates_and_geometry():
-    e = TuttiEngine(make_config())
-    with pytest.raises(TypeError):
-        e.bind({}, NL, 1)
-    with pytest.raises(ValueError):
-        e.bind({"l0": object()}, 0, 1)
-    with pytest.raises(ValueError):
-        e.bind({"l0": object()}, NL, 0)
-    # chunk_kv_bytes 不被 num_layers 整除 → packed 层段无法等分
-    e_bad = TuttiEngine(make_config(chunk_kv_bytes=CB + 1, capacity_bytes=NC * (CB + 1)))
-    with pytest.raises(ValueError):
-        e_bad.bind({"l0": object()}, NL, 1)
-
-    e.bind({"l0": object(), "l1": object()}, NL, blocks_per_chunk=1)
-    assert e.num_layers == NL
-    assert e.segment_bytes == SEG
-    assert e.num_slots == 2 * MCW
-    assert e.staging_addr == ctypes.addressof(e._staging)
-    # backend 已收到同一 staging 地址
-    assert e.backend._staging_addr == e.staging_addr
-
-
-def test_layer_ops_require_bind():
-    e = TuttiEngine(make_config())
-    plan = StorePlan(keys=(b"\x01" * 16,), chunk_ids=("mem://slot/0",), src_first_blocks=(0,), evicted=())
-    with pytest.raises(RuntimeError):
-        e.store_layer(plan, 0, (0,))
-
-
-def test_load_store_validation():
-    e = make_bound_engine()
-    keys = chain_keys(1)
-    fill_stored(e, keys)
-    lp = e.plan_load(keys)
-    with pytest.raises(ValueError):
-        e.load_layer(lp, layer_idx=NL)  # 层越界
-    with pytest.raises(ValueError):
-        e.load_layer(lp, 0, dst_first_blocks=())  # 长度不匹配
-    sp = e.plan_store(chain_keys(3))  # 3 chunks > MCW=2
-    with pytest.raises(ValueError):
-        e.store_layer(sp, 0, (0, 1, 2))
-
-
-# ---------- 执行态：store→load 往返（真拷贝） ----------
-
-
-def test_store_load_roundtrip_with_real_hooks():
-    e = make_bound_engine()
-    assert e.num_slots == 2 * MCW
-
-    chunk_payload = {
-        i: bytes([(0x10 + i + j) & 0xFF for j in range(CB)]) for i in range(2)
-    }
-    paged_src = {fb: chunk_payload[i] for i, fb in enumerate((10, 11))}
-    paged_dst: dict = {}
-
-    def gather(plan, layer_idx, slots, first_blocks):
-        st = e._staging
-        for cid, slot, fb in zip(plan.chunk_ids, slots, first_blocks):
-            seg = e.segment_bytes
-            off = slot * seg
-            st[off : off + seg] = paged_src[fb][layer_idx * seg : (layer_idx + 1) * seg]
-
-    def scatter(plan, layer_idx, slots, first_blocks):
-        st = e._staging
-        for cid, slot, fb in zip(plan.chunk_ids, slots, first_blocks):
-            seg = e.segment_bytes
-            off = slot * seg
-            paged_dst.setdefault(fb, bytearray(CB))[
-                layer_idx * seg : (layer_idx + 1) * seg
-            ] = bytes(st[off : off + seg])
-
-    e.gather_fn = gather
-    e.scatter_fn = scatter
-
-    # ---- store 两层 ----
-    keys = chain_keys(2)
-    sp = e.plan_store(keys)
-    assert sp is not None and len(sp.keys) == 2
-    for layer in range(NL):
-        h = e.store_layer(sp, layer, src_first_blocks=(10, 11))
-        h.wait()  # 句柄可 wait
-        assert h.query() is True
-    e.complete_store(sp)
-
-    # ---- load 两层（另一 plan/目标块） ----
-    lp = e.plan_load(keys)
-    for layer in range(NL):
-        h = e.load_layer(lp, layer, dst_first_blocks=(20, 21))
-        h.wait()
-    e.complete_load(lp)
-
-    assert bytes(paged_dst[20]) == chunk_payload[0]
-    assert bytes(paged_dst[21]) == chunk_payload[1]
-
-
-def test_default_hooks_record_only():
-    e = make_bound_engine()
-    keys = chain_keys(1)
-    fill_stored(e, keys)
-    lp = e.plan_load(keys)
-    e.load_layer(lp, 0, dst_first_blocks=(7,))
-    e.complete_load(lp)
-    sp = e.plan_store(chain_keys(2, base=100))
-    e.store_layer(sp, 0, src_first_blocks=(8, 9))
-    e.complete_store(sp)
-    ops = [op[0] for op in e.op_log]
-    assert ops == ["scatter", "gather"]
-    assert e.op_log[0][2] == 0 and e.op_log[0][3] == (0,)  # layer/slots
-    assert e.op_log[0][4] == (7,)
-
-
-# ---------- 执行态：环形窗口（§2b.3） ----------
-
-
-class RecEvent:
-    """记录 record/wait 调用的假事件（mock）。"""
+class TailEvent:
+    """模拟异步消费完成事件。"""
 
     def __init__(self):
-        self.recorded = 0
-        self.waited = 0
-
-    def record(self, stream=None):
-        self.recorded += 1
-
-    def wait(self, stream=None):
-        self.waited += 1
+        self.synchronize_count = 0
+        self.wait_count = 0
+        self._done = False
 
     def synchronize(self):
-        pass
+        self.synchronize_count += 1
+        self._done = True
+
+    def wait(self):
+        self.wait_count += 1
+        self._done = True
+
+    def query(self):
+        return self._done
+
+
+class EventHooks(MovingHooks):
+    """搬运钩子：目的侧返回一个消费完成事件。"""
+
+    def __init__(self, buffer=None, seg: int = SEG):
+        super().__init__(buffer, seg)
+        self.events: list[TailEvent] = []
+
+    def scatter(self, keys, layer_idx, first_blocks, slots):
+        super().scatter(keys, layer_idx, first_blocks, slots)
+        event = TailEvent()
+        self.events.append(event)
+        return event
+
+
+class StoreSpy:
+    """store 包装：记录 drop 与 register_buffer 调用。"""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.dropped: list[list[bytes]] = []
+        self.aborted: list[list[bytes]] = []
+        self.register_calls: list[int] = []
+
+    @property
+    def capacity_chunks(self) -> int:
+        return self._inner.capacity_chunks
+
+    def open(self):
+        self._inner.open()
+
+    def close(self):
+        self._inner.close()
+
+    def register_buffer(self, buffer, granularity):
+        self.register_calls.append(granularity)
+        return self._inner.register_buffer(buffer, granularity)
+
+    def put_batch(self, batch):
+        return self._inner.put_batch(batch)
+
+    def get_batch(self, batch):
+        return self._inner.get_batch(batch)
+
+    def drop(self, keys):
+        self.dropped.append(list(keys))
+        self._inner.drop(keys)
+
+    def abort_chunks(self, keys):
+        self.aborted.append(list(keys))
+
+    def scan(self):
+        return self._inner.scan()
+
+
+class DirectCompletion:
+    def __init__(self):
+        self.wait_count = 0
+
+    def wait(self):
+        self.wait_count += 1
 
     def query(self):
         return True
 
 
-def test_ring_window_backpressure_on_third_wave(monkeypatch):
-    """max_chunks_per_wave=2 → 窗口双缓冲；第 3 批必须 wait 第 1 批事件。"""
-    events: "list[RecEvent]" = []
+class DirectBackend:
+    def __init__(self):
+        self.registered = None
+        self.calls = []
 
-    def fake_make_event():
-        ev = RecEvent()
-        events.append(ev)
-        return ev
+    def register_paged_caches(self, caches, **kwargs):
+        self.registered = (caches, kwargs)
+        return True
 
-    monkeypatch.setattr(eng_mod, "_make_event", fake_make_event)
+    def get_paged_batch(self, keys, layer, blocks):
+        self.calls.append(("get", keys, layer, blocks))
+        return DirectCompletion()
 
-    e = make_bound_engine(max_chunks_per_wave=2)
-    keys = chain_keys(1)
-    fill_stored(e, keys)
-    lp = e.plan_load(keys)
-
-    # 批 0：窗口 0（slots 0..1），无等待
-    e.load_layer(lp, 0, dst_first_blocks=(0,))
-    assert events[0].recorded == 1 and events[0].waited == 0
-
-    # 批 1：窗口 1（slots 2..3），无等待
-    e.load_layer(lp, 1, dst_first_blocks=(0,))
-    assert events[1].waited == 0 and events[0].waited == 0
-
-    # 批 2：复用窗口 0 → 覆盖保护：wait 批 0 的事件（背压触发）
-    e.load_layer(lp, 0, dst_first_blocks=(0,))
-    assert events[0].waited == 1
-
-    # 批 3：复用窗口 1 → wait 批 1 的事件
-    e.load_layer(lp, 1, dst_first_blocks=(0,))
-    assert events[1].waited == 1
-
-    e.complete_load(lp)
+    def put_paged_batch(self, keys, layer, blocks):
+        self.calls.append(("put", keys, layer, blocks))
+        return DirectCompletion()
 
 
-def test_ring_window_slots_alternate():
-    e = make_bound_engine(max_chunks_per_wave=2)
-    keys = chain_keys(2)
-    fill_stored(e, keys)
-    lp = e.plan_load(keys)
-    seen = []
-    orig = e.scatter_fn
+class DirectStore(MemoryKVStore):
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.backend = DirectBackend()
+        self.register_calls = 0
 
-    def spy(plan, layer_idx, slots, first_blocks):
-        seen.append(tuple(slots))
+    def register_buffer(self, buffer, granularity):
+        self.register_calls += 1
+        return super().register_buffer(buffer, granularity)
 
-    e.scatter_fn = spy
-    e.load_layer(lp, 0, dst_first_blocks=(0, 1))  # 批 0 → slots (0,1)
-    e.load_layer(lp, 1, dst_first_blocks=(0, 1))  # 批 1 → slots (2,3)
-    e.load_layer(lp, 0, dst_first_blocks=(0, 1))  # 批 2 → slots (0,1)
-    e.complete_load(lp)
-    assert seen == [(0, 1), (2, 3), (0, 1)]
+    def create_direct_transfer(self, caches, **kwargs):
+        return self.backend
 
 
-def test_wait_idle_and_shutdown():
-    e = make_bound_engine()
-    keys = chain_keys(1)
-    fill_stored(e, keys)
-    lp = e.plan_load(keys)
-    e.load_layer(lp, 0, dst_first_blocks=(0,)).wait()
-    e.wait_idle()
-    e.complete_load(lp)
-    e.shutdown()  # 不抛即可
+class FakeEvent:
+    """可数完成事件。"""
+
+    def __init__(self):
+        self.wait_count = 0
+
+    def wait(self):
+        self.wait_count += 1
+
+    def query(self):
+        return True
 
 
-# ---------- 零依赖 ----------
+def _make_engine(store, hooks=None, num_chunks=NUM_CHUNKS, max_wave=MAX_WAVE):
+    """构造引擎 + 假显存窗口 + 绑定；返回 (engine, window, hooks)。"""
+    config = {
+        "chunk_tokens": CHUNK_TOKENS,
+        "chunk_kv_bytes": SEG * NUM_LAYERS,
+        "max_chunks_per_wave": max_wave,
+    }
+    if hooks is not None:
+        config["gather_fn"] = hooks.gather
+        config["scatter_fn"] = hooks.scatter
+    engine = KVEngine(config, store)
+    buffer = bytearray(NUM_SLOTS * SEG)
+    if hooks is not None:
+        hooks._view = memoryview(buffer)
+    window = RingWindow(buffer, NUM_SLOTS, SEG)
+    engine.bind({}, window, NUM_LAYERS, blocks_per_chunk=2)
+    return engine, window, hooks
 
 
-def test_engine_does_not_import_vllm():
-    """engine 自净：子进程隔离验证（同进程 adapter 测试会 import vllm）。"""
-    import subprocess
+class TestIoKeyHelpers:
+    def test_roundtrip(self):
+        ck = bytes(range(16))
+        io_key = derive_io_key(ck, 7)
+        assert len(io_key) == 18
+        assert chunk_key_of(io_key) == ck
+        assert layer_of(io_key) == 7
 
-    code = (
-        "import sys; sys.path.insert(0, %r); "
-        "import engine.core; "
-        "bad = [m for m in ('vllm', 'tutti_runtime') if m in sys.modules]; "
-        "assert not bad, f'leaked imports: {bad}'"
-    ) % str(_CONNECTOR_ROOT)
-    subprocess.run([sys.executable, "-c", code], check=True)
+    def test_layer_encoding_is_little_endian(self):
+        ck = b"\x11" * 16
+        io_key = derive_io_key(ck, 0x0102)
+        assert io_key[16:] == b"\x02\x01"
+
+    def test_bad_arguments_raise(self):
+        with pytest.raises(ValueError):
+            derive_io_key(b"\x00" * 15, 0)
+        with pytest.raises(ValueError):
+            derive_io_key(b"\x00" * 16, 1 << 16)
+        with pytest.raises(ValueError):
+            chunk_key_of(b"\x00" * 17)
+        with pytest.raises(ValueError):
+            layer_of(b"\x00" * 18 + b"\x00")
 
 
-def test_engine_sources_have_no_vllm_import():
-    from pathlib import Path
+class TestRoundtrip:
+    def test_failed_load_never_runs_scatter(self):
+        class FailedCompletion:
+            def wait_result(self):
+                return type("Result", (), {"ok": False})()
 
-    for mod in ("core.py", "backend.py", "memory_backend.py", "chunk_index.py"):
-        src = (Path(eng_mod.__file__).parent / mod).read_text(encoding="utf-8")
-        assert "vllm" not in src.replace("零 vllm 依赖", "").replace(
-            "不知道 vllm", ""
-        ).replace("对齐 vllm fork", ""), f"{mod} 不应引用 vllm"
+            def wait(self):
+                raise AssertionError("legacy wait must not be used")
+
+            def query(self):
+                return False
+
+        scattered = []
+        completion = _PostCompletion(
+            FailedCompletion(), lambda: scattered.append("scatter")
+        )
+        with pytest.raises(LoadGateError, match="禁止 scatter"):
+            completion.wait()
+        assert scattered == []
+
+    def test_structured_failed_index_maps_to_wave_block_ids(self):
+        failure = type("Failure", (), {"failure_scope": "REQUEST_INDICES"})()
+        result = type("Result", (), {
+            "ok": False,
+            "failed_batch_indices": (1,),
+            "failures": (failure,),
+        })()
+
+        class FailedCompletion:
+            def wait_result(self):
+                return result
+
+            def query(self):
+                return False
+
+        completion = _PostCompletion(
+            FailedCompletion(), lambda: None,
+            block_tables=[[10, 20], [11, 21]],
+        )
+        with pytest.raises(LoadGateError) as excinfo:
+            completion.wait()
+        assert excinfo.value.whole_operation is False
+        assert excinfo.value.failed_batch_indices == (1,)
+        assert excinfo.value.invalid_block_ids == (11, 21)
+
+    def test_abort_suppresses_scatter_for_prefetched_success(self):
+        class Completion:
+            def __init__(self):
+                self.wait_count = 0
+
+            def wait(self):
+                self.wait_count += 1
+
+            def query(self):
+                return True
+
+        scattered = []
+        inner = Completion()
+        completion = _PostCompletion(
+            inner, lambda: scattered.append("must-not-run")
+        )
+        completion.abort()
+        completion.abort()
+        assert inner.wait_count == 1
+        assert scattered == []
+
+    def test_multilayer_store_load_no_cross_talk(self):
+        store = MemoryKVStore(SEG, NUM_CHUNKS)
+        hooks = MovingHooks(None, SEG)
+        engine, _, _ = _make_engine(store, hooks)
+
+        keys = _chunk_keys(engine, 1, 2)
+        plan = engine.plan_store(keys)
+        assert plan.new_keys == keys
+        engine.confirm_store(keys)
+
+        # 逐层写入：source 侧备好每层数据
+        for layer in range(NUM_LAYERS):
+            for i, k in enumerate(keys):
+                hooks.source[(k, layer)] = _segment_bytes(i + 1, layer)
+        for layer in range(NUM_LAYERS):
+            engine.store_layer(keys, layer, src_first_blocks=10 + layer).wait()
+
+        # 全新目的侧逐层读回
+        for layer in range(NUM_LAYERS):
+            engine.load_layer(keys, layer, dst_first_blocks=50 + layer).wait()
+        for layer in range(NUM_LAYERS):
+            for i, k in enumerate(keys):
+                    assert hooks.sink[(k, layer)] == _segment_bytes(i + 1, layer)
+
+    def test_failed_store_plan_rolls_back_physical_chunks_at_settlement(self):
+        store = StoreSpy(MemoryKVStore(SEG, NUM_CHUNKS))
+        engine, _, _ = _make_engine(store)
+        keys = _chunk_keys(engine, 91, 2)
+        assert engine.plan_store(keys).new_keys == keys
+
+        engine.confirm_store(keys, ok=False)
+
+        assert store.aborted == [keys]
+        assert not engine.store_plan_pending(keys)
+
+    def test_load_completion_runs_scatter_on_wait(self):
+        store = MemoryKVStore(SEG, NUM_CHUNKS)
+        hooks = MovingHooks(None, SEG)
+        engine, _, _ = _make_engine(store, hooks)
+        keys = _chunk_keys(engine, 1, 1)
+        engine.plan_store(keys)
+        engine.confirm_store(keys)
+        hooks.source[(keys[0], 0)] = _segment_bytes(1, 0)
+        engine.store_layer(keys, 0, 0).wait()
+        assert engine.load_layer(keys, 0, 0).query() is True
+        # scatter 只在 wait 后执行
+        assert (keys[0], 0) not in hooks.sink
+        engine.wait_idle()
+        assert hooks.sink[(keys[0], 0)] == _segment_bytes(1, 0)
+
+    def test_wave_reuse_waits_for_scatter_event(self):
+        store = MemoryKVStore(SEG, NUM_CHUNKS)
+        hooks = EventHooks(None, SEG)
+        engine, _, _ = _make_engine(store, hooks)
+        keys = _chunk_keys(engine, 1, 3)
+        engine.plan_store(keys)
+        engine.confirm_store(keys)
+        for i, key in enumerate(keys):
+            hooks.source[(key, 0)] = _segment_bytes(i + 1, 0)
+        for key in keys:
+            engine.store_layer([key], 0, 0).wait()
+
+        first = engine.load_layer([keys[0]], 0, 0)
+        engine.load_layer([keys[1]], 0, 0)
+        # 第三波复用第一波槽位；acquire 必须等待底层搬运与 scatter 事件。
+        engine.load_layer([keys[2]], 0, 0)
+        assert len(hooks.events) == 1
+        assert hooks.events[0].wait_count == 1
+        # MemoryKVStore overwrites staging from the host and therefore uses
+        # its explicit compatibility fence; Tutti NVMe never takes this path.
+        assert hooks.events[0].synchronize_count == 1
+        assert first.query() is True
+
+    def test_load_unknown_key_raises(self):
+        store = MemoryKVStore(SEG, NUM_CHUNKS)
+        engine, _, _ = _make_engine(store)
+        keys = _chunk_keys(engine, 1, 1)
+        with pytest.raises(ValueError):
+            engine.load_layer(keys, 0, 0)
+
+
+class TestWindowWaves:
+    def test_oversized_batch_splits_keys_and_block_tables(self):
+        store = MemoryKVStore(SEG, NUM_CHUNKS)
+        hooks = MovingHooks(None, SEG)
+        engine, _, _ = _make_engine(store, hooks)
+        keys = _chunk_keys(engine, 10, 2 * MAX_WAVE + 3)
+        blocks = [[100 + i, 200 + i] for i in range(len(keys))]
+        engine.plan_store(keys)
+        engine.confirm_store(keys)
+        for i, key in enumerate(keys):
+            hooks.source[(key, 0)] = _segment_bytes(i + 1, 0)
+
+        store_handle = engine.store_layer(keys, 0, blocks)
+        store_handle.wait()
+        gather = [entry for entry in hooks.log if entry[0] == "gather"]
+        assert [entry[1] for entry in gather] == [
+            tuple(keys[0:2]), tuple(keys[2:4]), tuple(keys[4:6]),
+            tuple(keys[6:7]),
+        ]
+        assert [entry[4] for entry in gather] == [
+            blocks[0:2], blocks[2:4], blocks[4:6], blocks[6:7],
+        ]
+
+        load_handle = engine.load_layer(keys, 0, blocks)
+        assert load_handle.query() is True
+        # 提交到第 3 波时，环窗回绕已按 wave-2 规则等待前两波，
+        # 因而前两波的 scatter 可能已经发生；后两波仍由 wait 收尾。
+        assert set(hooks.sink) == {(key, 0) for key in keys[:4]}
+        load_handle.wait()
+        assert hooks.sink == {
+            (key, 0): _segment_bytes(i + 1, 0)
+            for i, key in enumerate(keys)
+        }
+        scatter = [entry for entry in hooks.log if entry[0] == "scatter"]
+        assert [entry[1] for entry in scatter] == [
+            tuple(keys[0:2]), tuple(keys[2:4]), tuple(keys[4:6]),
+            tuple(keys[6:7]),
+        ]
+        assert [entry[4] for entry in scatter] == [
+            blocks[0:2], blocks[2:4], blocks[4:6], blocks[6:7],
+        ]
+
+    def test_wave_and_slot_rotation_at_engine_level(self):
+        store = MemoryKVStore(SEG, NUM_CHUNKS)
+        hooks = MovingHooks(None, SEG)
+        engine, _, _ = _make_engine(store, hooks)
+        keys = _chunk_keys(engine, 1, 6)
+        engine.plan_store(keys)
+        engine.confirm_store(keys)
+        for layer in range(NUM_LAYERS):
+            for i, k in enumerate(keys):
+                hooks.source[(k, layer)] = _segment_bytes(i + 1, layer)
+        gather_slots = []
+        for start in range(0, 6, MAX_WAVE):
+            batch = keys[start:start + MAX_WAVE]
+            engine.store_layer(batch, 0, 0)
+            gather_slots.append(hooks.log[-1][3])
+        # 半窗交替：第 0 波前半窗、第 1 波后半窗、第 2 波复用前半窗
+        assert gather_slots == [
+            tuple(range(0, MAX_WAVE)),
+            tuple(range(MAX_WAVE, 2 * MAX_WAVE)),
+            tuple(range(0, MAX_WAVE)),
+        ]
+
+    def test_ring_window_wave_sequence_and_bounds(self):
+        window = RingWindow(bytearray(NUM_SLOTS * SEG), NUM_SLOTS, SEG)
+        wave0, slots0 = window.acquire(MAX_WAVE)
+        wave1, slots1 = window.acquire(1)
+        assert (wave0, wave1) == (0, 1)
+        assert slots0 == [0, 1] and slots1 == [2]
+        with pytest.raises(ValueError):
+            window.acquire(0)
+        with pytest.raises(ValueError):
+            window.acquire(MAX_WAVE + 1)
+        window.complete(wave0, FakeEvent())
+        window.complete(wave1, FakeEvent())
+
+    def test_overwrite_protection_waits_two_waves_back(self):
+        window = RingWindow(bytearray(NUM_SLOTS * SEG), NUM_SLOTS, SEG)
+        e0, e1, e2 = FakeEvent(), FakeEvent(), FakeEvent()
+        wave0, _ = window.acquire(1)
+        wave1, _ = window.acquire(1)
+        window.complete(wave0, e0)
+        window.complete(wave1, e1)
+        wave2, _ = window.acquire(1)  # 与 wave0 同半窗
+        window.complete(wave2, e2)
+        assert (e0.wait_count, e1.wait_count, e2.wait_count) == (1, 0, 0)
+
+    def test_unregistered_predecessor_does_not_block(self):
+        window = RingWindow(bytearray(NUM_SLOTS * SEG), NUM_SLOTS, SEG)
+        window.acquire(1)
+        window.acquire(1)  # 均未登记完成事件
+        wave, _ = window.acquire(1)  # 复用 wave0 的半窗，不阻塞
+        assert wave == 2
+
+    def test_constructor_validations(self):
+        with pytest.raises(ValueError):
+            RingWindow(bytearray(8 * SEG), 3, SEG)          # 奇数槽
+        with pytest.raises(ValueError):
+            RingWindow(bytearray(4 * SEG - 1), 4, SEG)      # 缓冲不足
+        with pytest.raises(ValueError):
+            RingWindow(bytearray(4 * SEG), 4, 0)            # 非法段宽
+
+    def test_split_banks_share_buffer_without_slot_overlap(self):
+        total_slots = 2 * MAX_WAVE * 3
+        buffer = bytearray(total_slots * SEG)
+        bank_slots = total_slots // 2
+        read = RingWindow(buffer, bank_slots, SEG,
+                          capacity_per_wave=MAX_WAVE, slot_base=0)
+        write = RingWindow(buffer, bank_slots, SEG,
+                           capacity_per_wave=MAX_WAVE, slot_base=bank_slots)
+        read_slots = set()
+        write_slots = set()
+        for _ in range(3):
+            read_slots.update(read.acquire(MAX_WAVE)[1])
+            write_slots.update(write.acquire(MAX_WAVE)[1])
+        assert read.buffer is write.buffer is buffer
+        assert read_slots == set(range(0, bank_slots))
+        assert write_slots == set(range(bank_slots, total_slots))
+        assert read_slots.isdisjoint(write_slots)
+
+    def test_drain_continues_other_bank_after_first_failure(self):
+        class FailingEvent(FakeEvent):
+            def wait(self):
+                self.wait_count += 1
+                raise RuntimeError("read failed")
+
+        buffer = bytearray(2 * SEG)
+        read = RingWindow(buffer, 1, SEG, capacity_per_wave=1, slot_base=0)
+        write = RingWindow(buffer, 1, SEG, capacity_per_wave=1, slot_base=1)
+        read_wave, _ = read.acquire(1)
+        write_wave, _ = write.acquire(1)
+        read_event = FailingEvent()
+        write_event = FakeEvent()
+        read.complete(read_wave, read_event)
+        write.complete(write_wave, write_event)
+        # A minimal engine with both banks exercises the real drain path.
+        store = MemoryKVStore(SEG, NUM_CHUNKS)
+        engine = KVEngine({"chunk_tokens": CHUNK_TOKENS,
+                           "chunk_kv_bytes": SEG * NUM_LAYERS,
+                           "max_chunks_per_wave": 1}, store)
+        engine.bind({}, read, NUM_LAYERS, 2, write_window=write)
+        with pytest.raises(RuntimeError, match="read failed"):
+            engine.abort()
+        assert read_event.wait_count == 1
+        assert write_event.wait_count == 1
+        assert read._allocations == write._allocations == {}
+
+
+class TestSplitBankRouting:
+    def test_gather_and_scatter_use_directional_store_contexts(self):
+        class DirectionalMemoryStore(MemoryKVStore):
+            def __init__(self):
+                super().__init__(SEG, NUM_CHUNKS)
+                self.active_direction = None
+                self.context_log = []
+
+            @contextmanager
+            def stream_context(self, direction):
+                assert self.active_direction is None
+                self.active_direction = direction
+                self.context_log.append(("enter", direction))
+                try:
+                    yield
+                finally:
+                    self.context_log.append(("exit", direction))
+                    self.active_direction = None
+
+        store = DirectionalMemoryStore()
+        total_slots = 2 * MAX_WAVE
+        buffer = bytearray(total_slots * SEG)
+        read = RingWindow(buffer, MAX_WAVE, SEG,
+                          capacity_per_wave=MAX_WAVE, slot_base=0)
+        write = RingWindow(buffer, MAX_WAVE, SEG,
+                           capacity_per_wave=MAX_WAVE, slot_base=MAX_WAVE)
+        hook_slots = {}
+
+        def gather(keys, layer, blocks, slots):
+            assert store.active_direction is None
+            hook_slots["write"] = tuple(slots)
+
+        def scatter(keys, layer, blocks, slots):
+            assert store.active_direction == "read_copy"
+            hook_slots["read"] = tuple(slots)
+
+        engine = KVEngine({"chunk_tokens": CHUNK_TOKENS,
+                           "chunk_kv_bytes": SEG * NUM_LAYERS,
+                           "max_chunks_per_wave": MAX_WAVE}, store)
+        engine.bind({}, read, NUM_LAYERS, 2, write_window=write,
+                    gather_fn=gather, scatter_fn=scatter)
+        key = _chunk_keys(engine, 9, 1)[0]
+        engine.store_layer([key], 0, [[0, 1]]).wait()
+        engine.load_layer([key], 0, [[0, 1]]).wait()
+        assert set(hook_slots["read"]).issubset(range(0, MAX_WAVE))
+        assert set(hook_slots["write"]).issubset(range(MAX_WAVE, 2 * MAX_WAVE))
+        assert store.context_log == [
+            ("enter", "read_copy"), ("exit", "read_copy")
+        ]
+
+
+class TestEvictionWiring:
+    def test_sync_releases_failed_planned_store_without_marker(self):
+        store = MemoryKVStore(SEG, num_chunks=1)
+        engine, _, _ = _make_engine(store, num_chunks=1)
+        key = _chunk_keys(engine, 1, 1)[0]
+        assert engine.plan_store([key]) is not None
+        assert engine.lookup_prefix([1000] * CHUNK_TOKENS) == 0
+        engine.sync_from_store()
+        # No durable layer markers: the reservation is released and can be
+        # planned again rather than leaking scheduler capacity forever.
+        assert engine.plan_store([key]) is not None
+
+    def test_plan_store_drops_all_layers_of_evicted(self):
+        spy = StoreSpy(MemoryKVStore(SEG, num_chunks=2))
+        engine, _, _ = _make_engine(spy, MovingHooks(None, SEG), num_chunks=2)
+        old_keys = _chunk_keys(engine, 1, 2)
+        engine.plan_store(old_keys)
+        engine.confirm_store(old_keys)
+
+        new_keys = _chunk_keys(engine, 2, 1)
+        plan = engine.plan_store(new_keys)
+        assert plan is not None
+        assert plan.evicted_keys == old_keys[:1]
+        # 驱逐 chunk 的全部层 io_key 恰好一次 drop
+        expected = {derive_io_key(old_keys[0], l) for l in range(NUM_LAYERS)}
+        assert len(spy.dropped) == 1
+        assert set(spy.dropped[0]) == expected
+        assert len(spy.dropped[0]) == NUM_LAYERS
+        engine.confirm_store(new_keys)
+
+    def test_no_drop_before_bind(self):
+        spy = StoreSpy(MemoryKVStore(SEG, 2))
+        config = {
+            "chunk_tokens": CHUNK_TOKENS,
+            "chunk_kv_bytes": SEG * NUM_LAYERS,
+            "max_chunks_per_wave": MAX_WAVE,
+        }
+        engine = KVEngine(config, spy)  # 未 bind：无层宽，不做数据面删除
+        keys = _chunk_keys(engine, 1, 2)
+        engine.plan_store(keys)
+        engine.confirm_store(keys)
+        plan = engine.plan_store(_chunk_keys(engine, 2, 1))
+        assert plan is not None
+        assert spy.dropped == []
+
+
+class TestBind:
+    def test_registers_staging_buffer_exactly_once(self):
+        spy = StoreSpy(MemoryKVStore(SEG, NUM_CHUNKS))
+        _make_engine(spy)
+        assert spy.register_calls == [SEG]
+
+    def test_direct_backend_skips_staging_registration_and_delegates(self):
+        store = DirectStore(SEG, NUM_CHUNKS)
+        config = {
+            "chunk_tokens": CHUNK_TOKENS,
+            "chunk_kv_bytes": SEG * NUM_LAYERS,
+            "max_chunks_per_wave": MAX_WAVE,
+            "direct_transfer": True,
+        }
+        engine = KVEngine(config, store)
+        window = RingWindow(bytearray(NUM_SLOTS * SEG), NUM_SLOTS, SEG)
+        engine.bind({"layer.0": object()}, window, NUM_LAYERS, 2)
+        assert store.register_calls == 0
+        keys = _chunk_keys(engine, 3, 1)
+        load = engine.load_layer(keys, 1, [[9, 10]])
+        save = engine.store_layer(keys, 2, [[9, 10]])
+        load.wait()
+        save.wait()
+        assert [entry[0] for entry in store.backend.calls] == ["get", "put"]
+        assert store.backend.registered[1]["num_layers"] == NUM_LAYERS
+
+    def test_direct_strict_rejects_store_without_capability(self):
+        config = {
+            "chunk_tokens": CHUNK_TOKENS,
+            "chunk_kv_bytes": SEG * NUM_LAYERS,
+            "max_chunks_per_wave": MAX_WAVE,
+            "direct_transfer": True,
+            "direct_transfer_strict": True,
+        }
+        engine = KVEngine(config, MemoryKVStore(SEG, NUM_CHUNKS))
+        window = RingWindow(bytearray(NUM_SLOTS * SEG), NUM_SLOTS, SEG)
+        with pytest.raises(DirectTransferUnavailable):
+            engine.bind({}, window, NUM_LAYERS, 2)
+
+    def test_direct_request_falls_back_to_staged_without_capability(self):
+        store = StoreSpy(MemoryKVStore(SEG, NUM_CHUNKS))
+        config = {
+            "chunk_tokens": CHUNK_TOKENS,
+            "chunk_kv_bytes": SEG * NUM_LAYERS,
+            "max_chunks_per_wave": MAX_WAVE,
+            "direct_transfer": True,
+        }
+        engine = KVEngine(config, store)
+        engine.bind({}, RingWindow(bytearray(NUM_SLOTS * SEG), NUM_SLOTS, SEG),
+                    NUM_LAYERS, 2)
+        assert store.register_calls == [SEG]
+
+    def test_double_bind_rejected(self):
+        engine, window, _ = _make_engine(MemoryKVStore(SEG, NUM_CHUNKS))
+        with pytest.raises(RuntimeError):
+            engine.bind({}, window, NUM_LAYERS, 2)
+
+    def test_geometry_mismatch_rejected(self):
+        store = MemoryKVStore(SEG, NUM_CHUNKS)
+        config = {
+            "chunk_tokens": CHUNK_TOKENS,
+            "chunk_kv_bytes": SEG * NUM_LAYERS,
+            "max_chunks_per_wave": MAX_WAVE,
+        }
+        engine = KVEngine(config, store)
+        bad_window = RingWindow(bytearray(NUM_SLOTS * (SEG * 2)), NUM_SLOTS, SEG * 2)
+        with pytest.raises(ValueError):
+            engine.bind({}, bad_window, NUM_LAYERS, 2)
+        with pytest.raises(ValueError):
+            engine.bind({}, RingWindow(bytearray(2 * SEG), 2, SEG), 7, 2)  # 不能整分
+        small = RingWindow(bytearray(2 * SEG), 2, SEG)  # 单波容量 1 < max_wave 2
+        with pytest.raises(ValueError):
+            engine.bind({}, small, NUM_LAYERS, 2)
+
+    def test_layer_calls_before_bind_rejected(self):
+        store = MemoryKVStore(SEG, NUM_CHUNKS)
+        config = {
+            "chunk_tokens": CHUNK_TOKENS,
+            "chunk_kv_bytes": SEG * NUM_LAYERS,
+            "max_chunks_per_wave": MAX_WAVE,
+        }
+        engine = KVEngine(config, store)
+        keys = _chunk_keys(engine, 1, 1)
+        with pytest.raises(RuntimeError):
+            engine.store_layer(keys, 0, 0)
+        with pytest.raises(RuntimeError):
+            engine.load_layer(keys, 0, 0)
+
+    def test_bad_config_rejected(self):
+        store = MemoryKVStore(SEG, NUM_CHUNKS)
+        base = {
+            "chunk_tokens": CHUNK_TOKENS,
+            "chunk_kv_bytes": SEG * NUM_LAYERS,
+            "max_chunks_per_wave": MAX_WAVE,
+        }
+        for key in base:
+            bad = dict(base, **{key: 0})
+            with pytest.raises(ValueError):
+                KVEngine(bad, store)
+        with pytest.raises(ValueError):
+            KVEngine(dict(base, gather_fn=1), store)
+
+    def test_layer_call_validation(self):
+        engine, _, _ = _make_engine(MemoryKVStore(SEG, NUM_CHUNKS))
+        keys = _chunk_keys(engine, 1, MAX_WAVE + 1)
+        # 超单波容量的请求自动拆成多个波次，仍保持单一完成句柄。
+        handle = engine.store_layer(keys, 0, 0)
+        handle.wait()
+        assert handle.query() is True
+        with pytest.raises(ValueError):
+            engine.store_layer([], 0, 0)        # 空批
+        with pytest.raises(ValueError):
+            engine.store_layer(keys[:1], NUM_LAYERS, 0)  # 层号越界
+        with pytest.raises(ValueError):
+            engine.store_layer(keys[:1], -1, 0)
+
+
+class TestLifecycle:
+    def test_close_is_idempotent_and_guards_state(self):
+        store = MemoryKVStore(SEG, NUM_CHUNKS)
+        engine, _, _ = _make_engine(store)
+        engine.close()
+        engine.close()
+        with pytest.raises(RuntimeError):
+            engine.lookup_prefix(_tokens(1, 1))
+        with pytest.raises(RuntimeError):
+            engine.plan_store([])
+
+    def test_wait_idle_drains_inflight(self):
+        engine, _, _ = _make_engine(MemoryKVStore(SEG, NUM_CHUNKS))
+        keys = _chunk_keys(engine, 1, 1)
+        engine.plan_store(keys)
+        engine.confirm_store(keys)
+        handle = engine.store_layer(keys, 0, 0)
+        engine.wait_idle()
+        assert handle.query() is True
+        assert engine.store_layer(keys, 1, 0).query() is True
+
+
+class TestColdStartRestore:
+    def test_incomplete_chunk_excluded_from_restore(self):
+        store = MemoryKVStore(SEG, NUM_CHUNKS)
+        hooks = MovingHooks(None, SEG)
+        engine_a, _, _ = _make_engine(store, hooks)
+
+        full_keys = _chunk_keys(engine_a, 1, 2)
+        engine_a.plan_store(full_keys)
+        engine_a.confirm_store(full_keys)
+        for layer in range(NUM_LAYERS):
+            for i, k in enumerate(full_keys):
+                hooks.source[(k, layer)] = _segment_bytes(i + 1, layer)
+            engine_a.store_layer(full_keys, layer, 0).wait()
+        engine_a.wait_idle()  # 不 close：保留 store 内容模拟持久状态
+
+        # 手工注入一个残缺 chunk（仅层 0 与层 2，缺层 1）
+        partial_keys = _chunk_keys(engine_a, 2, 1)
+        scratch = bytearray(SEG)
+        buf_id = store.register_buffer(scratch, SEG)
+        scratch[0] = 0xAB
+        store.put_batch(
+            [(derive_io_key(partial_keys[0], l), buf_id, 0) for l in (0, 2)]
+        )
+
+        engine_b, _, _ = _make_engine(store)
+        # 完整 chunk 命中，残缺 chunk 视为缺失
+        assert engine_b.lookup_prefix(_tokens(1, 2)) == 2 * CHUNK_TOKENS
+        assert engine_b.lookup_prefix(_tokens(2, 1)) == 0
+        engine_b.pin(full_keys)
+        engine_b.unpin(full_keys)
+
+    def test_restore_counts_toward_capacity(self):
+        store = MemoryKVStore(SEG, num_chunks=2)
+        hooks = MovingHooks(None, SEG)
+        engine_a, _, _ = _make_engine(store, hooks, num_chunks=2)
+        keys = _chunk_keys(engine_a, 1, 2)
+        engine_a.plan_store(keys)
+        engine_a.confirm_store(keys)
+        for layer in range(NUM_LAYERS):
+            for i, k in enumerate(keys):
+                hooks.source[(k, layer)] = _segment_bytes(i + 1, layer)
+            engine_a.store_layer(keys, layer, 0).wait()
+        engine_a.wait_idle()
+
+        engine_b, _, _ = _make_engine(store, MovingHooks(None, SEG), num_chunks=2)
+        # 恢复占用全部容量：第三个 chunk 驱逐最旧者
+        plan = engine_b.plan_store(_chunk_keys(engine_b, 2, 1))
+        assert plan is not None
+        assert plan.evicted_keys == keys[:1]
+
+
+class TestIsolation:
+    def test_import_pulls_no_heavy_dependencies(self):
+        """子进程断言：import engine.core 后 sys.modules 无 vllm/torch/tutti_runtime。"""
+        connector_root = Path(__file__).resolve().parents[2]
+        code = (
+            "import sys\n"
+            "import engine.core\n"
+            "leaked = {'vllm', 'torch', 'numpy', 'tutti_runtime'} & set(sys.modules)\n"
+            "assert not leaked, f'unexpected modules: {sorted(leaked)}'\n"
+            "print('clean')\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=connector_root,
+            capture_output=True,
+            text=True,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert "clean" in proc.stdout

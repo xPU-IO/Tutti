@@ -109,7 +109,6 @@ std::unique_ptr<const tutti::ResourceView> nvme_view(
             "/dev/ssnvme" + std::to_string(index),
             1,
             4096,
-            16384,
             128 * 1024,
             granted_queues,
         });
@@ -175,7 +174,7 @@ void test_local_nvme_creation_boundary() {
 #endif
 }
 
-void test_local_nvme_rejects_unsafe_block_size() {
+void test_local_nvme_allows_queue_sharing() {
     ViewResource resource("nvme0", "nvme", nvme_view(1));
     tutti::config::LocalNvmeDataPathConfig config;
     config.threads_per_block = 8;
@@ -186,9 +185,8 @@ void test_local_nvme_rejects_unsafe_block_size() {
     auto created = tutti::data_paths::create_data_path(
         spec, {resource, backend, 0});
 #if defined(TUTTI_TEST_HAS_LOCAL_NVME)
-    CHECK(!created.ok() &&
-              created.status().code() == tutti::StatusCode::INVALID_ARGUMENT,
-          "local-NVMe factory should reject block sizes above queue grant");
+    CHECK(created.ok(),
+          "local-NVMe factory should allow threads to share queues");
 #else
     CHECK(!created.ok() &&
               created.status().code() == tutti::StatusCode::UNSUPPORTED,
@@ -233,7 +231,7 @@ void test_striped_nvme_creation_boundary() {
 #endif
 }
 
-void test_striped_nvme_rejects_unsafe_block_size() {
+void test_striped_nvme_allows_queue_sharing() {
     ViewResource resource("nvme0", "nvme", nvme_view(2));
     tutti::config::StripedLocalNvmeDataPathConfig config;
     config.threads_per_block = 8;
@@ -245,9 +243,8 @@ void test_striped_nvme_rejects_unsafe_block_size() {
     auto created = tutti::data_paths::create_data_path(
         spec, {resource, backend, 0});
 #if defined(TUTTI_TEST_HAS_LOCAL_NVME)
-    CHECK(!created.ok() &&
-              created.status().code() == tutti::StatusCode::INVALID_ARGUMENT,
-          "striped factory should reject block sizes above any queue grant");
+    CHECK(created.ok(),
+          "striped factory should allow threads to share queues");
 #else
     CHECK(!created.ok() &&
               created.status().code() == tutti::StatusCode::UNSUPPORTED,
@@ -276,9 +273,9 @@ void test_relation_mismatch_rejected() {
 int main() {
     test_memfs_creation();
     test_local_nvme_creation_boundary();
-    test_local_nvme_rejects_unsafe_block_size();
+    test_local_nvme_allows_queue_sharing();
     test_striped_nvme_creation_boundary();
-    test_striped_nvme_rejects_unsafe_block_size();
+    test_striped_nvme_allows_queue_sharing();
     test_relation_mismatch_rejected();
     if (failures == 0) {
         std::puts("DataPath factory tests passed");

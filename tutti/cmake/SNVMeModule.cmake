@@ -1,5 +1,5 @@
-# Optional snvme kernel-module targets. This is intentionally opt-in because
-# it is tied to the running kernel and a GPU-vendor P2P API.
+# snvme kernel-module targets for the default hardware build. They are tied to
+# the running kernel and the NVIDIA P2P API.
 
 set(TUTTI_P2P_BACKEND "" CACHE STRING
     "SNVMe peer-memory backend: nvidia|metax (empty selects from TUTTI_ACCELERATOR)")
@@ -46,10 +46,16 @@ set(_snvme_root_dir
 set(_snvme_unified_dir "${_snvme_root_dir}/snvme")
 if(EXISTS "${_snvme_unified_dir}/Makefile.in")
     set(module_root "${_snvme_unified_dir}")
-    if(NOT SNVME_KERNEL_VERSION)
-        set(SNVME_KERNEL_VERSION "unified")
+    if(SNVME_KERNEL_VERSION AND NOT SNVME_KERNEL_VERSION STREQUAL "unified")
+        message(WARNING
+            "SNVME_KERNEL_VERSION='${SNVME_KERNEL_VERSION}' is ignored by the "
+            "unified snvme tree. Leave it unset; Makefile.in selects the "
+            "running-kernel baseline."
+        )
     endif()
-    set(_snvme_tags "unified(5.4-tlinux4|5.15|6.8, auto-selected by Makefile.in)")
+    set(SNVME_KERNEL_VERSION "unified" CACHE STRING
+        "snvme source layout selected for the module build" FORCE)
+    set(_snvme_tags "unified(5.4-tlinux4|5.10|5.15|6.8, auto-selected by Makefile.in)")
 else()
 file(GLOB _snvme_candidates RELATIVE "${_snvme_root_dir}"
     "${_snvme_root_dir}/snvme-*")
@@ -186,11 +192,11 @@ add_custom_target(clean_modules
     WORKING_DIRECTORY "${module_output}"
     ${_snvme_jobserver_args})
 add_custom_target(insmod
-    COMMAND sudo ${_snvme_make_command} TUTTI_P2P_BACKEND=${TUTTI_P2P_BACKEND} insmod
+    COMMAND ${_snvme_make_command} TUTTI_P2P_BACKEND=${TUTTI_P2P_BACKEND} insmod
     WORKING_DIRECTORY "${module_output}"
     ${_snvme_jobserver_args})
 add_custom_target(rmmod
-    COMMAND sudo ${_snvme_make_command} TUTTI_P2P_BACKEND=${TUTTI_P2P_BACKEND} rmmod
+    COMMAND ${_snvme_make_command} TUTTI_P2P_BACKEND=${TUTTI_P2P_BACKEND} rmmod
     WORKING_DIRECTORY "${module_output}"
     ${_snvme_jobserver_args})
 

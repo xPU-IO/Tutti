@@ -58,31 +58,34 @@ if(TUTTI_ACCELERATOR STREQUAL "CUDA")
 endif()
 
 # ---------------------------------------------------------------------------
-# Feature switches (Phase 6)
-#
-# Each feature can be turned OFF to exclude its package sources and
-# dependencies from configure/build.  Default ON preserves existing
-# behavior.  When OFF, the corresponding subdirectories, find_package
-# calls, and tests are skipped entirely — zero dependency participation.
-#
-# TUTTI_FEATURE_LOCAL_NVME
-#   ON  (default): libnvm, nvmeservice, LocalNvmeDataPath, backends,
-#                  io_engine, and all associated tests participate.
-#   OFF:           The above are excluded.  accel (CUDA HAL) still
-#                  builds if TUTTI_BUILD_HARDWARE_STACK is ON; only
-#                  local-NVMe-specific packages exit.
-#
-# TUTTI_FEATURE_MEMFS_SAMPLE
-#   ON  (default): memfs sample binding + its contract test participate.
-#   OFF:           Sample is excluded (community contributor may disable).
+# Default hardware build features
 # ---------------------------------------------------------------------------
+# The supported preset enables the local-NVMe stack, sample extension, kernel
+# module, and all tests together. These cache switches remain for internal
+# component development, not as separate user-facing build modes.
 
 option(TUTTI_FEATURE_LOCAL_NVME "Include local-NVMe DataPath and dependencies" ON)
 option(TUTTI_FEATURE_MEMFS_SAMPLE "Include memfs sample extension" ON)
 option(TUTTI_BUILD_KERNEL_MODULE
-    "Configure snvme kernel-module build/load targets" OFF)
+    "Configure snvme kernel-module build/load targets" ON)
 
-find_package(yaml-cpp REQUIRED)
+# System packages are preferred. If a required package is unavailable, use an
+# already-populated repository vcpkg tree as a local fallback; no toolchain
+# flag or alternate preset is required.
+set(TUTTI_VCPKG_FALLBACK_PREFIX
+    "${TUTTI_REPOSITORY_ROOT}/third_pkgs/vcpkg/installed/x64-linux")
+macro(tutti_enable_vcpkg_fallback)
+    if(EXISTS "${TUTTI_VCPKG_FALLBACK_PREFIX}")
+        list(PREPEND CMAKE_PREFIX_PATH "${TUTTI_VCPKG_FALLBACK_PREFIX}")
+        message(STATUS "Tutti: using repository vcpkg package fallback")
+    endif()
+endmacro()
+
+find_package(yaml-cpp QUIET)
+if(NOT yaml-cpp_FOUND)
+    tutti_enable_vcpkg_fallback()
+    find_package(yaml-cpp REQUIRED)
+endif()
 if(TARGET yaml-cpp::yaml-cpp)
     set(TUTTI_YAML_CPP_TARGET yaml-cpp::yaml-cpp)
 elseif(TARGET yaml-cpp)
@@ -244,25 +247,18 @@ if(TUTTI_BUILD_HARDWARE_STACK)
     # Phase 0 contract targets (built in all profiles) do NOT receive this.
     include_directories("${TUTTI_SOURCE_DIR}")
 
-    # Preset assembly layer (public API factory functions).
-    add_subdirectory(presets)
-
     # The CUDA profile requires CUDAToolkit (including its minimum version)
     # in cmake/accelerators/CUDA.cmake. MUSA/MACA profiles supply their own
     # SDK through their profile modules.
     find_package(Threads REQUIRED)
 
-    # gRPC is optional and local-NVMe-specific. yaml-cpp is resolved above for
-    # the profile-independent application config parser.
     if(TUTTI_FEATURE_LOCAL_NVME)
         find_package(gRPC CONFIG QUIET)
-        if(gRPC_FOUND)
-            message(STATUS "Tutti: gRPC found -- nvmeservice (daemon NVMe) enabled")
-        else()
-            message(STATUS "Tutti: gRPC NOT found -- daemon NVMe path disabled")
+        if(NOT gRPC_FOUND)
+            tutti_enable_vcpkg_fallback()
+            find_package(gRPC CONFIG REQUIRED)
         endif()
-    else()
-        message(STATUS "Tutti: TUTTI_FEATURE_LOCAL_NVME=OFF -- gRPC/libnvm skipped")
+        message(STATUS "Tutti: gRPC found -- nvmeservice (daemon NVMe) enabled")
     endif()
 
     if(TUTTI_ACCELERATOR STREQUAL "CUDA")
@@ -300,6 +296,9 @@ if(TUTTI_BUILD_HARDWARE_STACK)
         # above (lines ~170-171).
         add_subdirectory(data_paths/striped_local_nvme)
 
+        # Preset assembly only exists for the local-NVMe runtime stack.
+        add_subdirectory(presets)
+
         tutti_enable_data_path_factory_local_nvme()
         tutti_enable_nvme_resource_grpc()
 
@@ -319,16 +318,14 @@ endif()
 # ---------------------------------------------------------------------------
 # Tests
 #
-# Set -DBUILD_TESTING=ON to include the test suite in the build. The root
+# The default hardware build includes the full test suite. The root
 # CMakeLists.txt owns include(CTest) so CTest discovers this subdirectory.
-# Default is OFF so a plain `cmake -S . -B build` stays lean.
 # ---------------------------------------------------------------------------
 
-# Hardware tests (resolver on real FIEMAP mount, local-NVMe on real GPU+snvme)
-# are OFF by default.  When ON, they are registered with CTest labels
-# "hardware;resolver" and "hardware;local_nvme" so they can be filtered out
-# of default CI runs.
-option(TUTTI_BUILD_HARDWARE_TESTS "Register hardware-dependent tests" OFF)
+# Hardware tests cover real FIEMAP mounts and local-NVMe GPU+snvme paths.
+# The default hardware build registers them with CTest labels
+# "hardware;resolver" and "hardware;local_nvme".
+option(TUTTI_BUILD_HARDWARE_TESTS "Register hardware-dependent tests" ON)
 
 if(BUILD_TESTING)
     add_subdirectory(

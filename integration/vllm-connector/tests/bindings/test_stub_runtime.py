@@ -1,6 +1,6 @@
-"""Stub-mode contract tests for tutti_runtime (task T-101 acceptance).
+"""Stub-mode contract tests for tutti_runtime.
 
-All tests run hardware-free via make_stub_runtime (decisions D-002):
+All tests run hardware-free via make_stub_runtime:
 assembly -> open_batch -> register_memory(host) -> submit -> force-complete
 -> wait -> release_io -> shutdown.
 """
@@ -30,6 +30,8 @@ class TestCaps:
             "max_single_io_bytes": 0,
             "max_batch_requests": 0,
             "max_in_flight_operations": 0,
+            "supports_multi_stream": 0,
+            "max_concurrent_streams": 0,
         }
 
 
@@ -42,6 +44,17 @@ class TestOpenBatch:
         assert len(handles) == 2
         assert all(isinstance(h, int) for h in handles)
         assert len(set(handles)) == 2
+
+    def test_close_target_and_close_batch_invalidate_tickets(self, stub_rt):
+        handles = stub_rt.open_batch(
+            ["file:///tmp/close-a.bin", "file:///tmp/close-b.bin"]
+        )
+        stub_rt.close_target(handles[0])
+        with pytest.raises(RuntimeError, match="unknown target handle"):
+            stub_rt.close_target(handles[0])
+        stub_rt.close_batch([handles[1]])
+        with pytest.raises(RuntimeError, match="unknown target handle"):
+            stub_rt.close_batch([handles[1]])
 
 
 class TestRegisterMemory:
@@ -57,8 +70,54 @@ class TestRegisterMemory:
         with pytest.raises(ValueError):
             stub_rt.register_memory(ctypes.addressof(buf), 4096, "pinned")
 
+    def test_register_unregister_pair_and_duplicate_failure(self, stub_rt):
+        buf = _host_buffer(4096)
+        ticket = stub_rt.register_memory(
+            ctypes.addressof(buf), 4096, "host"
+        )
+        stub_rt.unregister_memory(ticket)
+        with pytest.raises(RuntimeError, match="unknown memory handle"):
+            stub_rt.unregister_memory(ticket)
+
+    def test_unregister_unknown_ticket_fails(self, stub_rt):
+        with pytest.raises(RuntimeError, match="unknown memory handle: 999999"):
+            stub_rt.unregister_memory(999999)
+
+    def test_unregister_busy_preserves_ticket_for_retry(self, stub_rt):
+        target = stub_rt.open_batch(["file:///tmp/unregister-busy.bin"])[0]
+        buf = _host_buffer(4096)
+        memory = stub_rt.register_memory(
+            ctypes.addressof(buf), 4096, "host"
+        )
+        submitted = stub_rt.submit(
+            [(target, 0, memory, 0, 512, "read")],
+            accel_id=-1, stream=None, execution="host",
+        )
+        with pytest.raises(
+            RuntimeError,
+            match=r"unregister_memory failed.*BUSY.*inflight",
+        ):
+            stub_rt.unregister_memory(memory)
+        stub_rt.testing_force_complete(submitted.io_handle)
+        stub_rt.wait(submitted.io_handle, timeout_ms=1000)
+        stub_rt.release_io(submitted.io_handle)
+        stub_rt.unregister_memory(memory)
+
+    def test_shutdown_clears_memory_ticket_table(self, stub_rt):
+        buf = _host_buffer(4096)
+        memory = stub_rt.register_memory(
+            ctypes.addressof(buf), 4096, "host"
+        )
+        stub_rt.shutdown(timeout_ms=1000)
+        with pytest.raises(RuntimeError, match="unknown memory handle"):
+            stub_rt.unregister_memory(memory)
+
 
 class TestSubmitValidation:
+    def test_read_failure_injection_is_disabled_by_default(self, stub_rt):
+        with pytest.raises(RuntimeError, match="injection is disabled"):
+            stub_rt.testing_inject_next_read_nvme_error(0)
+
     def test_invalid_direction_raises_value_error(self, stub_rt):
         targets = stub_rt.open_batch(["file:///tmp/a.bin"])
         buf = _host_buffer(4096)
@@ -134,4 +193,23 @@ class TestStubEndToEnd:
         stub_rt.testing_force_complete(result.io_handle, "COMPLETED")
         stub_rt.wait(result.io_handle, timeout_ms=1000)
         stub_rt.release_io(result.io_handle)
+        stub_rt.shutdown(timeout_ms=1000)
+
+    def test_structured_wait_result_survives_release(self, stub_rt):
+        targets = stub_rt.open_batch(["file:///tmp/t101-detail.bin"])
+        buf = _host_buffer(4096)
+        mem = stub_rt.register_memory(ctypes.addressof(buf), 4096, "host")
+        result = stub_rt.submit(
+            [(targets[0], 0, mem, 0, 512, "read")],
+            accel_id=-1, stream=None, execution="host",
+        )
+        stub_rt.testing_force_complete(result.io_handle)
+        detail = stub_rt.wait_result(result.io_handle, timeout_ms=1000)
+        assert detail.observation == "OK"
+        assert detail.state == "COMPLETED"
+        assert detail.confirmed_bytes == 0  # stub force-complete has no byte payload
+        assert detail.failure_scope == "NONE"
+        stub_rt.release_io(result.io_handle)
+        retained = stub_rt.wait_detail(result.io_handle, timeout_ms=0)
+        assert retained.state == "COMPLETED"
         stub_rt.shutdown(timeout_ms=1000)

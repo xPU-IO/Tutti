@@ -218,8 +218,7 @@ int nvm_wait_dev_info(nvm_ctrl_t* ctrl,
  * =================================================================== */
 
 int nvm_ctrl_attach_client(nvm_ctrl_t** ctrl,
-                           const char* snvme_dev_path,
-                           uint32_t bar0_size);
+                           const char* snvme_dev_path);
 
 void nvm_ctrl_free_client(nvm_ctrl_t* ctrl);
 

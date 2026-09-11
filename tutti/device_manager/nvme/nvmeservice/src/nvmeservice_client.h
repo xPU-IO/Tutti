@@ -12,8 +12,7 @@
  *   if (!sess) ...;
  *
  *   nvm_ctrl_t* ctrl = nullptr;
- *   nvm_ctrl_attach_client(&ctrl, sess->snvme_dev_path.c_str(),
- *                          (uint32_t)sess->bar0_size);
+ *   nvm_ctrl_attach_client(&ctrl, sess->snvme_dev_path.c_str());
  *   uint32_t group_id = 0, max_q = 0;
  *   nvm_create_group(ctrl, &group_id, &max_q);
  *   // map rings, add user queues up to sess->granted_queues, drive IO
@@ -64,7 +63,6 @@ struct ClientDeviceInfo {
     uint32_t    blk_size_log         = 0;
     uint32_t    queue_depth          = 0;
     uint32_t    dstrd                = 0;
-    uint64_t    bar0_size            = 0;
     uint32_t    max_user_qid         = 0;
     uint32_t    max_queues_per_group = 0;
     std::vector<ClientAllowedGpu> allowed_gpus;
@@ -90,7 +88,6 @@ struct ClientNvmeResource {
     uint32_t logical_block_size_log = 0;
     uint32_t queue_depth = 0;
     uint32_t dstrd = 0;
-    uint64_t bar0_size = 0;
     uint64_t max_data_size = 0;
     uint32_t max_user_qid = 0;
     uint32_t kernel_io_qps = 0;
@@ -122,7 +119,6 @@ struct ClientNvmeSlice {
     uint32_t logical_block_size_log = 0;
     uint32_t queue_depth = 0;
     uint32_t dstrd = 0;
-    uint64_t bar0_size = 0;
     uint64_t max_data_size = 0;
     uint32_t controller_queue_capacity = 0;
     uint32_t granted_queues = 0;
@@ -175,7 +171,6 @@ public:
         // Device metadata for nvm_ctrl_attach_client + IO submit.
         std::string pci_addr;
         std::string snvme_dev_path;
-        uint64_t    bar0_size     = 0;
         uint32_t    dstrd         = 0;
         uint32_t    namespace_id  = 0;
         uint32_t    page_size     = 0;

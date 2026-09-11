@@ -12,6 +12,7 @@
 #include <ioctl.h>            // nvm_ioctl_add_user_queue, NVM_MAX_QUEUES_PER_GROUP
 
 #include <tutti/cuda_like.h>
+#include <tutti/accelerator_device_guard.h>
 
 #include <algorithm>
 #include <cmath>
@@ -76,6 +77,14 @@ void NvmeQueueGroup::init_(uint32_t ns_id,
                            uint32_t num_queues,
                            uint32_t queue_depth)
 {
+    DeviceGuard device_guard(static_cast<std::int32_t>(cuda_device_));
+    if (!device_guard.ok()) {
+        throw std::runtime_error(
+            "NvmeQueueGroup: failed to select accelerator " +
+            std::to_string(cuda_device_) + ": " +
+            device_guard.status().message());
+    }
+
     int status = 0;
 
     // Step 1: per-fd queue group container.
@@ -155,8 +164,6 @@ void NvmeQueueGroup::init_(uint32_t ns_id,
     }
 
     // Step 4: bind doorbells + finish per-queue GPU init + cudaMemcpy.
-    cuda_check(cudaSetDevice(cuda_device_), "cudaSetDevice(primary)");
-
     void* devicePtr = nullptr;
     for (uint32_t i = 0; i < n_qps_; ++i) {
         volatile uint32_t* sq_db_host = (volatile uint32_t*)
@@ -214,6 +221,13 @@ void NvmeQueueGroup::init_(uint32_t ns_id,
                               cudaMemcpyHostToDevice),
                    "cudaMemcpy QueuePair -> d_qps[i]");
     }
+
+    Status restored = device_guard.restore();
+    if (!restored.ok()) {
+        throw std::runtime_error(
+            "NvmeQueueGroup: failed to restore caller accelerator: " +
+            restored.message());
+    }
 }
 
 NvmeQueueGroup::~NvmeQueueGroup() {
@@ -231,22 +245,40 @@ void NvmeQueueGroup::destroy_locked_() {
         group_id_ = 0;
     }
 
-    if (d_qps_ != nullptr) {
-        cudaError_t e = cudaFree(d_qps_);
-        if (e != cudaSuccess) {
-            std::fprintf(stderr,
-                "[nvme_queue_group] cudaFree(d_qps): %s\n",
-                cudaGetErrorString(e));
-        }
-        d_qps_ = nullptr;
+    DeviceGuard device_guard(static_cast<std::int32_t>(cuda_device_));
+    if (!device_guard.ok()) {
+        std::fprintf(stderr,
+            "[nvme_queue_group] failed to select accelerator %u during "
+            "cleanup: %s\n",
+            cuda_device_, device_guard.status().message().c_str());
     }
 
-    if (h_qps_ != nullptr) {
-        for (uint32_t i = 0; i < n_qps_; ++i) {
-            delete h_qps_[i];
+    if (device_guard.ok()) {
+        if (d_qps_ != nullptr) {
+            cudaError_t e = cudaFree(d_qps_);
+            if (e != cudaSuccess) {
+                std::fprintf(stderr,
+                    "[nvme_queue_group] cudaFree(d_qps): %s\n",
+                    cudaGetErrorString(e));
+            }
+            d_qps_ = nullptr;
         }
-        std::free(h_qps_);
-        h_qps_ = nullptr;
+
+        if (h_qps_ != nullptr) {
+            for (uint32_t i = 0; i < n_qps_; ++i) {
+                delete h_qps_[i];
+            }
+            std::free(h_qps_);
+            h_qps_ = nullptr;
+        }
+
+        Status restored = device_guard.restore();
+        if (!restored.ok()) {
+            std::fprintf(stderr,
+                "[nvme_queue_group] failed to restore caller accelerator "
+                "during cleanup: %s\n",
+                restored.message().c_str());
+        }
     }
     n_qps_ = 0;
 }

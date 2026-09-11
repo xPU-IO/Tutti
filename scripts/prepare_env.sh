@@ -1,8 +1,8 @@
 #!/bin/bash
 # Tutti 一键环境准备脚本
 # 目标：在多种 Linux 发行版（Debian/Ubuntu/RHEL/CentOS/TencentOS/Fedora/openSUSE/Arch）
-#       上自动安装编译依赖；系统未提供 grpc++ / grpc_cpp_plugin 时回退
-#       vcpkg，也可通过 --force-vcpkg 强制使用。脚本最后生成本机专用 preset。
+#       上自动安装编译依赖；完整系统 CMake 依赖不可用时才回退 vcpkg，
+#       也可通过 --force-vcpkg 强制使用。仓库共享的 default preset 不由脚本生成。
 
 set -eu
 # 注意：不开启 pipefail，因为 install_pkg 中允许部分非致命失败被吞掉。
@@ -11,17 +11,6 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # ---------------- 运行环境探测 ----------------
 ARCH="$(uname -m)"
-
-# 计算 sudo 前缀：root 用户无需 sudo；非 root 但缺少 sudo 时给出明确错误。
-if [ "$(id -u)" -eq 0 ]; then
-    SUDO=""
-elif command -v sudo >/dev/null 2>&1; then
-    SUDO="sudo"
-else
-    echo "错误：当前为非 root 用户且未安装 sudo，无法继续安装系统依赖。" >&2
-    echo "请使用 root 运行，或安装 sudo 后再试。" >&2
-    exit 1
-fi
 
 # 解析命令行参数
 # 默认使用全部 CPU 核数；nproc 不可用时回退到 4
@@ -35,9 +24,10 @@ FORCE_VCPKG=0
 show_help() {
     cat <<EOF
 用法: $0 [选项]
-  -j N, --jobs N      并行编译线程数（用于 vcpkg 等后续编译，默认 ${JOBS} = nproc）
+  当前系统依赖或仓库已有 vcpkg 已满足时，脚本会直接退出，不执行安装、下载或编译。
+  -j N, --jobs N      并行编译线程数（仅在需要 vcpkg 编译时使用，默认 ${JOBS} = nproc）
   -j=N, --jobs=N      同上
-  --force-vcpkg       即使检测到系统 gRPC，也强制使用 vcpkg 的 C++ 依赖
+  --force-vcpkg       即使完整系统 CMake 依赖可用，也强制使用 vcpkg 的 C++ 依赖
   -h, --help          显示帮助
 环境变量:
   VCPKG_ROOT          指定 vcpkg 安装路径（默认 \${PROJECT_ROOT}/third_pkgs/vcpkg）
@@ -77,6 +67,94 @@ done
 # 校验 JOBS 是正整数
 if ! [[ "$JOBS" =~ ^[1-9][0-9]*$ ]]; then
     echo "错误：--jobs 参数无效：$JOBS（必须为正整数）" >&2
+    exit 1
+fi
+
+cmake_presets_supported() {
+    local cmake_version
+    local cmake_major
+    local cmake_minor
+
+    command -v cmake >/dev/null 2>&1 || return 1
+    cmake_version="$(cmake --version | sed -n '1s/^cmake version //p')"
+    cmake_major="${cmake_version%%.*}"
+    cmake_minor="${cmake_version#*.}"
+    cmake_minor="${cmake_minor%%.*}"
+
+    [[ "${cmake_major}" =~ ^[0-9]+$ && "${cmake_minor}" =~ ^[0-9]+$ ]] || return 1
+    [ "${cmake_major}" -gt 3 ] \
+        || { [ "${cmake_major}" -eq 3 ] && [ "${cmake_minor}" -ge 21 ]; }
+}
+
+cmake_package_exists() {
+    cmake --find-package \
+        -DNAME="$1" \
+        -DCOMPILER_ID=GNU \
+        -DLANGUAGE=CXX \
+        -DMODE=EXIST >/dev/null 2>&1
+}
+
+system_cpp_deps_available() {
+    command -v protoc >/dev/null 2>&1 \
+        && command -v grpc_cpp_plugin >/dev/null 2>&1 \
+        && cmake_package_exists yaml-cpp \
+        && cmake_package_exists gRPC \
+        && cmake_package_exists Protobuf
+}
+
+vcpkg_cpp_deps_available() {
+    local vcpkg_root="${PROJECT_ROOT}/third_pkgs/vcpkg"
+    local vcpkg_prefix="${vcpkg_root}/installed/x64-linux"
+
+    [ -x "${vcpkg_root}/vcpkg" ] \
+        && [ -f "${vcpkg_prefix}/share/yaml-cpp/yaml-cpp-config.cmake" ] \
+        && [ -f "${vcpkg_prefix}/share/grpc/gRPCConfig.cmake" ] \
+        && [ -f "${vcpkg_prefix}/share/protobuf/protobuf-config.cmake" ] \
+        && [ -x "${vcpkg_prefix}/tools/protobuf/protoc" ] \
+        && [ -x "${vcpkg_prefix}/tools/grpc/grpc_cpp_plugin" ]
+}
+
+default_build_dependencies_available() {
+    cmake_presets_supported \
+        && command -v cc >/dev/null 2>&1 \
+        && command -v c++ >/dev/null 2>&1 \
+        && command -v make >/dev/null 2>&1 \
+        && [ -f "${PROJECT_ROOT}/CMakePresets.json" ] \
+        || return 1
+
+    if [ "${FORCE_VCPKG}" -eq 1 ]; then
+        if vcpkg_cpp_deps_available; then
+            READY_CPP_DEPS_PROVIDER="vcpkg"
+            return 0
+        fi
+        return 1
+    fi
+
+    if system_cpp_deps_available; then
+        READY_CPP_DEPS_PROVIDER="system"
+        return 0
+    fi
+    if vcpkg_cpp_deps_available; then
+        READY_CPP_DEPS_PROVIDER="vcpkg"
+        return 0
+    fi
+    return 1
+}
+
+READY_CPP_DEPS_PROVIDER=""
+if default_build_dependencies_available; then
+    echo "环境已满足（${READY_CPP_DEPS_PROVIDER} C++ 依赖）：跳过系统包安装和 vcpkg。"
+    exit 0
+fi
+
+# 只有环境不完整时才需要 sudo 或包管理器。
+if [ "$(id -u)" -eq 0 ]; then
+    SUDO=""
+elif command -v sudo >/dev/null 2>&1; then
+    SUDO="sudo"
+else
+    echo "错误：当前为非 root 用户且未安装 sudo，无法继续安装系统依赖。" >&2
+    echo "请使用 root 运行，或安装 sudo 后再试。" >&2
     exit 1
 fi
 
@@ -214,9 +292,9 @@ install_pkg "uuid-dev" "libuuid-devel" "util-linux"
 install_pkg "build-essential" "gcc-c++"              "base-devel"
 install_pkg "cmake"           "cmake"                "cmake"
 install_pkg "pkg-config"      "pkgconf-pkg-config"   "pkgconf"
-# yaml-cpp 在 RHEL/TencentOS 上常因 modular filtering 装不上（yaml-cpp-devel
-# 被过滤），且最终由 vcpkg 统一提供（见 ensure_cpp_deps_via_vcpkg），因此这里
-# 设为 optional：装不上只告警、不中断，后续 vcpkg 会补齐。
+# yaml-cpp 在 RHEL/TencentOS 上可能因 modular filtering 装不上
+# （yaml-cpp-devel 被过滤），因此这里设为 optional。脚本随后确认完整系统 CMake
+# 依赖；仅在系统路径不完整时才由 vcpkg 补齐。
 install_pkg "libyaml-cpp-dev" "yaml-cpp-devel"       "yaml-cpp" optional
 install_pkg "libunwind-dev"   "libunwind-devel"      "libunwind"
 
@@ -267,28 +345,19 @@ install_pkg "protobuf-compiler" "protobuf-compiler" "protobuf"
 install_pkg "libgrpc++-dev"          "grpc-devel"   "grpc" optional
 install_pkg "protobuf-compiler-grpc" "grpc-plugins" "grpc" optional
 
-# ----- 通过 vcpkg 提供 C++ 依赖（grpc / yaml-cpp 等） -----
-# 保留原有自动判断：pkg-config 能找到 grpc++ 且 grpc_cpp_plugin 在 PATH
-# 时使用系统包，否则回退 vcpkg。--force-vcpkg 会跳过该判断。
-# 之所以把 yaml-cpp 一并放进 vcpkg：
-#   - RHEL/TencentOS 系统包仅 yaml-cpp 0.5.x，其 CMake config 缺少
-#     RelWithDebInfo 配置的 IMPORTED_LOCATION，触发 CMP0111 警告刷屏。
-#   - 由 vcpkg 统一安装可保证版本一致、CMake 集成干净。
+# ----- C++ 依赖：优先使用系统 CMake package，必要时才回退 vcpkg -----
+# system_cpp_deps_available 已在包管理器操作前定义，用于快速跳过完整环境。
 ensure_cpp_deps_via_vcpkg() {
-    if [ "${FORCE_VCPKG}" -ne 1 ] \
-        && command -v pkg-config >/dev/null 2>&1 \
-        && pkg-config --exists grpc++ 2>/dev/null \
-        && command -v grpc_cpp_plugin >/dev/null 2>&1; then
+    if [ "${FORCE_VCPKG}" -ne 1 ] && system_cpp_deps_available; then
         CPP_DEPS_PROVIDER="system"
-        VCPKG_TOOLCHAIN_FILE=""
-        echo "系统已提供 gRPC（grpc++ + grpc_cpp_plugin），跳过 vcpkg 安装。"
+        echo "系统已提供 CMake 可发现的 yaml-cpp / gRPC / Protobuf 及代码生成工具，跳过 vcpkg 安装。"
         return 0
     fi
 
     if [ "${FORCE_VCPKG}" -eq 1 ]; then
         echo "已启用 --force-vcpkg：强制使用 vcpkg 的 grpc / yaml-cpp。"
     else
-        echo "系统未提供 gRPC，回退到 vcpkg 安装方案。"
+        echo "系统 CMake 依赖或代码生成工具不完整，回退到 vcpkg 安装方案。"
     fi
 
     # 代理环境健康提示（vcpkg 经常因公司代理把 GitHub release 拦掉）
@@ -378,7 +447,6 @@ ensure_cpp_deps_via_vcpkg() {
     fi
     echo "vcpkg 中 gRPC / yaml-cpp 安装校验通过。"
 
-    VCPKG_TOOLCHAIN_FILE="${vcpkg_root}/scripts/buildsystems/vcpkg.cmake"
     VCPKG_SELECTED_ROOT="${vcpkg_root}"
     CPP_DEPS_PROVIDER="vcpkg"
     cat <<EOF
@@ -386,20 +454,16 @@ ensure_cpp_deps_via_vcpkg() {
 ==============================================================
 gRPC 已通过 vcpkg 安装到: ${vcpkg_root}
 
-推荐使用按后端划分的 CMake Presets：
+唯一硬件构建入口：
 
-    cmake --preset cuda
-    cmake --build --preset cuda
-
-可用 preset：host / cuda / cuda-module / musa / maca
-查看完整列表：cmake --list-presets
+    cmake --preset default
+    cmake --build --preset default --parallel 8
 ==============================================================
 EOF
     return 0
 }
 
 CPP_DEPS_PROVIDER=""
-VCPKG_TOOLCHAIN_FILE=""
 VCPKG_SELECTED_ROOT=""
 if ! ensure_cpp_deps_via_vcpkg; then
     echo "错误：无法准备根构建所需的 C++ 依赖（grpc / yaml-cpp）。" >&2
@@ -407,171 +471,16 @@ if ! ensure_cpp_deps_via_vcpkg; then
     exit 1
 fi
 
-json_escape() {
-    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
-}
-
-generate_cmake_presets() {
+verify_default_preset() {
     local presets_file="${PROJECT_ROOT}/CMakePresets.json"
-    local presets_tmp
-    local toolchain_entry=""
-    local provider_label="system packages"
-
-    if [ "${CPP_DEPS_PROVIDER}" = "vcpkg" ]; then
-        if [ ! -f "${VCPKG_TOOLCHAIN_FILE}" ]; then
-            echo "错误：vcpkg toolchain 不存在：${VCPKG_TOOLCHAIN_FILE}" >&2
-            return 1
-        fi
-        provider_label="vcpkg"
-        toolchain_entry=",
-        \"CMAKE_TOOLCHAIN_FILE\": {
-          \"type\": \"FILEPATH\",
-          \"value\": \"$(json_escape "${VCPKG_TOOLCHAIN_FILE}")\"
-        }"
+    if [ ! -f "${presets_file}" ]; then
+        echo "错误：缺少仓库默认 preset：${presets_file}" >&2
+        return 1
     fi
-
-    presets_tmp="$(mktemp "${PROJECT_ROOT}/.CMakePresets.json.XXXXXX")" || return 1
-    cat >"${presets_tmp}" <<EOF
-{
-  "version": 3,
-  "cmakeMinimumRequired": {
-    "major": 3,
-    "minor": 21,
-    "patch": 0
-  },
-  "configurePresets": [
-    {
-      "name": "_tutti-base",
-      "hidden": true,
-      "generator": "Unix Makefiles",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": { "type": "STRING", "value": "RelWithDebInfo" }${toolchain_entry}
-      }
-    },
-    {
-      "name": "host",
-      "displayName": "HOST | contracts (${provider_label})",
-      "description": "Hardware-free HOST profile with contract tests enabled.",
-      "inherits": "_tutti-base",
-      "binaryDir": "\${sourceDir}/build/host",
-      "cacheVariables": {
-        "TUTTI_ACCELERATOR": { "type": "STRING", "value": "HOST" },
-        "BUILD_TESTING": { "type": "BOOL", "value": "ON" },
-        "TUTTI_FEATURE_MEMFS_SAMPLE": { "type": "BOOL", "value": "ON" },
-        "TUTTI_BUILD_HARDWARE_TESTS": { "type": "BOOL", "value": "OFF" },
-        "TUTTI_BUILD_KERNEL_MODULE": { "type": "BOOL", "value": "OFF" }
-      }
-    },
-    {
-      "name": "cuda",
-      "displayName": "CUDA | userspace (${provider_label})",
-      "description": "CUDA userspace stack and hardware-free contract tests; kernel module disabled.",
-      "inherits": "_tutti-base",
-      "binaryDir": "\${sourceDir}/build/cuda",
-      "cacheVariables": {
-        "TUTTI_ACCELERATOR": { "type": "STRING", "value": "CUDA" },
-        "CMAKE_CUDA_ARCHITECTURES": { "type": "STRING", "value": "90" },
-        "BUILD_TESTING": { "type": "BOOL", "value": "ON" },
-        "TUTTI_BUILD_HARDWARE_STACK": { "type": "BOOL", "value": "ON" },
-        "TUTTI_FEATURE_LOCAL_NVME": { "type": "BOOL", "value": "ON" },
-        "TUTTI_FEATURE_MEMFS_SAMPLE": { "type": "BOOL", "value": "ON" },
-        "TUTTI_BUILD_HARDWARE_TESTS": { "type": "BOOL", "value": "OFF" },
-        "TUTTI_BUILD_KERNEL_MODULE": { "type": "BOOL", "value": "OFF" }
-      }
-    },
-    {
-      "name": "cuda-module",
-      "displayName": "CUDA | userspace + snvme module (${provider_label})",
-      "description": "CUDA stack with kernel-specific snvme module targets enabled.",
-      "inherits": "cuda",
-      "binaryDir": "\${sourceDir}/build/cuda-module",
-      "cacheVariables": {
-        "TUTTI_BUILD_KERNEL_MODULE": { "type": "BOOL", "value": "ON" },
-        "TUTTI_P2P_BACKEND": { "type": "STRING", "value": "nvidia" },
-        "SNVME_KERNEL_VERSION": { "type": "STRING", "value": "" },
-        "SNVME_P2P_INCLUDE_DIR": { "type": "PATH", "value": "" }
-      }
-    },
-    {
-      "name": "musa",
-      "displayName": "MUSA | porting profile (${provider_label})",
-      "description": "MUSA framework profile; SDK/compiler integration remains vendor-dependent.",
-      "inherits": "_tutti-base",
-      "binaryDir": "\${sourceDir}/build/musa",
-      "cacheVariables": {
-        "TUTTI_ACCELERATOR": { "type": "STRING", "value": "MUSA" },
-        "BUILD_TESTING": { "type": "BOOL", "value": "ON" },
-        "TUTTI_BUILD_HARDWARE_STACK": { "type": "BOOL", "value": "ON" },
-        "TUTTI_FEATURE_LOCAL_NVME": { "type": "BOOL", "value": "ON" },
-        "TUTTI_BUILD_HARDWARE_TESTS": { "type": "BOOL", "value": "OFF" },
-        "TUTTI_BUILD_KERNEL_MODULE": { "type": "BOOL", "value": "OFF" },
-        "MUSA_INCLUDE_DIR": { "type": "PATH", "value": "/usr/local/musa/include" },
-        "MUSA_LIB_DIR": { "type": "PATH", "value": "/usr/local/musa/lib" }
-      }
-    },
-    {
-      "name": "maca",
-      "displayName": "MACA | porting profile (${provider_label})",
-      "description": "MACA framework profile; SDK/compiler integration remains vendor-dependent.",
-      "inherits": "_tutti-base",
-      "binaryDir": "\${sourceDir}/build/maca",
-      "cacheVariables": {
-        "TUTTI_ACCELERATOR": { "type": "STRING", "value": "MACA" },
-        "BUILD_TESTING": { "type": "BOOL", "value": "ON" },
-        "TUTTI_BUILD_HARDWARE_STACK": { "type": "BOOL", "value": "ON" },
-        "TUTTI_FEATURE_LOCAL_NVME": { "type": "BOOL", "value": "ON" },
-        "TUTTI_BUILD_HARDWARE_TESTS": { "type": "BOOL", "value": "OFF" },
-        "TUTTI_BUILD_KERNEL_MODULE": { "type": "BOOL", "value": "OFF" },
-        "MACA_ROOT": { "type": "PATH", "value": "/opt/maca" }
-      }
-    },
-    {
-      "name": "maca-module",
-      "displayName": "MXMACA | userspace + snvme module (${provider_label})",
-      "description": "CUDA stack with kernel-specific snvme module targets enabled.",
-      "inherits": "maca",
-      "binaryDir": "\${sourceDir}/build/maca-module",
-      "cacheVariables": {
-        "TUTTI_BUILD_KERNEL_MODULE": { "type": "BOOL", "value": "ON" },
-        "TUTTI_P2P_BACKEND": { "type": "STRING", "value": "metax" },
-        "SNVME_KERNEL_VERSION": { "type": "STRING", "value": "" },
-        "SNVME_P2P_INCLUDE_DIR": { "type": "PATH", "value": "" }
-      }
-    }
-  ],
-  "buildPresets": [
-    { "name": "host",        "configurePreset": "host" },
-    { "name": "cuda",        "configurePreset": "cuda" },
-    { "name": "cuda-module", "configurePreset": "cuda-module" },
-    { "name": "musa",        "configurePreset": "musa" },
-    { "name": "maca",        "configurePreset": "maca" },
-    { "name": "maca-module", "configurePreset": "maca-module" }
-  ],
-  "testPresets": [
-    {
-      "name": "host",
-      "configurePreset": "host",
-      "output": { "outputOnFailure": true },
-      "execution": { "jobs": 16, "timeout": 60 }
-    },
-    {
-      "name": "cuda",
-      "configurePreset": "cuda",
-      "output": { "outputOnFailure": true },
-      "execution": { "jobs": 16, "timeout": 60 }
-    }
-  ]
-}
-EOF
-    chmod 0644 -- "${presets_tmp}" || return 1
-    mv -f -- "${presets_tmp}" "${presets_file}"
-    echo "已生成 CMake presets：${presets_file}（依赖提供方：${CPP_DEPS_PROVIDER}）"
+    echo "使用唯一硬件 preset：${presets_file}（依赖提供方：${CPP_DEPS_PROVIDER}）"
 }
 
-generate_cmake_presets || {
-    echo "错误：生成 CMakePresets.json 失败。" >&2
-    exit 1
-}
+verify_default_preset || exit 1
 
 tsv_clean() {
     printf '%s' "$1" | tr '\t\r\n' '   '
@@ -691,4 +600,4 @@ generate_dependency_manifest || {
     exit 1
 }
 
-echo "操作完成！可运行：cmake --preset cuda && cmake --build --preset cuda"
+echo "操作完成！可运行：cmake --preset default && cmake --build --preset default --parallel 8"

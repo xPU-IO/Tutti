@@ -528,6 +528,16 @@ static int nvme_ctrl_ioctl(struct nvme_ctrl *ctrl, unsigned int cmd,
 	}
 }
 
+/* Controller passthrough entry used by the snvme per-controller cdev. */
+int snvme_admin_ioctl(struct nvme_ctrl *ctrl, unsigned int cmd,
+		void __user *argp, bool open_for_write)
+{
+	if (cmd != NVME_IOCTL_ADMIN_CMD && cmd != NVME_IOCTL_ADMIN64_CMD)
+		return -ENOTTY;
+	return nvme_ctrl_ioctl(ctrl, cmd, argp, open_for_write);
+}
+EXPORT_SYMBOL_GPL(snvme_admin_ioctl);
+
 #ifdef COMPAT_FOR_U64_ALIGNMENT
 struct nvme_user_io32 {
 	__u8	opcode;

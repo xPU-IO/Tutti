@@ -47,9 +47,7 @@ Two errors from the T-003 harness are fixed:
 
 2. **Client binary name corrected.** `nvmeservice_client_example` is the CMake
    target name; the real executable is `nvmeservice_client` (OUTPUT_NAME).
-   The default `CLIENT_BIN` is now
-   `build/cuda-module/tutti/device_manager/nvme/nvmeservice/examples/nvmeservice_client`
-   (or set `CLIENT_BIN` to a different build preset's output).
+   The default `CLIENT_BIN` is `build/bin/nvmeservice_client`.
 
 ## Dry-run vs execute
 

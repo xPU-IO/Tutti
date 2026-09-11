@@ -141,7 +141,9 @@ std::unique_ptr<StorageRuntime> make_runtime(LocalNvmeDataPath& dp,
     RuntimeComponents components;
     components.resolvers.push_back({"file", &resolver});
     components.data_paths.push_back({kDataPathKey, &dp, DataPathConfig{"local_nvme"}});
-    auto created = StorageRuntime::create({}, std::move(components));
+    RuntimeConfig config;
+    config.accel_id = kCudaDev;
+    auto created = StorageRuntime::create(config, std::move(components));
     if (!created.ok()) return nullptr;
     return std::move(created).value();
 }
@@ -244,7 +246,7 @@ int main(int argc, char** argv) {
     // =====================================================================
     printf("--- 1. assembly/open ---\n");
     {
-        LocalNvmeDataPath dp(g_device.ssnvme_path, g_device.bar0_size, kCudaDev,
+        LocalNvmeDataPath dp(g_device.ssnvme_path, kCudaDev,
                              kNumQueues, g_device.namespace_id, g_device.block_size);
         auto resolver = make_resolver();
         auto rt = make_runtime(dp, resolver);
@@ -268,7 +270,7 @@ int main(int argc, char** argv) {
         // DataPath key mismatch: resolver sets key "local-nvme-ext4"; inject a
         // runtime whose only DataPath has a different key → no route.
         {
-            LocalNvmeDataPath dp2(g_device.ssnvme_path, g_device.bar0_size, kCudaDev,
+            LocalNvmeDataPath dp2(g_device.ssnvme_path, kCudaDev,
                                   kNumQueues, g_device.namespace_id,
                                   g_device.block_size);
             auto resolver2 = make_resolver();
@@ -295,7 +297,7 @@ int main(int argc, char** argv) {
     // =====================================================================
     printf("--- 2. memory / lazy registration ---\n");
     {
-        LocalNvmeDataPath dp(g_device.ssnvme_path, g_device.bar0_size, kCudaDev,
+        LocalNvmeDataPath dp(g_device.ssnvme_path, kCudaDev,
                              kNumQueues, g_device.namespace_id, g_device.block_size);
         auto resolver = make_resolver();
         auto rt = make_runtime(dp, resolver);
@@ -343,7 +345,7 @@ int main(int argc, char** argv) {
     // =====================================================================
     printf("--- 3. real data SINGLE/DUAL/LIST/cross-segment ---\n");
     {
-        LocalNvmeDataPath dp(g_device.ssnvme_path, g_device.bar0_size, kCudaDev,
+        LocalNvmeDataPath dp(g_device.ssnvme_path, kCudaDev,
                              kNumQueues, g_device.namespace_id, g_device.block_size);
         auto resolver = make_resolver();
         auto rt = make_runtime(dp, resolver);
@@ -451,7 +453,7 @@ int main(int argc, char** argv) {
     // =====================================================================
     printf("--- 4. batch / mixed / partial commit ---\n");
     {
-        LocalNvmeDataPath dp(g_device.ssnvme_path, g_device.bar0_size, kCudaDev,
+        LocalNvmeDataPath dp(g_device.ssnvme_path, kCudaDev,
                              kNumQueues, g_device.namespace_id, g_device.block_size);
         auto resolver = make_resolver();
         auto rt = make_runtime(dp, resolver);
@@ -537,7 +539,7 @@ int main(int argc, char** argv) {
     // =====================================================================
     printf("--- 5. order/concurrency ---\n");
     {
-        LocalNvmeDataPath dp(g_device.ssnvme_path, g_device.bar0_size, kCudaDev,
+        LocalNvmeDataPath dp(g_device.ssnvme_path, kCudaDev,
                              kNumQueues, g_device.namespace_id, g_device.block_size);
         auto resolver = make_resolver();
         auto rt = make_runtime(dp, resolver);
@@ -657,7 +659,7 @@ int main(int argc, char** argv) {
     // =====================================================================
     printf("--- 6. failure/timeout ---\n");
     {
-        LocalNvmeDataPath dp(g_device.ssnvme_path, g_device.bar0_size, kCudaDev,
+        LocalNvmeDataPath dp(g_device.ssnvme_path, kCudaDev,
                              kNumQueues, g_device.namespace_id, g_device.block_size);
         auto resolver = make_resolver();
         auto rt = make_runtime(dp, resolver);
@@ -727,7 +729,7 @@ int main(int argc, char** argv) {
     printf("--- 7. teardown / repeat lifecycle ---\n");
     {
         for (int round = 0; round < 2; ++round) {
-            LocalNvmeDataPath dp(g_device.ssnvme_path, g_device.bar0_size, kCudaDev,
+            LocalNvmeDataPath dp(g_device.ssnvme_path, kCudaDev,
                                  kNumQueues, g_device.namespace_id,
                                  g_device.block_size);
             auto resolver = make_resolver();
@@ -777,7 +779,7 @@ int main(int argc, char** argv) {
         // in-flight=8, batch_entries=4096 (both >= task minimums); the
         // other two new knobs (max_batch_requests, max_request_bytes_override)
         // are left at 0 (follow entries / entries*MDTS).
-        LocalNvmeDataPath dp_big(g_device.ssnvme_path, g_device.bar0_size,
+        LocalNvmeDataPath dp_big(g_device.ssnvme_path,
                                  kCudaDev, kNumQueues, g_device.namespace_id,
                                  g_device.block_size,
                                  /*mdts_bytes=*/0, /*max_batch_entries=*/4096,
@@ -939,7 +941,7 @@ int main(int argc, char** argv) {
     // =====================================================================
     printf("--- 9. default capacity regression: oversized batch fail-closed ---\n");
     {
-        LocalNvmeDataPath dp(g_device.ssnvme_path, g_device.bar0_size, kCudaDev,
+        LocalNvmeDataPath dp(g_device.ssnvme_path, kCudaDev,
                              kNumQueues, g_device.namespace_id, g_device.block_size);
         auto resolver = make_resolver();
         auto rt = make_runtime(dp, resolver);
@@ -986,7 +988,7 @@ int main(int argc, char** argv) {
     // =====================================================================
     printf("--- 10. batch open: mixed scenarios + byte verify ---\n");
     {
-        LocalNvmeDataPath dp(g_device.ssnvme_path, g_device.bar0_size, kCudaDev,
+        LocalNvmeDataPath dp(g_device.ssnvme_path, kCudaDev,
                              kNumQueues, g_device.namespace_id, g_device.block_size);
         auto resolver = make_resolver();
         auto rt = make_runtime(dp, resolver);
@@ -1077,6 +1079,120 @@ int main(int argc, char** argv) {
 
         ::unlink(p_v0.c_str()); ::unlink(p_v1.c_str());
         CHECK(rt->shutdown(1000).ok(), "shutdown batch-open runtime");
+    }
+
+    // =====================================================================
+    // 11. A 256 KiB registered IO slice needs 63 PRP-list entries. This is
+    //     the connector's Hy3 layer-segment geometry and must use one full,
+    //     page-aligned host PRP page rather than the removed 256B packing.
+    // =====================================================================
+    printf("--- 11. 256KiB prebuilt host PRP page ---\n");
+    {
+        constexpr std::uint64_t kSegmentBytes = 256 * 1024;
+        LocalNvmeDataPath dp(g_device.ssnvme_path, kCudaDev,
+                             kNumQueues, g_device.namespace_id,
+                             g_device.block_size);
+        auto resolver = make_resolver();
+        auto rt = make_runtime(dp, resolver);
+        CHECK(rt != nullptr, "create 256KiB prebuilt runtime");
+
+        std::string path = std::string(kDir) + "/rt_prebuilt_256k.bin";
+        CHECK(create_file(path, kSegmentBytes, 0x00), "create 256KiB file");
+        auto target = rt->open(std::string("file://") + path,
+                               OpenOptions{"file"});
+        CHECK(target.ok(), "open 256KiB target");
+
+        void* raw = nullptr;
+        void* buffer = alloc_gpu(kSegmentBytes, &raw);
+        CHECK(buffer != nullptr, "allocate 256KiB device buffer");
+        auto memory = rt->register_memory(MemoryView{
+            buffer, kSegmentBytes, MemoryKind::DEVICE,
+            MemoryOwnership::CALLER_OWNED, kCudaDev, "", kSegmentBytes});
+        CHECK(memory.ok(), "register 256KiB prebuilt slice");
+
+        cudaStream_t stream = nullptr;
+        CHECK(cudaStreamCreate(&stream) == cudaSuccess,
+              "create 256KiB IO stream");
+        if (target.ok() && memory.ok() && stream != nullptr) {
+            CHECK(public_write(*rt, memory.value(), target.value(), buffer,
+                               0, 0, kSegmentBytes, stream, 0xA6),
+                  "256KiB prebuilt WRITE");
+            CHECK(dp.test_last_prebuilt_entry_count() == 1,
+                  "256KiB WRITE uses one prebuilt descriptor");
+            CHECK(dp.test_last_dynamic_entry_count() == 0,
+                  "256KiB WRITE avoids dynamic descriptor fallback");
+            CHECK(public_read_verify(*rt, memory.value(), target.value(),
+                                     buffer, 0, 0, kSegmentBytes, stream, 0xA6),
+                  "256KiB prebuilt READ byte-exact");
+        }
+
+        if (stream) cudaStreamDestroy(stream);
+        if (memory.ok()) rt->unregister_memory(memory.value());
+        if (target.ok()) rt->close(target.value());
+        CHECK(rt->shutdown(1000).ok(), "shutdown 256KiB prebuilt runtime");
+        if (raw) cudaFree(raw);
+        ::unlink(path.c_str());
+    }
+
+    // =====================================================================
+    // 12. Python supplies only the 4 MiB logical block size. The DataPath
+    //     reads the hardware MDTS (2 MiB on this deployment) and prebuilds
+    //     the required number of sub-IO descriptors itself.
+    // =====================================================================
+    printf("--- 12. logical block split by driver MDTS ---\n");
+    {
+        constexpr std::uint64_t kLogicalBlockBytes = 4 * 1024 * 1024;
+        LocalNvmeDataPath dp(g_device.ssnvme_path, kCudaDev,
+                             kNumQueues, g_device.namespace_id,
+                             g_device.block_size);
+        auto resolver = make_resolver();
+        auto rt = make_runtime(dp, resolver);
+        CHECK(rt != nullptr, "create driver-MDTS runtime");
+        CHECK(dp.test_effective_mdts_bytes() > 0,
+              "driver reports a positive effective MDTS");
+
+        std::string path = std::string(kDir) + "/rt_driver_mdts.bin";
+        CHECK(create_file(path, kLogicalBlockBytes, 0x00),
+              "create 4MiB logical-block file");
+        auto target = rt->open(std::string("file://") + path,
+                               OpenOptions{"file"});
+        CHECK(target.ok(), "open driver-MDTS target");
+
+        void* raw = nullptr;
+        void* buffer = alloc_gpu(kLogicalBlockBytes, &raw);
+        CHECK(buffer != nullptr, "allocate 4MiB device buffer");
+        auto memory = rt->register_memory(MemoryView{
+            buffer, kLogicalBlockBytes, MemoryKind::DEVICE,
+            MemoryOwnership::CALLER_OWNED, kCudaDev, "",
+            kLogicalBlockBytes});
+        CHECK(memory.ok(), "register one 4MiB logical block");
+
+        cudaStream_t stream = nullptr;
+        CHECK(cudaStreamCreate(&stream) == cudaSuccess,
+              "create driver-MDTS IO stream");
+        if (target.ok() && memory.ok() && stream != nullptr) {
+            CHECK(public_write(*rt, memory.value(), target.value(), buffer,
+                               0, 0, kLogicalBlockBytes, stream, 0xB4),
+                  "4MiB logical-block WRITE");
+            const std::uint64_t expected_sub_ios =
+                (kLogicalBlockBytes + dp.test_effective_mdts_bytes() - 1) /
+                dp.test_effective_mdts_bytes();
+            CHECK(dp.test_last_prebuilt_entry_count() == expected_sub_ios,
+                  "C++ splits logical block using driver MDTS");
+            CHECK(dp.test_last_dynamic_entry_count() == 0,
+                  "driver-MDTS split remains fully prebuilt");
+            CHECK(public_read_verify(*rt, memory.value(), target.value(),
+                                     buffer, 0, 0, kLogicalBlockBytes,
+                                     stream, 0xB4),
+                  "4MiB logical-block READ byte-exact");
+        }
+
+        if (stream) cudaStreamDestroy(stream);
+        if (memory.ok()) rt->unregister_memory(memory.value());
+        if (target.ok()) rt->close(target.value());
+        CHECK(rt->shutdown(1000).ok(), "shutdown driver-MDTS runtime");
+        if (raw) cudaFree(raw);
+        ::unlink(path.c_str());
     }
 
     printf("\n=== Summary ===\n  passed: %d\n  failed: %d\n", g_pass, g_fail);

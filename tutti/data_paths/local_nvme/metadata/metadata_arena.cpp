@@ -94,65 +94,8 @@ bool MetadataArena::init(const Config& cfg, nvm_ctrl_t* ctrl) {
     }
     ++alloc_counts_.cuda_malloc;
 
-    // 4. Allocate PRP-list pool: 64 KiB-aligned, DMA-mapped.
-    //    Each slot gets max_entries_per_slot PRP pages (worst case:
-    //    every entry is a LIST sub-IO needing one PRP-list page).
-    prp_pages_per_slot_ = cfg_.max_entries_per_slot;
-    std::size_t total_prp_pages = static_cast<std::size_t>(cfg_.num_slots) *
-                                  prp_pages_per_slot_;
-    std::size_t prp_user_bytes = total_prp_pages * cfg_.page_size;
-
-    // 64 KiB alignment for the DMA mapping base.
-    prp_aligned_bytes_ = (prp_user_bytes + 65535) & ~static_cast<std::size_t>(65535);
-    if (prp_aligned_bytes_ == 0) prp_aligned_bytes_ = 65536;
-
-    ce = cudaMalloc(&prp_raw_, prp_aligned_bytes_ + 65536);
-    if (ce != cudaSuccess) {
-        cudaFree(d_status_pool_);
-        d_status_pool_ = nullptr;
-        ++alloc_counts_.cuda_free;
-        cudaFree(d_entries_pool_);
-        d_entries_pool_ = nullptr;
-        ++alloc_counts_.cuda_free;
-        for (auto& ev : events_) {
-            cudaEventDestroy(static_cast<cudaEvent_t>(ev));
-            ++alloc_counts_.cuda_event_destroy;
-        }
-        events_.clear();
-        cudaSetDevice(prev_dev);
-        return false;
-    }
-    ++alloc_counts_.cuda_malloc;
-
-    // Align to 64 KiB (snvme pins GPU pages at 64 KiB granularity).
-    std::uintptr_t raw_addr = reinterpret_cast<std::uintptr_t>(prp_raw_);
-    std::uintptr_t aligned_addr = (raw_addr + 65535) & ~static_cast<std::uintptr_t>(65535);
-    prp_aligned_ = reinterpret_cast<void*>(aligned_addr);
-
-    // DMA-map the entire PRP-list pool as one contiguous region.
-    int rc = nvm_dma_map_data_device(&prp_dma_, ctrl_, prp_aligned_,
-                                     prp_aligned_bytes_);
-    if (rc != 0 || prp_dma_ == nullptr) {
-        cudaFree(prp_raw_);
-        prp_raw_ = nullptr;
-        ++alloc_counts_.cuda_free;
-        cudaFree(d_status_pool_);
-        d_status_pool_ = nullptr;
-        ++alloc_counts_.cuda_free;
-        cudaFree(d_entries_pool_);
-        d_entries_pool_ = nullptr;
-        ++alloc_counts_.cuda_free;
-        for (auto& ev : events_) {
-            cudaEventDestroy(static_cast<cudaEvent_t>(ev));
-            ++alloc_counts_.cuda_event_destroy;
-        }
-        events_.clear();
-        cudaSetDevice(prev_dev);
-        return false;
-    }
-    ++alloc_counts_.nvm_dma_map;
-
-    // 5. Round 16 S6 (REQUIRED 0): allocate descriptor pool for dynamic-path
+    // 4. Allocate the GPU AddressDescriptor pool. PRP list backing is
+    // host-pinned and owned outside the arena.
     //    entries.  The kernel ALWAYS reads prp1/prp2/data_length from
     //    e.prp_entry; for entries without a pre-built descriptor, the host
     //    writes the computed descriptor into this pool + H2D before launch.
@@ -161,12 +104,6 @@ bool MetadataArena::init(const Config& cfg, nvm_ctrl_t* ctrl) {
                                    sizeof(AddressDescriptor);
     ce = cudaMalloc(reinterpret_cast<void**>(&d_desc_pool_), desc_pool_bytes);
     if (ce != cudaSuccess) {
-        nvm_dma_unmap(prp_dma_);
-        prp_dma_ = nullptr;
-        ++alloc_counts_.nvm_dma_unmap;
-        cudaFree(prp_raw_);
-        prp_raw_ = nullptr;
-        ++alloc_counts_.cuda_free;
         cudaFree(d_status_pool_);
         d_status_pool_ = nullptr;
         ++alloc_counts_.cuda_free;
@@ -205,19 +142,7 @@ void MetadataArena::shutdown(bool skip_prp) {
     cudaGetDevice(&prev_dev);
     cudaSetDevice(cfg_.cuda_device);
 
-    // PRP-list pool: skip cleanup if any op timed out (conservative retention).
-    if (!skip_prp) {
-        if (prp_dma_) {
-            nvm_dma_unmap(prp_dma_);
-            prp_dma_ = nullptr;
-            ++alloc_counts_.nvm_dma_unmap;
-        }
-        if (prp_raw_) {
-            cudaFree(prp_raw_);
-            prp_raw_ = nullptr;
-            ++alloc_counts_.cuda_free;
-        }
-    }
+    (void)skip_prp;
     // Events and entry/status pools are always safe to free — the kernel
     // has returned (caller synced all streams before calling shutdown).
     if (d_status_pool_) {
@@ -246,9 +171,6 @@ void MetadataArena::shutdown(bool skip_prp) {
     cudaSetDevice(prev_dev);
 
     free_list_.clear();
-    prp_aligned_ = nullptr;
-    prp_aligned_bytes_ = 0;
-    prp_pages_per_slot_ = 0;
     initialized_ = false;
 }
 
@@ -269,10 +191,6 @@ bool MetadataArena::acquire(Lease& out) {
     out.event = events_[slot];
     out.d_entries = d_entries_pool_ + static_cast<std::size_t>(slot) * cfg_.max_entries_per_slot;
     out.d_status = d_status_pool_ + static_cast<std::size_t>(slot) * cfg_.max_entries_per_slot;
-    out.prp_pages_devptr = static_cast<char*>(prp_aligned_) +
-                           static_cast<std::size_t>(slot) * prp_pages_per_slot_ * cfg_.page_size;
-    out.prp_ioaddrs_base = slot * prp_pages_per_slot_;
-    out.prp_page_capacity = prp_pages_per_slot_;
     out.d_desc_pool = d_desc_pool_ + static_cast<std::size_t>(slot) * cfg_.max_entries_per_slot;
 
     return true;
@@ -292,16 +210,10 @@ void MetadataArena::release(std::uint32_t slot_index) {
 // -----------------------------------------------------------------------
 
 void MetadataArena::release_with_timeout_leak(std::uint32_t slot_index) {
-    // Intentionally do NOT return the slot to the free list.
-    // The timed-out NVMe command may still be in the controller SQ/CQ
-    // and could DMA into the PRP-list pages after they are reused.
-    // The CID was also not returned to the SQ, so that queue slot is
-    // degraded until an abort/reset (future work).
-    //
-    // Bounded leak: at most cfg_.num_slots slots can be consumed this way.
-    // After all slots are leaked, acquire() always returns false and
-    // submit() returns RESOURCE_EXHAUSTED for every request.
-    (void)slot_index;  // no-op: slot is simply not returned to free_list_
+    // PRP list backing is now a host-pinned pool lease whose lifetime is
+    // independent of this GPU metadata slot. The descriptor/status/event
+    // workspace is safe to reuse after the submit kernel has returned.
+    release(slot_index);
 }
 
 // -----------------------------------------------------------------------

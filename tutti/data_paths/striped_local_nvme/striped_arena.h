@@ -10,16 +10,13 @@
 // cudaMalloc/cudaEventCreate calls (Round 15 Session 5 boundary: "禁止 per-op
 // cudaMalloc 简化交付").
 //
-// One structural difference from MetadataArena: the PRP-list page pool must
-// be DMA-mapped once PER DEVICE CONTROLLER (N mappings of the same GPU
-// buffer), because a PRP-list page's IOVA is only valid within the
-// controller/IOMMU domain that mapped it. This mirrors how register_memory
-// DMA-maps the caller's data buffer once per device (StripedMemory::dmas).
+// PRP-list pages are host-pinned per-controller resources owned by
+// StripedDataPath's PrpBufPool/PrpPageCache, never by this GPU arena.
 //
 // submit() calls acquire() to lease a slot; release() returns it.  Arena
 // exhaustion -> submit() returns RESOURCE_EXHAUSTED (no cudaMalloc fallback).
-// Timeout ops use release_with_timeout_leak(): the slot is permanently
-// consumed (bounded leak, same semantics as MetadataArena).
+// Timeout only retains the separate host PRP lease; GPU metadata slots remain
+// reusable.
 
 #include <cstdint>
 #include <deque>
@@ -70,10 +67,6 @@ public:
         void* event = nullptr;                          // cudaEvent_t
         StripedDeviceSubmitEntry* d_entries = nullptr;   // GPU: entry array base
         EntryCompletionStatus* d_status = nullptr;       // GPU: status array base
-        // PRP-list workspace (pre-allocated, DMA-mapped once per device).
-        void* prp_pages_devptr = nullptr;    // GPU: this slot's PRP page base
-        std::uint32_t prp_ioaddrs_base = 0;  // index into each device's DMA ioaddrs[]
-        std::uint32_t prp_page_capacity = 0; // max PRP pages for this slot
         // Device table workspace (pre-allocated).  Host fills up to
         // dev_table_capacity entries with DeviceTargetHandle* pointers,
         // H2D-copies to d_dev_table, then the kernel indexes it by dev_idx.
@@ -90,6 +83,7 @@ public:
         std::uint64_t cuda_event_destroy = 0;
         std::uint64_t nvm_dma_map = 0;
         std::uint64_t nvm_dma_unmap = 0;
+        std::uint64_t gpu_prp_cuda_malloc = 0;
     };
 
     StripedArena() = default;
@@ -98,18 +92,15 @@ public:
     StripedArena(const StripedArena&) = delete;
     StripedArena& operator=(const StripedArena&) = delete;
 
-    // Pre-allocate all GPU memory, events, and PRP-list DMA mappings (one
-    // per device controller in `ctrls`).  Must be called after all N
+    // Pre-allocate GPU metadata memory and events. `ctrls` remains for source
+    // compatibility; no PRP DMA mapping is created. Must be called after all N
     // controllers are attached.  Returns false on any CUDA/DMA failure
     // (rolls back partial allocations).
     bool init(const Config& cfg, const std::vector<nvm_ctrl_t*>& ctrls);
 
     // Free all resources. Idempotent. Caller must ensure no in-flight GPU
     // work touches arena memory (sync all streams first).
-    // If skip_prp is true, the PRP-list pool (all N DMA mappings + the CUDA
-    // allocation) is NOT freed -- used when a timeout op's command may still
-    // be in a controller queue.  Events and entry/status pools are always
-    // freed.
+    // `skip_prp` is a compatibility no-op: this arena owns no PRP backing.
     void shutdown(bool skip_prp = false);
 
     bool initialized() const { return initialized_; }
@@ -123,12 +114,6 @@ public:
     const AllocCounts& alloc_counts() const { return alloc_counts_; }
     void reset_alloc_counts() { alloc_counts_ = {}; }
 
-    // Access device dev_idx's DMA mapping of the shared PRP-list pool (for
-    // filling a LIST entry's prp2 with THAT device's IOVA of the page).
-    const nvm_dma_t* prp_dma(std::uint32_t dev_idx) const {
-        return dev_idx < prp_dmas_.size() ? prp_dmas_[dev_idx] : nullptr;
-    }
-
 private:
     Config cfg_{};
     std::vector<nvm_ctrl_t*> ctrls_;  // borrowed, one per device
@@ -140,15 +125,6 @@ private:
     EntryCompletionStatus* d_status_pool_ = nullptr;
     void* d_dev_table_pool_ = nullptr;  // GPU: const void*[num_slots * dev_table_capacity_per_slot]
     const tutti::data_paths::local_nvme::AddressDescriptor* d_desc_pool_ = nullptr;  // Round 16 S6: dynamic-path descriptors
-
-    // PRP-list pool: one contiguous GPU buffer, 64 KiB-aligned, DMA-mapped
-    // ONCE PER DEVICE (prp_dmas_.size() == ctrls_.size()).
-    void* prp_raw_ = nullptr;
-    void* prp_aligned_ = nullptr;
-    std::vector<nvm_dma_t*> prp_dmas_;
-    std::size_t prp_aligned_bytes_ = 0;
-
-    std::uint32_t prp_pages_per_slot_ = 0;
 
     std::deque<std::uint32_t> free_list_;
     mutable std::mutex mtx_;

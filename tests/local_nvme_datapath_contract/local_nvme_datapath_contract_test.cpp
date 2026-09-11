@@ -914,7 +914,6 @@ int main(int argc, char** argv) {
         std::printf("RESULT: FAIL (test directory)\n");
         return 1;
     }
-    const std::uint32_t kBar0Size = primary_device().bar0_size;
     const std::size_t kBufSize = 1 * 1024 * 1024;  // 1 MiB
 
     // Phase 2 direct-DataPath probe: initialize/shutdown must select the
@@ -923,7 +922,7 @@ int main(int argc, char** argv) {
         const int caller_gpu = test_gpu == 0 ? 1 : 0;
         CHECK(cudaSetDevice(caller_gpu) == cudaSuccess,
               "direct DataPath probe selects non-target caller device");
-        LocalNvmeDataPath direct_dp(kSnvmeDevPath, kBar0Size);
+        LocalNvmeDataPath direct_dp(kSnvmeDevPath);
         DataPathConfig direct_config{"local_nvme"};
         ResourceProvider* direct_resources = nullptr;
         const Status direct_init = direct_dp.initialize(
@@ -947,7 +946,7 @@ int main(int argc, char** argv) {
 
     // Helper lambda for DP with real device.
     auto make_real_dp = [&]() {
-        return LocalNvmeDataPath(kSnvmeDevPath, kBar0Size);
+        return LocalNvmeDataPath(kSnvmeDevPath);
     };
 
     // Helper to initialize.
@@ -1221,7 +1220,7 @@ int main(int argc, char** argv) {
     const std::uint32_t kBlockSize = 4096;
 
     auto make_qg_dp = [&]() {
-        return LocalNvmeDataPath(kSnvmeDevPath, kBar0Size,
+        return LocalNvmeDataPath(kSnvmeDevPath,
                                   kCudaDevice, kNumQueues,
                                   kNamespaceId, kDeviceBlockSize);
     };
@@ -1303,6 +1302,10 @@ int main(int argc, char** argv) {
     {
         LocalNvmeDataPath dp = make_qg_dp();
         CHECK(init_dp(dp).ok(), "initialize");
+
+        auto init_counts = dp.test_arena_alloc_counts();
+        CHECK(init_counts.gpu_prp_cuda_malloc == 0,
+              "arena initialization performs zero GPU PRP cudaMalloc");
 
         auto rf = make_resolved_file("round8_test20.bin", kBlockSize);
         CHECK(rf.target.ok(), "resolve test file");
@@ -1562,7 +1565,7 @@ int main(int argc, char** argv) {
                    rt.value().valid() ? 1u : 0u);
 
             // Create DataPath with queue group.
-            LocalNvmeDataPath dp(kSnvmeDevPath, kBar0Size,
+            LocalNvmeDataPath dp(kSnvmeDevPath,
                                  kCudaDevice, kNumQueues,
                                  kNamespaceId, kDeviceBlockSize);
             Status init_status = init_dp(dp);
@@ -2940,6 +2943,20 @@ int main(int argc, char** argv) {
             CHECK(snap0.ok() && snap0.value().state == OpState::IN_FLIGHT,
                   "op is IN_FLIGHT during delay");
 
+            // A progress work unit is exactly one event query. It must not
+            // spin until the 0.3s delayed event becomes ready.
+            auto poll_start = std::chrono::steady_clock::now();
+            auto poll = dp.progress(ProgressBudget{1, 1000000000});
+            auto poll_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - poll_start).count();
+            CHECK(poll.ok(), "single-query progress succeeds");
+            CHECK(poll.value().work_units_consumed == 1,
+                  "single-query progress consumes one work unit");
+            CHECK(poll.value().operations_advanced == 1,
+                  "not-ready event reports one advanced operation");
+            CHECK(poll_ms < 100,
+                  "single-query progress returns without busy-spinning");
+
             // shutdown(0) must TIMEOUT — don't free anything.
             Status st = dp.shutdown(0);
             CHECK(!st.ok(), "shutdown(0) with in-flight → non-OK");
@@ -3554,6 +3571,10 @@ int main(int argc, char** argv) {
 
         const uint32_t ec = dp.test_entry_count(wo.op.value());
         CHECK(ec == (uint32_t)expected_entries, "LIST entry_count == ceil(1MiB/MDTS)");
+        CHECK(dp.test_last_prebuilt_entry_count() == 0,
+              "dynamic fallback test uses no prebuilt descriptors");
+        CHECK(dp.test_last_dynamic_entry_count() == ec,
+              "dynamic fallback builds every AddressDescriptor in arena pool");
         CHECK(dp.test_op_has_prp_list_dma(wo.op.value()), "LIST op owns PRP-list DMA");
         const uint32_t prp_pages = dp.test_prp_list_page_count(wo.op.value());
         CHECK(prp_pages >= 1, "LIST has >=1 PRP-list page");
@@ -3698,19 +3719,20 @@ int main(int argc, char** argv) {
         }
 
         // 64KiB buffer; write an 8KiB request straddling the boundary.
+        const uint64_t cross_off = boundary - bs;   // 4KiB before boundary
+        const uint64_t cross_len = bs * 2;          // 8KiB total (4+4)
         void* raw = nullptr;
         void* buf = cuda_malloc_aligned_64k(65536, &raw);
         CHECK(buf != nullptr, "alloc buf");
         if (!buf) { dp.close(target); dp.shutdown(0); ::unlink(pathA.c_str()); ::unlink(pathB.c_str()); goto next_t48; }
 
         auto mem = dp.register_memory(
-            DataPathMemoryView{buf, 65536, 0, DataPathMemoryKind::DEVICE},
+            DataPathMemoryView{buf, 65536, 0, DataPathMemoryKind::DEVICE,
+                               cross_len},
             primary_registration_domain());
         CHECK(mem.ok(), "register_memory");
         if (!mem.ok()) { cudaFree(raw); dp.close(target); dp.shutdown(0); ::unlink(pathA.c_str()); ::unlink(pathB.c_str()); goto next_t48; }
 
-        const uint64_t cross_off = boundary - bs;   // 4KiB before boundary
-        const uint64_t cross_len = bs * 2;          // 8KiB total (4+4)
         launch_fill_pattern(buf, 0x5A, cross_len, (void*)ctx_stream());
         cudaStreamSynchronize(ctx_stream());
 
@@ -3728,6 +3750,10 @@ int main(int argc, char** argv) {
 
         const uint32_t ec = dp.test_entry_count(wo.op.value());
         CHECK(ec >= 2, "cross-extent: host fan-out >= 2 entries");
+        CHECK(dp.test_last_prebuilt_entry_count() == 0,
+              "fragmented extent does not use an unsplittable prebuilt slice");
+        CHECK(dp.test_last_dynamic_entry_count() == ec,
+              "fragmented extent falls back to dynamic descriptors per fragment");
 
         // Each entry must not cross the extent boundary.
         for (uint32_t i = 0; i < ec; ++i) {
@@ -4301,7 +4327,7 @@ int main(int argc, char** argv) {
         }
         auto memory = runtime->register_memory(MemoryView{
             buffer, 65536, MemoryKind::DEVICE, MemoryOwnership::CALLER_OWNED,
-            0, ""});
+            0, "", kBlockSize});
         CHECK(memory.ok(), "StorageRuntime register device memory");
         if (!memory.ok()) {
             cudaFree(raw);
@@ -4321,6 +4347,10 @@ int main(int argc, char** argv) {
         auto write_outcome = runtime->submit(&write, 1, context);
         CHECK(write_outcome.status.ok() && write_outcome.io.has_value(),
               "public WRITE submitted through StorageRuntime");
+        CHECK(data_path.test_last_prebuilt_entry_count() == 1,
+              "public staging-shaped WRITE hits prebuilt descriptor");
+        CHECK(data_path.test_last_dynamic_entry_count() == 0,
+              "normal prebuilt WRITE avoids MetadataArena descriptor fallback");
         if (write_outcome.io.has_value()) {
             auto write_wait = runtime->wait(*write_outcome.io, 1000);
             CHECK(write_wait.observation_status.ok() && write_wait.result.has_value() &&
@@ -4337,6 +4367,10 @@ int main(int argc, char** argv) {
         auto read_outcome = runtime->submit(&read, 1, context);
         CHECK(read_outcome.status.ok() && read_outcome.io.has_value(),
               "public READ submitted through StorageRuntime");
+        CHECK(data_path.test_last_prebuilt_entry_count() == 1,
+              "public staging-shaped READ hits prebuilt descriptor");
+        CHECK(data_path.test_last_dynamic_entry_count() == 0,
+              "normal prebuilt READ avoids MetadataArena descriptor fallback");
         if (read_outcome.io.has_value()) {
             auto read_wait = runtime->wait(*read_outcome.io, 1000);
             CHECK(read_wait.observation_status.ok() && read_wait.result.has_value() &&
@@ -4500,6 +4534,15 @@ int main(int argc, char** argv) {
                 CHECK(!snap.value().status.ok(), "status non-OK");
                 CHECK(snap.value().bytes_transferred == 0,
                       "bytes_transferred == 0 (no confirmed success)");
+                CHECK(snap.value().detail.failure_kind == IoFailureKind::RESOLVE_LBA,
+                      "structured failure kind == RESOLVE_LBA");
+                CHECK(snap.value().detail.first_failed_entry == 0,
+                      "structured first_failed_entry == 0");
+                CHECK(snap.value().detail.failure_scope == IoFailureScope::REQUEST_INDICES,
+                      "structured failure scope identifies requests");
+                CHECK(snap.value().detail.failed_request_indices ==
+                          std::vector<std::uint32_t>{0},
+                      "structured failed request index is exact");
                 printf("  resolve_lba failure: state=%d status=%s bytes=%llu\n",
                        (int)snap.value().state,
                        snap.value().status.message().c_str(),
@@ -4559,7 +4602,7 @@ int main(int argc, char** argv) {
 
         // Verify custom budget.
         LocalNvmeDataPath dp_custom(
-            kSnvmeDevPath, kBar0Size,
+            kSnvmeDevPath,
             kCudaDevice, kNumQueues,
             kNamespaceId, kDeviceBlockSize,
             0, 0,  // mdts=0, max_batch_entries=0
@@ -5033,6 +5076,18 @@ int main(int argc, char** argv) {
                 CHECK(has_nvme_err, "status contains 'NVMe CQ error (dword3=...)'");
                 CHECK(snap.value().bytes_transferred == 0,
                       "bytes_transferred == 0 (no confirmed success)");
+                CHECK(snap.value().detail.failure_kind == IoFailureKind::NVME_CQ_ERROR,
+                      "structured failure kind == NVME_CQ_ERROR");
+                CHECK(snap.value().detail.first_failed_entry == 0,
+                      "structured first_failed_entry == 0");
+                CHECK(snap.value().detail.raw_cq_status == 0x30000u,
+                      "structured raw CQ status preserved");
+                CHECK(snap.value().detail.failure_scope ==
+                          IoFailureScope::REQUEST_INDICES,
+                      "structured CQ failure scope identifies requests");
+                CHECK(snap.value().detail.failed_request_indices ==
+                          std::vector<std::uint32_t>{0},
+                      "structured CQ failed request index is exact");
                 printf("  nvme-error injection: state=%d status=%s bytes=%llu\n",
                        (int)snap.value().state, msg.c_str(),
                        (unsigned long long)snap.value().bytes_transferred);
@@ -5174,7 +5229,7 @@ int main(int argc, char** argv) {
 
         // ---- Timeout path: budget=1 forces CQ timeout on real LIST IO ----
         LocalNvmeDataPath dp(
-            kSnvmeDevPath, kBar0Size,
+            kSnvmeDevPath,
             kCudaDevice, kNumQueues,
             kNamespaceId, kDeviceBlockSize,
             0, 0,   // mdts=0, max_batch_entries=0
@@ -5233,6 +5288,12 @@ int main(int argc, char** argv) {
                 if (snap.ok()) {
                     CHECK(snap.value().state == OpState::FAILED,
                           "timeout → FAILED");
+                    CHECK(snap.value().detail.failure_kind == IoFailureKind::CQ_TIMEOUT,
+                          "structured failure kind == CQ_TIMEOUT");
+                    CHECK(snap.value().detail.timeout_seen,
+                          "structured timeout_seen == true");
+                    CHECK(snap.value().detail.first_failed_entry == 0,
+                          "structured first_failed_entry == 0");
                     printf("  timeout op: state=%d status=%s bytes=%llu\n",
                            (int)snap.value().state,
                            snap.value().status.message().c_str(),
@@ -5472,6 +5533,8 @@ int main(int argc, char** argv) {
         auto counts_before = dp.test_arena_alloc_counts();
         CHECK(counts_before.cuda_malloc == 0, "zero cudaMalloc after reset");
         CHECK(counts_before.cuda_event_create == 0, "zero cudaEventCreate after reset");
+        CHECK(counts_before.gpu_prp_cuda_malloc == 0,
+              "zero GPU PRP allocation after reset");
 
         auto rf = make_resolved_file("round11_t60.bin", kBlockSize, 0x60);
         CHECK(rf.target.ok(), "resolve");
@@ -5521,6 +5584,8 @@ int main(int argc, char** argv) {
         CHECK(counts_after.cuda_malloc == 0, "zero cudaMalloc in hot path");
         CHECK(counts_after.cuda_event_create == 0, "zero cudaEventCreate in hot path");
         CHECK(counts_after.nvm_dma_map == 0, "zero nvm_dma_map in hot path");
+        CHECK(counts_after.gpu_prp_cuda_malloc == 0,
+              "submit performs zero GPU PRP allocation");
 
         cudaStreamDestroy(s);
         dp.unregister_memory(mem.value());
@@ -5532,10 +5597,9 @@ int main(int argc, char** argv) {
     next_arena60:;
 
     // =====================================================================
-    // 61. Arena: LIST op uses PRP-list from arena pool, PRP IOVA correct.
-    //           Regression: real LIST roundtrip with arena.
+    // 61. LIST op uses host-pinned growing PRP pool, PRP IOVA correct.
     // =====================================================================
-    TEST_CASE("72. arena LIST PRP from pool + regression");
+    TEST_CASE("72. host-pinned LIST PRP pool + regression");
     {
         constexpr std::uint64_t kListBytes = 1024 * 1024;  // 1 MiB
         LocalNvmeDataPath dp = make_qg_dp();
@@ -5579,21 +5643,21 @@ int main(int argc, char** argv) {
         wr.intent.target_offset = 0;
         wr.intent.length = kListBytes;
         auto out = dp.submit(&wr, 1, ctx);
-        CHECK(out.status.ok() && out.op.has_value(), "submit LIST write via arena");
+        CHECK(out.status.ok() && out.op.has_value(), "submit LIST write via host pool");
         if (out.op.has_value()) {
             cudaStreamSynchronize(s);
             CHECK(drain_to_terminal(dp, out.op.value()), "LIST drains to terminal");
             auto snap = dp.query(out.op.value());
             CHECK(snap.ok() && snap.value().state == OpState::COMPLETED,
-                  "LIST COMPLETED via arena");
+                  "LIST COMPLETED via host pool");
             CHECK(dp.test_op_has_prp_list_dma(out.op.value()),
-                  "LIST op has PRP-list from arena");
+                  "LIST op has host-pinned PRP-list lease");
             CHECK(dp.test_prp_list_page_count(out.op.value()) > 0,
                   "LIST op PRP page count > 0");
 
-            // Verify PRP IOVA is from the arena's DMA mapping.
+            // Verify host-pinned PRP IOVA is non-zero.
             std::uint64_t ioaddr0 = dp.test_prp_list_ioaddr(out.op.value(), 0);
-            CHECK(ioaddr0 != 0, "LIST PRP IOVA[0] non-zero (arena pool)");
+            CHECK(ioaddr0 != 0, "LIST PRP IOVA[0] non-zero (host pool)");
 
             // Read back and verify data.
             DataPathRequest rd;
@@ -5619,6 +5683,8 @@ int main(int argc, char** argv) {
         auto counts = dp.test_arena_alloc_counts();
         CHECK(counts.cuda_malloc == 0, "LIST hot path zero cudaMalloc");
         CHECK(counts.nvm_dma_map == 0, "LIST hot path zero nvm_dma_map");
+        CHECK(counts.gpu_prp_cuda_malloc == 0,
+              "LIST hot path zero GPU PRP allocation");
 
         cudaStreamDestroy(s);
         dp.unregister_memory(mem.value());
@@ -5630,9 +5696,9 @@ int main(int argc, char** argv) {
     next_arena61:;
 
     // =====================================================================
-    // 62. Arena: timeout op leaks slot, arena available decreases.
+    // 62. Timeout retains host PRP backing but returns GPU arena slot.
     // =====================================================================
-    TEST_CASE("73. arena timeout slot leak");
+    TEST_CASE("73. timeout host PRP retention + arena reuse");
     {
         constexpr std::uint64_t kListBytes = 1024 * 1024;
         LocalNvmeDataPath dp = make_qg_dp();
@@ -5683,7 +5749,7 @@ int main(int argc, char** argv) {
         CHECK(out.status.ok() && out.op.has_value(), "submit delayed LIST");
         if (out.op.has_value()) {
             CHECK(dp.test_op_has_prp_list_dma(out.op.value()),
-                  "LIST op owns PRP from arena");
+                  "LIST op owns host PRP lease");
             CHECK(dp.test_op_has_resources(out.op.value()),
                   "LIST op holds arena slot");
 
@@ -5698,20 +5764,14 @@ int main(int argc, char** argv) {
             cudaStreamSynchronize(s);
             CHECK(drain_to_terminal(dp, out.op.value()), "LIST drains after timeout");
 
-            // Release: the timeout slot should be leaked.
-            // (If the op completed successfully, has_timeout == false and
-            // the slot is returned normally.  If it timed out due to the
-            // sleep delay causing a CQ timeout, has_timeout == true and the
-            // slot is leaked.)
+            // GPU metadata slot is always reusable. If the controller timed
+            // out, host PRP backing is retained by the pool until safe teardown.
             if (dp.test_op_has_timeout(out.op.value())) {
-                printf("  op timed out (has_timeout == true): slot will be leaked\n");
+                printf("  op timed out: host PRP backing retained\n");
                 Status rel = dp.release(out.op.value());
                 CHECK(rel.ok(), "release timeout op");
-                // Arena available should be less than before (slot leaked).
-                CHECK(dp.test_arena_available() < avail_before,
-                      "arena available decreased after timeout leak");
-                printf("  arena available: %u -> %u (leaked 1 slot)\n",
-                       avail_before, dp.test_arena_available());
+                CHECK(dp.test_arena_available() == avail_before,
+                      "GPU arena slot returned after timeout");
             } else {
                 printf("  op completed normally (no timeout): slot returned\n");
                 Status rel = dp.release(out.op.value());
@@ -5736,7 +5796,7 @@ int main(int argc, char** argv) {
     // =====================================================================
     TEST_CASE("63. handle cache: repeated open hit");
     {
-        LocalNvmeDataPath dp(kSnvmeDevPath, kBar0Size,
+        LocalNvmeDataPath dp(kSnvmeDevPath,
                              kCudaDevice, kNumQueues,
                              kNamespaceId, kDeviceBlockSize,
                              0, 0, 0, /*handle_cache_cap=*/8, /*prp_cache_cap=*/0);
@@ -5783,7 +5843,7 @@ int main(int argc, char** argv) {
     {
         // Capacity 2: open 3 files, submit to 1st (in-flight), open 3rd
         // (evicts LRU), verify 1st's handle is NOT evicted (pinned).
-        LocalNvmeDataPath dp(kSnvmeDevPath, kBar0Size,
+        LocalNvmeDataPath dp(kSnvmeDevPath,
                              kCudaDevice, kNumQueues,
                              kNamespaceId, kDeviceBlockSize,
                              0, 0, 0, /*handle_cache_cap=*/2, /*prp_cache_cap=*/0);
@@ -5862,7 +5922,7 @@ int main(int argc, char** argv) {
     // =====================================================================
     TEST_CASE("65. handle cache: eviction after close");
     {
-        LocalNvmeDataPath dp(kSnvmeDevPath, kBar0Size,
+        LocalNvmeDataPath dp(kSnvmeDevPath,
                              kCudaDevice, kNumQueues,
                              kNamespaceId, kDeviceBlockSize,
                              0, 0, 0, /*handle_cache_cap=*/1, /*prp_cache_cap=*/0);
@@ -5905,11 +5965,11 @@ int main(int argc, char** argv) {
     next_t65:;
 
     // =====================================================================
-    // 66. PRP cache: repeated LIST submit hits cache (no H2D fill)
+    // 66. PRP cache: repeated LIST submit hits host cache
     // =====================================================================
     TEST_CASE("66. PRP cache: repeated LIST hit");
     {
-        LocalNvmeDataPath dp(kSnvmeDevPath, kBar0Size,
+        LocalNvmeDataPath dp(kSnvmeDevPath,
                              kCudaDevice, kNumQueues,
                              kNamespaceId, kDeviceBlockSize,
                              0, 0, 0, /*handle_cache_cap=*/0, /*prp_cache_cap=*/32);
@@ -5940,7 +6000,7 @@ int main(int argc, char** argv) {
         cudaStream_t s; cudaStreamCreate(&s);
         HostSubmitContext ctx{ExecutionDomain::DEVICE_EXECUTION, 0, s};
 
-        // First LIST write: cache miss (fill + H2D).
+        // First LIST write: host-cache miss and direct host-page fill.
         launch_fill_pattern(buf, 0x77, io_size, (void*)s);
         DataPathRequest wr;
         wr.intent.direction = IoDirection::WRITE;
@@ -6001,6 +6061,69 @@ int main(int argc, char** argv) {
         ::unlink(rf.path.c_str());
     }
     next_t66:;
+
+    // Cache capacity 1, two distinct LIST pages in one batch: the second
+    // checkout exhausts the cache and the batch must fall back to the growing
+    // host-pinned pool without any GPU PRP allocation.
+    TEST_CASE("66b. PRP cache exhaustion falls back to host pool");
+    {
+        constexpr std::uint64_t kList = 1024 * 1024;
+        constexpr std::uint64_t kTotal = 2 * kList;
+        LocalNvmeDataPath dp(kSnvmeDevPath, kCudaDevice, kNumQueues,
+                             kNamespaceId, kDeviceBlockSize,
+                             0, 0, 0, /*handle_cache_cap=*/0,
+                             /*prp_cache_cap=*/1);
+        CHECK(init_dp(dp).ok(), "initialize cache capacity 1");
+        dp.test_arena_reset_alloc_counts();
+        auto rf = make_resolved_file("round11_t66b.bin", kTotal, 0x6B);
+        CHECK(rf.target.ok(), "resolve 2MiB LIST file");
+        if (!rf.target.ok()) { dp.shutdown(0); goto next_t66b; }
+        {
+            auto opened = dp.open(rf.target.value());
+            CHECK(opened.ok(), "open 2MiB target");
+            void* raw = nullptr;
+            void* buf = cuda_malloc_aligned_64k(kTotal, &raw);
+            auto mem = dp.register_memory(
+                DataPathMemoryView{buf, kTotal, 0, DataPathMemoryKind::DEVICE},
+                primary_registration_domain());
+            CHECK(buf && mem.ok(), "alloc/register 2MiB memory");
+            if (opened.ok() && buf && mem.ok()) {
+                cudaStream_t s; cudaStreamCreate(&s);
+                launch_fill_pattern(buf, 0x6B, kTotal, (void*)s);
+                cudaStreamSynchronize(s);
+                HostSubmitContext ctx{ExecutionDomain::DEVICE_EXECUTION, 0, s};
+                DataPathRequest reqs[2];
+                for (std::uint32_t i = 0; i < 2; ++i) {
+                    reqs[i].intent.direction = IoDirection::WRITE;
+                    reqs[i].memory = mem.value();
+                    reqs[i].intent.memory_offset = i * kList;
+                    reqs[i].target = opened.value();
+                    reqs[i].intent.target_offset = i * kList;
+                    reqs[i].intent.length = kList;
+                }
+                auto out = dp.submit(reqs, 2, ctx);
+                CHECK(out.status.ok() && out.op.has_value(),
+                      "cache-exhausted LIST batch submits via host pool");
+                if (out.op.has_value()) {
+                    cudaStreamSynchronize(s);
+                    CHECK(drain_to_terminal(dp, out.op.value()),
+                          "cache-exhausted LIST batch drains");
+                    dp.release(out.op.value());
+                }
+                auto stats = dp.test_prp_cache_stats();
+                CHECK(stats.misses >= 2, "two distinct cache misses observed");
+                CHECK(dp.test_arena_alloc_counts().gpu_prp_cuda_malloc == 0,
+                      "cache exhaustion performs zero GPU PRP allocation");
+                cudaStreamDestroy(s);
+                dp.unregister_memory(mem.value());
+            }
+            if (raw) cudaFree(raw);
+            if (opened.ok()) dp.close(opened.value());
+        }
+        dp.shutdown(0);
+        ::unlink(rf.path.c_str());
+    }
+    next_t66b:;
 
     // =====================================================================
     // 67. Same-stream compute→IO→compute ordering (no host sync between ops)
@@ -6605,7 +6728,7 @@ int main(int argc, char** argv) {
         // dp_big: every optional knob set to a distinct, non-default value
         // to prove the four caps vary independently of each other.
         LocalNvmeDataPath dp_big(
-            kSnvmeDevPath, kBar0Size,
+            kSnvmeDevPath,
             kCudaDevice, kNumQueues,
             kNamespaceId, kDeviceBlockSize,
             /*mdts_bytes=*/0, /*max_batch_entries=*/512,
@@ -6634,7 +6757,7 @@ int main(int argc, char** argv) {
         // dp_def: all new optional params left at 0 -> must reproduce the
         // exact pre-S4 constructor behavior (16 / 256 / follow-entries /
         // entries*effective_mdts).
-        LocalNvmeDataPath dp_def(kSnvmeDevPath, kBar0Size,
+        LocalNvmeDataPath dp_def(kSnvmeDevPath,
                                  kCudaDevice, kNumQueues,
                                  kNamespaceId, kDeviceBlockSize);
         CHECK(init_dp(dp_def).ok(), "initialize dp_def (all-default capacity)");
@@ -6738,21 +6861,21 @@ int main(int argc, char** argv) {
         // resolver/components lists only include what's mounted.
         const auto& dev0 = g_devices.at(0);
         const auto& dev1 = g_devices.at(1);
-        LocalNvmeDataPath dp0(dev0.ssnvme_path, dev0.bar0_size, kCudaDev,
+        LocalNvmeDataPath dp0(dev0.ssnvme_path, kCudaDev,
                               kNumQueues, dev0.namespace_id, dev0.block_size);
-        LocalNvmeDataPath dp1(dev1.ssnvme_path, dev1.bar0_size, kCudaDev,
+        LocalNvmeDataPath dp1(dev1.ssnvme_path, kCudaDev,
                               kNumQueues, dev1.namespace_id, dev1.block_size);
         std::unique_ptr<LocalNvmeDataPath> dp2, dp3;
         if (num_avail >= 3) {
             const auto& dev2 = g_devices.at(2);
             dp2 = std::make_unique<LocalNvmeDataPath>(
-                dev2.ssnvme_path, dev2.bar0_size, kCudaDev, kNumQueues,
+                dev2.ssnvme_path, kCudaDev, kNumQueues,
                 dev2.namespace_id, dev2.block_size);
         }
         if (num_avail >= 4) {
             const auto& dev3 = g_devices.at(3);
             dp3 = std::make_unique<LocalNvmeDataPath>(
-                dev3.ssnvme_path, dev3.bar0_size, kCudaDev, kNumQueues,
+                dev3.ssnvme_path, kCudaDev, kNumQueues,
                 dev3.namespace_id, dev3.block_size);
         }
 
@@ -7380,7 +7503,7 @@ int main(int argc, char** argv) {
         const std::uint64_t io_size = kBlockSize * 4;
 
         // Enable handle cache with capacity=1 to force eviction path.
-        LocalNvmeDataPath dp_hc(kSnvmeDevPath, kBar0Size, kCudaDev, kNumQueues,
+        LocalNvmeDataPath dp_hc(kSnvmeDevPath, kCudaDev, kNumQueues,
                                 primary_device().namespace_id,
                                 primary_device().block_size,
                                 /*mdts*/0, /*max_batch_entries*/256,

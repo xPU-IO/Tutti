@@ -1,5 +1,4 @@
 #pragma once
-
 #include "tutti/data_paths/local_nvme/io/prp_builder.h"  // AddressDescriptor
 
 // tutti/data_paths/striped_local_nvme/fused_submit_kernel.cuh

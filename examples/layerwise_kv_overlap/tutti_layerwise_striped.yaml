@@ -3,10 +3,6 @@
 #
 # 运行时由 TuttiRuntime 从本文件组装；设备、队列、挂载等部署事实全部来自
 # daemon，应用侧不感知 PCI BDF / chrdev / 挂载点。
-# 运行示例：
-#   sudo ./build/cuda-module/bin/tutti_layerwise_kv_overlap --striped \
-#     --directory /mnt/gpu0/ssnvme0 --directory /mnt/gpu0/ssnvme1 \
-#     --directory /mnt/gpu0/ssnvme2 --directory /mnt/gpu0/ssnvme3
 # ============================================================================
 
 # ---------------------------------------------------------------------------

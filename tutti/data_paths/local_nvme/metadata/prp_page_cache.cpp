@@ -11,6 +11,7 @@
 #include <nvm_dma.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 
@@ -24,14 +25,15 @@ bool PrpPageCache::init(const Config& cfg, nvm_ctrl_t* ctrl) {
     cfg_ = cfg;
     ctrl_ = ctrl;
 
-    // Host-pinned pool: cudaHostAlloc + one nvm_dma_map_data_host for the
-    // whole pool.  The NVMe controller DMAs PRP lists from host DRAM;
-    // fills are plain host memcpy.
+    // Allocate page-aligned host memory, then let nvm_dma_map_data_host pin
+    // and DMA-map it.  CUDA host allocations are not valid backing for this
+    // kernel get_user_pages path on every deployment: the mapping can succeed
+    // while the controller observes stale/zero PRP-list entries.
     const std::size_t bytes =
         static_cast<std::size_t>(cfg_.capacity) * cfg_.page_size;
-
 #if defined(TUTTI_USE_HOST)
-    std::fprintf(stderr, "[prp_cache] init: HOST profile has no pinned-host allocator\n");
+    std::fprintf(stderr,
+                 "[prp_cache] init: HOST profile has no pinned-host allocator\n");
     return false;
 #elif defined(TUTTI_USE_MACA)
     // MACA cudaHostAlloc page can't get user page for its own memory framework
@@ -47,14 +49,15 @@ bool PrpPageCache::init(const Config& cfg, nvm_ctrl_t* ctrl) {
                      "[prp_cache] init: cudaHostRegister(%zu bytes) failed: %s\n",
                      bytes, cudaGetErrorString(ce));
         free(pool_host_);
+        pool_host_ = nullptr;
         return false;
     }
 #else
-    cudaError_t ce = cudaHostAlloc(&pool_host_, bytes, cudaHostAllocDefault);
-    if (ce != cudaSuccess || pool_host_ == nullptr) {
+    const int alloc_rc = posix_memalign(&pool_host_, cfg_.page_size, bytes);
+    if (alloc_rc != 0 || pool_host_ == nullptr) {
         std::fprintf(stderr,
-                     "[prp_cache] init: cudaHostAlloc(%zu bytes) failed: %s\n",
-                     bytes, cudaGetErrorString(ce));
+                     "[prp_cache] init: posix_memalign(%zu bytes) failed: rc=%d\n",
+                     bytes, alloc_rc);
         return false;
     }
 #endif
@@ -68,7 +71,7 @@ bool PrpPageCache::init(const Config& cfg, nvm_ctrl_t* ctrl) {
         cudaHostUnregister(pool_host_);
         free(pool_host_);
 #else
-        cudaFreeHost(pool_host_);
+        std::free(pool_host_);
 #endif
         pool_host_ = nullptr;
         return false;
@@ -88,24 +91,26 @@ bool PrpPageCache::init(const Config& cfg, nvm_ctrl_t* ctrl) {
     return true;
 }
 
-void PrpPageCache::shutdown() {
+void PrpPageCache::shutdown(bool retain) {
     std::lock_guard<std::mutex> lock(mtx_);
     if (!initialized_) return;
 
-    // DMA unmap FIRST, then free host memory (lives/dies together).
-    if (pool_dma_) {
-        nvm_dma_unmap(pool_dma_);
-        pool_dma_ = nullptr;
-    }
-    if (pool_host_) {
+    // A timed-out controller command may still fetch the PRP list.  Retain
+    // both DMA mapping and host backing together in that case.  Otherwise
+    // DMA unmap FIRST, then free host memory (they live/die together).
+    if (!retain) {
+        if (pool_dma_) nvm_dma_unmap(pool_dma_);
+        if (pool_host_) {
 #if defined(TUTTI_USE_MACA)
-        cudaHostUnregister(pool_host_);
-        free(pool_host_);
+            cudaHostUnregister(pool_host_);
+            std::free(pool_host_);
 #else
-        cudaFreeHost(pool_host_);
+            std::free(pool_host_);
 #endif
-        pool_host_ = nullptr;
+        }
     }
+    pool_dma_ = nullptr;
+    pool_host_ = nullptr;
 
     entries_.clear();
     free_list_.clear();

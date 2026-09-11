@@ -5,7 +5,7 @@
 // Single-tier content-addressed LRU cache for PRP-list pages.
 //
 // Design (2026-08-20 rework, replaces the GPU-resident pool):
-//   The pool is host-pinned memory (cudaHostAlloc), DMA-mapped with
+//   The pool is page-aligned host memory, pinned and DMA-mapped with
 //   nvm_dma_map_data_host once at init().  This makes the miss path a plain
 //   host memcpy — no cudaMemcpy, no stream, no event fencing:
 //     - fill_prp_list_page() writes the page content directly into the pool
@@ -15,10 +15,8 @@
 //       one PCIe fetch either way, equivalent to fetching from GPU memory.
 //     - Host RAM is the right tier for page tables at GB-scale working
 //       sets; HBM is left for payload data.
-//   Sizing requirement: the pool MUST hold the whole deployment working set
-//   (all LIST keys of all registered memories).  Exhaustion falls back to
-//   the arena path (correct, slower) — size prp_cache_capacity accordingly
-//   (~1-2 GB per device for KV-cache-scale deployments).
+//   Exhaustion falls back to the growing host-pinned PrpBufPool; there is no
+//   GPU PRP backing.
 //
 // DMA lifecycle:
 //   The cache owns one contiguous host-pinned allocation and one shared
@@ -99,9 +97,9 @@ public:
     PrpPageCache(const PrpPageCache&) = delete;
     PrpPageCache& operator=(const PrpPageCache&) = delete;
 
-    // Pre-allocate the pool: one cudaHostAlloc + one nvm_dma_map_data_host.
+    // Pre-allocate the pool: one aligned allocation + one DMA map/pin.
     bool init(const Config& cfg, nvm_ctrl_t* ctrl);
-    void shutdown();
+    void shutdown(bool retain = false);
 
     bool enabled() const { return cfg_.capacity > 0 && initialized_; }
     std::uint32_t capacity() const { return cfg_.capacity; }

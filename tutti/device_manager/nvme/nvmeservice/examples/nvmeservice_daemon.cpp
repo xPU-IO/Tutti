@@ -153,7 +153,6 @@ int main(int argc, char** argv) {
                     << " blk=" << d.logical_block_size
                     << " qdepth=" << d.queue_depth
                     << " dstrd=" << d.dstrd
-                    << " bar0=" << d.bar0_size
                     << " max_user_qid=" << d.max_user_qid
                     << " max_q/grp=" << d.max_queues_per_group
                     << "\n";

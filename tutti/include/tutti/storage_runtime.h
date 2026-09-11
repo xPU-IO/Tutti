@@ -157,6 +157,7 @@ struct IoSnapshot {
 struct IoResult {
     IoState state = IoState::COMPLETED;
     Status status;
+    IoCompletionDetail detail;
 };
 
 // WaitOutcome distinguishes observation status from operation terminal state.
@@ -402,6 +403,7 @@ public:
         entry.ownership = MemoryOwnership::RUNTIME_OWNED;
         entry.kind = spec.kind;
         entry.accel_id = spec.accel_id;
+        entry.io_granularity = 0;
         entry.inflight_count = 0;
         entry.data_path_registrations.clear();
         return MemoryAllocation{
@@ -489,6 +491,7 @@ public:
             : ((view.expected_kind == MemoryKind::DEVICE ||
                 view.expected_kind == MemoryKind::MANAGED)
                ? config_.accel_id : -1);
+        entry.io_granularity = view.io_granularity;
         entry.inflight_count = 0;
         entry.data_path_registrations.clear();
         return MemoryHandle(runtime_id_, slot, gen);
@@ -956,6 +959,7 @@ public:
         entry.terminal = false;
         entry.released = false;
         entry.io_status = Status::Ok();
+        entry.completion_detail = IoCompletionDetail{};
         entry.data_path_operations.clear();
         entry.memory_slots.clear();
         entry.target_slots.clear();
@@ -999,6 +1003,10 @@ public:
     WaitOutcome wait(const IoHandle& handle,
                      std::uint64_t timeout_ms) {
         std::unique_lock<std::mutex> lock(registry_mutex_);
+        auto retained = released_results_.find(handle_key_(handle));
+        if (retained != released_results_.end()) {
+            return WaitOutcome{Status::Ok(), retained->second};
+        }
         if (!validate_io_(handle)) {
             return WaitOutcome{
                 Status(StatusCode::NOT_FOUND, "invalid IO handle"),
@@ -1009,7 +1017,8 @@ public:
             return WaitOutcome{
                 Status::Ok(),
                 IoResult{io_entries_[slot].state,
-                         io_entries_[slot].io_status}};
+                         io_entries_[slot].io_status,
+                         io_entries_[slot].completion_detail}};
         }
         if (timeout_ms == 0) {
             return WaitOutcome{
@@ -1024,7 +1033,8 @@ public:
                 return WaitOutcome{
                     Status::Ok(),
                     IoResult{io_entries_[slot].state,
-                             io_entries_[slot].io_status}};
+                             io_entries_[slot].io_status,
+                             io_entries_[slot].completion_detail}};
             }
             if (std::chrono::steady_clock::now() >= deadline) {
                 return WaitOutcome{
@@ -1038,6 +1048,27 @@ public:
             io_cv_.wait_for(lock, std::chrono::microseconds(50),
                             [this, slot]{ return io_entries_[slot].terminal; });
         }
+    }
+
+    // Structured counterpart to wait(). wait() remains source-compatible and
+    // now carries the same detail in WaitOutcome::result.
+    WaitOutcome wait_result(const IoHandle& handle,
+                            std::uint64_t timeout_ms) {
+        return wait(handle, timeout_ms);
+    }
+
+    // Convenience API for callers that only accept a terminal result.
+    Result<IoResult> wait_detail(const IoHandle& handle,
+                                 std::uint64_t timeout_ms) {
+        WaitOutcome outcome = wait_result(handle, timeout_ms);
+        if (!outcome.observation_status.ok()) {
+            return Result<IoResult>::Failure(outcome.observation_status);
+        }
+        if (!outcome.result.has_value()) {
+            return Result<IoResult>::Failure(Status(
+                StatusCode::INTERNAL, "terminal wait returned no result"));
+        }
+        return Result<IoResult>::Success(std::move(outcome.result.value()));
     }
 
     Status release_io(const IoHandle& handle) {
@@ -1061,6 +1092,8 @@ public:
             if (!status.ok()) return status;
         }
         entry.data_path_operations.clear();
+        released_results_[handle_key_(handle)] = IoResult{
+            entry.state, entry.io_status, entry.completion_detail};
         entry.released = true;
         entry.active = false;
         if (terminal_result_count_ > 0) {
@@ -1084,6 +1117,7 @@ private:
         MemoryOwnership ownership = MemoryOwnership::CALLER_OWNED;
         MemoryKind kind = MemoryKind::HOST;
         std::int32_t accel_id = -1;
+        std::uint64_t io_granularity = 0;
         int inflight_count = 0;
         std::vector<DataPathMemoryRegistration> data_path_registrations;
     };
@@ -1103,6 +1137,10 @@ private:
     struct DataPathOperation {
         DataPath* data_path = nullptr;
         DataPathOp op;
+        // DataPath completion indices are local to the request array passed
+        // to DataPath::submit(). Preserve the corresponding public Runtime
+        // indices so REQUEST_INDICES can be translated without guessing.
+        std::vector<std::size_t> request_indices;
     };
 
     struct IoEntry {
@@ -1113,6 +1151,7 @@ private:
         bool released = false;
         bool references_released = false;
         Status io_status;
+        IoCompletionDetail completion_detail;
         std::vector<DataPathOperation> data_path_operations;
         std::vector<std::uint32_t> memory_slots;
         std::vector<std::uint32_t> target_slots;
@@ -1205,6 +1244,7 @@ private:
         }
         initialized_data_paths_.clear();
         progress_gates_.clear();
+        released_results_.clear();
         state_.store(RuntimeState::STOPPED);
         (void)lock;
         return Status::Ok();
@@ -1430,8 +1470,10 @@ private:
         return Status::Ok();
     }
 
-    Result<DataPathMemory> registration_for_(MemoryEntry& memory,
-                                              const TargetEntry& target) {
+    Result<DataPathMemory> registration_for_(
+        MemoryEntry& memory,
+        const TargetEntry& target,
+        std::int32_t data_path_accel_id) {
         for (const auto& registration : memory.data_path_registrations) {
             if (registration.data_path == target.data_path &&
                 registration.domain == target.registration_domain) {
@@ -1444,13 +1486,18 @@ private:
              memory.kind == MemoryKind::MANAGED)
             ? DataPathMemoryKind::DEVICE
             : DataPathMemoryKind::HOST;
-        DataPathMemoryView view{memory.address, memory.size, memory.accel_id, kind};
-        auto registration = call_data_path_result_<DataPathMemory>(
-            *target.data_path,
-            [&] {
-                return target.data_path->register_memory(
-                    view, target.registration_domain);
-            });
+        DataPathMemoryView view{memory.address, memory.size, memory.accel_id,
+                                kind, memory.io_granularity};
+        DeviceGuard guard(data_path_accel_id);
+        if (!guard.ok()) {
+            return Result<DataPathMemory>::Failure(guard.status());
+        }
+        auto registration = target.data_path->register_memory(
+            view, target.registration_domain);
+        Status restored = guard.restore();
+        if (!restored.ok()) {
+            return Result<DataPathMemory>::Failure(std::move(restored));
+        }
         if (!registration.ok()) {
             return Result<DataPathMemory>::Failure(registration.status());
         }
@@ -1522,15 +1569,10 @@ private:
 #endif
     }
 
-    Status validate_component_request_(const IoRequest& request,
-                                       const TargetEntry& target,
-                                       const MemoryEntry& memory,
-                                       const HostSubmitContext& context) const {
-        const DataPathCapabilities& caps = target.data_path->capabilities();
-        // HOST_EXECUTION has no accelerator ownership.  Preserve the
-        // historical host contract where callers may leave a legacy ordinal
-        // in this field; it is ignored when this Runtime itself is host-only.
-        // Accelerator Runtimes still reject an explicit mismatching ordinal.
+    Status validate_submit_context_(const HostSubmitContext& context) const {
+        // These fields are invariant across every request in one submit.
+        // Validate them once so a wide byte-range batch does not issue one
+        // cudaStreamGetDevice call per request.
         if (context.accel_id >= 0 && config_.accel_id >= 0 &&
             context.accel_id != config_.accel_id) {
             return Status(StatusCode::INVALID_ARGUMENT,
@@ -1541,51 +1583,60 @@ private:
             return Status(StatusCode::INVALID_ARGUMENT,
                           "submit accelerator does not match Runtime");
         }
+        if (context.execution_domain != ExecutionDomain::DEVICE_EXECUTION) {
+            return Status::Ok();
+        }
+        const std::int32_t effective_accel_id = context.accel_id >= 0
+            ? context.accel_id : config_.accel_id;
+        if (config_.accel_id < 0 || effective_accel_id != config_.accel_id) {
+            return Status(StatusCode::INVALID_ARGUMENT,
+                          "submit accelerator does not match Runtime");
+        }
+        if (context.stream == nullptr) {
+            return Status(StatusCode::INVALID_ARGUMENT,
+                          "DEVICE_EXECUTION requires a non-null stream");
+        }
+#if defined(TUTTI_USE_CUDA)
+        int stream_accel_id = -1;
+        const cudaError_t stream_error =
+            cudaStreamGetDevice(context.stream, &stream_accel_id);
+        if (stream_error != cudaSuccess) {
+            return Status(StatusCode::DEVICE_ERROR,
+                          "stream accelerator ownership query failed: " +
+                          std::string(cudaGetErrorString(stream_error)));
+        }
+        if (stream_accel_id != config_.accel_id) {
+            return Status(StatusCode::INVALID_ARGUMENT,
+                          "stream belongs to a different Runtime accelerator");
+        }
+#endif
+        return Status::Ok();
+    }
+
+    Status validate_data_path_context_(
+        const DataPathCapabilities& caps,
+        const HostSubmitContext& context) const {
         if (context.execution_domain == ExecutionDomain::HOST_EXECUTION &&
             !caps.supports_host_execution) {
             return Status(StatusCode::UNSUPPORTED,
                           "DataPath does not support HOST_EXECUTION");
         }
-        if (context.execution_domain == ExecutionDomain::DEVICE_EXECUTION) {
-            const std::int32_t effective_accel_id = context.accel_id >= 0
-                ? context.accel_id : config_.accel_id;
-            if (config_.accel_id < 0 || effective_accel_id != config_.accel_id) {
-                return Status(StatusCode::INVALID_ARGUMENT,
-                              "submit accelerator does not match Runtime");
-            }
-            if (memory.kind == MemoryKind::DEVICE ||
-                memory.kind == MemoryKind::MANAGED) {
-                if (memory.accel_id >= 0 && memory.accel_id != config_.accel_id) {
-                    return Status(StatusCode::INVALID_ARGUMENT,
-                                  "device memory accelerator does not match Runtime");
-                }
-            }
-            if (!caps.supports_device_execution) {
-                return Status(StatusCode::UNSUPPORTED,
-                              "DataPath does not support DEVICE_EXECUTION");
-            }
-            if (context.stream == nullptr) {
-                return Status(StatusCode::INVALID_ARGUMENT,
-                              "DEVICE_EXECUTION requires a non-null stream");
-            }
-#if defined(TUTTI_USE_CUDA)
-            int stream_accel_id = -1;
-            const cudaError_t stream_error =
-                cudaStreamGetDevice(context.stream, &stream_accel_id);
-            if (stream_error != cudaSuccess) {
-                return Status(StatusCode::DEVICE_ERROR,
-                              "stream accelerator ownership query failed: " +
-                              std::string(cudaGetErrorString(stream_error)));
-            }
-            if (stream_accel_id != config_.accel_id) {
-                return Status(StatusCode::INVALID_ARGUMENT,
-                              "stream belongs to a different Runtime accelerator");
-            }
-#else
-            // MUSA/MACA shims currently have no portable stream-owner query;
-            // callers must create/pass the stream on the Runtime accelerator.
-            // Pointer ownership remains fail-closed where the shim exposes it.
-#endif
+        if (context.execution_domain == ExecutionDomain::DEVICE_EXECUTION &&
+            !caps.supports_device_execution) {
+            return Status(StatusCode::UNSUPPORTED,
+                          "DataPath does not support DEVICE_EXECUTION");
+        }
+        return Status::Ok();
+    }
+
+    Status validate_component_memory_(
+        const MemoryEntry& memory,
+        const DataPathCapabilities& caps) const {
+        if ((memory.kind == MemoryKind::DEVICE ||
+             memory.kind == MemoryKind::MANAGED) &&
+            memory.accel_id >= 0 && memory.accel_id != config_.accel_id) {
+            return Status(StatusCode::INVALID_ARGUMENT,
+                          "device memory accelerator does not match Runtime");
         }
         Status pointer_status = validate_pointer_accel_(
             memory.address, memory.kind, memory.accel_id);
@@ -1597,6 +1648,12 @@ private:
             return Status(StatusCode::UNSUPPORTED,
                           "DataPath does not support the request memory kind");
         }
+        return Status::Ok();
+    }
+
+    Status validate_component_request_(
+        const IoRequest& request,
+        const DataPathCapabilities& caps) const {
         if ((request.direction == IoDirection::READ && !caps.supports_read) ||
             (request.direction == IoDirection::WRITE && !caps.supports_write)) {
             return Status(StatusCode::UNSUPPORTED,
@@ -1645,6 +1702,11 @@ private:
             reject_all(Status(StatusCode::INVALID_ARGUMENT, "null requests"));
             return outcome;
         }
+        Status context_status = validate_submit_context_(context);
+        if (!context_status.ok()) {
+            reject_all(std::move(context_status));
+            return outcome;
+        }
         if (terminal_result_count_ >= config_.max_terminal_results) {
             reject_all(Status(StatusCode::RESOURCE_EXHAUSTED,
                               "terminal result limit reached"));
@@ -1657,10 +1719,23 @@ private:
         // target). See spi/data_path.h for the SPI contract.
         struct PendingGroup {
             DataPath* data_path = nullptr;
+            std::int32_t data_path_accel_id = -1;
             std::vector<std::size_t> indices;
             std::vector<DataPathRequest> requests;
         };
         std::vector<PendingGroup> groups;
+        struct DataPathValidation {
+            DataPath* data_path = nullptr;
+            const DataPathCapabilities* capabilities = nullptr;
+            Status status;
+        };
+        struct MemoryValidation {
+            DataPath* data_path = nullptr;
+            std::uint32_t memory_slot = 0;
+            Status status;
+        };
+        std::vector<DataPathValidation> data_path_validations;
+        std::vector<MemoryValidation> memory_validations;
         Status first_rejection(StatusCode::INVALID_ARGUMENT,
                                "all requests rejected");
         bool have_rejection = false;
@@ -1688,12 +1763,53 @@ private:
                                          "target has no DataPath"));
                 continue;
             }
-            status = validate_component_request_(request, target, memory, context);
+            auto data_path_validation = std::find_if(
+                data_path_validations.begin(), data_path_validations.end(),
+                [&](const DataPathValidation& cached) {
+                    return cached.data_path == target.data_path;
+            });
+            if (data_path_validation == data_path_validations.end()) {
+                const DataPathCapabilities& capabilities =
+                    target.data_path->capabilities();
+                data_path_validations.push_back(DataPathValidation{
+                    target.data_path,
+                    &capabilities,
+                    validate_data_path_context_(capabilities, context)});
+                data_path_validation = std::prev(data_path_validations.end());
+            }
+            if (!data_path_validation->status.ok()) {
+                reject_one(index, data_path_validation->status);
+                continue;
+            }
+            auto memory_validation = std::find_if(
+                memory_validations.begin(), memory_validations.end(),
+                [&](const MemoryValidation& cached) {
+                    return cached.data_path == target.data_path &&
+                           cached.memory_slot == request.memory.slot_;
+                });
+            if (memory_validation == memory_validations.end()) {
+                memory_validations.push_back(MemoryValidation{
+                    target.data_path, request.memory.slot_,
+                    validate_component_memory_(
+                        memory, *data_path_validation->capabilities)});
+                memory_validation = std::prev(memory_validations.end());
+            }
+            if (!memory_validation->status.ok()) {
+                reject_one(index, memory_validation->status);
+                continue;
+            }
+            status = validate_component_request_(
+                request, *data_path_validation->capabilities);
             if (!status.ok()) {
                 reject_one(index, std::move(status));
                 continue;
             }
-            auto registration = registration_for_(memory, target);
+            const std::int32_t data_path_accel_id =
+                data_path_validation->capabilities->bound_accel_id >= 0
+                ? data_path_validation->capabilities->bound_accel_id
+                : config_.accel_id;
+            auto registration = registration_for_(
+                memory, target, data_path_accel_id);
             if (!registration.ok()) {
                 reject_one(index, registration.status());
                 continue;
@@ -1710,6 +1826,7 @@ private:
                 groups.push_back(PendingGroup{});
                 group = &groups.back();
                 group->data_path = target.data_path;
+                group->data_path_accel_id = data_path_accel_id;
             }
             group->indices.push_back(index);
             group->requests.push_back(DataPathRequest{
@@ -1735,6 +1852,7 @@ private:
         entry.released = false;
         entry.references_released = false;
         entry.io_status = Status::Ok();
+        entry.completion_detail = IoCompletionDetail{};
         entry.data_path_operations.clear();
         entry.memory_slots.clear();
         entry.target_slots.clear();
@@ -1777,7 +1895,7 @@ private:
             SubmitOutcome submitted;
             Status guard_status = Status::Ok();
             {
-                DeviceGuard guard(data_path_accel_id_(*group.data_path));
+                DeviceGuard guard(group.data_path_accel_id);
                 if (!guard.ok()) {
                     guard_status = guard.status();
                 } else if (gate_ptr) {
@@ -1852,7 +1970,8 @@ private:
             }
             if (has_op && group_has_accepted) {
                 entry.data_path_operations.push_back(
-                    DataPathOperation{group.data_path, submitted.op.value()});
+                    DataPathOperation{group.data_path, submitted.op.value(),
+                                      group.indices});
             } else if (has_op) {
                 // DataPath returned an op but no request in this group
                 // was accepted — release the orphan op.
@@ -1953,13 +2072,21 @@ private:
         entry.references_released = true;
     }
 
-    void finish_io_(IoEntry& entry, IoState state, Status status) {
+    void finish_io_(IoEntry& entry, IoState state, Status status,
+                    IoCompletionDetail detail = {}) {
         if (entry.terminal) {
             return;
+        }
+        if (state == IoState::FAILED &&
+            detail.failure_kind == IoFailureKind::NONE) {
+            detail.failure_kind = IoFailureKind::UNKNOWN;
+            detail.failure_scope = IoFailureScope::WHOLE_OPERATION;
+            detail.timeout_seen = status.code() == StatusCode::TIMEOUT;
         }
         entry.state = state;
         entry.terminal = true;
         entry.io_status = std::move(status);
+        entry.completion_detail = std::move(detail);
         ++terminal_result_count_;
         release_inflight_references_(entry);
         // Notify any waiters blocked on shutdown()/wait().
@@ -1988,6 +2115,9 @@ private:
         bool all_terminal = true;
         bool failed = false;
         Status first_failure = Status::Ok();
+        IoCompletionDetail completion_detail;
+        std::uint64_t confirmed_bytes = 0;
+        bool have_failure_detail = false;
         for (const auto& sub_op : entry.data_path_operations) {
             // Acquire the progress gate so query() does not overlap with
             // a concurrent progress() on the same DataPath.
@@ -2005,21 +2135,88 @@ private:
                 failed = true;
                 if (first_failure.ok()) {
                     first_failure = snapshot.status();
+                    completion_detail.failure_kind = IoFailureKind::UNKNOWN;
+                    completion_detail.failure_scope =
+                        IoFailureScope::WHOLE_OPERATION;
                 }
                 continue;
             }
             if (snapshot.value().state == OpState::IN_FLIGHT) {
                 all_terminal = false;
-            } else if (snapshot.value().state == OpState::FAILED) {
+                continue;
+            }
+
+            const std::uint64_t sub_confirmed =
+                (snapshot.value().state == OpState::COMPLETED &&
+                 snapshot.value().detail.confirmed_bytes == 0)
+                    ? snapshot.value().bytes_transferred
+                    : snapshot.value().detail.confirmed_bytes;
+            confirmed_bytes += sub_confirmed;
+            if (snapshot.value().state == OpState::FAILED) {
                 failed = true;
+                IoCompletionDetail detail = snapshot.value().detail;
+                if (detail.failure_scope == IoFailureScope::REQUEST_INDICES) {
+                    std::vector<std::uint32_t> translated;
+                    translated.reserve(detail.failed_request_indices.size());
+                    bool mapping_valid = true;
+                    for (std::uint32_t local : detail.failed_request_indices) {
+                        if (local >= sub_op.request_indices.size() ||
+                            sub_op.request_indices[local] > UINT32_MAX) {
+                            mapping_valid = false;
+                            break;
+                        }
+                        translated.push_back(static_cast<std::uint32_t>(
+                            sub_op.request_indices[local]));
+                    }
+                    if (mapping_valid) {
+                        detail.failed_request_indices = std::move(translated);
+                    } else {
+                        detail.failure_scope = IoFailureScope::WHOLE_OPERATION;
+                        detail.failed_request_indices.clear();
+                    }
+                }
                 if (first_failure.ok()) {
                     first_failure = snapshot.value().status;
+                    completion_detail = detail;
+                    have_failure_detail = true;
+                } else {
+                    completion_detail.timeout_seen |= detail.timeout_seen;
+                    if (completion_detail.failure_scope ==
+                            IoFailureScope::WHOLE_OPERATION ||
+                        detail.failure_scope == IoFailureScope::WHOLE_OPERATION) {
+                        completion_detail.failure_scope =
+                            IoFailureScope::WHOLE_OPERATION;
+                        completion_detail.failed_request_indices.clear();
+                    } else if (detail.failure_scope ==
+                               IoFailureScope::REQUEST_INDICES) {
+                        completion_detail.failure_scope =
+                            IoFailureScope::REQUEST_INDICES;
+                        for (std::uint32_t index :
+                             detail.failed_request_indices) {
+                            if (std::find(
+                                    completion_detail.failed_request_indices.begin(),
+                                    completion_detail.failed_request_indices.end(),
+                                    index) ==
+                                completion_detail.failed_request_indices.end()) {
+                                completion_detail.failed_request_indices.push_back(
+                                    index);
+                            }
+                        }
+                    }
                 }
             }
         }
         if (!all_terminal && !failed) {
-            // Still in flight and no query errors — keep waiting.
+            // Without a terminal failure, retain the public operation until
+            // every accepted sub-op is observable as terminal.
             return;
+        }
+
+        completion_detail.confirmed_bytes = confirmed_bytes;
+        if (failed && !have_failure_detail &&
+            completion_detail.failure_kind == IoFailureKind::NONE) {
+            completion_detail.failure_kind = IoFailureKind::UNKNOWN;
+            completion_detail.failure_scope = IoFailureScope::WHOLE_OPERATION;
         }
 
         // Release all DataPath ops that are safe to release (terminal or
@@ -2035,7 +2232,8 @@ private:
         }
         entry.data_path_operations.clear();
         finish_io_(entry, failed ? IoState::FAILED : IoState::COMPLETED,
-                   failed ? std::move(first_failure) : Status::Ok());
+                   failed ? std::move(first_failure) : Status::Ok(),
+                   std::move(completion_detail));
     }
 
     // Drives each DataPath at most once and then harvests the states of all
@@ -2117,7 +2315,8 @@ private:
     // solely for the legacy hardware-free stub test path.
     Status testing_force_complete_io_(const IoHandle& handle,
                                       IoState terminal_state,
-                                      Status io_status = Status::Ok()) {
+                                      Status io_status = Status::Ok(),
+                                      IoCompletionDetail detail = {}) {
         std::lock_guard<std::mutex> lock(registry_mutex_);
         if (!validate_io_(handle)) {
             return Status(StatusCode::NOT_FOUND, "invalid IO handle");
@@ -2131,7 +2330,8 @@ private:
             return Status(StatusCode::UNSUPPORTED,
                           "component-backed IO is completed by its DataPath");
         }
-        finish_io_(entry, terminal_state, std::move(io_status));
+        finish_io_(entry, terminal_state, std::move(io_status),
+                   std::move(detail));
         return Status::Ok();
     }
 
@@ -2146,6 +2346,12 @@ private:
         if (!e.active) return false;
         if (e.generation != h.generation_) return false;
         return true;
+    }
+
+    static std::uint64_t handle_key_(const IoHandle& h) {
+        // io_gen_counter_ is monotonic within a Runtime, so generation alone
+        // is an immutable, collision-free key until uint64 wraparound.
+        return h.generation_;
     }
 
     bool validate_target_(const TargetHandle& h) const {
@@ -2254,6 +2460,9 @@ private:
     std::uint64_t target_gen_counter_ = 0;
     std::uint64_t io_gen_counter_ = 0;
     std::uint64_t terminal_result_count_ = 0;
+    // Retain structured terminal results after release_io(). Entries are
+    // keyed by the immutable handle identity and cleared at shutdown.
+    std::unordered_map<std::uint64_t, IoResult> released_results_;
 };
 
 // =========================================================================
@@ -2274,10 +2483,13 @@ struct StorageRuntimeTestAccess {
     static Status force_complete_io(StorageRuntime& rt,
                                     const IoHandle& handle,
                                     IoState terminal_state,
-                                    Status io_status = Status::Ok()) {
+                                    Status io_status = Status::Ok(),
+                                    IoCompletionDetail detail = {}) {
         return rt.testing_force_complete_io_(handle, terminal_state,
-                                             std::move(io_status));
+                                             std::move(io_status),
+                                             std::move(detail));
     }
+
 };
 
 } // namespace testing

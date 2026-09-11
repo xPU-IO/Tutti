@@ -120,7 +120,6 @@ RuntimeNvmeSlice valid_slice() {
     slice.view_path = "/mnt/gpu0/ssnvme0";
     slice.namespace_id = 1;
     slice.logical_block_size = 4096;
-    slice.bar0_size = 16384;
     slice.max_data_size = 131072;
     slice.granted_queues = 4;
     slice.allowed_accel_ids = {0};

@@ -31,7 +31,6 @@ struct NvmeDataPathSliceView {
     std::string chrdev_path;
     std::uint32_t namespace_id = 0;
     std::uint32_t logical_block_size = 0;
-    std::uint64_t bar0_size = 0;
     std::uint64_t max_data_size = 0;
     std::uint32_t granted_queues = 0;
 };

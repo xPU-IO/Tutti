@@ -70,7 +70,6 @@ std::vector<ClientDeviceInfo> NvmeServiceClient::list_devices() {
         info.blk_size_log         = d.blk_size_log();
         info.queue_depth          = d.queue_depth();
         info.dstrd                = d.dstrd();
-        info.bar0_size            = d.bar0_size();
         info.max_user_qid         = d.max_user_qid();
         info.max_queues_per_group = d.max_queues_per_group();
         info.allowed_gpus.reserve(d.allowed_gpus_size());
@@ -129,7 +128,6 @@ std::vector<ClientNvmeResource> NvmeServiceClient::list_nvme_resources() {
         resource.logical_block_size_log = source.logical_block_size_log();
         resource.queue_depth = source.queue_depth();
         resource.dstrd = source.dstrd();
-        resource.bar0_size = source.bar0_size();
         resource.max_data_size = source.max_data_size();
         resource.max_user_qid = source.max_user_qid();
         resource.kernel_io_qps = source.kernel_io_qps();
@@ -202,7 +200,6 @@ NvmeServiceClient::acquire_nvme_slices(
         slice.logical_block_size_log = source.logical_block_size_log();
         slice.queue_depth = source.queue_depth();
         slice.dstrd = source.dstrd();
-        slice.bar0_size = source.bar0_size();
         slice.max_data_size = source.max_data_size();
         slice.controller_queue_capacity = source.controller_queue_capacity();
         slice.granted_queues = source.granted_queues();
@@ -257,7 +254,6 @@ NvmeServiceClient::connect(int32_t device_id,
     sess->granted_queues         = resp.granted_queues();
     sess->pci_addr               = resp.pci_addr();
     sess->snvme_dev_path         = resp.snvme_dev_path();
-    sess->bar0_size              = resp.bar0_size();
     sess->dstrd                  = resp.dstrd();
     sess->namespace_id           = resp.namespace_id();
     sess->page_size              = resp.page_size();

@@ -31,11 +31,14 @@ namespace tutti::data_paths::local_nvme {
 // device kernel and read back by the host after the stream event signals.
 //
 //   result: 0 = success, 1 = resolve_lba failure,
-//           2 = CQ timeout, 3 = NVMe CQ error status (non-zero SCT/SC)
+//           2 = CQ timeout, 3 = NVMe CQ error status (non-zero SCT/SC),
+//           UINT32_MAX = pending / kernel did not execute this entry
 //   nvme_status_dword3: raw CQE dword[3] for error diagnostics (0 if ok)
 // -------------------------------------------------------------------------
+constexpr std::uint32_t kEntryCompletionPending = UINT32_MAX;
+
 struct EntryCompletionStatus {
-    std::uint32_t result = 0;
+    std::uint32_t result = kEntryCompletionPending;
     std::uint32_t nvme_status_dword3 = 0;
 };
 
@@ -208,7 +211,7 @@ void submit_read_one(const DeviceTargetHandle* h,
     std::uint64_t starting_lba = 0;
     std::uint64_t n_blocks     = 0;
     if (!resolve_lba(h, logical_off, nbytes, &starting_lba, &n_blocks, inject_flag)) {
-        if (status) { status->result = 1; }
+        if (status) { status->result = 1; status->nvme_status_dword3 = 0; }
         return;
     }
 
@@ -234,7 +237,7 @@ void submit_read_one(const DeviceTargetHandle* h,
         if (status) { status->result = 3; status->nvme_status_dword3 = status_dword3 | (1u << 17); }
         return;
     }
-    if (status) { status->nvme_status_dword3 = status_dword3; }
+    if (status) { status->result = 0; status->nvme_status_dword3 = status_dword3; }
 }
 
 TUTTI_DEVICE TUTTI_FORCEINLINE
@@ -250,7 +253,7 @@ void submit_write_one(const DeviceTargetHandle* h,
     std::uint64_t starting_lba = 0;
     std::uint64_t n_blocks     = 0;
     if (!resolve_lba(h, logical_off, nbytes, &starting_lba, &n_blocks, inject_flag)) {
-        if (status) { status->result = 1; }
+        if (status) { status->result = 1; status->nvme_status_dword3 = 0; }
         return;
     }
 
@@ -276,7 +279,7 @@ void submit_write_one(const DeviceTargetHandle* h,
         if (status) { status->result = 3; status->nvme_status_dword3 = status_dword3 | (1u << 17); }
         return;
     }
-    if (status) { status->nvme_status_dword3 = status_dword3; }
+    if (status) { status->result = 0; status->nvme_status_dword3 = status_dword3; }
 }
 
 } // namespace tutti::data_paths::local_nvme

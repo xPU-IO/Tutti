@@ -17,6 +17,7 @@ if(TUTTI_BUILD_HARDWARE_TESTS AND TUTTI_BUILD_HARDWARE_STACK AND
    TUTTI_FEATURE_LOCAL_NVME)
     add_executable(tutti_tutti_runtime_hardware_test
         tutti_runtime_hardware_test.cpp
+        tutti_runtime_hardware_helper.cu
     )
     target_link_libraries(tutti_tutti_runtime_hardware_test PRIVATE
         tutti_runtime
@@ -24,6 +25,10 @@ if(TUTTI_BUILD_HARDWARE_TESTS AND TUTTI_BUILD_HARDWARE_STACK AND
     set_target_properties(tutti_tutti_runtime_hardware_test PROPERTIES
         CXX_STANDARD 17
         CXX_STANDARD_REQUIRED ON
+        CUDA_STANDARD 17
+        CUDA_STANDARD_REQUIRED ON
+        CUDA_SEPARABLE_COMPILATION ON
+        LINKER_LANGUAGE CUDA
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
     add_test(NAME tutti_tutti_runtime_hardware_test

@@ -99,12 +99,10 @@ struct LocalNvmeTargetState {
 class LocalNvmeDataPath : public DataPath {
 public:
     // Skeleton constructor (Round 7): no controller, no queue group.
-    LocalNvmeDataPath(std::string snvme_dev_path = "",
-                      std::uint32_t bar0_size = 0);
+    LocalNvmeDataPath(std::string snvme_dev_path = "");
 
     // Production constructor: includes queue group parameters.
     // snvme_dev_path: e.g. "/dev/ssnvme0"
-    // bar0_size: BAR0 size in bytes
     // cuda_device: primary GPU for d_qps + per-queue rings
     // num_user_queues: count of user QPs to create
     // (SQ/CQ ring depth is NOT a parameter: it is fixed by the kernel
@@ -143,7 +141,6 @@ public:
     //   ~= 259.5 MiB. Callers requesting large batch_entries must budget
     //   GPU memory accordingly.
     LocalNvmeDataPath(std::string snvme_dev_path,
-                      std::uint32_t bar0_size,
                       std::uint32_t cuda_device,
                       std::uint32_t num_user_queues,
                       std::uint32_t namespace_id,
@@ -285,6 +282,11 @@ public:
     // for a large multi-target batch.
     std::uint64_t test_submit_call_count() const;
     std::uint64_t test_kernel_launch_count() const;
+    std::uint64_t test_last_prebuilt_entry_count() const;
+    std::uint64_t test_last_dynamic_entry_count() const;
+    std::uint64_t test_effective_mdts_bytes() const {
+        return effective_mdts_bytes_;
+    }
     void test_reset_submit_counters();
 
     // ---- test-only: completion error injection seams ----
@@ -387,17 +389,17 @@ private:
             // GPU-resident AddressDescriptor[] (24 bytes each: prp1, prp2, data_length)
             void* d_descs = nullptr;       // cudaMalloc'd
             std::uint64_t num_descs = 0;   // total sub-IO descriptors
-            std::uint64_t bytes_per_slice = 0;  // granularity used (= min(io_granularity, MDTS))
+            std::uint64_t bytes_per_slice = 0;  // caller's logical IO block size
             std::uint64_t ios_per_slice = 0;    // sub-IOs per slice
             // PRP-list DMA mapping (host-pinned, DMA-mapped via nvm_dma_map_data_host).
             // prp2 in each AddressDescriptor points into the pool segment's ioaddrs[].
             // The NVMe controller reads PRP lists from these IOVAs via PCIe DMA.
-            // R19 S3: sub-page packing — 16 slices share one 4KiB page
-            // (each slice's list uses ≤31 entries = 248B, packed at 256B slots).
-            // R19 S3b: pool-managed (PrpBufPool). Ownership is in the pool;
+            // Each LIST slice owns one page-aligned PRP-list page, supporting
+            // the controller's full single-page PRP capacity. R19 S3b:
+            // pool-managed (PrpBufPool). Ownership is in the pool;
             // freed on DataPath shutdown. No per-unregister nvm_dma_unmap.
             PrpBufRef prp_buf_ref;          // pool sub-allocation reference
-            std::uint64_t num_prp_pages = 0;    // pages allocated (≤ num_slices/16)
+            std::uint64_t num_prp_pages = 0;    // pages allocated (= LIST slices)
             bool valid = false;
         };
         PrebuiltDesc prebuilt;
@@ -427,6 +429,7 @@ private:
         Status status;
         std::uint64_t bytes_transferred = 0;
         std::uint64_t total_bytes = 0;       // target bytes for completion verification
+        IoCompletionDetail completion_detail;
 
         // Arena lease: slot_index identifies the borrowed arena slot.
         // UINT32_MAX = no lease (op not yet submitted or already released).
@@ -440,17 +443,17 @@ private:
         // DeviceSubmitEntry::length; now in descriptor on GPU, but
         // aggregate_completion_status_ needs them host-side).
         std::vector<std::uint64_t> entry_lengths;
+        // Maps each fanned-out device entry back to its DataPath request.
+        std::vector<std::uint32_t> entry_request_indices;
         void* event = nullptr;          // arena slot's pre-created cudaEvent_t
         void* stream = nullptr;         // borrowed cudaStream_t
         CompletionMode completion_mode = CompletionMode::EVENT;
 
-        // PRP-list workspace (borrowed from arena's pre-allocated DMA-mapped pool).
-        // prp_list_dma is the arena's shared DMA mapping; per-slot IOVAs
-        // start at prp_ioaddrs_base.  prp_pages_devptr is this slot's
-        // PRP page GPU base.  prp_list_page_count = pages actually used.
-        nvm_dma_t* prp_list_dma = nullptr;   // arena DMA mapping (shared, borrowed)
-        std::uint32_t prp_ioaddrs_base = 0;  // this slot's first IOVA index
-        void* prp_pages_devptr = nullptr;    // this slot's PRP page GPU base
+        // Host-pinned PRP-list lease from the growing PrpBufPool. The pool
+        // backing remains valid through controller-safe teardown.
+        PrpBufRef prp_buf_ref;
+        nvm_dma_t* prp_list_dma = nullptr;
+        std::uint32_t prp_ioaddrs_base = 0;
         std::uint32_t prp_list_page_count = 0; // pages used (LIST sub-IOs, 0 if none)
 
         // PRP cache references (when PrpPageCache is enabled).
@@ -465,10 +468,9 @@ private:
         std::vector<HandleWorkspaceCache::Entry*> handle_cache_refs;
 
         // FIX 4: set by aggregate_completion_status_ when any entry result==2.
-        // When true, release()/shutdown() call arena_.release_with_timeout_leak()
-        // instead of arena_.release(): the timed-out NVMe command may still be
-        // in the controller SQ/CQ and could DMA into the PRP-list pages after
-        // they are reused.  The slot is permanently consumed (bounded leak).
+        // When true, shutdown conservatively retains the host PRP pool because
+        // the timed-out command may still fetch its PRP list. GPU arena slots
+        // are reusable once the submit kernel has returned.
         // The CID is also not returned to the SQ, so that queue slot is
         // degraded until an abort/reset (future work).  event/d_entries/
         // d_status are still returned to the arena -- the kernel has returned.
@@ -495,7 +497,6 @@ private:
 
     // Controller connection (client-only attach).
     std::string snvme_dev_path_;
-    std::uint32_t bar0_size_ = 0;
     nvm_ctrl_t* ctrl_ = nullptr;
 
     // Queue group parameters (production mode).
@@ -536,14 +537,15 @@ private:
     // Round 15 S4 test-only counters (see test_submit_call_count() above).
     std::uint64_t test_submit_call_count_ = 0;
     std::uint64_t test_kernel_launch_count_ = 0;
+    std::uint64_t test_last_prebuilt_entry_count_ = 0;
+    std::uint64_t test_last_dynamic_entry_count_ = 0;
 
     // Queue group (created in initialize(), destroyed before ctrl free).
     std::unique_ptr<NvmeQueueGroup> queue_group_;
 
     // MetadataArena: per-device, bounded pool of per-op workspace.
-    // Pre-allocates all events, entry/status arrays, and PRP-list pages
-    // at initialize() time.  submit() leases from the arena (zero cudaMalloc);
-    // release() returns the slot.  Timeout ops leak the slot (bounded).
+    // Pre-allocates events and GPU entry/status/AddressDescriptor arrays.
+    // PRP list backing is exclusively host-pinned.
     MetadataArena arena_;
 
     // HandleWorkspaceCache: caches device target handles by file extent signature.
@@ -553,7 +555,7 @@ private:
     std::uint32_t handle_cache_l2_capacity_ = 0;  // Round 16 S6b: 0 = 4×L1
 
     // PrpPageCache: caches PRP-list pages by {memory_token, start_page, pages_in_io}.
-    // Capacity 0 = disabled (arena PRP pool used per submit, current behavior).
+    // Capacity 0 = disabled (growing host PrpBufPool used per submit).
     PrpPageCache prp_cache_;
     std::uint32_t prp_cache_capacity_ = 0;
 
@@ -568,6 +570,7 @@ private:
     // R19 S3b REQUIRED 1: host-pinned PRP-list buffer pool — replaces
     // per-registration nvm_dma_map_data_host for pre-built PRP pages.
     PrpBufPool prp_buf_pool_;
+    bool timeout_prp_retained_ = false;
 };
 
 } // namespace tutti::data_paths::local_nvme

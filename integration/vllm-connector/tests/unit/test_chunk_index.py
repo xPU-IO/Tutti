@@ -1,368 +1,312 @@
-"""ChunkIndex 测试（纯逻辑零依赖）。
+"""ChunkIndex 单元测试：链式哈希、前缀命中、两阶段写入、LRU 与 pin 保护。"""
 
-运行：
-    cd /data/home/ryeqiu/Tutti/integration/vllm-connector && \
-    python -m pytest tests/unit/ -v
-"""
+from __future__ import annotations
 
-import re
+import subprocess
 import sys
 from pathlib import Path
 
-# engine 包位于 integration/vllm-connector/（本测试文件的上两级目录）
-_CONNECTOR_ROOT = Path(__file__).resolve().parents[2]
-if str(_CONNECTOR_ROOT) not in sys.path:
-    sys.path.insert(0, str(_CONNECTOR_ROOT))
-
 import pytest
 
-from engine.chunk_index import CHUNK_SIZE, ChunkIndex, hash_chunk
+from index.chunk_index import ChunkIndex, StorePlan
 
-CS = 4  # 小 chunk_size 方便构造（构造参数可覆盖）
-
-
-def chunk_tokens(base: int, n: int = CS) -> list[int]:
-    return list(range(base, base + n))
+CT = 4  # 每个 chunk 的 token 数
 
 
-def key_of(base: int) -> bytes:
-    return hash_chunk(tuple(range(base, base + CS)))
+def _tokens(n: int, base: int) -> list[int]:
+    """生成 n 个 token id；不同 base 保证序列彼此不同。"""
+    return [base * 1000 + i for i in range(n)]
 
 
-def fill(bi: ChunkIndex, bases: list[int]) -> list[bytes]:
-    """allocate + complete_store 一批 chunk（base 为各 chunk 首 token）。"""
-    keys = [key_of(b) for b in bases]
-    alloc, evicted = bi.allocate(keys)
-    assert evicted == []
-    assert len(alloc) == len(keys)
-    bi.complete_store(keys)
+def _keys(idx: ChunkIndex, base: int, n_chunks: int = 1) -> list[bytes]:
+    """取 base 序列前 n_chunks 个完整 chunk 的 key。"""
+    keys, _ = idx.hash_keys(_tokens(n_chunks * CT, base))
     return keys
 
 
-# ---------- hash_chunk ----------
-
-def test_hash_chunk_deterministic():
-    assert hash_chunk((1, 2, 3)) == hash_chunk((1, 2, 3))
-    assert hash_chunk(()) == hash_chunk(())
-    k = hash_chunk((5, 6, 7))
-    assert isinstance(k, bytes)
-    assert len(k) == 16  # blake2b digest_size=16
-
-
-def test_hash_chunk_distinct():
-    assert hash_chunk((1, 2)) != hash_chunk((1, 2, 3))
-    assert hash_chunk((1, 2)) != hash_chunk((12,))  # 无分隔歧义
-    assert hash_chunk((1, 2)) != hash_chunk((2, 1))
-    assert hash_chunk((0,)) != hash_chunk((-1,))
-
-
-# ---------- hash_chunk 链式性质（D-007 / Rework-1） ----------
-
-def test_hash_chunk_parent_default_empty():
-    """parent=b"" 与无 parent 调用兼容；parent 影响结果。"""
-    assert hash_chunk((1, 2, 3)) == hash_chunk((1, 2, 3), parent=b"")
-    h_a = hash_chunk((7,))
-    assert hash_chunk((1, 2, 3), parent=h_a) != hash_chunk((1, 2, 3))
-    # 同 tokens + parent 必同 key
-    assert hash_chunk((1, 2), parent=h_a) == hash_chunk((1, 2), parent=bytes(h_a))
-
-
-def test_hash_chunk_chained_property():
-    """H(prefix_a + b) == hash_chunk(b, parent=H_a)：链式指纹整个前缀。"""
-    bi = ChunkIndex(paths=8, chunk_size=CS)
-    a_tokens = list(range(2 * CS))          # 前缀 a：两个 chunk
-    b_chunk = list(range(100, 100 + CS))    # 追加 chunk b
-    full = bi.keys_for_tokens(a_tokens + b_chunk)
-
-    keys_a, last_parent = bi.keys_and_last_parent(a_tokens)
-    assert keys_a == full[:2]
-    # H(a ‖ b) == hash_chunk(b, parent=H_a)
-    assert hash_chunk(tuple(b_chunk), parent=last_parent) == full[2]
-    # 增量续算与全量一致
-    assert bi.keys_for_tokens(
-        a_tokens + b_chunk, start_chunk=2, parent=last_parent) == full[2:]
-
-
-# ---------- lookup_prefix ----------
-
-def test_lookup_prefix_3_of_5_chunks():
-    bi = ChunkIndex(paths=8, chunk_size=CS)
-    tokens = list(range(5 * CS))
-    keys = bi.keys_for_tokens(tokens)
-    assert len(keys) == 5
-    # 存前 3 个 chunk（链式 key：key_i 依赖 H_{i-1}）
-    bi.allocate(keys[:3])
-    bi.complete_store(keys[:3])
-    assert bi.lookup_prefix(tokens) == 3 * CS
-
-
-def test_lookup_prefix_stops_at_first_miss():
-    bi = ChunkIndex(paths=8, chunk_size=CS)
-    tokens = list(range(5 * CS))
-    keys = bi.keys_for_tokens(tokens)
-    # 只存 chunk0 与 chunk2（跳过 chunk1）
-    bi.allocate([keys[0], keys[2]])
-    bi.complete_store([keys[0], keys[2]])
-    assert bi.lookup_prefix(tokens) == 1 * CS  # chunk1 未命中即停
-
-
-def test_lookup_prefix_ignores_pending():
-    bi = ChunkIndex(paths=8, chunk_size=CS)
-    tokens = chunk_tokens(0)
-    key = bi.keys_for_tokens(tokens)[0]
-    bi.allocate([key])  # pending，未 complete_store
-    assert bi.lookup_prefix(tokens) == 0
-
-
-def test_lookup_prefix_empty_or_partial_input():
-    bi = ChunkIndex(paths=8, chunk_size=CS)
-    assert bi.lookup_prefix([]) == 0
-    assert bi.lookup_prefix([1, 2, 3]) == 0  # 不满一个 chunk
-
-
-# ---------- keys_for_tokens ----------
-
-def test_keys_for_tokens_truncates_tail():
-    bi = ChunkIndex(paths=8, chunk_size=CS)
-    tokens = list(range(2 * CS + 2))  # 2 整 chunk + 2 个尾部 token
-    keys = bi.keys_for_tokens(tokens)
-    assert len(keys) == 2
-    # 链式：H_0 的 parent 为 b""，H_1 的 parent 为 H_0
-    assert keys[0] == hash_chunk(tuple(tokens[:CS]))
-    assert keys[1] == hash_chunk(tuple(tokens[CS : 2 * CS]), parent=keys[0])
-
-
-def test_keys_for_tokens_start_chunk_offset():
-    bi = ChunkIndex(paths=8, chunk_size=CS)
-    tokens = list(range(3 * CS))
-    full = bi.keys_for_tokens(tokens)
-    # 无 parent：在 start_chunk 处重新起链（parent=b""）
-    assert bi.keys_for_tokens(tokens, start_chunk=1) == [
-        hash_chunk(tuple(tokens[CS : 2 * CS])),
-        hash_chunk(tuple(tokens[2 * CS :]),
-                   parent=hash_chunk(tuple(tokens[CS : 2 * CS]))),
-    ]
-    assert bi.keys_for_tokens(tokens, start_chunk=2) == [
-        hash_chunk(tuple(tokens[2 * CS :]))
-    ]
-    assert bi.keys_for_tokens(tokens, start_chunk=3) == []
-    # 带 parent 的增量调用与全序列一致
-    assert bi.keys_for_tokens(tokens, start_chunk=1, parent=full[0]) == full[1:]
-    assert bi.keys_for_tokens(tokens, start_chunk=2, parent=full[1]) == full[2:]
-
-
-def test_keys_and_last_parent_incremental():
-    """增量接口：返回 (keys, last_parent)，空产出时原样回传 parent。"""
-    bi = ChunkIndex(paths=8, chunk_size=CS)
-    tokens = list(range(2 * CS + 2))  # 2 整 chunk + 尾部舍弃
-    keys, last_parent = bi.keys_and_last_parent(tokens)
-    assert keys == bi.keys_for_tokens(tokens)
-    assert last_parent == keys[-1]
-
-    # 不满一个 chunk：keys 空，last_parent 原样回传
-    marker = b"\x01\x02\x03"
-    empty_keys, back = bi.keys_and_last_parent([1, 2], parent=marker)
-    assert empty_keys == []
-    assert back == marker
-
-    # 跨调用增量续算 == 全量
-    more = tokens + list(range(100, 100 + CS))  # 3 整 chunk
-    full_keys, full_last = bi.keys_and_last_parent(more)
-    inc_keys, inc_last = bi.keys_and_last_parent(
-        more, start_chunk=2, parent=last_parent)
-    assert inc_keys == full_keys[2:]
-    assert inc_last == full_last
-
-
-# ---------- allocate / 驱逐 ----------
-
-def test_allocate_basic_and_all_existing():
-    bi = ChunkIndex(paths=4, chunk_size=CS)
-    keys = fill(bi, [0, CS])
-    assert len(bi.stored) == 2
-    assert bi.pending_store == {}
-    # 全已存在 → ([], [])
-    assert bi.allocate(keys) == ([], [])
-    # 混合：一个已存在、一个新
-    k2 = key_of(2 * CS)
-    alloc, evicted = bi.allocate([keys[0], k2])
-    assert evicted == []
-    assert len(alloc) == 1  # 只为新 key 分配
-    bi.complete_store([k2])
-    assert len(bi.stored) == 3
-
-
-def test_allocate_evicts_lru_when_full():
-    bi = ChunkIndex(paths=3, chunk_size=CS)
-    k0, k1, k2 = key_of(0), key_of(CS), key_of(2 * CS)
-    bi.allocate([k0, k1, k2])
-    bi.complete_store([k0, k1, k2])
-    assert list(bi.stored.keys()) == [k0, k1, k2]  # 头 = LRU
-    k3 = key_of(3 * CS)
-    alloc, evicted = bi.allocate([k3])
-    assert evicted == [k0]  # LRU 头被驱逐
-    assert k0 not in bi.stored
-    assert len(alloc) == 1
-    bi.complete_store([k3])
-    assert bi.lookup_prefix(chunk_tokens(0)) == 0  # k0 数据已没了
-    assert bi.lookup_prefix(chunk_tokens(CS)) == CS
-
-
-def test_touch_protects_from_eviction():
-    bi = ChunkIndex(paths=2, chunk_size=CS)
-    k0, k1 = key_of(0), key_of(CS)
-    bi.allocate([k0, k1])
-    bi.complete_store([k0, k1])
-    bi.touch([k0])  # k0 → MRU，k1 成为 LRU 头
-    k2 = key_of(2 * CS)
-    _, evicted = bi.allocate([k2])
-    assert evicted == [k1]  # 被 touch 的 k0 不驱逐
-    bi.complete_store([k2])
-    assert k0 in bi.stored
-
-
-def test_pinned_not_evicted():
-    bi = ChunkIndex(paths=2, chunk_size=CS)
-    k0, k1 = key_of(0), key_of(CS)
-    bi.allocate([k0, k1])
-    bi.complete_store([k0, k1])
-    eids = bi.pin([k0])
-    assert eids == [bi.stored[k0]]
-    k2 = key_of(2 * CS)
-    _, evicted = bi.allocate([k2])  # 只能驱逐 k1
-    assert evicted == [k1]
-    bi.complete_store([k2])
-    bi.unpin([k0])
-    # 解 pin 后 k0 变为 LRU 头（stored: k0, k2），可被驱逐
-    k3 = key_of(3 * CS)
-    _, evicted = bi.allocate([k3])
-    assert evicted == [k0]
-    bi.complete_store([k3])
-
-
-def test_allocate_none_when_no_evictable():
-    bi = ChunkIndex(paths=1, chunk_size=CS)
-    k0 = fill(bi, [0])[0]
-    bi.pin([k0])
-    assert bi.allocate([key_of(CS)]) is None  # 唯一 path pinned
-    assert list(bi.stored.keys()) == [k0]  # 状态未变
-    bi.unpin([k0])
-
-
-def test_allocate_none_leaves_state_intact():
-    # 需 3 个新 path，可驱逐只有 2 个 → None 且零副作用
-    bi = ChunkIndex(paths=3, chunk_size=CS)
-    k0, k1, k2 = key_of(0), key_of(CS), key_of(2 * CS)
-    bi.allocate([k0, k1, k2])
-    bi.complete_store([k0, k1, k2])
-    bi.pin([k0])
-    before = list(bi.stored.keys())
-    assert bi.allocate([key_of(10), key_of(20), key_of(30)]) is None
-    assert list(bi.stored.keys()) == before  # k1/k2 未被误驱逐
-    assert bi.free == []
-    assert bi.pending_store == {}
-    bi.unpin([k0])
-
-
-# ---------- complete_store(success=False) ----------
-
-def test_complete_store_failure_recycles_path():
-    bi = ChunkIndex(paths=2, chunk_size=CS)
-    k0 = key_of(0)
-    alloc, _ = bi.allocate([k0])
-    eid = alloc[0]
-    assert bi.pinned == {eid: 1}
-    bi.complete_store([k0], success=False)
-    assert bi.stored == {}
-    assert bi.pending_store == {}
-    assert eid in bi.free  # path 回收
-    assert bi.pinned == {}  # 解 pin
-    assert bi.lookup_prefix(chunk_tokens(0)) == 0
-
-
-# ---------- pin / unpin ----------
-
-def test_pin_unpin_refcount():
-    bi = ChunkIndex(paths=4, chunk_size=CS)
-    k0 = fill(bi, [0])[0]
-    e1 = bi.pin([k0])[0]
-    e2 = bi.pin([k0])  # 重复 pin → refcount 2
-    assert e2 == [e1]
-    assert bi.pinned[e1] == 2
-    bi.unpin([k0])
-    assert bi.pinned[e1] == 1
-    bi.unpin([k0])
-    assert e1 not in bi.pinned
-
-
-def test_pin_missing_raises_keyerror():
-    bi = ChunkIndex(paths=4, chunk_size=CS)
-    fill(bi, [0])
-    with pytest.raises(KeyError):
-        bi.pin([key_of(99)])
-    # 部分 key 缺失 → 整体失败，不留半截 pin
-    with pytest.raises(KeyError):
-        bi.pin([key_of(0), key_of(98)])
-    assert bi.pinned == {}
-
-
-def test_unpin_not_pinned_raises():
-    bi = ChunkIndex(paths=4, chunk_size=CS)
-    k0 = fill(bi, [0])[0]
-    with pytest.raises(ValueError):
-        bi.unpin([k0])  # 从未 pin
-
-
-# ---------- reset / 属性 ----------
-
-def test_reset_clears_all():
-    bi = ChunkIndex(paths=3, chunk_size=CS)
-    k0 = fill(bi, [0, CS])[0]
-    bi.pin([k0])
-    bi.allocate([key_of(5 * CS)])  # 留一个 pending
-    assert bi.pending_store != {}
-    assert bi.pinned != {}
-    bi.reset()
-    assert bi.stored == {}
-    assert bi.pinned == {}
-    assert bi.pending_store == {}
-    assert bi.free == ["slot://0", "slot://1", "slot://2"]
-    # reset 后可继续正常使用
-    k = fill(bi, [0])[0]
-    assert k in bi.stored
-
-
-def test_num_paths_and_chunk_size_constants():
-    assert ChunkIndex(paths=7, chunk_size=CS).capacity == 7
-    assert CHUNK_SIZE == 256
-
-
-def test_constructor_validation():
-    with pytest.raises(ValueError):
-        ChunkIndex(paths=0, chunk_size=CS)
-    with pytest.raises(ValueError):
-        ChunkIndex(paths=4, chunk_size=0)
-
-
-# ---------- 零依赖 ----------
-
-def test_no_heavy_imports_in_sys_modules():
-    """chunk_index 自净：子进程隔离验证（同进程其他测试可能已 import torch）。"""
-    import subprocess
-
-    code = (
-        "import sys; sys.path.insert(0, %r); "
-        "import engine.chunk_index; "
-        "bad = [m for m in ('vllm', 'torch', 'tutti_runtime', 'numpy') "
-        "if m in sys.modules]; "
-        "assert not bad, f'heavy imports: {bad}'"
-    ) % str(_CONNECTOR_ROOT)
-    subprocess.run([sys.executable, "-c", code], check=True)
-
-
-def test_chunk_index_module_imports_stdlib_only():
-    import engine.chunk_index as bi_mod
-
-    src = Path(bi_mod.__file__).read_text(encoding="utf-8")
-    imported = set(re.findall(r"^\s*(?:import|from)\s+([A-Za-z_][A-Za-z0-9_]*)", src, re.M))
-    assert imported <= {"hashlib", "collections"}, imported
+class TestConstructor:
+    def test_rejects_nonpositive_arguments(self):
+        with pytest.raises(ValueError):
+            ChunkIndex(0, CT)
+        with pytest.raises(ValueError):
+            ChunkIndex(4, 0)
+        with pytest.raises(ValueError):
+            ChunkIndex(-1, CT)
+        with pytest.raises(ValueError):
+            ChunkIndex(4, -1)
+
+
+class TestHashKeys:
+    def test_empty_and_short_input_yield_no_keys(self):
+        idx = ChunkIndex(4, CT)
+        assert idx.hash_keys([]) == ([], b"")
+        assert idx.hash_keys(_tokens(CT - 1, 1)) == ([], b"")
+
+    def test_full_chunks_and_tail_discard(self):
+        idx = ChunkIndex(4, CT)
+        toks = _tokens(2 * CT + 2, 1)  # 2 个完整 chunk + 2 个尾部 token
+        keys, parent = idx.hash_keys(toks)
+        assert len(keys) == 2
+        assert all(isinstance(k, bytes) and len(k) == 16 for k in keys)
+        assert parent == keys[-1]
+        keys_again, parent_again = idx.hash_keys(toks)
+        assert keys_again == keys and parent_again == parent
+
+    def test_key_chain_depends_on_parent(self):
+        idx = ChunkIndex(4, CT)
+        first, _ = idx.hash_keys(_tokens(CT, 1))
+        chained, _ = idx.hash_keys(_tokens(2 * CT, 1))
+        # 同一段 token 换了前缀（parent）→ key 不同
+        assert chained[0] == first[0]
+        assert chained[1] != first[0]
+
+    @pytest.mark.parametrize("m", [0, 1, CT, 2 * CT, 2 * CT + 3, 5 * CT])
+    def test_incremental_matches_full(self, m):
+        idx = ChunkIndex(8, CT)
+        toks = _tokens(5 * CT + 2, 1)
+        full_keys, full_parent = idx.hash_keys(toks)
+        head_keys, head_parent = idx.hash_keys(toks[:m])
+        consumed = len(head_keys) * CT
+        tail_keys, tail_parent = idx.hash_keys(toks, start=consumed, parent=head_parent)
+        assert head_keys + tail_keys == full_keys
+        assert tail_parent == full_parent
+
+    def test_negative_start_raises(self):
+        idx = ChunkIndex(4, CT)
+        with pytest.raises(ValueError):
+            idx.hash_keys(_tokens(CT, 1), start=-1)
+
+
+class TestLookupPrefix:
+    def test_empty_index_misses_everything(self):
+        idx = ChunkIndex(4, CT)
+        assert idx.lookup_prefix(_tokens(3 * CT, 1)) == 0
+        assert idx.lookup_prefix([]) == 0
+        assert idx.lookup_prefix(_tokens(CT - 1, 1)) == 0
+
+    def test_store_confirm_then_hit(self):
+        idx = ChunkIndex(4, CT)
+        toks = _tokens(3 * CT, 1)
+        keys = _keys(idx, 1, 3)
+        plan = idx.plan_store(keys)
+        assert isinstance(plan, StorePlan)
+        assert plan.new_keys == keys
+        assert plan.evicted_keys == []
+        # 在途 chunk 不参与命中
+        assert idx.lookup_prefix(toks) == 0
+        idx.confirm_store(keys)
+        assert idx.lookup_prefix(toks) == 3 * CT
+        # 前缀部分命中
+        assert idx.lookup_prefix(toks[:2 * CT]) == 2 * CT
+        # 第三个 chunk 分叉 → 命中止于前两个
+        divergent = toks[:2 * CT] + _tokens(CT, 9)
+        assert idx.lookup_prefix(divergent) == 2 * CT
+
+
+class TestPlanStore:
+    def test_evicts_oldest_unpinned(self):
+        idx = ChunkIndex(3, CT)
+        for base in (1, 2, 3):
+            keys = _keys(idx, base)
+            idx.plan_store(keys)
+            idx.confirm_store(keys)
+        plan = idx.plan_store(_keys(idx, 4))
+        assert plan.new_keys == _keys(idx, 4)
+        assert plan.evicted_keys == _keys(idx, 1)
+        assert idx.lookup_prefix(_tokens(CT, 1)) == 0
+        assert idx.lookup_prefix(_tokens(CT, 2)) == CT
+
+    def test_all_pinned_returns_none_and_state_intact(self):
+        idx = ChunkIndex(2, CT)
+        for base in (1, 2):
+            keys = _keys(idx, base)
+            idx.plan_store(keys)
+            idx.confirm_store(keys)
+            idx.pin(keys)
+        assert idx.plan_store(_keys(idx, 3)) is None
+        # None 不改变状态：仍全部命中
+        assert idx.lookup_prefix(_tokens(CT, 1)) == CT
+        assert idx.lookup_prefix(_tokens(CT, 2)) == CT
+
+    def test_partial_pin_limits_eviction(self):
+        idx = ChunkIndex(3, CT)
+        for base in (1, 2, 3):
+            keys = _keys(idx, base)
+            idx.plan_store(keys)
+            idx.confirm_store(keys)
+        idx.pin(_keys(idx, 2))
+        idx.pin(_keys(idx, 3))
+        # 可驱逐者只剩 base=1：单新 key 腾位受理成功
+        plan = idx.plan_store(_keys(idx, 4))
+        assert plan.evicted_keys == _keys(idx, 1)
+        assert plan.new_keys == _keys(idx, 4)
+        idx.confirm_store(_keys(idx, 4))
+        idx.pin(_keys(idx, 4))
+        # 驻留者全部受保护：要 2 个空位 → None
+        assert idx.plan_store(_keys(idx, 5) + _keys(idx, 6)) is None
+        # 要 1 个空位同样 → None
+        assert idx.plan_store(_keys(idx, 5)) is None
+        # 受保护者全部仍命中
+        for base in (2, 3, 4):
+            assert idx.lookup_prefix(_tokens(CT, base)) == CT
+
+    def test_pending_reentrant_returns_none(self):
+        idx = ChunkIndex(2, CT)
+        ka, kb = _keys(idx, 1), _keys(idx, 2)
+        assert idx.plan_store(ka) is not None
+        # 重复计划在途 key（单独或混批）→ 整批不受理
+        assert idx.plan_store(ka) is None
+        assert idx.plan_store(ka + kb) is None
+        idx.confirm_store(ka)
+        # 结算后再计划：已驻留 → 空计划（无可写内容、无驱逐）
+        plan = idx.plan_store(ka)
+        assert plan.new_keys == [] and plan.evicted_keys == []
+
+    def test_pending_holds_capacity_and_is_never_evicted(self):
+        idx = ChunkIndex(2, CT)
+        ka, kb, kc = _keys(idx, 1), _keys(idx, 2), _keys(idx, 3)
+        idx.plan_store(ka)
+        idx.plan_store(kb)
+        # 容量被两个在途 key 占满，无驻留者可驱逐 → None
+        assert idx.plan_store(kc) is None
+        idx.confirm_store(ka)
+        # 在途 kb 不参与驱逐：腾位来自驻留者 ka
+        plan = idx.plan_store(kc)
+        assert plan.evicted_keys == ka
+        assert kb[0] not in plan.evicted_keys
+        idx.confirm_store(kb)
+        idx.confirm_store(kc)
+        assert idx.lookup_prefix(_tokens(CT, 2)) == CT
+        assert idx.lookup_prefix(_tokens(CT, 3)) == CT
+
+    def test_confirm_store_failure_recycles(self):
+        idx = ChunkIndex(2, CT)
+        ka = _keys(idx, 1)
+        idx.plan_store(ka)
+        idx.confirm_store(ka, ok=False)
+        assert idx.lookup_prefix(_tokens(CT, 1)) == 0
+        # 容量已回收：新 key 无需驱逐即可受理
+        plan = idx.plan_store(_keys(idx, 2))
+        assert plan.evicted_keys == []
+
+    def test_empty_batch_and_duplicate_keys(self):
+        idx = ChunkIndex(2, CT)
+        plan = idx.plan_store([])
+        assert plan.new_keys == [] and plan.evicted_keys == []
+        ka = _keys(idx, 1)
+        plan = idx.plan_store(ka + ka)
+        assert plan.new_keys == ka
+
+
+class TestPin:
+    def test_pin_miss_raises_and_is_atomic(self):
+        idx = ChunkIndex(2, CT)
+        ka = _keys(idx, 1)
+        idx.plan_store(ka)
+        idx.confirm_store(ka)
+        with pytest.raises(KeyError):
+            idx.pin(ka + [b"\x00" * 16])
+        # 整批不生效：ka 未被 pin（对其 unpin 应报 KeyError）
+        with pytest.raises(KeyError):
+            idx.unpin(ka)
+
+    def test_unpin_without_pin_raises(self):
+        idx = ChunkIndex(2, CT)
+        ka = _keys(idx, 1)
+        idx.plan_store(ka)
+        idx.confirm_store(ka)
+        with pytest.raises(KeyError):
+            idx.unpin(ka)
+
+    def test_unpin_makes_key_evictable_again(self):
+        idx = ChunkIndex(1, CT)
+        ka, kb = _keys(idx, 1), _keys(idx, 2)
+        idx.plan_store(ka)
+        idx.confirm_store(ka)
+        idx.pin(ka)
+        assert idx.plan_store(kb) is None
+        idx.unpin(ka)
+        plan = idx.plan_store(kb)
+        assert plan.evicted_keys == ka
+
+    def test_pin_counts_pair_up(self):
+        idx = ChunkIndex(1, CT)
+        ka, kb = _keys(idx, 1), _keys(idx, 2)
+        idx.plan_store(ka)
+        idx.confirm_store(ka)
+        idx.pin(ka)
+        idx.pin(ka)
+        idx.unpin(ka)
+        # 还剩一层 pin：仍不可驱逐
+        assert idx.plan_store(kb) is None
+        idx.unpin(ka)
+        assert idx.plan_store(kb).evicted_keys == ka
+
+
+class TestLru:
+    def test_mark_recent_changes_eviction_order(self):
+        idx = ChunkIndex(3, CT)
+        for base in (1, 2, 3):
+            keys = _keys(idx, base)
+            idx.plan_store(keys)
+            idx.confirm_store(keys)
+        idx.mark_recent(_keys(idx, 1))  # 最旧者被刷新
+        plan = idx.plan_store(_keys(idx, 4))
+        assert plan.evicted_keys == _keys(idx, 2)
+        # 非驻留 key 静默忽略
+        idx.mark_recent([b"\xff" * 16])
+
+    def test_confirm_refreshes_recency(self):
+        idx = ChunkIndex(2, CT)
+        ka, kb = _keys(idx, 1), _keys(idx, 2)
+        for keys in (ka, kb):
+            idx.plan_store(keys)
+            idx.confirm_store(keys)
+        # 重新写入并确认 ka → ka 变为最近使用
+        idx.plan_store(ka)
+        idx.confirm_store(ka)
+        plan = idx.plan_store(_keys(idx, 3))
+        assert plan.evicted_keys == kb
+
+
+class TestRestore:
+    def test_restore_is_idempotent(self):
+        idx = ChunkIndex(4, CT)
+        keys = _keys(idx, 1, 3)
+        toks = _tokens(3 * CT, 1)
+        idx.restore(keys)
+        assert idx.lookup_prefix(toks) == 3 * CT
+        idx.restore(keys)
+        idx.restore(keys)
+        assert idx.lookup_prefix(toks) == 3 * CT
+        # 重复灌入不重复占容量：4 - 3 = 1 个空位，无需驱逐
+        plan = idx.plan_store(_keys(idx, 2))
+        assert plan.evicted_keys == []
+
+    def test_restore_order_sets_initial_lru(self):
+        idx = ChunkIndex(3, CT)
+        idx.restore(_keys(idx, 1) + _keys(idx, 2) + _keys(idx, 3))
+        plan = idx.plan_store(_keys(idx, 4))
+        # 排前者更旧：先驱逐 base=1
+        assert plan.evicted_keys == _keys(idx, 1)
+
+
+class TestIsolation:
+    def test_import_pulls_no_heavy_dependencies(self):
+        """子进程断言：import 本模块后 sys.modules 无 vllm/torch/numpy。"""
+        connector_root = Path(__file__).resolve().parents[2]
+        code = (
+            "import sys\n"
+            "import index.chunk_index\n"
+            "leaked = {'vllm', 'torch', 'numpy'} & set(sys.modules)\n"
+            "assert not leaked, f'unexpected modules: {sorted(leaked)}'\n"
+            "print('clean')\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=connector_root,
+            capture_output=True,
+            text=True,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert "clean" in proc.stdout
