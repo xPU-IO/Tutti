@@ -184,6 +184,39 @@ def _expand_placeholders(value, vllm_config=None, *, rank: str | None = None):
     return value
 
 
+def _apply_device_groups(options: dict, *, rank: str, tp_size: int) -> dict:
+    """按 rank 把 preset.device_groups 展开为 preset.devices。
+
+    多卡共用盘组的部署形态（如 8 卡、每 4 个 rank 共用一组 2 盘条带）：
+    ``device_groups=[[0, 1], [2, 3]]`` 表示前一半 rank 用盘 0-1、后一半
+    用盘 2-3；组数必须整除 tp_size，组内 rank 数 = tp_size / 组数。
+    无 device_groups 时原样返回（单设备/单组部署不变）。
+    """
+    preset = options.get("preset")
+    if not isinstance(preset, dict) or "device_groups" not in preset:
+        return options
+    groups = preset["device_groups"]
+    if (not isinstance(groups, (list, tuple)) or not groups
+            or any(not isinstance(group, (list, tuple)) or not group
+                   for group in groups)):
+        raise ValueError("preset.device_groups 必须是非空设备组列表")
+    if tp_size % len(groups):
+        raise ValueError(
+            f"tensor_parallel_size({tp_size}) 必须能被 device_groups "
+            f"组数({len(groups)}) 整除"
+        )
+    group_span = tp_size // len(groups)
+    index = int(rank) // group_span
+    if not 0 <= index < len(groups):
+        raise ValueError(f"rank {rank} 越出 device_groups 分组范围")
+    preset = dict(preset)
+    preset.pop("device_groups")
+    preset["devices"] = [{"device_id": int(device)} for device in groups[index]]
+    expanded = dict(options)
+    expanded["preset"] = preset
+    return expanded
+
+
 def _key_namespace(vllm_config, extra: dict) -> str:
     """组装 chunk key 命名空间（影响字节布局的维度，v2 格式头）。
 
@@ -237,14 +270,15 @@ def _worker_engine_for(vllm_config, extra: dict):
             rank=worker_rank,
         )
         if store_spec["type"] == "tutti_nvme":
-            options.setdefault("rank_id", int(worker_rank))
-            options.setdefault(
-                "tp_size",
-                int(getattr(
-                    getattr(vllm_config, "parallel_config", None),
-                    "tensor_parallel_size", 1,
-                )),
+            tp_size = int(getattr(
+                getattr(vllm_config, "parallel_config", None),
+                "tensor_parallel_size", 1,
+            ))
+            options = _apply_device_groups(
+                options, rank=worker_rank, tp_size=tp_size
             )
+            options.setdefault("rank_id", int(worker_rank))
+            options.setdefault("tp_size", tp_size)
         segment_bytes = extra["chunk_kv_bytes"] // extra["num_layers"]
         configured_segment = options.get("segment_bytes")
         if configured_segment is not None and configured_segment != segment_bytes:
@@ -302,10 +336,19 @@ def _scheduler_index_for(vllm_config, extra: dict):
                 list(range(tp_size)) if tp_size > 1
                 else [int(_deployment_rank(vllm_config))]
             )
-            rank_options = [
-                _expand_placeholders(raw_options, vllm_config, rank=str(rank))
-                for rank in metadata_ranks
-            ]
+            rank_options = []
+            for rank in metadata_ranks:
+                item = dict(_apply_device_groups(
+                    _expand_placeholders(
+                        raw_options, vllm_config, rank=str(rank)
+                    ),
+                    rank=str(rank),
+                    tp_size=tp_size,
+                ))
+                # striped 数据盘按 rank 分目录（<mount>/striped/r<rank>/...），
+                # 调度侧的 target_size 探测必须用与 worker 相同的 rank。
+                item.setdefault("rank_id", int(rank))
+                rank_options.append(item)
             roots = [str(item.get("root", "")) for item in rank_options]
             if tp_size > 1 and len(set(roots)) != tp_size:
                 raise ValueError(

@@ -378,7 +378,9 @@ class Layout:
     def pool_create_slot(self, slot: int, slot_bytes: int) -> None:
         path = self.pool_slot_paths(slot)[0]
         path.parent.mkdir(parents=True, exist_ok=True)
-        _append_real_zeros(path, 0, slot_bytes)
+        # 覆盖语义（非 append）：崩溃残留的同名文件必须被截断重建，
+        # 否则追加会得到 2×slot_bytes 的文件、槽位校验必然失败。
+        _rewrite_real_zeros(path, slot_bytes)
 
     def pool_zero_slot(self, slot: int, slot_bytes: int) -> None:
         path = self.pool_slot_paths(slot)[0]
@@ -452,6 +454,7 @@ def _append_real_zeros(path: Path, start: int, end: int) -> None:
     FIEMAP 只对已分配物理块的区域返回 extent，稀疏/预分配空洞会让
     resolver 的 DMA 映射缺段，因此扩展必须真实写入零数据。
     """
+    path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "ab") as handle:
         position = start
         while position < end:
@@ -464,6 +467,7 @@ def _append_real_zeros(path: Path, start: int, end: int) -> None:
 
 def _rewrite_real_zeros(path: Path, size: int) -> None:
     """Overwrite an existing regular file with real zeros and fsync."""
+    path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "wb") as handle:
         position = 0
         while position < size:

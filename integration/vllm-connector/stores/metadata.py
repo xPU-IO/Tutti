@@ -11,6 +11,7 @@ import json
 import logging
 
 from .tutti_nvme.layout import Layout
+from .tutti_nvme.preset_derive import derive_device_fields
 from .tutti_nvme.striped_layout import StripedLayout
 
 
@@ -251,10 +252,17 @@ def _metadata_layout(options, segment_bytes):
         return Layout(root, segment_bytes)
     if layout == "striped":
         mounts = options.get("mounts")
-        if mounts is None:
-            mounts = _preset_mounts(options.get("preset"))
+        preset = options.get("preset")
+        if mounts is None and isinstance(preset, dict):
+            if "daemon_config" in preset:
+                import yaml
+                preset = derive_device_fields(preset, yaml)
+            mounts = _preset_mounts(preset)
         stripe_unit = options.get("stripe_unit")
         if stripe_unit is None:
             raise ValueError("striped metadata store requires stripe_unit")
-        return StripedLayout(root, segment_bytes, mounts, stripe_unit)
+        return StripedLayout(
+            root, segment_bytes, mounts, stripe_unit,
+            rank_id=int(options.get("rank_id", 0)),
+        )
     raise ValueError(f"unknown tutti_nvme layout: {layout!r}")

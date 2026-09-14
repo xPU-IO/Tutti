@@ -192,12 +192,61 @@ def main() -> int:
         help="vLLM policy after the connector reports invalid block IDs",
     )
     parser.add_argument(
+        "--enable-compile",
+        action="store_true",
+        help=(
+            "leave eager mode (enforce_eager=False) so vLLM's compilation "
+            "path runs; this activates fuse_allreduce_rms (all-reduce + "
+            "RMSNorm fused into one kernel, one cross-rank sync per layer "
+            "instead of two) and CUDA graph capture. Default stays eager "
+            "for clean, comparable NVTX timelines."
+        ),
+    )
+    parser.add_argument(
         "--expect-b-failure", action="store_true",
         help="treat an explicit request-B failure as the expected test result",
     )
     parser.add_argument(
         "--kv-root",
         default="/mnt/nvme{LOCAL_RANK}/tutti-kv-profile-rank{LOCAL_RANK}",
+    )
+    parser.add_argument(
+        "--kv-layout",
+        choices=("file_per_chunk", "striped"),
+        default="file_per_chunk",
+        help=(
+            "KV 落盘布局：file_per_chunk（默认，chunk 整块落单盘）或 "
+            "striped（多盘条带，需配 --device-groups）"
+        ),
+    )
+    parser.add_argument(
+        "--stripe-unit",
+        type=int,
+        default=65536,
+        help=(
+            "striped 条带粒度（字节，默认 64KiB）。须不小于单个 IO entry "
+            "（block_size × 每 token 每层每 rank 的 KV 字节），以免把提交切碎"
+        ),
+    )
+    parser.add_argument(
+        "--device-groups",
+        default=None,
+        help=(
+            "striped 的 rank→盘组映射：分号分组、逗号列设备号，如 "
+            "'0,1;2,3'（前一半 rank 用盘 0-1、后一半用盘 2-3）；"
+            "组数必须整除 tensor_parallel_size"
+        ),
+    )
+    parser.add_argument(
+        "--num-queues",
+        type=int,
+        default=8,
+        help=(
+            "striped 每设备用户队列数（per-device）。每盘用户 QID 池约 "
+            "119（QID 17..135，见内核 GET_DEV_INFO），须满足 "
+            "num_queues × 每盘 rank 数 ≤ 119——8 卡每 4 rank 共用一组盘 "
+            "时取 8（4×8=32），32（StripedNvmePreset 默认）会撑爆池"
+        ),
     )
     parser.add_argument(
         "--wait-for-start-file",
@@ -244,24 +293,56 @@ def main() -> int:
         # 复用不重跑 resolve（open+fstat+fsync+FIEMAP）。
         num_chunks = max(10000, per_request_chunks * 2 * args.rounds + 16)
         # 预建槽位数只覆盖单请求工作集：全量预建 1w × 20MiB ≈ 200GiB
-        # 的实零写入会把 bind 变成分钟级；其余由后台分配器按水位扩展
-        # （这正是动态扩展路径要验证的部分）。
+        # 的实零写入会把 bind 变成分钟级；其余由启动期预热补齐。
         initial_slots = min(num_chunks, per_request_chunks + 8)
+        # 水位必须覆盖整个 workload 的唯一 chunk 集合，否则后台分配器会在
+        # 请求中途扩容：建槽位是磁盘实零写 + fsync（32k 实测 64 槽位
+        # 2.85s），会直接阻塞前向线程（allocate 等就绪槽位）。
+        # 唯一 chunk 上界 = 每轮(A 整请求 + B 新增部分) × 轮数
+        #              ≈ per_request_chunks × (1 + (1 - reuse)) × rounds；
+        # 再留一整轮 + 余量，保证分配完仍高于 low_watermark（否则触发补货）。
+        high_watermark = min(
+            num_chunks, per_request_chunks * (args.rounds + 2) + 16
+        )
+        low_watermark = max(1, per_request_chunks // 2)
         store_options = {
             "root": args.kv_root,
             "num_chunks": num_chunks,
             "initial_slots": initial_slots,
+            "high_watermark": high_watermark,
+            "low_watermark": low_watermark,
             "io_stream": "auto",
             "preset": {
-                "type": "local",
                 "daemon_config": (
                     "/data/home/ryeqiu/Tutti/"
                     "config/local/tutti_daemon.yaml"
                 ),
-                "device_id": "{LOCAL_RANK}",
                 "gpu_id": "{LOCAL_RANK}",
             },
         }
+        if args.kv_layout == "striped":
+            if not args.device_groups:
+                parser.error("--kv-layout striped 需要 --device-groups")
+            groups = [
+                [int(item) for item in group.split(",") if item.strip()]
+                for group in args.device_groups.split(";")
+                if group.strip()
+            ]
+            if not groups or any(not group for group in groups):
+                parser.error("--device-groups 解析为空，示例：'0,1;2,3'")
+            store_options["layout"] = "striped"
+            store_options["stripe_unit"] = args.stripe_unit
+            store_options["preset"].update({
+                "type": "striped",
+                "device_groups": groups,
+                "stripe_unit": args.stripe_unit,
+                "num_queues": args.num_queues,
+            })
+        else:
+            store_options["preset"].update({
+                "type": "local",
+                "device_id": "{LOCAL_RANK}",
+            })
         if args.max_in_flight_operations is not None:
             if args.max_in_flight_operations <= 0:
                 parser.error("--max-in-flight-operations must be positive")
@@ -292,7 +373,7 @@ def main() -> int:
         model=args.model,
         tensor_parallel_size=args.tensor_parallel_size,
         block_size=args.block_size,
-        enforce_eager=True,
+        enforce_eager=not args.enable_compile,
         max_model_len=args.tokens + args.max_tokens,
         load_format=args.load_format,
         enable_prefix_caching=True,

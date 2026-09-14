@@ -24,6 +24,7 @@ from pathlib import Path
 
 from .layout import Layout, decode_io_key
 from .object_pool import ObjectPool, PoolConfig
+from .preset_derive import derive_device_fields
 
 from .striped_layout import StripedLayout
 from engine.nvtx import range as nvtx_range
@@ -243,6 +244,60 @@ class TuttiDirectBackend:
         )
         return True
 
+    def warm_up_registration(self) -> bool:
+        """绑定期强制完成每个 DataPath 的 peer-memory 注册（一次性）。
+
+        注册是惰性的：``StorageRuntime::submit`` 首次遇到一个未注册的
+        (data_path, registration_domain) 才会把 KV 池显存映射成该 NVMe
+        设备的 peer 内存（``nvm_dma_map_data_device``，走 NVIDIA 驱动 +
+        phxfs 的 p2p 注册，对 48.7GB 的池逐页建表）。实测单次 200~275ms，
+        且全程持 runtime registry 锁——8 卡首轮 476ms 期间所有前向线程的
+        ``submit`` 都被阻塞、GPU 全空转（nsys: ioctl 275+201ms）。
+
+        在 bind 期（KV 池已注册、槽位句柄已就绪）用一个 1-page **读**
+        把它做掉，代价是启动多 ~0.5s、首个请求少 ~0.5s。读方向不写盘，
+        失败也不影响正确性，故这里吞掉异常并返回 False。
+        """
+        store = self._store
+        geometry = self._geometry
+        if self._closed or geometry is None or self._memory_ticket is None:
+            return False
+        # 非池部署（无对象池的 store 实现）没有就绪槽位句柄，跳过。
+        pool = getattr(store, "_object_pool", None)
+        if pool is None or not getattr(pool, "configured", False):
+            return False
+        target_ticket = 0
+        for entry in pool.gpu_files():
+            if entry.ticket:
+                target_ticket = int(entry.ticket)
+                break
+        if not target_ticket:
+            return False
+        length = int(geometry.page_bytes)
+        if not 0 < length <= int(geometry.segment_bytes):
+            return False
+        started_ns = time.perf_counter_ns()
+        try:
+            with nvtx_range("tutti.direct.warm_up_registration"):
+                handles = store._submit_retry(
+                    [(target_ticket, 0, int(self._memory_ticket), 0,
+                      length, "read")],
+                    "read",
+                )
+                completion = _TuttiCompletion(
+                    store._runtime, handles, lambda _ok: None,
+                    auto_watch=False, direction="read",
+                )
+                completion.wait_result()
+        except Exception as exc:
+            _LOG.warning("DIRECT_REGISTRATION_WARMUP_FAILED err=%r", exc)
+            return False
+        _LOG.warning(
+            "DIRECT_REGISTRATION_WARMUP_DONE elapsed_ms=%.1f",
+            (time.perf_counter_ns() - started_ns) / 1_000_000,
+        )
+        return True
+
     @staticmethod
     def _derive_geometry(pool, *, num_layers, blocks_per_chunk,
                          chunk_tokens, segment_bytes) -> DirectPoolGeometry:
@@ -252,7 +307,7 @@ class TuttiDirectBackend:
         if not callable(dim) or int(dim()) != 5:
             raise DirectAdmissionError(
                 "KV pool must have rank 5: "
-                "[num_blocks, num_layers, block_size, 2, kv_channels]"
+                "[num_blocks, num_layers, block_size, kv_heads, kv_channels]"
             )
         shape = tuple(int(value) for value in pool.shape)
         if any(value <= 0 for value in shape):
@@ -261,9 +316,13 @@ class TuttiDirectBackend:
             raise DirectAdmissionError(
                 f"KV pool layer axis is {shape[1]}, expected {num_layers}"
             )
-        if shape[3] != 2:
+        # shape[3] 是**每 rank 的 KV head 数**（TP 分片后），不是 K/V 轴：
+        # 实测 TP4 [nb, 80, 64, 2, 256]、TP8 [nb, 80, 64, 1, 256]——K 与 V
+        # 拼接在最后一维（2 × head_dim），head 数随 TP 变化。IO 按整页
+        # （block × 层）搬运，不区分 K/V，故只校验其非零。
+        if shape[3] < 1:
             raise DirectAdmissionError(
-                f"KV pool K/V axis must be shape[3] == 2, got {shape[3]}"
+                f"KV pool head axis must be >= 1, got {shape[3]}"
             )
         if shape[2] != int(chunk_tokens) // int(blocks_per_chunk):
             raise DirectAdmissionError(
@@ -1039,6 +1098,12 @@ class TuttiKVStore:
         self._runtime = runtime
         self._own_runtime = runtime is None
         self._preset = _normalize_preset(preset) if preset is not None else None
+        if self._preset is not None and "daemon_config" in self._preset:
+            # layout 构造需要设备字段（striped 的 mounts 来自 devices[].mount_path），
+            # 在构造 layout 前先按 daemon 配置推导一次；_build_runtime 的推导
+            # 幂等，重复调用不改变结果。
+            import yaml
+            self._preset = derive_device_fields(self._preset, yaml)
         self._key_namespace: bytes | None = None
         if layout in (None, "file_per_chunk", "file"):
             self._layout = Layout(self._root, segment_bytes)
@@ -1047,8 +1112,17 @@ class TuttiKVStore:
                 mounts = _preset_mounts(self._preset)
             if stripe_unit is None:
                 raise ValueError("striped target 必须提供 stripe_unit")
+            preset_unit = (self._preset or {}).get("stripe_unit")
+            if preset_unit is not None and int(preset_unit) != int(stripe_unit):
+                # Python 布局与 C++ 组装器必须同粒度，否则 IO 的
+                # logical→shard 映射会和文件布局错位。
+                raise RuntimeError(
+                    f"stripe_unit 不一致：options={stripe_unit} "
+                    f"preset={preset_unit}"
+                )
             self._layout = StripedLayout(
-                self._root, segment_bytes, mounts, stripe_unit
+                self._root, segment_bytes, mounts, stripe_unit,
+                rank_id=rank_id,
             )
         else:
             raise ValueError(f"未知 tutti_nvme layout：{layout!r}")
@@ -1619,6 +1693,10 @@ class TuttiKVStore:
             pool.set_gpu_file_opener(self._open_gpu_files)
             pool.set_gpu_file_closer(self._close_cached_targets)
             pool.mark_gpu_files_ready()
+            # 预热到 high_watermark：扩容 + open_batch 的 peer-memory 映射
+            # 必须整体留在启动期，否则请求期扩容会把前向线程阻塞秒级
+            # （registry 锁被 open_batch 全程持有）。
+            pool.warm_up()
 
     def _open_gpu_files(self, uris) -> list[int]:
         """GpuFile 就绪化：把槽位文件打开成运行时句柄。
@@ -1983,7 +2061,7 @@ def _build_runtime(preset: dict):
     if not isinstance(preset, dict):
         raise RuntimeError("preset 必须是映射")
     if "daemon_config" in preset:
-        preset = _derive_device_fields(preset, yaml)
+        preset = derive_device_fields(preset, yaml)
 
     try:
         import tutti_runtime  # bindings 构建产物（需在 sys.path/PYTHONPATH）
@@ -2021,31 +2099,5 @@ def _build_runtime_from_env():
 
 
 def _derive_device_fields(preset: dict, yaml) -> dict:
-    """daemon_config + device_id → 设备字段（硬件信息单一来源）。
-
-    daemon 配置（yaml）的 nvmes 列表按 device_id 给出权威事实：
-    pci_addr、backing_mount_path、namespace_id；preset 可显式覆盖。
-    SNVMe 字符设备由 C++ preset 组装器按 BDF 查询 sysfs，Python 不拼接
-    `/dev/ssnvme<N>`；backing block device 仍可按 namespace 约定回退。
-    """
-    daemon_path = preset.get("daemon_config")
-    device_id = preset.get("device_id")
-    if not daemon_path or device_id is None:
-        raise RuntimeError("preset 携带 daemon_config 时必须同时给出 device_id")
-    daemon = yaml.safe_load(Path(daemon_path).read_text())
-    entry = next(
-        (n for n in daemon.get("nvmes", []) if n.get("device_id") == device_id), None
-    )
-    if entry is None:
-        raise RuntimeError(f"daemon 配置无 device_id={device_id} 的 NVMe 条目")
-    device = dict(preset.get("device") or {})
-    namespace_id = device.get("namespace_id", entry.get("namespace_id", 1))
-    device.setdefault("pci_bdf", entry["pci_addr"])
-    device.setdefault("mount_path", entry["backing_mount_path"])
-    device.setdefault("namespace_id", namespace_id)
-    device.setdefault(
-        "backing_device", f"/dev/snvme{device_id}n{device.get('namespace_id', 1)}"
-    )
-    derived = dict(preset)
-    derived["device"] = device
-    return derived
+    """兼容别名：设备字段推导已提取到 preset_derive（store/metadata 共用）。"""
+    return derive_device_fields(preset, yaml)

@@ -373,6 +373,15 @@ private:
     std::uint64_t next_target_ = 1;
     std::uint64_t next_memory_ = 1;
     std::uint64_t next_op_token_ = 1;
+    // Registration domain shared by every target of this DataPath: the
+    // memory registration maps the buffer for ALL devices_ regardless of
+    // the target, so the domain must be a function of the device set --
+    // NOT of the target token.  A per-target key makes the runtime
+    // re-run nvm_dma_map_data_device for every freshly opened target
+    // (measured 2026-09-14: 39 new chunk targets x 2 shards = 19.3s in
+    // submit, each map taking the NVIDIA RM global lock), while the
+    // device-keyed key registers once and reuses.
+    std::string device_domain_key_;
     std::unordered_map<std::uint64_t, StripedTarget> targets_;
     std::unordered_map<std::uint64_t, StripedMemory> memory_regs_;
     std::unordered_map<std::uint64_t, OpEntry> ops_;

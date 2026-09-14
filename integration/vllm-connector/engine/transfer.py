@@ -56,6 +56,18 @@ class DirectTransfer:
                 "direct backend rejected paged cache registration"
             )
 
+    def warm_up_registration(self) -> bool:
+        """Force the backend's lazy per-DataPath memory registration now.
+
+        Registration normally happens inside the first ``submit``; doing it
+        at bind time keeps the multi-hundred-millisecond peer-memory map
+        (which holds the runtime registry lock) out of the first request.
+        """
+        method = getattr(self._backend, "warm_up_registration", None)
+        if not callable(method):
+            return False
+        return bool(method())
+
     def load_layer(self, keys, layer_idx: int, block_tables):
         method = getattr(self._backend, "get_paged_batch", None)
         if not callable(method):

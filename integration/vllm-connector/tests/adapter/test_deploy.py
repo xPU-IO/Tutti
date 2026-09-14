@@ -9,6 +9,7 @@ import pytest
 
 from adapter.connector import (
     TuttiConnectorV1,
+    _apply_device_groups,
     _deployment_rank,
     _expand_placeholders,
 )
@@ -160,6 +161,55 @@ class TestLocalRankPlaceholder:
                 for item in captured["rank_options"]] == [str(rank)
                                                           for rank in range(4)]
 
+    def test_device_groups_expand_per_rank_in_scheduler(self, monkeypatch):
+        """scheduler 侧：8 卡 device_groups 按 rank 展开为各自盘组。"""
+        captured = {}
+        import stores.metadata as metadata_mod
+
+        def fake_create_store(type_name, options):
+            captured.update(options)
+            from stores.memory import MemoryKVStore
+            return MemoryKVStore(segment_bytes=4096, num_chunks=4)
+
+        monkeypatch.setattr(metadata_mod, "create_metadata_store",
+                            fake_create_store)
+        cfg = SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(kv_connector_extra_config={
+                "chunk_tokens": 8,
+                "chunk_kv_bytes": 12288,
+                "max_chunks_per_wave": 4,
+                "num_layers": 3,
+                "store": {"type": "tutti_nvme", "options": {
+                    "root": "/mnt/nvme0/pool-rank{LOCAL_RANK}",
+                    "layout": "striped",
+                    "stripe_unit": 4096,
+                    "preset": {
+                        "type": "striped",
+                        "device_groups": [[0, 1], [2, 3]],
+                        "gpu_id": "{LOCAL_RANK}",
+                    },
+                }},
+            }),
+            cache_config=SimpleNamespace(block_size=16),
+            parallel_config=SimpleNamespace(
+                rank=4, tensor_parallel_size=8,
+                decode_context_parallel_size=1,
+            ),
+        )
+        connector = TuttiConnectorV1(cfg, KVConnectorRole.SCHEDULER, object())
+        connector.shutdown()
+        rank_devices = [
+            [device["device_id"] for device in item["preset"]["devices"]]
+            for item in captured["rank_options"]
+        ]
+        assert rank_devices == [[0, 1]] * 4 + [[2, 3]] * 4
+        # TP8 的 8 个 root 必须两两不同（scheduler 侧强校验）
+        assert len({item["root"]
+                    for item in captured["rank_options"]}) == 8
+        # device_groups 不应泄漏进运行时 preset
+        assert all("device_groups" not in item["preset"]
+                   for item in captured["rank_options"])
+
 
 class TestPresetNormalization:
     """preset 归一：纯十进制数字字符串转 int，其余原样。"""
@@ -228,3 +278,39 @@ class TestTuttiStorePresetParam:
         with pytest.raises(RuntimeError, match="stop-here"):
             store.open()
         assert called["preset"] == {"device_id": 1}  # 归一化后直达
+
+
+class TestDeviceGroups:
+    """device_groups：多卡共用盘组（8 卡 / 每 4 个 rank 一组 2 盘条带）。"""
+
+    def test_groups_split_by_rank_span(self):
+        options = {"preset": {"type": "striped",
+                              "device_groups": [[0, 1], [2, 3]]}}
+        for rank in range(4):
+            got = _apply_device_groups(options, rank=str(rank), tp_size=8)
+            assert [d["device_id"] for d in got["preset"]["devices"]] == [0, 1]
+        for rank in range(4, 8):
+            got = _apply_device_groups(options, rank=str(rank), tp_size=8)
+            assert [d["device_id"] for d in got["preset"]["devices"]] == [2, 3]
+        # 原 options 不被就地修改
+        assert "device_groups" in options["preset"]
+        assert "devices" not in options["preset"]
+
+    def test_single_group_covers_all_ranks(self):
+        options = {"preset": {"device_groups": [[0, 1]]}}
+        got = _apply_device_groups(options, rank="7", tp_size=8)
+        assert [d["device_id"] for d in got["preset"]["devices"]] == [0, 1]
+
+    def test_absent_groups_passthrough(self):
+        options = {"preset": {"type": "local", "device_id": "0"}}
+        assert _apply_device_groups(options, rank="0", tp_size=8) is options
+
+    def test_group_count_must_divide_tp_size(self):
+        options = {"preset": {"device_groups": [[0], [1], [2]]}}
+        with pytest.raises(ValueError, match="整除"):
+            _apply_device_groups(options, rank="0", tp_size=8)
+
+    def test_empty_groups_rejected(self):
+        options = {"preset": {"device_groups": []}}
+        with pytest.raises(ValueError, match="非空"):
+            _apply_device_groups(options, rank="0", tp_size=8)

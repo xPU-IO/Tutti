@@ -9,12 +9,15 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import os
 import struct
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+_LOG = logging.getLogger(__name__)
 
 
 _FIEMAP_IOCTL = 0xC020660B
@@ -235,7 +238,8 @@ class ObjectPool:
                 # 避免在无分配器的部署（测试/单线程）里空等超时。
                 if self._thread is not None:
                     self._ready_shortfall = True
-                    wait_deadline = time.monotonic() + self.config.wait_timeout_s
+                    wait_started = time.monotonic()
+                    wait_deadline = wait_started + self.config.wait_timeout_s
                     while True:
                         self._condition.notify_all()
                         self._request_refill_locked(force=True)
@@ -246,6 +250,14 @@ class ObjectPool:
                         if remaining <= 0:
                             break
                         self._condition.wait(min(remaining, 0.01))
+                    # 就绪队列短缺是性能事件（请求路径退回按需 open）：正常
+                    # 部署不应出现，出现即说明预热不足或分配器被阻塞。
+                    _LOG.warning(
+                        "POOL_READY_SHORTFALL missing=%d elapsed_ms=%.1f "
+                        "got=%s thread=%s",
+                        len(missing), (time.monotonic() - wait_started) * 1e3,
+                        slots is not None, threading.current_thread().name,
+                    )
                     self._ready_shortfall = False
                 if slots is None:
                     # 兜底：就绪队列始终不足时退回未就绪槽位，正确性
@@ -537,6 +549,34 @@ class ObjectPool:
         触发一次就绪化；此后新增槽位由分配器自动就绪化。
         """
         self._ready_gpu_files()
+
+    def warm_up(self, target_free: int | None = None) -> int:
+        """启动期把池预热到目标自由槽位数，并同步就绪化（返回新建槽位数）。
+
+        动机（2026-09-14 实测）：扩容若落在请求路径上，分配器会调
+        `open_batch`，其中每个目标句柄构建要走 peer-memory DMA 映射
+        （`nvidia_p2p_get_pages`/`nvidia_p2p_dma_map_pages`，受 NVIDIA
+        RM 全局锁串行化），39 个槽位实测 **19.7s**；而 `open_batch` 全程
+        持 registry 锁，前向线程的 `submit` 因此被阻塞同样时长（8 卡
+        A 请求 22.6s vs 纯 vLLM 1.55s）。
+
+        预热把"建槽位 + open + 映射"整体挪到启动期（模型加载窗口内，
+        不在请求关键路径），请求期只做纯内存取用。
+        """
+        target = (self.config.high_watermark if target_free is None
+                  else int(target_free))
+        created = 0
+        while True:
+            with self._condition:
+                if self._stop or self._total_locked() >= self.config.max_slots:
+                    break
+                if len(self._free) >= target:
+                    break
+            if self._create_one_sync() is None:
+                break
+            created += 1
+        self._ready_gpu_files()
+        return created
 
     def _ready_free_slots_locked(self, count: int) -> list[int] | None:
         """最小的 ``count`` 个**已就绪**自由槽位；不足返回 None。"""

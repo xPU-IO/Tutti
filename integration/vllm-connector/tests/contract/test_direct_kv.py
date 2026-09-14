@@ -240,6 +240,84 @@ class FakeEngineStore(FakeStoreOwner):
         return None
 
 
+class _FakeGpuFile:
+    def __init__(self, slot, ticket):
+        self.slot = slot
+        self.ticket = ticket
+
+
+class _FakeObjectPool:
+    """最小对象池替身：只暴露 warm_up_registration 需要的就绪句柄视图。"""
+
+    configured = True
+
+    def __init__(self, tickets):
+        self._files = [
+            _FakeGpuFile(slot, ticket) for slot, ticket in enumerate(tickets)
+        ]
+
+    def gpu_files(self):
+        return list(self._files)
+
+
+def _warm_up_backend(tickets):
+    runtime = FakeRuntime()
+    store = FakeStoreOwner(runtime)
+    if tickets is not None:
+        store._object_pool = _FakeObjectPool(tickets)
+    backend = TuttiDirectBackend(store)
+    backend.register_paged_caches(
+        FakePool(128), num_layers=3, blocks_per_chunk=2,
+        chunk_tokens=256, segment_bytes=8192, max_chunks_per_wave=2,
+    )
+    return runtime, backend
+
+
+def test_direct_warm_up_registration_issues_one_page_read():
+    """绑定期预热：一个 1-page 读触发 peer-memory 注册（首轮成本前移）。
+
+    注册本身在 C++ 侧是惰性的（首次 submit 触发 nvm_dma_map_data_device，
+    8 卡实测 476ms 且持 registry 锁），这里只验证 Python 侧正确地用
+    一个最小的读把该路径走通，且不写盘、不动 live 集合。
+    """
+    runtime, backend = _warm_up_backend([777])
+    try:
+        assert backend.warm_up_registration() is True
+        requests, kwargs = runtime.submit_calls[-1]
+        assert len(requests) == 1
+        target, target_offset, memory, memory_offset, length, direction = (
+            requests[0]
+        )
+        assert target == 777
+        assert target_offset == 0
+        assert memory == 41          # register_paged_caches 的 memory ticket
+        assert memory_offset == 0
+        assert length == backend.geometry.page_bytes
+        assert direction == "read"
+        assert kwargs.get("stream") == 11     # 读流
+        # 读方向不产生落盘回调，也不改 live 集合
+        assert backend._store.put_results == []
+        assert backend._store._live == set()
+    finally:
+        backend.close()
+
+
+def test_direct_warm_up_registration_skips_without_ready_targets():
+    """无对象池（非池部署）或槽位句柄未就绪时预热直接跳过，不抛异常。"""
+    runtime, backend = _warm_up_backend(None)
+    try:
+        assert backend.warm_up_registration() is False
+    finally:
+        backend.close()
+
+    runtime, backend = _warm_up_backend([0])   # ticket=0 → 尚未 open
+    try:
+        assert backend.warm_up_registration() is False
+        assert runtime.submit_calls == []
+    finally:
+        backend.close()
+
+
 @pytest.mark.parametrize("block_size", [64, 128, 256])
 def test_direct_address_formula_and_one_submit_per_layer(block_size):
     runtime = FakeRuntime()

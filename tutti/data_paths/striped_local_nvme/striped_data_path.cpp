@@ -434,6 +434,21 @@ Status StripedDataPath::initialize_impl_(const DataPathConfig& config,
         devices_.push_back(std::move(slot));
     }
 
+    // Registration domain: one key for the whole DataPath, derived from the
+    // device set.  register_memory maps the buffer for every device_, so
+    // two targets that share the device set share the registration -- see
+    // the device_domain_key_ declaration for the measured failure mode.
+    {
+        std::string key = "striped-local-nvme";
+        for (const auto& device : devices_) {
+            key += ':';
+            key += device.desc.controller_pci_addr;
+            key += "/ns";
+            key += std::to_string(device.desc.namespace_id);
+        }
+        device_domain_key_ = std::move(key);
+    }
+
     // The public capability is the conservative minimum. Submission and
     // prebuild use each selected controller's own driver-reported MDTS.
     std::uint64_t min_mdts = UINT64_MAX;
@@ -617,6 +632,7 @@ Status StripedDataPath::shutdown_impl_(std::uint64_t timeout_ns) {
         }
     }
     devices_.clear();
+    device_domain_key_.clear();
 
     initialized_ = false;
     timeout_prp_retained_ = false;
@@ -675,7 +691,11 @@ Result<DataPathTarget> StripedDataPath::open_impl_(const ResolvedTarget& target)
 
     std::uint64_t tok = next_target_++;
     tgt.generation = 1;
-    tgt.domain_key = "striped-local-nvme:" + std::to_string(tok);
+    // Domain shared by all targets of this DataPath (device-set keyed, see
+    // device_domain_key_): memory registration maps the buffer for every
+    // device_, so keying by the target token would force a full
+    // nvm_dma_map_data_device sweep per newly opened target.
+    tgt.domain_key = device_domain_key_;
     targets_[tok] = std::move(tgt);
 
     return Result<DataPathTarget>::Success(

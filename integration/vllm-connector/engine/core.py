@@ -1127,6 +1127,12 @@ class KVEngine:
             setter = getattr(self._store, "set_layer_span", None)
             if callable(setter):
                 setter(num_layers)
+            # 池就绪后立刻把每个 DataPath 的 peer-memory 注册做掉：注册是
+            # 惰性的（首次 submit 触发），对 48.7GB 的 KV 池是 200~275ms/盘
+            # 且持 runtime registry 锁，8 卡首轮实测 476ms 全落在首个请求里。
+            warmer = getattr(transfer, "warm_up_registration", None)
+            if callable(warmer):
+                warmer()
         except Exception:
             transfer.close()
             raise

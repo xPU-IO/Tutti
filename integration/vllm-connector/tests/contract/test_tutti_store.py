@@ -945,6 +945,95 @@ def test_derive_device_fields_unknown_device(tmp_path):
         )
 
 
+def test_derive_striped_devices_from_daemon(tmp_path):
+    """striped preset：devices 的 device_id 列表按 daemon 配置逐个推导。"""
+    import yaml
+
+    daemon = {
+        "nvmes": [
+            {"device_id": 0, "pci_addr": "0000:08:00.0",
+             "backing_mount_path": "/mnt/nvme0", "namespace_id": 1},
+            {"device_id": 2, "pci_addr": "0000:57:00.0",
+             "backing_mount_path": "/mnt/nvme2", "namespace_id": 1},
+        ]
+    }
+    daemon_path = tmp_path / "daemon.yaml"
+    daemon_path.write_text(yaml.safe_dump(daemon))
+
+    preset = {
+        "type": "striped",
+        "daemon_config": str(daemon_path),
+        "devices": [{"device_id": 0}, {"device_id": 2}],
+        "stripe_unit": 65536,
+    }
+    derived = _derive_device_fields(preset, yaml)
+    devices = derived["devices"]
+    assert [d["pci_bdf"] for d in devices] == [
+        "0000:08:00.0", "0000:57:00.0"
+    ]
+    assert [d["mount_path"] for d in devices] == ["/mnt/nvme0", "/mnt/nvme2"]
+    assert [d["backing_device"] for d in devices] == [
+        "/dev/snvme0n1", "/dev/snvme2n1"
+    ]
+    assert all("device_id" not in d for d in devices)
+    # 幂等：store 构造与 runtime 构造各推导一次，结果必须一致
+    assert _derive_device_fields(derived, yaml)["devices"] == devices
+    # 显式字段优先于 daemon 事实
+    override = dict(preset, devices=[{"device_id": 0, "mount_path": "/custom"}])
+    assert (_derive_device_fields(override, yaml)["devices"][0]["mount_path"]
+            == "/custom")
+
+
+def test_striped_store_derives_mounts_from_preset(tmp_path):
+    """striped store：mounts 从 preset.devices 的 daemon 推导结果取得。"""
+    import yaml
+
+    nvme0 = tmp_path / "nvme0"
+    nvme2 = tmp_path / "nvme2"
+    daemon_path = tmp_path / "daemon.yaml"
+    daemon_path.write_text(yaml.safe_dump({"nvmes": [
+        {"device_id": 0, "pci_addr": "0000:08:00.0",
+         "backing_mount_path": str(nvme0), "namespace_id": 1},
+        {"device_id": 2, "pci_addr": "0000:57:00.0",
+         "backing_mount_path": str(nvme2), "namespace_id": 1},
+    ]}))
+    preset = {
+        "type": "striped",
+        "daemon_config": str(daemon_path),
+        "devices": [{"device_id": 0}, {"device_id": 2}],
+        "stripe_unit": 4096,
+    }
+    store = TuttiKVStore(
+        tmp_path / "meta-root", 8, SEG,
+        layout="striped", preset=preset, stripe_unit=4096,
+    )
+    assert store._layout.mounts == (
+        str(nvme0.resolve()), str(nvme2.resolve())
+    )
+
+
+def test_striped_store_rejects_stripe_unit_mismatch(tmp_path):
+    """options 与 preset 的 stripe_unit 不一致必须 fail-closed。"""
+    import yaml
+
+    daemon_path = tmp_path / "daemon.yaml"
+    daemon_path.write_text(yaml.safe_dump({"nvmes": [
+        {"device_id": 0, "pci_addr": "0000:08:00.0",
+         "backing_mount_path": str(tmp_path / "nvme0"), "namespace_id": 1},
+    ]}))
+    preset = {
+        "type": "striped",
+        "daemon_config": str(daemon_path),
+        "devices": [{"device_id": 0}],
+        "stripe_unit": 8192,
+    }
+    with pytest.raises(RuntimeError, match="stripe_unit 不一致"):
+        TuttiKVStore(
+            tmp_path / "meta-root", 8, SEG,
+            layout="striped", preset=preset, stripe_unit=4096,
+        )
+
+
 # ---------- layout 单元 ----------
 
 
