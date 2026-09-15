@@ -795,11 +795,6 @@ class WorkerImpl:
                         "read plan compute event bridge is unavailable"
                     )
                 wait_compute(fence_event)
-                kick_feeder = getattr(self._read_plan, "kick_feeder", None)
-                if direct and callable(kick_feeder) and callback == 0:
-                    # The callback only queues the compute dependency; the
-                    # feeder performs subsequent Runtime submits independently.
-                    kick_feeder()
                 self._load_waited_callbacks.add(callback)
             except LoadGateError as exc:
                 self._mark_load_failure(exc)

@@ -38,6 +38,11 @@ from index.chunk_index import (
 )
 _LOG = logging.getLogger(__name__)
 _FEEDER_DIAG = os.environ.get("TUTTI_FEEDER_DIAGNOSTICS") == "1"
+# feeder 滞后时 compute 回调等待其登记的时长上限。等待是正常路径（feeder 只是
+# 落后于 compute），超时仅用于把"feeder 卡死"这类真故障转成显式错误。
+_DIRECT_FEEDER_WAIT_SECONDS = 120.0
+# 一次等待超过该阈值（毫秒）就记一行，用于观测 compute 与 feeder 的竞速余量。
+_DIRECT_FEEDER_WAIT_LOG_MS = 1.0
 
 
 class _ReadPlan:
@@ -158,8 +163,8 @@ class _DirectAllLayerReadPlan:
 
     Layer zero is submitted synchronously so ``start_load_kv`` can return
     without waiting for the complete plan. Remaining layers are submitted by
-    an independent host feeder after the first callback has queued its compute
-    wait. The callback never invokes Runtime I/O itself.
+    an independent host feeder that starts as soon as the plan is constructed.
+    The callback never invokes Runtime I/O itself.
     """
 
     def __init__(self, engine, keys, block_tables, physical_layers,
@@ -180,7 +185,10 @@ class _DirectAllLayerReadPlan:
         self._submit_all_total_ms = 0.0
         self._first_read_submit_completed_ns = None
         self._state_lock = threading.RLock()
-        self._feeder_kick = threading.Event()
+        # fence 可用性的专用条件变量：**必须与 _state_lock 分离**——feeder 在
+        # 提交单层期间持有 _state_lock（load_layer 可达数百毫秒），若等待者共用
+        # 该锁，等待会退化成互斥排队，超时与失败检查都会失效。
+        self._ready_cond = threading.Condition()
         self._feeder_stop = threading.Event()
         self._feeder_done = threading.Event()
         self._feeder_thread = None
@@ -188,6 +196,9 @@ class _DirectAllLayerReadPlan:
             raise ValueError("direct all-layer read plan requires at least one layer")
         self._submit_layer(0)
         if self.layer_count > 1:
+            # feeder 立即起跑：余下层不等首个 compute 回调。提前提交让读尽早占满
+            # 盘侧带宽，并把"某层尚未提交"的窗口压到最小；并发由 in-flight 配额
+            # 约束，不需要靠 compute 节奏限流。
             self._feeder_thread = threading.Thread(
                 target=self._run_feeder,
                 name="tutti-direct-read-feeder",
@@ -208,13 +219,7 @@ class _DirectAllLayerReadPlan:
 
     def wait_layer(self, callback, physical=None):
         self._validate_callback(callback, physical)
-        event = self.read_ready_events.get(callback)
-        if event is None:
-            error = RuntimeError(
-                f"direct read callback {callback} has no recorded ready event"
-            )
-            self._record_failure(error)
-            raise error
+        event = self._await_ready_event(callback)
         if callback in self.waited_callbacks:
             return event
         expected = len(self.waited_callbacks)
@@ -226,6 +231,57 @@ class _DirectAllLayerReadPlan:
             self._record_failure(error)
             raise error
         self.waited_callbacks.add(callback)
+        return event
+
+    def _await_ready_event(self, callback: int):
+        """等到 feeder 为 callback 层登记 fence event，再返回该 event。
+
+        compute 回调可能早于 feeder 提交该层（feeder 是主机线程、逐层提交，
+        单层耗时与 compute 同量级），此时**必须等**而不是判定失败：feeder 的
+        推进只受 in-flight 配额约束，配额随 IO 完成释放、不依赖 compute 进度，
+        所以等待必然收敛。等待期间若发现计划已失败或 feeder 已停止，立即抛出
+        对应错误，避免把真故障变成挂起。
+        """
+        deadline = time.monotonic() + _DIRECT_FEEDER_WAIT_SECONDS
+        waited_started_ns = None
+        error = None
+        event = None
+        with self._ready_cond:
+            while True:
+                event = self.read_ready_events.get(callback)
+                if event is not None:
+                    break
+                failure = self.terminal_failure
+                if failure is not None:
+                    error = failure
+                    break
+                if self._feeder_stop.is_set():
+                    error = RuntimeError(
+                        f"direct read feeder stopped before layer {callback}"
+                    )
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    error = RuntimeError(
+                        f"direct read feeder did not submit layer {callback} "
+                        f"within {_DIRECT_FEEDER_WAIT_SECONDS:.0f}s"
+                    )
+                    break
+                if waited_started_ns is None:
+                    waited_started_ns = time.perf_counter_ns()
+                self._ready_cond.wait(timeout=min(remaining, 0.5))
+        if error is not None:
+            # _record_failure 会通知同一条件变量，必须在释放后调用。
+            if error is not self.terminal_failure:
+                self._record_failure(error)
+            raise error
+        if waited_started_ns is not None:
+            waited_ms = (time.perf_counter_ns() - waited_started_ns) / 1_000_000
+            if waited_ms >= _DIRECT_FEEDER_WAIT_LOG_MS:
+                _LOG.info(
+                    "DIRECT_READ_LAYER_WAIT layer=%d waited_ms=%.3f",
+                    callback, waited_ms,
+                )
         return event
 
     def after_layer(self, callback, physical=None) -> None:
@@ -244,7 +300,6 @@ class _DirectAllLayerReadPlan:
         self.advanced_callbacks.add(callback)
 
     def require_complete(self) -> None:
-        self._feeder_kick.set()
         self.join_feeder()
         expected = set(range(self.layer_count))
         missing_waits = tuple(sorted(expected - self.waited_callbacks))
@@ -302,7 +357,6 @@ class _DirectAllLayerReadPlan:
         elapsed_ms = (completed_ns - layer_started_ns) / 1_000_000
         with self._state_lock:
             self.handles[callback] = handle
-            self.read_ready_events[callback] = fence_event
             self.next_read_to_submit = max(
                 self.next_read_to_submit, callback + 1
             )
@@ -310,6 +364,9 @@ class _DirectAllLayerReadPlan:
             self._layer_submit_completed_ns[callback] = completed_ns
             if callback == 0:
                 self._first_read_submit_completed_ns = completed_ns
+        with self._ready_cond:
+            self.read_ready_events[callback] = fence_event
+            self._ready_cond.notify_all()
         _LOG.warning(
             "DIRECT_READ_LAYER_SUBMIT layer=%d physical=%d "
             "elapsed_ms=%.3f completed_ns=%d",
@@ -323,7 +380,6 @@ class _DirectAllLayerReadPlan:
 
     def _run_feeder(self) -> None:
         try:
-            self._feeder_kick.wait()
             started_ns = time.perf_counter_ns()
             for callback in range(1, self.layer_count):
                 if self._feeder_stop.is_set() or self.terminal_failure is not None:
@@ -346,11 +402,13 @@ class _DirectAllLayerReadPlan:
                 max_layer_ms,
                 self._first_read_submit_completed_ns,
             )
+            self._publish_ready()
             self._feeder_done.set()
 
-    def kick_feeder(self) -> None:
-        """Release the feeder after the first compute dependency is queued."""
-        self._feeder_kick.set()
+    def _publish_ready(self) -> None:
+        """唤醒等待 fence 的 compute 回调（登记新层 / 失败 / feeder 结束）。"""
+        with self._ready_cond:
+            self._ready_cond.notify_all()
 
     def join_feeder(self) -> None:
         thread = self._feeder_thread
@@ -371,6 +429,9 @@ class _DirectAllLayerReadPlan:
         if self.terminal_failure is not None:
             return
         self.terminal_failure = error
+        # 唤醒可能在 _await_ready_event 里等待 fence 的 compute 回调，让它们
+        # 立刻看到失败而不是睡到超时。
+        self._publish_ready()
         if callable(self.on_failure):
             self.on_failure(error)
 
@@ -404,7 +465,7 @@ class _DirectAllLayerReadPlan:
 
     def abort(self):
         self._feeder_stop.set()
-        self._feeder_kick.set()
+        self._publish_ready()
         self.join_feeder()
         self._abort_submitted()
 
@@ -1497,7 +1558,6 @@ class KVEngine:
         """等待全部在途批次并 drain read/write 两个 bank。"""
         active_plan = getattr(self, "_active_read_plan", None)
         if active_plan is not None:
-            active_plan.kick_feeder()
             active_plan.join_feeder()
         inflight = self._inflight
         self._inflight = []

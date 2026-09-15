@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -993,8 +994,21 @@ def _direct_engine(log):
 
 
 def _finish_direct_plan(plan):
-    plan.kick_feeder()
     plan.join_feeder()
+
+
+def _gated_load_layer(engine, layer_idx, gate, entered=None):
+    """包装 engine.load_layer：命中 layer_idx 时先置 entered 再等 gate。"""
+    original = engine.load_layer
+
+    def gated(keys, layer, blocks, **kwargs):
+        if layer == layer_idx:
+            if entered is not None:
+                entered.set()
+            gate.wait(30.0)
+        return original(keys, layer, blocks, **kwargs)
+
+    return gated
 
 
 def test_staged_read_plan_submission_behavior_is_unchanged(monkeypatch):
@@ -1024,9 +1038,11 @@ def test_direct_all_layer_constructor_submits_complete_order(monkeypatch):
     plan = _DirectAllLayerReadPlan(
         engine, [b"r" * 16], [[2, 7]], (0, 1, 2)
     )
-    assert [item for item in log if item[0] == "read_submit"] == [
-        ("read_submit", 0)
-    ]
+    # 第 0 层必须在构造函数返回前提交完成（start_load_kv 快速返回的前提）；
+    # 余下层由 feeder 并发补上，因此这里只校验"首个提交是第 0 层"。
+    submits = [item for item in log if item[0] == "read_submit"]
+    assert submits[0] == ("read_submit", 0)
+    assert plan.read_ready_events.get(0) is not None
     _finish_direct_plan(plan)
     assert [item for item in log if item[0] == "read_submit"] == [
         ("read_submit", 0), ("read_submit", 1), ("read_submit", 2)
@@ -1041,7 +1057,7 @@ def test_direct_all_layer_constructor_submits_complete_order(monkeypatch):
     assert set(plan.read_ready_events) == {0, 1, 2}
 
 
-def test_direct_feeder_starts_after_explicit_kick_and_is_idempotent(monkeypatch):
+def test_direct_feeder_submits_without_kick_and_join_is_idempotent(monkeypatch):
     log = []
     engine = _direct_engine(log)
     monkeypatch.setattr("torch.cuda.is_available", lambda: True)
@@ -1049,12 +1065,11 @@ def test_direct_feeder_starts_after_explicit_kick_and_is_idempotent(monkeypatch)
     plan = _DirectAllLayerReadPlan(
         engine, [b"feed" * 4], [[2, 7]], (0, 1, 2)
     )
-    assert [item for item in log if item[0] == "read_submit"] == [
-        ("read_submit", 0)
-    ]
-    plan.kick_feeder()
+    # feeder 不等 compute 回调：构造函数返回后即可自行把余下层提交完。
     plan.join_feeder()
-    plan.kick_feeder()
+    assert [item for item in log if item[0] == "read_submit"] == [
+        ("read_submit", 0), ("read_submit", 1), ("read_submit", 2)
+    ]
     plan.join_feeder()
     assert [item for item in log if item[0] == "read_submit"] == [
         ("read_submit", 0), ("read_submit", 1), ("read_submit", 2)
@@ -1078,10 +1093,9 @@ def test_direct_feeder_failure_is_recorded_asynchronously(monkeypatch):
     plan = _DirectAllLayerReadPlan(
         engine, [b"fail" * 4], [[2, 7]], (0, 1, 2)
     )
-    assert [item for item in log if item[0] == "read_submit"] == [
-        ("read_submit", 0)
-    ]
-    plan.kick_feeder()
+    assert [item for item in log if item[0] == "read_submit"][0] == (
+        "read_submit", 0
+    )
     plan.join_feeder()
     assert isinstance(plan.failed, RuntimeError)
     assert "fake feeder admission failure" in str(plan.failed)
@@ -1124,7 +1138,7 @@ def test_engine_selects_all_layer_plan_only_for_direct(monkeypatch):
         [b"q" * 16], [[2, 7]], (0, 1, 2), depth=99
     )
     assert isinstance(plan, _DirectAllLayerReadPlan)
-    assert [item for item in log if item[0] == "read_submit"] == [("read_submit", 0)]
+    assert plan.read_ready_events.get(0) is not None
     _finish_direct_plan(plan)
     assert [item for item in log if item[0] == "read_submit"] == [
         ("read_submit", 0), ("read_submit", 1), ("read_submit", 2)
@@ -1139,11 +1153,12 @@ def test_direct_all_layer_wait_is_submit_and_host_wait_free(monkeypatch):
     plan = _DirectAllLayerReadPlan(
         engine, [b"s" * 16], [[2, 7]], (0, 1, 2)
     )
+    _finish_direct_plan(plan)
     before = list(log)
     assert plan.wait_layer(0, 0) is plan.read_ready_events[0]
     assert log == before
     assert plan.handles[0].wait_count == 0
-    _finish_direct_plan(plan)
+    plan.abort()
 
 
 def test_direct_all_layer_after_layer_does_not_submit_or_duplicate(monkeypatch):
@@ -1154,8 +1169,8 @@ def test_direct_all_layer_after_layer_does_not_submit_or_duplicate(monkeypatch):
     plan = _DirectAllLayerReadPlan(
         engine, [b"t" * 16], [[2, 7]], (0, 1, 2)
     )
-    assert len([item for item in log if item[0] == "read_submit"]) == 1
     _finish_direct_plan(plan)
+    assert len([item for item in log if item[0] == "read_submit"]) == 3
     plan.after_layer(0, 0)
     assert len([item for item in log if item[0] == "read_submit"]) == 3
     plan.after_layer(0, 0)
@@ -1172,8 +1187,80 @@ def test_direct_all_layer_after_layer_does_not_submit_or_duplicate(monkeypatch):
     plan.require_complete()
 
 
-def test_direct_all_layer_out_of_order_and_missing_callbacks_fail_closed(
-        monkeypatch):
+def test_direct_all_layer_wait_blocks_until_feeder_registers(monkeypatch):
+    """feeder 尚未提交该层时，compute 必须等 fence，而不是判定失败。"""
+    log = []
+    engine = _direct_engine(log)
+    gate = threading.Event()
+    entered = threading.Event()
+    engine.load_layer = _gated_load_layer(engine, 1, gate, entered)
+    monkeypatch.setattr("torch.cuda.is_available", lambda: True)
+    monkeypatch.setattr("torch.cuda.Event", lambda enable_timing=False: object())
+    plan = _DirectAllLayerReadPlan(
+        engine, [b"w" * 16], [[2, 7]], (0, 1, 2)
+    )
+    assert plan.wait_layer(0, 0) is plan.read_ready_events[0]
+    assert entered.wait(5.0), "feeder 应已进入第 1 层提交"
+    outcome = {}
+
+    def waiter():
+        outcome["event"] = plan.wait_layer(1, 1)
+
+    thread = threading.Thread(target=waiter)
+    thread.start()
+    thread.join(0.3)
+    assert thread.is_alive(), "feeder 未登记时 wait_layer 应等待而非失败"
+    assert plan.failed is None
+    gate.set()
+    thread.join(5.0)
+    assert not thread.is_alive()
+    assert outcome["event"] is plan.read_ready_events[1]
+    plan.abort()
+
+
+def test_direct_all_layer_wait_surfaces_feeder_failure(monkeypatch):
+    """feeder 真失败时，等待中的 compute 立刻拿到该错误。"""
+    log = []
+    engine = _direct_engine(log)
+    original = engine.load_layer
+
+    def fail_second(keys, layer, blocks, **kwargs):
+        if layer == 1:
+            raise RuntimeError("fake feeder admission failure")
+        return original(keys, layer, blocks, **kwargs)
+
+    engine.load_layer = fail_second
+    monkeypatch.setattr("torch.cuda.is_available", lambda: True)
+    monkeypatch.setattr("torch.cuda.Event", lambda enable_timing=False: object())
+    plan = _DirectAllLayerReadPlan(
+        engine, [b"x" * 16], [[2, 7]], (0, 1, 2)
+    )
+    assert plan.wait_layer(0, 0) is plan.read_ready_events[0]
+    with pytest.raises(RuntimeError, match="fake feeder admission failure"):
+        plan.wait_layer(1, 1)
+    plan.abort()
+
+
+def test_direct_all_layer_wait_times_out_when_feeder_stalls(monkeypatch):
+    """feeder 卡死（既未登记也未报错）时，等待以显式错误收敛，不永久挂起。"""
+    log = []
+    engine = _direct_engine(log)
+    gate = threading.Event()
+    engine.load_layer = _gated_load_layer(engine, 1, gate)
+    monkeypatch.setattr("torch.cuda.is_available", lambda: True)
+    monkeypatch.setattr("torch.cuda.Event", lambda enable_timing=False: object())
+    monkeypatch.setattr("engine.core._DIRECT_FEEDER_WAIT_SECONDS", 0.5)
+    plan = _DirectAllLayerReadPlan(
+        engine, [b"y" * 16], [[2, 7]], (0, 1, 2)
+    )
+    assert plan.wait_layer(0, 0) is plan.read_ready_events[0]
+    with pytest.raises(RuntimeError, match="did not submit layer 1"):
+        plan.wait_layer(1, 1)
+    gate.set()
+    plan.abort()
+
+
+def test_direct_all_layer_out_of_order_callbacks_fail_closed(monkeypatch):
     log = []
     engine = _direct_engine(log)
     monkeypatch.setattr("torch.cuda.is_available", lambda: True)
@@ -1181,12 +1268,15 @@ def test_direct_all_layer_out_of_order_and_missing_callbacks_fail_closed(
     plan = _DirectAllLayerReadPlan(
         engine, [b"u" * 16], [[2, 7]], (0, 1, 2)
     )
-    with pytest.raises(RuntimeError, match="has no recorded ready event"):
+    _finish_direct_plan(plan)
+    with pytest.raises(RuntimeError, match="out-of-order direct wait callback"):
         plan.wait_layer(1, 1)
     plan.after_layer(0, 0)
     with pytest.raises(RuntimeError, match="incomplete direct all-layer"):
         plan.require_complete()
-    assert [item for item in log if item[0] == "read_submit"] == [("read_submit", 0)]
+    assert [item for item in log if item[0] == "read_submit"] == [
+        ("read_submit", 0), ("read_submit", 1), ("read_submit", 2)
+    ]
 
 
 def test_direct_all_layer_rejects_wrong_physical_mapping(monkeypatch):
