@@ -115,6 +115,34 @@ class TestLocalRankPlaceholder:
         connector.shutdown()
         assert captured["type"] == "tutti_nvme"
         assert captured["options"]["root"] == "/mnt/nvme2/kv-pool"
+        # 调度侧没有 bind 阶段，层宽必须构造时注入：metadata store 的 scan() 在
+        # layer_span 未声明时 fail-closed 返回空，漏传会让"复用已有池"的进程
+        # 永远恢复不到驻留项（命中静默归零，曾实测 B 请求退化为全量重算）。
+        assert captured["options"]["layer_span"] == 3
+
+    def test_metadata_store_applies_layer_span(self, tmp_path):
+        """层宽注入后落到各 rank 的 layout；缺省保持未声明（fail-closed）。"""
+        from stores.metadata import TuttiMetadataStore
+
+        store = TuttiMetadataStore(
+            root=str(tmp_path / "pool"),
+            num_chunks=4,
+            segment_bytes=4096,
+            layer_span=80,
+        )
+        assert store._layout.layer_span == 80
+        assert all(
+            layout.layer_span == 80 for layout in store._layouts.values()
+        )
+
+        bare = TuttiMetadataStore(
+            root=str(tmp_path / "bare"),
+            num_chunks=4,
+            segment_bytes=4096,
+        )
+        bare.open()
+        assert bare._layout.layer_span is None
+        assert bare.scan() == []
 
     def test_rank_local_nvme_and_gpu_are_expanded_together(self, monkeypatch):
         """TP rank selects matching mount, daemon device, and CUDA device."""

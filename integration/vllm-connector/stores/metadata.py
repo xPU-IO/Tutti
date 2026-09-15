@@ -80,6 +80,7 @@ class TuttiMetadataStore:
         preset=None,
         rank_options=None,
         tp_size: int = 1,
+        layer_span: int | None = None,
         **_data_plane_options,
     ) -> None:
         if num_chunks <= 0:
@@ -114,6 +115,13 @@ class TuttiMetadataStore:
             raise ValueError("every TP rank requires a distinct metadata root")
         self._layout = self._layouts[0]
         self._namespace_matches = {rank: True for rank in self._layouts}
+        # 冷启动对账需要层宽：scan() 按 layer_span 判定"全层齐备"，未声明时
+        # 一律返回空（fail-closed）。worker 侧在 bind 后由引擎注入；调度侧没有
+        # bind 阶段，必须在构造时给出——否则复用已有池时永远恢复不到任何驻留
+        # 项，命中率静默归零（索引此后以内存为权威，不会再扫盘）。
+        if layer_span is not None:
+            for layout in self._layouts.values():
+                layout.set_layer_span(int(layer_span))
 
     @property
     def capacity_chunks(self) -> int:

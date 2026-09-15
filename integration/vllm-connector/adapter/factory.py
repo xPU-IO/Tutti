@@ -155,6 +155,9 @@ def scheduler_index_for(vllm_config, extra: dict):
                 f"推导值 {segment_bytes} 不一致"
             )
         options["segment_bytes"] = segment_bytes
+        # 调度侧没有 bind 阶段，层宽必须构造时注入，否则冷启动对账扫不出
+        # 已有池的完整层组（scan() 在 layer_span 未声明时 fail-closed 返回空）。
+        options["layer_span"] = int(extra["num_layers"])
         store = create_metadata_store(store_spec["type"], options)
         config = {k: extra[k] for k in _ENGINE_KEYS}
         config["num_layers"] = extra["num_layers"]
