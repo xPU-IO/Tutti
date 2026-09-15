@@ -32,6 +32,10 @@ _SLOT_CACHE_LIMIT = 1024
 #: 层名序号提取（vLLM 层名约定 model.layers.{i}....）。
 _LAYER_NAME_RE = re.compile(r"layers\.(\d+)")
 
+#: worker 侧在途写入预留的步龄上限。写入在同一请求步内受理、并由该步的
+#: wait_for_save 结算，2 步已足够宽裕（1 步留给"结算回调缺失"的检测）。
+_WORKER_PENDING_MAX_AGE_STEPS = 2
+
 
 @dataclass(frozen=True)
 class _LogicalFailure:
@@ -478,6 +482,11 @@ class WorkerImpl:
         self._store_committed: dict[bytes, int] = {}
         self._store_failed: set[bytes] = set()
         self._committed_this_step: set[bytes] = set()
+        # 本进程索引判定"不驻留"的 key（pin 未遂）：回传调度侧对齐视图，
+        # 自愈两套独立 LRU 驱逐集合不同造成的幽灵命中。
+        self._index_forgotten: set[bytes] = set()
+        # 本进程为腾容量驱逐的 key（漂移观测，仅上报比对，不改变决策）
+        self._index_evicted: set[bytes] = set()
         # 本步写入批是否已准备（每步在 start_load_kv 复位）
         self._write_batch_prepared = False
         self._save_inflight: list = []
@@ -610,6 +619,11 @@ class WorkerImpl:
         self._diag_wait_sequence = []
         self._diag_save_sequence = []
         self._pinned = False
+        # 步进边界：回收"上一步计划、却始终没等到 wait_for_save 结算"的
+        # 在途写入预留（save 抛错后上层跳过结算、请求被抢占等）。
+        begin_step = getattr(self._engine, "begin_step", None)
+        if callable(begin_step):
+            begin_step(_WORKER_PENDING_MAX_AGE_STEPS)
         keys: list[bytes] = []
         block_tables: list[list[int]] = []
         for request_ordinal, meta in enumerate(
@@ -626,11 +640,19 @@ class WorkerImpl:
             flat_chunk_start = len(keys)
             try:
                 self._engine.pin(req_keys)
-            except KeyError:
+            except KeyError as exc:
                 # 近似视图未遂：该区间块上报重算
                 self._report_load_errors(
                     request_ordinal, meta, first_chunk, n_chunks
                 )
+                # 本进程索引判定缺失的 key 回传调度侧：两侧是独立 LRU，
+                # 驱逐集合可能不同（worker 已删数据、调度侧仍报驻留），
+                # 不报告就会永久重复"假命中→重算"。
+                missing = exc.args[0] if exc.args else ()
+                if isinstance(missing, (list, tuple, set, frozenset)):
+                    self._index_forgotten.update(
+                        bytes(key) for key in missing
+                    )
                 continue
             keys.extend(req_keys)
             block_tables.extend(
@@ -702,7 +724,8 @@ class WorkerImpl:
         if not self._load_failed:
             self._prepare_write_batch()
         if bool(getattr(self._engine, "direct", False)):
-            _LOG.warning(
+            # 正常路径的耗时诊断：debug（原先 warning，每步都刷）。
+            _LOG.debug(
                 "DIRECT_START_LOAD_RETURN total_ms=%.3f",
                 (time.perf_counter_ns() - started_ns) / 1_000_000,
             )
@@ -832,6 +855,7 @@ class WorkerImpl:
         if self._write_batch_prepared:
             return
         self._write_batch_prepared = True
+        self._apply_scheduler_evictions()
         keys: list[bytes] = []
         generations: list[str] = []
         block_tables: list[list[int]] = []
@@ -854,6 +878,17 @@ class WorkerImpl:
         if keys:
             self._validate_direct_or_fallback(block_tables)
             plan = self._engine.plan_store(keys)
+            if plan is not None and plan.evicted_keys:
+                # 漂移观测：本进程为腾容量驱逐的 chunk 上报调度侧比对。
+                # 两侧是独立 LRU（各自按自身迭代序选牺牲者），序不同则
+                # 驱逐集合不同——"worker 已删、调度侧仍报驻留"会让调度
+                # 侧永久重复假命中。这里只观测，不改变任何决策。
+                self._index_evicted.update(plan.evicted_keys)
+                # 驱逐此前完全静默（评审 L4）：记一行便于对齐容量行为。
+                _LOG.info(
+                    "EVICTION_WORKER count=%d capacity=%d source=plan_store",
+                    len(plan.evicted_keys), self._engine.capacity_chunks,
+                )
             if plan is None:
                 pending = getattr(self._engine, "store_plan_pending", None)
                 if not callable(pending) or not pending(keys):
@@ -866,6 +901,12 @@ class WorkerImpl:
                     keys = []
                     generations = []
                     block_tables = []
+            else:
+                # 只写本次真正受理的 chunk：跳过已驻留（外部命中的 chunk
+                # 仍在 save span 内）与批内重复，消除冗余写。
+                keys, generations, block_tables = self._select_new_chunks(
+                    keys, generations, block_tables, plan.new_keys
+                )
         if keys:
             # 对象池分配 + 目标票据就绪；与 store_layer 内的首层惰性
             # 调用等价（幂等），提前到这里以避开计算下发关键路径。
@@ -874,12 +915,72 @@ class WorkerImpl:
         self._save_generations = generations
         self._save_block_tables = block_tables
 
+    def _apply_scheduler_evictions(self) -> int:
+        """执行调度侧本步下发的驱逐决策（数据面删除 + 本 rank 索引对齐）。
+
+        调度侧是唯一知道全局访问序的一方（命中刷新只发生在它那边），
+        由它选定牺牲者、worker 执行，两侧索引便按构造收敛，不必等到
+        "假命中→pin 失败"才靠 forgotten 通道自愈。
+
+        worker 自身的 plan_store 驱逐仍保留为兜底：若本 rank 索引里
+        并没有调度侧选中的 key（已漂移），这里是空操作，随后 worker
+        仍会自行腾容量——不会因"容量不足"让写入被拒。
+        """
+        keys = list(getattr(self._metadata, "evicted_keys", None) or ())
+        if not keys:
+            return 0
+        apply_evictions = getattr(self._engine, "apply_evictions", None)
+        if not callable(apply_evictions):
+            return 0
+        try:
+            applied = int(apply_evictions(keys))
+            if applied:
+                _LOG.info(
+                    "EVICTION_WORKER count=%d requested=%d "
+                    "source=scheduler_decision",
+                    applied, len(keys),
+                )
+            return applied
+        except Exception as exc:
+            # 驱逐是优化而非正确性前提：失败降级为 worker 自行驱逐。
+            _LOG.warning("EVICTION_APPLY_FAILED err=%r", exc)
+            return 0
+
+    @staticmethod
+    def _select_new_chunks(keys, generations, block_tables, new_keys):
+        """把写入批裁剪为本次真正受理的 chunk（去重 + 排除已驻留）。
+
+        两条冗余来源：
+        1. **已驻留**——外部命中的 chunk 仍在本次 save span 内（调度侧的
+           span 是按"未保存 token 边界"切的，不含逐 chunk 驻留判断）。
+           实测 B 请求（80% 复用）save span 39 个 chunk，其中 30 个已在
+           盘上，写它们等于 77% 的写入量纯属重复。
+        2. **批内重复**——多个请求共享前缀时同一 chunk key 出现多次。
+
+        裁剪安全性：chunk key 由 token 前缀派生，key 相同 ⟹ 前缀相同
+        ⟹ 因果注意力下的 KV 内容与绝对位置都相同，写一份即可。三个
+        并行数组按同一索引集切片，保持 store_layer/confirm_store 的
+        对齐契约。
+        """
+        if len(new_keys) == len(keys):
+            return keys, generations, block_tables   # 无冗余，原样返回
+        first_seen: dict[bytes, int] = {}
+        for position, key in enumerate(keys):
+            first_seen.setdefault(key, position)
+        keep = [first_seen[key] for key in new_keys if key in first_seen]
+        return (
+            [keys[i] for i in keep],
+            [generations[i] for i in keep],
+            [block_tables[i] for i in keep],
+        )
+
     def save_kv_layer(self, layer_name: str, kv_layer=None, attn_metadata=None, **kwargs) -> None:
         """发起指定层的写入批（组批由 _prepare_write_batch 完成）。
 
         组批时执行写入准入（plan_store）：为腾容量驱逐的 chunk 由
-        engine 展开全层 io_key 实际删除（盘与权威索引）。数据面写
-        全批（不按受理子集切片）；resident 只在所有层 save completion
+        engine 展开全层 io_key 实际删除（盘与权威索引）。数据面只写
+        **本次受理的子集**（已驻留/批内重复已裁剪，见
+        _select_new_chunks）；resident 只在所有层 save completion
         成功后发布，失败则回收 pending 预留。
         """
         direct = bool(getattr(self._engine, "direct", False))
@@ -1152,16 +1253,21 @@ class WorkerImpl:
     def build_connector_worker_meta(self):
         """交出本步索引增量（vLLM 每步调用一次，调用即清空）。"""
         self._settle_unreported_plans()
-        if not self._store_committed and not self._store_failed:
+        if (not self._store_committed and not self._store_failed
+                and not self._index_forgotten and not self._index_evicted):
             self._committed_this_step.clear()
             return None
         meta = TuttiWorkerMetadata(
             committed=dict(self._store_committed),
             failed=set(self._store_failed),
+            forgotten=set(self._index_forgotten),
+            evicted=set(self._index_evicted),
         )
         self._store_committed = {}
         self._store_failed = set()
         self._committed_this_step = set()
+        self._index_forgotten = set()
+        self._index_evicted = set()
         return meta
 
     # ---- 内部 ----

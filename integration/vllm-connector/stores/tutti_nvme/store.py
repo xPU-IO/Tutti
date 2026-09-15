@@ -25,6 +25,12 @@ from pathlib import Path
 from .layout import Layout, decode_io_key
 from .object_pool import ObjectPool, PoolConfig
 from .preset_derive import derive_device_fields
+from .runtime_factory import (
+    build_runtime,
+    build_runtime_from_env,
+    normalize_preset,
+    preset_mounts,
+)
 
 from .striped_layout import StripedLayout
 from engine.nvtx import range as nvtx_range
@@ -554,6 +560,18 @@ class TuttiDirectBackend:
             self._invalid_plan_tokens.discard(plan.plan_token)
         if direction == "write":
             self._prepared_write_chunks = None
+
+    def has_write_plan(self) -> bool:
+        """是否已存在写方向的 target 计划（供执行引擎查询，避免窥探私有表）。"""
+        return "write" in self._target_plans
+
+    def planned_directions(self) -> tuple[str, ...]:
+        """当前活跃的 target 计划方向（含尚未提交的预备写计划）。"""
+        directions = list(self._target_plans)
+        if (getattr(self, "_prepared_write_chunks", None) is not None
+                and "write" not in directions):
+            directions.append("write")
+        return tuple(directions)
 
     def _invalidate_target_uris(self, uris) -> None:
         invalid = set(uris)
@@ -2028,76 +2046,10 @@ class TuttiKVStore:
 # ---------- 真机 runtime 构造（TUTTI_NVME_PRESET） ----------
 
 
-def _normalize_preset(preset) -> dict:
-    """递归归一 preset：字符串值恰为纯十进制整数时转 int。"""
-    if isinstance(preset, dict):
-        return {k: _normalize_preset(v) for k, v in preset.items()}
-    if isinstance(preset, list):
-        return [_normalize_preset(v) for v in preset]
-    if isinstance(preset, str) and preset.strip().isdigit():
-        return int(preset)
-    return preset
-
-
-def _preset_mounts(preset):
-    """Derive striped layout mounts from a striped preset when available."""
-    if not isinstance(preset, dict):
-        return None
-    devices = preset.get("devices")
-    if not isinstance(devices, (list, tuple)):
-        return None
-    mounts = []
-    for device in devices:
-        if not isinstance(device, dict) or not device.get("mount_path"):
-            return None
-        mounts.append(device["mount_path"])
-    return mounts or None
-
-
-def _build_runtime(preset: dict):
-    """按 preset dict 构造真机 runtime（daemon_config 推导与归一同环境变量路径）。"""
-    import yaml
-
-    if not isinstance(preset, dict):
-        raise RuntimeError("preset 必须是映射")
-    if "daemon_config" in preset:
-        preset = derive_device_fields(preset, yaml)
-
-    try:
-        import tutti_runtime  # bindings 构建产物（需在 sys.path/PYTHONPATH）
-    except ImportError as exc:
-        raise RuntimeError(
-            "tutti_runtime 绑定不可用：先构建 integration/vllm-connector/"
-            "bindings/python 并将其加入 PYTHONPATH"
-        ) from exc
-
-    preset = dict(preset)
-    preset_type = preset.pop("type", "local")
-    preset.pop("daemon_config", None)  # 推导元键不进 runtime preset
-    preset.pop("device_id", None)
-    if preset_type == "striped":
-        return tutti_runtime.make_striped_nvme_runtime(preset)
-    if preset_type == "local":
-        return tutti_runtime.make_local_nvme_runtime(preset)
-    raise RuntimeError(f"未知 preset type：{preset_type}")
-
-
-def _build_runtime_from_env():
-    """按 TUTTI_NVME_PRESET 构造真机 runtime（本包私有推导）。"""
-    import yaml
-
-    raw = os.environ.get("TUTTI_NVME_PRESET", "").strip()
-    if not raw:
-        raise RuntimeError(
-            "runtime=None 需要 TUTTI_NVME_PRESET（yaml/json 内联或文件路径）"
-        )
-    text = Path(raw).read_text() if os.path.isfile(raw) else raw
-    preset = yaml.safe_load(text)
-    if not isinstance(preset, dict):
-        raise RuntimeError("TUTTI_NVME_PRESET 解析结果必须是映射")
-    return _build_runtime(_normalize_preset(preset))
-
-
-def _derive_device_fields(preset: dict, yaml) -> dict:
-    """兼容别名：设备字段推导已提取到 preset_derive（store/metadata 共用）。"""
-    return derive_device_fields(preset, yaml)
+# 兼容别名：装配逻辑已迁至 stores.tutti_nvme.runtime_factory，这里保留
+# 同名私有符号供既有调用点与测试使用（行为完全一致）。
+_normalize_preset = normalize_preset
+_preset_mounts = preset_mounts
+_build_runtime = build_runtime
+_build_runtime_from_env = build_runtime_from_env
+_derive_device_fields = derive_device_fields

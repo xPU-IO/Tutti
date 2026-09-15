@@ -10,6 +10,10 @@ from __future__ import annotations
 import json
 import logging
 
+from .registry import (
+    create_metadata_store as _create_metadata_store,
+    register_metadata_store_type,
+)
 from .tutti_nvme.layout import Layout
 from .tutti_nvme.preset_derive import derive_device_fields
 from .tutti_nvme.striped_layout import StripedLayout
@@ -222,13 +226,14 @@ class TuttiMetadataStore:
             return False
 
 
-def create_metadata_store(type_name: str, options: dict):
-    """Construct a scheduler store without importing a data-plane store."""
-    if type_name == "memory":
-        return MemoryMetadataStore(**options)
-    if type_name == "tutti_nvme":
-        return TuttiMetadataStore(**options)
-    raise ValueError(f"store type {type_name!r} has no metadata-only client")
+# 调度侧 store 的注册：与数据面共用 stores.registry 的注册面，目标以
+# "module:Class" 惰性给出，因此导入本模块不会拉起数据面实现。
+register_metadata_store_type("memory", "stores.metadata:MemoryMetadataStore")
+register_metadata_store_type("tutti_nvme", "stores.metadata:TuttiMetadataStore")
+
+#: 兼容别名：实现已上移到 stores.registry.create_metadata_store，这里保留
+#: 同名模块属性，使既有导入路径与测试打桩（monkeypatch 本模块属性）不变。
+create_metadata_store = _create_metadata_store
 
 
 def _preset_mounts(preset):

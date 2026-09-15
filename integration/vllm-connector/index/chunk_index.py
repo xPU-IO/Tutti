@@ -3,6 +3,23 @@
 纯逻辑组件，单线程使用，不加锁；只维护 key 与状态，不接触数据本体。
 token 序列按 chunk_tokens 切块并链式哈希为 key 序列，key 即跨进程
 一致的 chunk 身份。
+
+术语表（评审 N3：chunk / block / page 三个词此前混用）
+-----------------------------------------------------
+- **token**：模型输入的最小单位，也是 chunk key 的派生依据。
+- **block**：vLLM 的 KV 分配单位，``block_size`` 个 token（生产为 64）；
+  vLLM 的 block table 决定请求的 KV 落在哪些物理块上。
+- **chunk**：**本 connector 的落盘/复用单位**，``chunk_tokens`` 个 token
+  （生产为 256 = 4 个 block）。chunk key 由 token 前缀链式哈希派生，
+  故相同前缀的请求命中同一个 chunk。
+- **page**：物理页，指一个 block 在**单层**上的 KV 字节
+  （``page_size_bytes``）；``segment_bytes = blocks_per_chunk × page_size_bytes``
+  是 chunk 在单层的字节数，``chunk_kv_bytes = num_layers × segment_bytes``。
+- **io_key**：``chunk_key(16B) + layer(2B)`` 的线格式（``IO_KEY_BYTES``），
+  数据面最小的可寻址/可删除单位——按层落盘、按层校验。
+
+命名约定：容量类字段以 chunk 计数（capacity / resident / pending / pinned），
+字节类字段一律带 ``_bytes`` 后缀。
 """
 
 from __future__ import annotations
@@ -40,6 +57,10 @@ def _chunk_digest(parent: bytes, chunk: Sequence[int]) -> bytes:
 
 # io_key 中层编号的编码宽度（字节，小端）
 _IO_LAYER_BYTES = 2
+
+#: io_key 的线格式长度（chunk key 16B + 层编号 2B）。对外公开，
+#: 供扫描/校验等工具共用，避免各处重复字面量 18。
+IO_KEY_BYTES = _KEY_BYTES + _IO_LAYER_BYTES
 
 
 def derive_io_key(chunk_key: bytes, layer_idx: int) -> bytes:
@@ -113,10 +134,13 @@ class ChunkIndex:
         self._namespace = bytes(namespace)
         # 驻留表：插入序即 LRU 序（最旧在前）。
         self._resident: OrderedDict[bytes, None] = OrderedDict()
-        # 在途集合：plan_store 受理、confirm_store 尚未结算。
-        self._pending: set[bytes] = set()
+        # 在途表：plan_store 受理、confirm_store 尚未结算；值为受理时的
+        # epoch，用于回收"永远等不到结算"的预留（见 reclaim_stale_pending）。
+        self._pending: dict[bytes, int] = {}
         # pin 计数：条目存在即计数 ≥ 1。
         self._pins: Counter[bytes] = Counter()
+        # 步进计数：由调用方（调度侧每步一次）推进，是 pending 步龄的时基。
+        self._epoch = 0
 
     @property
     def capacity(self) -> int:
@@ -127,6 +151,56 @@ class ChunkIndex:
     def chunk_tokens(self) -> int:
         """每 chunk 的 token 数。"""
         return self._chunk_tokens
+
+    def is_resident(self, key: bytes) -> bool:
+        """该 key 是否已发布驻留（不含在途/pending）。"""
+        return key in self._resident
+
+    def stats(self) -> dict[str, int]:
+        """容量快照（可观测性：每步汇总与压测断言共用）。"""
+        return {
+            "capacity": self.capacity,
+            "resident": len(self._resident),
+            "pending": len(self._pending),
+            "pinned": len(self._pins),
+            "epoch": self._epoch,
+        }
+
+    def is_pinned(self, key: bytes) -> bool:
+        """该 key 是否处于读保护中（在途读取期间不得删除数据）。"""
+        return self._pins.get(key, 0) > 0
+
+    @property
+    def epoch(self) -> int:
+        """当前步进计数（pending 步龄的时基）。"""
+        return self._epoch
+
+    def advance_epoch(self) -> int:
+        """推进一个步进（调度侧每步调用一次）。"""
+        self._epoch += 1
+        return self._epoch
+
+    def reclaim_stale_pending(self, max_age: int) -> list[bytes]:
+        """回收在途超过 max_age 个步进仍未结算的预留，返回被回收的 key。
+
+        正常路径下 pending 会在同一批的 confirm_store 结算（TP rank 的
+        完成可能跨步，故 max_age 需覆盖该窗口）。但若某个 rank 从未回报
+        （进程崩溃/重启、请求被抢占后不再 save），该项会永久占用容量：
+        ``free = capacity - len(resident) - len(pending)`` 单调下降，最终
+        写入被静默拒绝。这里按步龄兜底回收。
+
+        **max_age 必须足够大**：过小会误回收正常跨步结算的预留，随后该
+        key 的 confirm_store 找不到在途项，驻留发布落空——那比容量泄漏
+        更糟（会造成调度侧认为未驻留而重复重算）。
+        """
+        if max_age <= 0 or not self._pending:
+            return []
+        cutoff = self._epoch - max_age
+        stale = [key for key, planned in self._pending.items()
+                 if planned <= cutoff]
+        for key in stale:
+            del self._pending[key]
+        return stale
 
     # ---- 查询 ----
 
@@ -206,7 +280,8 @@ class ChunkIndex:
                 return None
             for k in evicted:
                 del self._resident[k]
-        self._pending.update(new_keys)
+        for key in new_keys:
+            self._pending[key] = self._epoch
         return StorePlan(new_keys=new_keys, evicted_keys=evicted)
 
     def confirm_store(self, keys: Iterable[bytes], ok: bool = True) -> None:
@@ -217,7 +292,7 @@ class ChunkIndex:
         无副作用）；调用方应只结算自己受理的批次。
         """
         for k in keys:
-            self._pending.discard(k)
+            self._pending.pop(k, None)
             if ok:
                 if k in self._resident:
                     self._resident.move_to_end(k)
@@ -271,7 +346,7 @@ class ChunkIndex:
         一并结算为驻留。
         """
         for k in keys:
-            self._pending.discard(k)
+            self._pending.pop(k, None)
             if k not in self._resident:
                 self._resident[k] = None
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from common.utils import is_int
+
 
 class RingWindow:
     """staging 环形窗口：有界槽位轮转，波次单调递增。
@@ -25,11 +27,11 @@ class RingWindow:
     def __init__(self, buffer, num_slots: int, segment_bytes: int,
                  capacity_per_wave: int | None = None, *, slot_base: int = 0):
         """buffer 为注入的字节缓冲；几何参数见类契约。"""
-        if not _is_int(num_slots) or num_slots <= 0:
+        if not is_int(num_slots) or num_slots <= 0:
             raise ValueError(f"num_slots 须为正整数，got {num_slots!r}")
-        if not _is_int(slot_base) or slot_base < 0:
+        if not is_int(slot_base) or slot_base < 0:
             raise ValueError(f"slot_base 须为非负整数，got {slot_base!r}")
-        if not _is_int(segment_bytes) or segment_bytes <= 0:
+        if not is_int(segment_bytes) or segment_bytes <= 0:
             raise ValueError(f"segment_bytes 须为正整数，got {segment_bytes!r}")
         try:
             nbytes = len(buffer)
@@ -52,7 +54,7 @@ class RingWindow:
                     f"got {num_slots!r}"
                 )
             capacity_per_wave = num_slots // 2
-        if (not _is_int(capacity_per_wave) or capacity_per_wave <= 0
+        if (not is_int(capacity_per_wave) or capacity_per_wave <= 0
                 or capacity_per_wave > num_slots):
             raise ValueError(
                 "capacity_per_wave 须为正整数且不超过 num_slots，"
@@ -73,7 +75,7 @@ class RingWindow:
     def slot_offset(self, slot: int) -> int:
         """返回槽位在 buffer 内的起始字节偏移；槽号越界 → ValueError。"""
         end = self.slot_base + self.num_slots
-        if not _is_int(slot) or not self.slot_base <= slot < end:
+        if not is_int(slot) or not self.slot_base <= slot < end:
             raise ValueError(
                 f"slot 须在 [{self.slot_base}, {end}) 内，got {slot!r}"
             )
@@ -81,7 +83,7 @@ class RingWindow:
 
     def acquire(self, n: int, *, wait_for_reuse: bool = True) -> tuple[int, list[int]]:
         """领取下一波次的 n 个槽；语义见类契约。"""
-        if not _is_int(n) or not 1 <= n <= self._half:
+        if not is_int(n) or not 1 <= n <= self._half:
             raise ValueError(f"n 须在 [1, {self._half}] 内，got {n!r}")
         self._wave += 1
         wave = self._wave
@@ -109,7 +111,7 @@ class RingWindow:
 
     def complete(self, wave: int, event) -> None:
         """登记波次完成事件；wave 非法 → ValueError。"""
-        if not _is_int(wave) or wave < 0 or wave > self._wave:
+        if not is_int(wave) or wave < 0 or wave > self._wave:
             raise ValueError(f"wave 须在 [0, {self._wave}] 内，got {wave!r}")
         if wave not in self._allocations:
             raise ValueError(f"wave {wave} 无有效槽位分配")
@@ -134,6 +136,3 @@ class RingWindow:
             raise first_error
 
 
-def _is_int(value) -> bool:
-    """判断是否为真 int（排除 bool）。"""
-    return isinstance(value, int) and not isinstance(value, bool)

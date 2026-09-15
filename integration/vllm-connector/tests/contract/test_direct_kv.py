@@ -1292,6 +1292,238 @@ def test_worker_save_without_save_plan_does_not_submit_read(monkeypatch):
     assert not [item for item in log if item[0] == "write_submit"]
 
 
+def test_select_new_chunks_trims_resident_and_duplicates():
+    """写入批裁剪：排除已驻留 chunk 与批内重复，三数组同步切片。"""
+    a, b, c = b"a" * 16, b"b" * 16, b"c" * 16
+    keys = [a, b, c, a]
+    gens = [1, 2, 3, 4]
+    tables = [[10], [20], [30], [40]]
+
+    # 全受理（批内重复 a 仍需去重）
+    trimmed = WorkerImpl._select_new_chunks(keys, gens, tables, [a, b, c])
+    assert trimmed[0] == [a, b, c]
+    assert trimmed[1] == [1, 2, 3]          # 取首次出现位置
+    assert trimmed[2] == [[10], [20], [30]]
+
+    # 部分已驻留（b 已在盘上 → 不在 new_keys 中）
+    trimmed = WorkerImpl._select_new_chunks(keys, gens, tables, [a, c])
+    assert trimmed[0] == [a, c]
+    assert trimmed[1] == [1, 3]
+    assert trimmed[2] == [[10], [30]]
+
+    # 全部已驻留 → 裁剪为空（不写任何 chunk）
+    trimmed = WorkerImpl._select_new_chunks(keys, gens, tables, [])
+    assert trimmed[0] == []
+    assert trimmed[1] == []
+    assert trimmed[2] == []
+
+    # 无冗余 → 原样返回（保持原对象，避免热路径无谓拷贝）
+    plain = [a, b, c]
+    assert WorkerImpl._select_new_chunks(
+        plain, gens[:3], tables[:3], plain
+    )[0] is plain
+
+
+def test_worker_write_batch_excludes_resident_chunks():
+    """端到端：save span 内的已驻留 chunk 不得进入数据面写入。
+
+    B 请求（外部命中）的 save span 由调度侧按"未保存 token 边界"切出，
+    含已驻留 chunk；若不过滤，实测 39 个 chunk 里有 30 个是重复写。
+    """
+    runtime = FakeRuntime()
+    store = FakeEngineStore(runtime)
+    engine = KVEngine(
+        {
+            "chunk_tokens": 256,
+            "chunk_kv_bytes": 3 * 8192,
+            "max_chunks_per_wave": 4,
+            "num_layers": 3,
+        },
+        store,
+    )
+    assert engine.try_bind_direct(FakePool(128), 3, 2)
+
+    resident_tokens = list(range(256))
+    fresh_tokens = list(range(256, 512))
+    resident_key, _ = engine.hash_keys(resident_tokens)
+
+    # 先把第一个 chunk 走完两阶段，使其成为"已驻留"
+    plan = engine.plan_store(resident_key)
+    assert plan is not None and plan.new_keys == resident_key
+    engine.store_layer(resident_key, 0, [[3, 1]])
+    engine.wait_idle()
+    engine.confirm_store(resident_key)
+
+    worker = WorkerImpl(engine)
+    worker._ensure_bound = lambda: None
+    worker._chunk_tokens = 256
+    worker._block_size = 128
+    # block_size=128 + chunk_tokens=256 ⇒ 每 chunk 2 个块（准入会校验）
+    worker._metadata = SimpleNamespace(requests=[
+        SimpleNamespace(
+            token_ids=resident_tokens, save_chunk_start=0, save_chunk_count=1,
+            block_ids=[0, 1], save_generations=["g-resident"],
+        ),
+        SimpleNamespace(
+            token_ids=fresh_tokens, save_chunk_start=0, save_chunk_count=1,
+            block_ids=[2, 3], save_generations=["g-fresh"],
+        ),
+    ])
+
+    worker._prepare_write_batch()
+
+    # 只保留未驻留的那个 chunk（已驻留的 39→30 冗余在此消除）
+    assert len(worker._save_keys) == 1
+    assert worker._save_keys == engine.hash_keys(fresh_tokens)[0]
+    assert worker._save_generations == ["g-fresh"]
+    assert worker._save_block_tables == [[2, 3]]
+    engine.close()
+
+
+def _bound_engine(capacity=4):
+    runtime = FakeRuntime()
+    store = FakeEngineStore(runtime)
+    engine = KVEngine(
+        {
+            "chunk_tokens": 256,
+            "chunk_kv_bytes": 3 * 8192,
+            "max_chunks_per_wave": 8,
+            "num_layers": 3,
+        },
+        store,
+    )
+    assert engine.try_bind_direct(FakePool(128), 3, 2)
+    return engine
+
+
+def test_apply_evictions_drops_data_and_forgets():
+    """调度侧下发的驱逐：数据面删除 + 本 rank 索引对齐。"""
+    engine = _bound_engine()
+    tokens = list(range(256))
+    keys, _ = engine.hash_keys(tokens)
+    plan = engine.plan_store(keys)
+    assert plan is not None and plan.new_keys == keys
+    engine.store_layer(keys, 0, [[0, 1]])
+    engine.wait_idle()
+    engine.confirm_store(keys)
+    assert engine._index.is_resident(keys[0])
+
+    assert engine.apply_evictions(keys) == 1
+    assert not engine._index.is_resident(keys[0])
+    engine.close()
+
+
+def test_apply_evictions_skips_pinned_keys():
+    """在途读取（pin）中的数据不得被删除。"""
+    engine = _bound_engine()
+    tokens = list(range(256))
+    keys, _ = engine.hash_keys(tokens)
+    plan = engine.plan_store(keys)
+    assert plan is not None
+    engine.store_layer(keys, 0, [[0, 1]])
+    engine.wait_idle()
+    engine.confirm_store(keys)
+
+    engine.pin(keys)
+    assert engine.apply_evictions(keys) == 0      # 受保护，跳过
+    assert engine._index.is_resident(keys[0])
+    engine.unpin(keys)
+    assert engine.apply_evictions(keys) == 1      # 解除后即可驱逐
+    engine.close()
+
+
+def test_apply_evictions_is_noop_for_unknown_keys():
+    """漂移兜底：调度侧选中的 key 在本 rank 不存在时不得报错。
+
+    此时 worker 仍会自行驱逐腾容量（plan_store 的兜底路径），
+    因此不会出现"容量不足导致写入被拒"。
+    """
+    engine = _bound_engine()
+    assert engine.apply_evictions([b"never-here-key!1"]) == 0
+    engine.close()
+
+
+def test_worker_applies_scheduler_evictions_before_planning():
+    """worker 在自身写入计划之前执行调度侧驱逐，使两侧索引收敛。"""
+    engine = _bound_engine()
+    tokens = list(range(256))
+    keys, _ = engine.hash_keys(tokens)
+    plan = engine.plan_store(keys)
+    assert plan is not None
+    engine.store_layer(keys, 0, [[0, 1]])
+    engine.wait_idle()
+    engine.confirm_store(keys)
+    assert engine._index.is_resident(keys[0])
+
+    worker = WorkerImpl(engine)
+    worker._metadata = SimpleNamespace(
+        requests=[], evicted_keys=list(keys),
+    )
+    assert worker._apply_scheduler_evictions() == 1
+    assert not engine._index.is_resident(keys[0])
+    engine.close()
+
+
+def test_worker_eviction_apply_failure_is_non_fatal():
+    """驱逐执行失败必须降级（worker 仍会自行驱逐），不能让写路径崩。"""
+    class Exploding:
+        def apply_evictions(self, keys):
+            raise RuntimeError("boom")
+
+    worker = WorkerImpl(Exploding())
+    worker._metadata = SimpleNamespace(requests=[], evicted_keys=[b"k" * 16])
+    assert worker._apply_scheduler_evictions() == 0
+
+
+def test_worker_reports_pin_missing_keys_as_forgotten():
+    """pin 未遂的 key 必须回传调度侧（幽灵命中自愈的入口）。
+
+    两侧索引是独立 LRU，worker 驱逐后调度侧仍可能报命中；worker 在此
+    把本进程判定缺失的 key 记入 forgotten，由 build_connector_worker_meta
+    交给调度侧对齐。
+    """
+
+    class Engine:
+        direct = True
+        read_plan_supported = True
+
+        def hash_keys(self, token_ids):
+            return [b"missing-key-0001"], b"parent"
+
+        def pin(self, keys):
+            raise KeyError([b"missing-key-0001"])
+
+        def start_read_plan(self, *args, **kwargs):
+            raise AssertionError("读取未遂不应进入读取计划")
+
+    meta = SimpleNamespace(
+        load_tokens=256,
+        load_start_token=0,
+        token_ids=list(range(256)),
+        req_id="r-ghost",
+        block_ids=[4, 5],
+        save_chunk_start=0,
+        save_chunk_count=0,
+    )
+    worker = WorkerImpl(Engine())
+    worker._metadata = SimpleNamespace(requests=[meta])
+    worker._chunk_tokens = 256
+    worker._max_chunks_per_wave = 2
+    worker._block_size = 128
+    worker._callback_to_physical = (0, 1, 2)
+    worker._ensure_bound = lambda: None
+    worker._finalize_load_state = lambda: None
+    worker.start_load_kv(None)
+
+    assert worker._index_forgotten == {b"missing-key-0001"}
+    worker._settle_unreported_plans = lambda: None
+    payload = worker.build_connector_worker_meta()
+    assert payload is not None
+    assert payload.forgotten == {b"missing-key-0001"}
+    # 交出即清空（避免重复上报）
+    assert worker._index_forgotten == set()
+
+
 def test_worker_logs_direct_start_load_return(caplog):
     class Plan:
         failed = None
@@ -1327,14 +1559,16 @@ def test_worker_logs_direct_start_load_return(caplog):
     worker._callback_to_physical = (0, 1, 2)
     worker._ensure_bound = lambda: None
     worker._finalize_load_state = lambda: None
-    with caplog.at_level("WARNING", logger="adapter.worker"):
+    # 该诊断是正常路径日志，级别为 debug（避免每步刷 warning）。
+    with caplog.at_level("DEBUG", logger="adapter.worker"):
         worker.start_load_kv(None)
-    messages = [
-        record.message for record in caplog.records
+    records = [
+        record for record in caplog.records
         if record.message.startswith("DIRECT_START_LOAD_RETURN")
     ]
-    assert len(messages) == 1
-    assert "total_ms=" in messages[0]
+    assert len(records) == 1
+    assert records[0].levelname == "DEBUG"
+    assert "total_ms=" in records[0].message
 
 
 def test_worker_direct_bind_allocates_no_staging(monkeypatch):

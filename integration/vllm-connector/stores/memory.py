@@ -2,6 +2,8 @@
 
 from collections.abc import Iterable, Sequence
 
+from common.utils import is_int
+
 from .base import Completion
 
 
@@ -43,9 +45,9 @@ class MemoryKVStore:
     _GRANULARITY_UNIT = 4096
 
     def __init__(self, segment_bytes: int, num_chunks: int) -> None:
-        if not _is_int(segment_bytes) or segment_bytes <= 0:
+        if not is_int(segment_bytes) or segment_bytes <= 0:
             raise ValueError(f"segment_bytes 须为正整数，got {segment_bytes!r}")
-        if not _is_int(num_chunks) or num_chunks < 0:
+        if not is_int(num_chunks) or num_chunks < 0:
             raise ValueError(f"num_chunks 须为非负整数，got {num_chunks!r}")
         self._segment_bytes = segment_bytes
         self._num_chunks = num_chunks
@@ -76,7 +78,7 @@ class MemoryKVStore:
         不可写（bytes / 非缓冲对象 / 只读视图）→ None。
         """
         self._require_open()
-        if not _is_int(granularity):
+        if not is_int(granularity):
             return None
         if (
             granularity <= 0
@@ -162,7 +164,7 @@ class MemoryKVStore:
         if view is None:
             raise ValueError(f"buffer {buffer_id!r} 未注册")
         if (
-            not _is_int(offset)
+            not is_int(offset)
             or offset < 0
             or offset + self._segment_bytes > view.nbytes
         ):
@@ -173,6 +175,3 @@ class MemoryKVStore:
         return view[offset : offset + self._segment_bytes]
 
 
-def _is_int(value) -> bool:
-    """判断是否为真 int（排除 bool）。"""
-    return isinstance(value, int) and not isinstance(value, bool)

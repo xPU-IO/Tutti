@@ -17,204 +17,27 @@ from engine.transfer import (
     select_transfer,
 )
 from engine.nvtx import range as nvtx_range
+from common.utils import (
+    flatten_block_ids as _flatten_block_ids,
+    group_scan,
+    is_int,
+    positive_int,
+)
+# 完成句柄与门禁异常在 engine.completion 中实现；此处再导出以保持
+# 既有导入路径（adapter.worker、契约测试）不变。
+from engine.completion import (
+    LoadGateError,
+    _AggregateCompletion,
+    _PostCompletion,
+)
 from index.chunk_index import (
     ChunkIndex,
+    IO_KEY_BYTES,
     StorePlan,
-    chunk_key_of,
     derive_io_key,
-    layer_of,
 )
-
-# 冷启动恢复时 io_key 分组的来源宽度（chunk key 16 字节 + 层编号 2 字节）
-_IO_KEY_BYTES = 18
 _LOG = logging.getLogger(__name__)
 _FEEDER_DIAG = os.environ.get("TUTTI_FEEDER_DIAGNOSTICS") == "1"
-
-
-class LoadGateError(RuntimeError):
-    """A layer's runtime/CQ completion failed before scatter."""
-
-    def __init__(self, message: str, failed_batch_indices=(),
-                 whole_operation: bool = True, invalid_block_ids=()):
-        super().__init__(message)
-        self.failed_batch_indices = tuple(failed_batch_indices)
-        self.whole_operation = bool(whole_operation)
-        self.invalid_block_ids = tuple(invalid_block_ids)
-
-
-class _PostCompletion:
-    """底层完成句柄与消费侧事件组成的完成句柄。
-
-    契约：wait 先等底层完成，再执行收尾动作并等待其返回的事件（恰一
-    次）；query 在收尾尚未启动时反映底层状态，事件已产生后反映事件状态。
-    """
-
-    __slots__ = (
-        "_inner", "_after", "_before", "_after_event", "_event", "_done",
-        "_block_tables", "_fence_event",
-    )
-
-    def __init__(self, inner, after, block_tables=None, after_event=None,
-                 before=None, fence_event=None):
-        """inner 为底层完成句柄，after 为无参收尾可调用。"""
-        self._inner = inner
-        self._after = after
-        self._before = before
-        self._fence_event = fence_event
-        self._after_event = after_event
-        self._event = None
-        self._done = False
-        self._block_tables = block_tables
-
-    def wait(self) -> None:
-        """阻塞至底层完成并执行收尾动作（恰一次）。"""
-        if self._done:
-            return
-        try:
-            wait_result = getattr(self._inner, "wait_result", None)
-            if callable(wait_result):
-                result = wait_result()
-                if not getattr(result, "ok", True):
-                    failed = tuple(getattr(result, "failed_batch_indices", ()) or ())
-                    failures = tuple(getattr(result, "failures", ()) or ())
-                    whole = not failed or any(
-                        getattr(item, "failure_scope", "WHOLE_OPERATION")
-                        != "REQUEST_INDICES" for item in failures
-                    )
-                    selected = self._block_tables
-                    if not whole and failed and self._block_tables is not None:
-                        selected = [
-                            self._block_tables[index]
-                            for index in failed
-                            if 0 <= index < len(self._block_tables)
-                        ]
-                    invalid_blocks = _flatten_block_ids(selected)
-                    raise LoadGateError(
-                        "底层 IO 失败，禁止 scatter",
-                        failed_batch_indices=failed,
-                        whole_operation=whole,
-                        invalid_block_ids=invalid_blocks,
-                    )
-            else:
-                # Legacy completions have no request-index detail; fail closed.
-                self._inner.wait()
-            if self._before is not None:
-                self._before()
-            self._event = self._after()
-            if self._event is not None:
-                if callable(self._after_event):
-                    self._after_event(self._event)
-                else:
-                    wait = getattr(self._event, "wait", None)
-                    if callable(wait):
-                        wait()
-        finally:
-            self._done = True
-
-    def poll(self) -> bool:
-        """Non-blocking terminal probe with exactly-once post processing."""
-        if self._done:
-            return True
-        if not self._inner.query():
-            return False
-        self.wait()
-        return True
-
-    @property
-    def fence_event(self):
-        return self._fence_event if self._fence_event is not None else self._event
-
-    def abort(self, timeout=None) -> None:
-        """Drain the inner operation without running consumer-side ``after``.
-
-        A look-ahead load may have already submitted later layers when an
-        earlier layer fails.  Those operations still need CQ draining and
-        release, but their scatter callback must never publish data after the
-        step has entered the failed state.
-        """
-        if self._done:
-            return
-        try:
-            wait_result = getattr(self._inner, "wait_result", None)
-            if callable(wait_result):
-                wait_result()
-            else:
-                self._inner.wait()
-        except Exception:
-            pass
-        self._done = True
-
-    def query(self) -> bool:
-        """非阻塞查询底层是否完成。"""
-        if not self._inner.query():
-            return False
-        if self._event is None:
-            return True
-        query = getattr(self._event, "query", None)
-        return bool(query()) if callable(query) else self._done
-
-
-class _AggregateCompletion:
-    """按提交顺序组合多个波次完成句柄。
-
-    每个子句柄已经登记到环窗，因此这里只负责对外提供一个句柄：
-    ``wait`` 顺序等待全部波次，``query`` 只有在全部波次完成时才返回
-    true。顺序等待也保证同一批的 scatter/gather 收尾契约不被重排。
-    """
-
-    __slots__ = ("_handles", "_done")
-
-    def __init__(self, handles):
-        self._handles = tuple(handles)
-        self._done = False
-
-    def wait(self) -> None:
-        if self._done:
-            return
-        first_error = None
-        for handle in self._handles:
-            try:
-                handle.wait()
-            except Exception as exc:
-                if first_error is None:
-                    first_error = exc
-        self._done = True
-        if first_error is not None:
-            raise first_error
-
-    def abort(self, timeout=None) -> None:
-        """Drain child operations while suppressing all scatter callbacks."""
-        if self._done:
-            return
-        for handle in self._handles:
-            abort = getattr(handle, "abort", None)
-            try:
-                if callable(abort):
-                    if timeout is None:
-                        abort()
-                    else:
-                        try:
-                            abort(timeout=timeout)
-                        except TypeError:
-                            abort()
-                else:
-                    handle.wait()
-            except Exception:
-                pass
-        self._done = True
-
-    def query(self) -> bool:
-        if self._done:
-            return True
-        # 子句柄的 query 可能在其 after/scatter 尚未执行时已为真；不要
-        # 在这里标记聚合句柄完成，否则后续 wait 会跳过必要收尾。
-        return all(handle.query() for handle in self._handles)
-
-    @property
-    def fence_event(self):
-        if not self._handles:
-            return None
-        return getattr(self._handles[-1], "fence_event", None)
 
 
 class _ReadPlan:
@@ -933,9 +756,9 @@ class KVEngine:
 
     def __init__(self, config: dict, store):
         """config 见类契约；store 为 KVStore 实现。参数非法 → ValueError。"""
-        self._chunk_tokens = _positive_int(config, "chunk_tokens")
-        self._chunk_kv_bytes = _positive_int(config, "chunk_kv_bytes")
-        self._max_chunks_per_wave = _positive_int(config, "max_chunks_per_wave")
+        self._chunk_tokens = positive_int(config, "chunk_tokens")
+        self._chunk_kv_bytes = positive_int(config, "chunk_kv_bytes")
+        self._max_chunks_per_wave = positive_int(config, "max_chunks_per_wave")
         for name in ("gather_fn", "scatter_fn"):
             fn = config.get(name)
             if fn is not None and not callable(fn):
@@ -948,7 +771,7 @@ class KVEngine:
         self._store = store
         self._closed = False
         layers_hint = config.get("num_layers")
-        if layers_hint is not None and (not _is_int(layers_hint) or layers_hint <= 0):
+        if layers_hint is not None and (not is_int(layers_hint) or layers_hint <= 0):
             raise ValueError(f"config['num_layers'] 须为正整数或 None，got {layers_hint!r}")
         raw_ns = config.get("key_namespace")
         if raw_ns is None:
@@ -973,7 +796,7 @@ class KVEngine:
         self._index = ChunkIndex(store.capacity_chunks, self._chunk_tokens,
                                  namespace=namespace)
         # 冷启动分组：层数定案前暂存；层集合不完整的 chunk 视为缺失。
-        self._scan_groups = _group_scan(store)
+        self._scan_groups = group_scan(store)
         self._restored = False
         # 上次对账判完整的组（完整性翻转修正的基准）与因 pin 保护
         # 未遂的移除项（下次对账重试）。
@@ -1035,12 +858,16 @@ class KVEngine:
         self._planned_store_keys.update(plan.new_keys)
         if plan.evicted_keys and self._num_layers is not None:
             self._store.drop(_expand_io_keys(plan.evicted_keys, self._num_layers))
-        if keys and self.direct:
+        # 只预置**本次受理的** chunk（plan.new_keys，已去重且排除驻留）：
+        # 已驻留的 chunk 不会写，不该占用对象池槽位；且预置集合必须与
+        # 后续 store_layer/_prepare_write_batch 实际提交的集合一致，否则
+        # backend 会以"同一步内写目标变更"拒绝（fail-closed 守卫）。
+        if plan.new_keys and self.direct:
             backend = getattr(self._transfer, "_backend", None)
             prepare = getattr(backend, "prepare_write_targets", None)
             if callable(prepare):
                 try:
-                    prepare(keys)
+                    prepare(plan.new_keys)
                 except Exception:
                     abort_chunks = getattr(self._store, "abort_chunks", None)
                     if callable(abort_chunks):
@@ -1052,6 +879,64 @@ class KVEngine:
                     self._planned_store_keys.difference_update(plan.new_keys)
                     raise
         return plan
+
+    def apply_evictions(self, keys) -> int:
+        """执行调度侧下发的驱逐决策（数据面删除 + 本 rank 索引对齐）。
+
+        动机：两侧索引是独立 LRU（只有调度侧在命中时刷新访问序），容量
+        压力下选出的牺牲者可能不同——worker 删了 K 而调度侧仍报驻留
+        （幽灵命中，由 forgotten 通道自愈），或调度侧删了 J 而 worker
+        仍持有（盘上容量泄漏）。让调度侧把决策下发、worker 执行，可让
+        两侧在常规情况下**按构造收敛**，不必等到事后自愈。
+
+        保留 worker 自身的 plan_store 驱逐作为兜底：索引漂移时（调度侧
+        选中的 key 在本 rank 并不驻留）这里是无操作，worker 仍会自行
+        腾容量，不会出现"容量不足导致写入被拒"。
+
+        过滤两条，其余跳过：
+        - **本 rank 未驻留**——索引漂移时调度侧选中的 key 可能不在本 rank，
+          删它既无对象也无意义（避免无谓的删除 IO）；
+        - **读保护（pin）中**——在途读取的数据不能被删。
+
+        反过来，"调度侧已删、本 rank 仍驻留"（容量泄漏方向）会被正常
+        删除，因为该 key 在本 rank 是驻留的。
+        """
+        self._require_open()
+        batch = [bytes(key) for key in keys or ()]
+        if not batch:
+            return 0
+        index = self._index
+        droppable = [
+            key for key in batch
+            if index.is_resident(key) and not index.is_pinned(key)
+        ]
+        if not droppable:
+            return 0
+        if self._num_layers is not None:
+            self._store.drop(_expand_io_keys(droppable, self._num_layers))
+        index.forget(droppable)
+        self._planned_store_keys.difference_update(droppable)
+        return len(droppable)
+
+    def begin_step(self, max_pending_age: int) -> int:
+        """推进一个步进并回收超龄的在途写入预留，返回回收数量。
+
+        与调度侧同名方法对称：worker 侧的在途项正常由 wait_for_save 的
+        confirm_store 结算，但该回调未必总被调用（save 抛错后上层跳过、
+        请求被抢占），漏结算的项会永久占用容量并让同 key 的后续计划
+        被拒（"在途重复计划"）。按步龄兜底回收。
+        """
+        self._require_open()
+        self._index.advance_epoch()
+        reclaimed = self._index.reclaim_stale_pending(max_pending_age)
+        if reclaimed:
+            self._planned_store_keys.difference_update(reclaimed)
+            _LOG.warning(
+                "PENDING_RECLAIMED_WORKER count=%d age>%d steps："
+                "写入预留未在预期步数内结算（save 回调缺失），已回收",
+                len(reclaimed), max_pending_age,
+            )
+        return len(reclaimed)
 
     def confirm_store(self, keys, ok: bool = True) -> None:
         """结算写入计划（转发语义索引）。"""
@@ -1094,14 +979,14 @@ class KVEngine:
         self._require_open()
         if self._transfer is not None:
             raise RuntimeError("bind 恰允许一次")
-        if not _is_int(num_layers) or num_layers <= 0:
+        if not is_int(num_layers) or num_layers <= 0:
             raise ValueError(f"num_layers 须为正整数，got {num_layers!r}")
         if self._num_layers is not None and self._num_layers != num_layers:
             raise ValueError(
                 f"bind 层数 {num_layers} 与构造预告 num_layers"
                 f"({self._num_layers}) 不一致"
             )
-        if not _is_int(blocks_per_chunk) or blocks_per_chunk <= 0:
+        if not is_int(blocks_per_chunk) or blocks_per_chunk <= 0:
             raise ValueError(
                 f"blocks_per_chunk 须为正整数，got {blocks_per_chunk!r}"
             )
@@ -1188,14 +1073,14 @@ class KVEngine:
         self._require_open()
         if self._transfer is not None:
             raise RuntimeError("bind 恰允许一次")
-        if not _is_int(num_layers) or num_layers <= 0:
+        if not is_int(num_layers) or num_layers <= 0:
             raise ValueError(f"num_layers 须为正整数，got {num_layers!r}")
         if self._num_layers is not None and self._num_layers != num_layers:
             raise ValueError(
                 f"bind 层数 {num_layers} 与构造预告 num_layers"
                 f"({self._num_layers}) 不一致"
             )
-        if not _is_int(blocks_per_chunk) or blocks_per_chunk <= 0:
+        if not is_int(blocks_per_chunk) or blocks_per_chunk <= 0:
             raise ValueError(f"blocks_per_chunk 须为正整数，got {blocks_per_chunk!r}")
         if not isinstance(window, RingWindow):
             raise ValueError(f"window 须为 RingWindow 实例，got {window!r}")
@@ -1482,8 +1367,11 @@ class KVEngine:
             direct_lock = getattr(self, "_direct_submit_lock", None)
             with (direct_lock if direct_lock is not None else nullcontext()):
                 backend = getattr(self._transfer, "_backend", None)
-                plans = getattr(backend, "_target_plans", {})
-                if "write" not in plans:
+                # 走公开查询接口，不窥探 backend 的私有计划表（见阶段 C）。
+                has_plan = getattr(backend, "has_write_plan", None)
+                planned = (bool(has_plan()) if callable(has_plan)
+                           else False)
+                if not planned:
                     prepare = getattr(backend, "prepare_write_targets", None)
                     begin = getattr(backend, "begin_target_plan", None)
                     if callable(prepare) != callable(begin):
@@ -1632,7 +1520,8 @@ class KVEngine:
                 getattr(completion, "drain_stats", {})
                 for completion in inflight
             ]
-            _LOG.warning(
+            # 正常路径的排空统计：debug（原先 warning，每步都刷）。
+            _LOG.debug(
                 "DIRECT_COMPLETION_DRAIN completions=%d wait_result_calls=%d "
                 "release_io_calls=%d failed=%d read=%d write=%d elapsed_ms=%.3f",
                 len(inflight),
@@ -1745,12 +1634,17 @@ class KVEngine:
     def _end_direct_target_plans(self) -> None:
         backend = getattr(self._transfer, "_backend", None)
         end_plan = getattr(backend, "end_target_plan", None)
-        plans = getattr(backend, "_target_plans", {})
-        if callable(end_plan):
-            for direction in tuple(plans):
+        if not callable(end_plan):
+            return
+        # 走公开查询接口（含尚未提交的预备写计划），不窥探私有计划表。
+        directions = getattr(backend, "planned_directions", None)
+        if callable(directions):
+            for direction in tuple(directions()):
                 end_plan(direction)
-            if getattr(backend, "_prepared_write_chunks", None) is not None:
-                end_plan("write")
+            return
+        # 兼容不含该接口的轻量替身：退化为仅结束预备写计划。
+        if getattr(backend, "_prepared_write_chunks", None) is not None:
+            end_plan("write")
 
     # ---- 内部 ----
 
@@ -1759,7 +1653,7 @@ class KVEngine:
         self._require_open()
         if self._transfer is None:
             raise RuntimeError("执行态方法须在 bind 之后调用")
-        if not _is_int(layer_idx) or not 0 <= layer_idx < self._num_layers:
+        if not is_int(layer_idx) or not 0 <= layer_idx < self._num_layers:
             raise ValueError(
                 f"layer_idx 须在 [0, {self._num_layers}) 内，got {layer_idx!r}"
             )
@@ -1864,7 +1758,7 @@ class KVEngine:
         （完整性翻转修正，见 ChunkIndex.reconcile）。
         """
         self._require_open()
-        groups = _group_scan(self._store)
+        groups = group_scan(self._store)
         expected = set(range(self._num_layers or 0))
         # 灌入序 = 枚举序（确定；restore 的首次灌入序即 LRU 初始序）
         full_keys = [
@@ -1906,17 +1800,6 @@ class KVEngine:
             raise RuntimeError("engine 已 close")
 
 
-def _group_scan(store) -> dict[bytes, set[int]]:
-    """把 store 的存活枚举按 chunk key 分组为层集合；线格式非法的条目忽略。"""
-    groups: dict[bytes, set[int]] = {}
-    for io_key in store.scan():
-        if not isinstance(io_key, (bytes, bytearray)) or len(io_key) != _IO_KEY_BYTES:
-            continue
-        chunk_key = chunk_key_of(bytes(io_key))
-        groups.setdefault(chunk_key, set()).add(layer_of(bytes(io_key)))
-    return groups
-
-
 def _expand_io_keys(chunk_keys, num_layers: int) -> list[bytes]:
     """把一批 chunk key 展开为全部层的 io_key。"""
     return [
@@ -1924,14 +1807,6 @@ def _expand_io_keys(chunk_keys, num_layers: int) -> list[bytes]:
         for chunk_key in chunk_keys
         for layer in range(num_layers)
     ]
-
-
-def _positive_int(config: dict, key: str) -> int:
-    """从 config 读取正整数键；缺失或非法 → ValueError。"""
-    value = config.get(key)
-    if not _is_int(value) or value <= 0:
-        raise ValueError(f"config[{key!r}] 须为正整数，got {value!r}")
-    return value
 
 
 def _slice_first_blocks(first_blocks, start: int, end: int, total: int):
@@ -1950,25 +1825,5 @@ def _slice_first_blocks(first_blocks, start: int, end: int, total: int):
         return first_blocks
 
 
-def _flatten_block_ids(block_tables) -> tuple[int, ...]:
-    """Flatten wave-local block tables for fail-closed error reporting."""
-    if block_tables is None:
-        return ()
-    if isinstance(block_tables, (bytes, bytearray, str)):
-        return ()
-    try:
-        values = list(block_tables)
-    except TypeError:
-        return (block_tables,) if isinstance(block_tables, int) else ()
-    flattened = []
-    for value in values:
-        if isinstance(value, (list, tuple, set)):
-            flattened.extend(item for item in value if isinstance(item, int))
-        elif isinstance(value, int):
-            flattened.append(value)
-    return tuple(flattened)
 
 
-def _is_int(value) -> bool:
-    """判断是否为真 int（排除 bool）。"""
-    return isinstance(value, int) and not isinstance(value, bool)
