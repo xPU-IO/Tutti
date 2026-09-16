@@ -5,8 +5,6 @@ build_tutti/
 build_tutti/*
 build_layer2/
 build_layer2/*
-# In-tree CMake build dir under the Layer 2 tests (configured artifacts only).
-tutti/device_manager/tests/build/
 build_snvme_module/
 # In-source cmake debris (accidental `cmake .` at the repo root).
 CMakeFiles/
@@ -48,19 +46,13 @@ build_dependencies.tsv
 
 # Smoke-test binaries built in-tree by the test/Makefile.  The .c/.cu
 # sources are committed; the binaries are not.
-backends/local/kernel_modules/test/snvme_smoke
-backends/local/kernel_modules/test/snvme_smoke_gpu
-backends/local/kernel_modules/test/snvme_smoke_addq
-backends/local/kernel_modules/test/snvme_smoke_qgroup
-backends/local/kernel_modules/test/snvme_smoke_recycle
-backends/local/kernel_modules/test/snvme_smoke_io
-tutti/device_manager/nvme/kernel_modules/test/snvme_smoke
-tutti/device_manager/nvme/kernel_modules/test/snvme_smoke_gpu
-tutti/device_manager/nvme/kernel_modules/test/snvme_smoke_addq
-tutti/device_manager/nvme/kernel_modules/test/snvme_smoke_qgroup
-tutti/device_manager/nvme/kernel_modules/test/snvme_smoke_recycle
-tutti/device_manager/nvme/kernel_modules/test/snvme_smoke_io
-tutti/device_manager/nvme/kernel_modules/test/snvme_ubind
+csrc/device_manager/nvme/kernel_modules/test/snvme_smoke
+csrc/device_manager/nvme/kernel_modules/test/snvme_smoke_gpu
+csrc/device_manager/nvme/kernel_modules/test/snvme_smoke_addq
+csrc/device_manager/nvme/kernel_modules/test/snvme_smoke_qgroup
+csrc/device_manager/nvme/kernel_modules/test/snvme_smoke_recycle
+csrc/device_manager/nvme/kernel_modules/test/snvme_smoke_io
+csrc/device_manager/nvme/kernel_modules/test/snvme_ubind
 
 # Nsight Systems profile output -- per-run, not source.
 *.nsys-rep
@@ -72,16 +64,6 @@ sweep_logs/
 # Exported chat history (not source)
 history_*.md
 tutti_build/
-
-# Local CUDA-like profile verification build trees.
-tutti/build-profile-cuda/
-tutti/build-profile-host/
-tutti/build-profile-cuda/
-tutti/build-profile-host/
-
-# Phase 3 gate script working build trees (scripts/phase3_gate.sh).
-tutti/build_host/
-tutti/build_cuda/
 
 /chat/
 
@@ -97,6 +79,11 @@ modules.order
 # board, round scratch) -- per-run collaboration artifacts, not source.
 doc/intergration/ai-orch/
 doc/intergration/rounds/
+
+# pytest-benchmark 产物（即使没跑 benchmark 也会建空目录）
+.benchmarks/
+# pytest 缓存（pyproject 已加 -p no:cacheprovider，此为兜底）
+.pytest_cache/
 
 # Python
 __pycache__/
