@@ -216,6 +216,12 @@ add_subdirectory(resolvers/striped_file)
 add_subdirectory(resolvers)
 add_subdirectory(data_paths)
 
+# Storage object layer: object lifecycle, space accounting, validity and crash
+# recovery. Sits above the resolvers (which it uses to reach media) and below
+# the KV index. Private implementation; the SPI is
+# <tutti/spi/storage_object_store.h>.
+add_subdirectory(storage_objects)
+
 # SAMPLE-ONLY: community extension sample (doc/extending_tutti.md).
 # The subdirectory is added inside BUILD_TESTING (below) because its
 # contract test uses add_test(), which requires include(CTest) first.
@@ -384,6 +390,26 @@ if(BUILD_TESTING)
     add_subdirectory(
         "${TUTTI_REPOSITORY_ROOT}/tests/storage_runtime_contract"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_storage_runtime_contract"
+    )
+    # Storage-object-layer SPI: on-media layout constants plus the semantic
+    # invariants callers depend on (partial reserve acceptance, under-report-
+    # only cross-rank residency, fail-closed open).
+    add_subdirectory(
+        "${TUTTI_REPOSITORY_ROOT}/tests/storage_object_store_contract"
+        "${CMAKE_CURRENT_BINARY_DIR}/tests_storage_object_store_contract"
+    )
+    # On-media digests. Frozen format: CRC-32C pinned to the standard vectors,
+    # object_identity pinned to captured literals.
+    add_subdirectory(
+        "${TUTTI_REPOSITORY_ROOT}/tests/object_digest_contract"
+        "${CMAKE_CURRENT_BINARY_DIR}/tests_object_digest_contract"
+    )
+    # Storage object layer implementation: header codec, checkpoint containers,
+    # residency bitmap, space allocator. Adversarial -- corrupts headers, tears
+    # checkpoint writes, desynchronises bitmaps, recycles space under records.
+    add_subdirectory(
+        "${TUTTI_REPOSITORY_ROOT}/tests/storage_objects_contract"
+        "${CMAKE_CURRENT_BINARY_DIR}/tests_storage_objects_contract"
     )
     message(STATUS "Tutti: added tests/data_path_contract and tests/storage_runtime_contract")
 
