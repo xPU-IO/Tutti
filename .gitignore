@@ -101,5 +101,8 @@ doc/intergration/rounds/
 # Python
 __pycache__/
 *.pyc
+# setuptools/pip 构建残留（pip wheel / pip install -e 会生成）
+*.egg-info/
+/build/
 doc/intergration/redesign/
 /orchestra/

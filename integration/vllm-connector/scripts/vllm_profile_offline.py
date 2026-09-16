@@ -264,6 +264,31 @@ def main() -> int:
             "file exists; create it only after externally stopping Nsight"
         ),
     )
+    parser.add_argument(
+        "--torch-profiler-dir",
+        default="",
+        help=(
+            "非空则改用 torch profiler 并把 trace 落到该目录（含 Python 调用栈）；"
+            "留空保持 cuda profiler（给外部 Nsight 用）"
+        ),
+    )
+    parser.add_argument(
+        "--profile-window",
+        choices=("all", "b-only"),
+        default="all",
+        help=(
+            "torch profiler 采集窗口：all=整个工作负载；"
+            "b-only=只采复用加载的 B 请求（A 的冷启动 prefill 不进 trace）"
+        ),
+    )
+    parser.add_argument(
+        "--torch-profiler-skip-table",
+        action="store_true",
+        help=(
+            "跳过 stop_profile 后的 CUDA 耗时汇总表（key_averages 在长上下文"
+            "trace 上要跑好几分钟，trace 本身早已落盘时可直接跳过）"
+        ),
+    )
     args = parser.parse_args()
     if not 1 <= args.reuse_pct < 100:
         parser.error("--reuse-pct must be in [1, 99]")
@@ -364,7 +389,7 @@ def main() -> int:
             })
         kv_transfer_config = KVTransferConfig(
             kv_connector="TuttiConnectorV1",
-            kv_connector_module_path="adapter.connector",
+            kv_connector_module_path="tutti.integration.vllm.connector",
             kv_role="kv_both",
             kv_load_failure_policy=args.kv_load_failure_policy,
             kv_connector_extra_config=connector_extra,
@@ -379,7 +404,18 @@ def main() -> int:
         enable_prefix_caching=True,
         enable_layerwise_nvtx_tracing=args.layerwise_nvtx,
         enable_flashinfer_autotune=not args.disable_flashinfer_autotune,
-        profiler_config={"profiler": "cuda"},
+        profiler_config=(
+            {
+                "profiler": "torch",
+                "torch_profiler_dir": args.torch_profiler_dir,
+                "torch_profiler_with_stack": True,
+                "torch_profiler_dump_cuda_time_total": (
+                    not args.torch_profiler_skip_table
+                ),
+            }
+            if args.torch_profiler_dir
+            else {"profiler": "cuda"}
+        ),
         kv_transfer_config=kv_transfer_config,
     )
     sampling_params = SamplingParams(
@@ -397,8 +433,12 @@ def main() -> int:
             time.sleep(0.2)
         print("profile workload released", flush=True)
 
-    # Start profiling in all TP workers once. Nsight is stopped externally.
-    llm.start_profile()
+    # cuda profiler 全程开启，由外部 Nsight 停止；torch profiler 由本脚本 stop
+    # 以落盘 trace，b-only 窗口时推迟到 B 请求前再开。
+    torch_profiling = bool(args.torch_profiler_dir)
+    b_only_window = torch_profiling and args.profile_window == "b-only"
+    if not b_only_window:
+        llm.start_profile()
     walls_a: list[float] = []
     walls_b: list[float] = []
     for round_idx in range(args.rounds):
@@ -411,6 +451,8 @@ def main() -> int:
             if not llm.reset_prefix_cache(reset_connector=False):
                 raise RuntimeError("failed to reset vLLM local prefix cache")
             print("local prefix cache reset; Tutti cache retained", flush=True)
+        if b_only_window:
+            llm.start_profile()
         try:
             walls_b.append(
                 _generate(llm, tokens_b, sampling_params, f"B-80pct{suffix}")
@@ -428,6 +470,10 @@ def main() -> int:
                 raise RuntimeError(
                     "request B unexpectedly succeeded under fail policy"
                 )
+        finally:
+            if b_only_window:
+                # 即使请求失败也要落盘：失败现场正是要看的 trace。
+                llm.stop_profile()
         if args.reset_local_prefix_between_rounds and round_idx + 1 < args.rounds:
             # Keep每轮 A 处于"vLLM 本地无前缀命中"状态，否则轮间本地
             # prefix cache 会让后续 A 不再是 cold（外部命中亦不触发）。
@@ -453,6 +499,8 @@ def main() -> int:
         _stats("A-cold", walls_a)
         _stats("B-80pct", walls_b)
     print("profile workload complete", flush=True)
+    if torch_profiling and not b_only_window:
+        llm.stop_profile()
     if args.wait_for_exit_file:
         print(
             f"profile hold: waiting for {args.wait_for_exit_file}",
