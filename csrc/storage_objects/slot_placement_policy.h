@@ -43,9 +43,18 @@ public:
     // striped one.
     virtual std::uint32_t shard_count() const = 0;
 
+    // Scheme to put in ResolveOptions. Distinct from the URI prefix only in
+    // that it carries no "://" -- the resolvers check this field before parsing.
+    virtual std::string resolver_scheme() const = 0;
+
     // Filesystem paths of the files backing `slot`, in stripe order. Used for
     // materialisation (writing real zeros) and for header IO -- never handed to
     // the caller, who only ever sees an ObjectPlacement.
+    //
+    // MUST agree byte for byte with the paths the resolver derives from
+    // uri_for_slot(). The resolvers build their own backing paths from the URI,
+    // so a mismatch would have materialisation write one set of files while
+    // resolution reads another -- and DMA would target unallocated extents.
     virtual Status paths_for_slot(std::uint64_t slot,
                                   std::vector<std::string>* out) const = 0;
 
@@ -54,8 +63,8 @@ public:
     // per-shard share plus the reserved header prefix.
     virtual std::uint64_t shard_file_bytes(std::uint64_t slot_bytes) const = 0;
 
-    // URI to hand the resolver to obtain this slot's ResolvedTarget. The scheme
-    // selects the resolver, so this string is what ties a slot to its backend.
+    // URI to hand the resolver to obtain this slot's ResolvedTarget. Its format
+    // is fixed by the resolver, not chosen here.
     virtual std::string uri_for_slot(std::uint64_t slot) const = 0;
 
     // Where the object header lives: which shard, and at what offset in that
@@ -78,14 +87,16 @@ public:
 // Layout of "<root>/slots/<slot>.obj":
 //   [0, 4096)                 object header
 //   [4096, 4096 + payload)    payload, segments back to back
+//
+// The local-file resolver takes the path verbatim from a "file://<abs path>"
+// URI, so the path shape is this policy's choice.
 // -------------------------------------------------------------------------
 class SingleFilePlacement final : public SlotPlacementPolicy {
 public:
-    // `uri_scheme` selects the resolver (e.g. "local_nvme_file"). `root` is the
-    // namespace directory on the mounted filesystem.
-    SingleFilePlacement(std::string root, std::string uri_scheme);
+    explicit SingleFilePlacement(std::string root);
 
     std::uint32_t shard_count() const override { return 1; }
+    std::string resolver_scheme() const override { return "file"; }
     Status paths_for_slot(std::uint64_t slot,
                           std::vector<std::string>* out) const override;
     std::uint64_t shard_file_bytes(std::uint64_t slot_bytes) const override;
@@ -97,32 +108,35 @@ private:
     std::string slot_path(std::uint64_t slot) const;
 
     std::string root_;
-    std::string uri_scheme_;
 };
 
 // -------------------------------------------------------------------------
 // StripedPlacement -- N shard files per slot, one per device.
 //
-// Layout of "<mount_i>/slots/<slot>.s<i>":
+// The striped resolver parses
+//     striped://<name>?devs=<m1,m2,...>&unit=<bytes>
+// and derives each shard path itself as
+//     <mount_i>/striped/<name>.shard<i>
+// so BOTH the URI format and the resulting paths are dictated by the resolver.
+// This policy uses the slot number as <name> and must reproduce those paths
+// exactly, since it is what materialises the files the resolver will map.
+//
+// Layout of each shard:
 //   [0, 4096)                 header region; only shard 0's is written, the
 //                             rest is reserved so all shards are equal size
 //   [4096, 4096 + share)      this shard's slice of the payload
-//
-// The payload's logical space is mapped onto the shards by the resolver using
-// the stripe formula; this policy only has to produce the right paths and
-// sizes.
 // -------------------------------------------------------------------------
 class StripedPlacement final : public SlotPlacementPolicy {
 public:
     // `mounts` is one directory per device, in stripe order. `stripe_unit` is
     // the round-robin granularity and must divide the per-shard payload share
     // so no segment straddles a shard boundary unevenly.
-    StripedPlacement(std::vector<std::string> mounts, std::uint64_t stripe_unit,
-                     std::string uri_scheme);
+    StripedPlacement(std::vector<std::string> mounts, std::uint64_t stripe_unit);
 
     std::uint32_t shard_count() const override {
         return static_cast<std::uint32_t>(mounts_.size());
     }
+    std::string resolver_scheme() const override { return "striped"; }
     Status paths_for_slot(std::uint64_t slot,
                           std::vector<std::string>* out) const override;
     std::uint64_t shard_file_bytes(std::uint64_t slot_bytes) const override;
@@ -131,10 +145,11 @@ public:
     std::uint64_t stripe_unit() const { return stripe_unit_; }
     const std::vector<std::string>& mounts() const { return mounts_; }
 
-    // True when the geometry is self-consistent: at least one mount, a nonzero
-    // stripe unit, and a payload that divides evenly across shards in whole
-    // stripe units. Checked by the store at open() so a bad configuration fails
-    // loudly instead of producing objects whose segments straddle shards.
+    // True when the geometry is self-consistent: at least one mount, a stripe
+    // unit that is nonzero and 4096-aligned (the resolver's own requirement),
+    // and a payload that divides evenly across shards in whole stripe units.
+    // Checked by the store at open() so a bad configuration fails loudly instead
+    // of producing objects whose segments straddle shards.
     bool geometry_valid(std::uint64_t slot_bytes) const;
 
 private:
@@ -142,7 +157,6 @@ private:
 
     std::vector<std::string> mounts_;
     std::uint64_t stripe_unit_;
-    std::string uri_scheme_;
 };
 
 } // namespace tutti::storage_objects

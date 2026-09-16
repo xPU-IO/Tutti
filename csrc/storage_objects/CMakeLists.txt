@@ -18,6 +18,8 @@ add_library(tutti_storage_objects STATIC
     space_allocator.cpp
     slot_placement_policy.cpp
     slot_media.cpp
+    object_store_core.cpp
+    store_factory.cpp
 )
 
 # Repo root on the include path so private headers are addressed as

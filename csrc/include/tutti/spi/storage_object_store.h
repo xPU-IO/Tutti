@@ -98,6 +98,30 @@ struct ObjectLayout {
 };
 
 // -------------------------------------------------------------------------
+// StoreDevice -- one backing device.
+//
+// Deployment facts the store cannot derive: which filesystem directory holds
+// slot files, and which NVMe namespace those files must resolve into. The
+// resolver needs the controller identity to prove that FIEMAP physical offsets
+// belong to the namespace it was configured for; without it a file could be
+// mapped onto the wrong device.
+// -------------------------------------------------------------------------
+struct StoreDevice {
+    // Directory holding this device's slot files.
+    std::string mount_path;
+
+    // NVMe namespace identity, used by the resolver to validate extents.
+    std::string controller_pci_addr;
+    std::uint32_t namespace_id = 0;
+    std::uint32_t block_size = 0;
+
+    // Block device whose extents back mount_path (e.g. /dev/ssnvme0n1), and the
+    // namespace's byte offset within it.
+    std::string backing_device_path;
+    std::uint64_t namespace_base_bytes = 0;
+};
+
+// -------------------------------------------------------------------------
 // StoreConfig
 //
 // capacity_bytes is a CEILING declaration; prewarm_bytes is how much space is
@@ -107,7 +131,9 @@ struct ObjectLayout {
 // terabyte-scale ceiling must not imply an hour-scale open().
 // -------------------------------------------------------------------------
 struct StoreConfig {
-    // Namespace root. Uses the same URI scheme space as the resolver layer.
+    // Namespace root: where this store's metadata (checkpoint, residency
+    // bitmaps) lives. Slot data lives under each device's mount_path, which for
+    // a single-device deployment is usually this same directory.
     std::string uri;
 
     // Total capacity ceiling for this store. 0 means "whatever the backend
@@ -119,6 +145,13 @@ struct StoreConfig {
     // Geometry/model fingerprint. A mismatch against persisted state is
     // fail-closed (open() returns INVALID_ARGUMENT and preserves the data).
     std::vector<std::uint8_t> namespace_fingerprint;
+
+    // Backing devices, in stripe order. Exactly one for a single-file layout.
+    std::vector<StoreDevice> devices;
+
+    // Round-robin granularity across devices. 0 selects the single-file layout,
+    // which requires exactly one device.
+    std::uint64_t stripe_unit = 0;
 
     // Bytes of usable space to materialise before open() returns. 0 = none.
     std::uint64_t prewarm_bytes = 0;

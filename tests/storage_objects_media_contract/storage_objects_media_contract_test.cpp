@@ -96,7 +96,7 @@ ObjectKey key_of(std::uint8_t tag, std::size_t len = 18) {
 // 1. SingleFilePlacement
 // ======================================================================
 void test_single_file_placement() {
-    SingleFilePlacement policy("/mnt/nvme0/ns", "local_nvme_file");
+    SingleFilePlacement policy("/mnt/nvme0/ns");
 
     CHECK(policy.shard_count() == 1);
     CHECK(policy.header_shard() == 0);
@@ -117,10 +117,15 @@ void test_single_file_placement() {
     CHECK(again == paths);
 
     CHECK(policy.shard_file_bytes(kSlotBytes) == kSlotBytes);
-    CHECK(policy.uri_for_slot(7) ==
-          "local_nvme_file:///mnt/nvme0/ns/slots/7.obj");
-    // The scheme is what selects the resolver, so it must survive into the URI.
-    CHECK(policy.uri_for_slot(0).rfind("local_nvme_file://", 0) == 0);
+    // The URI format is dictated by the local-file resolver, which requires the
+    // "file://" prefix followed by an absolute path and takes that path verbatim
+    // as the backing file.
+    CHECK(policy.resolver_scheme() == "file");
+    CHECK(policy.uri_for_slot(7) == "file:///mnt/nvme0/ns/slots/7.obj");
+    CHECK(policy.uri_for_slot(0).rfind("file:///", 0) == 0);
+    // The URI's path must be exactly the path that gets materialised, or
+    // materialisation and resolution would touch different files.
+    CHECK(policy.uri_for_slot(7) == "file://" + paths[0]);
 
     // Distinct slots never collide.
     std::vector<std::string> a, b;
@@ -131,7 +136,7 @@ void test_single_file_placement() {
     CHECK(!policy.paths_for_slot(0, nullptr).ok());
 
     // A root with a trailing slash must not produce a doubled separator.
-    SingleFilePlacement trailing("/mnt/nvme0/ns/", "local_nvme_file");
+    SingleFilePlacement trailing("/mnt/nvme0/ns/");
     std::vector<std::string> tp;
     CHECK(trailing.paths_for_slot(3, &tp).ok());
     REQUIRE(tp.size() == 1);
@@ -144,7 +149,7 @@ void test_single_file_placement() {
 void test_striped_placement() {
     const std::vector<std::string> mounts = {"/mnt/nvme0/st", "/mnt/nvme1/st"};
     constexpr std::uint64_t kUnit = 65536;  // 64 KiB, as deployed
-    StripedPlacement policy(mounts, kUnit, "striped_local_nvme_file");
+    StripedPlacement policy(mounts, kUnit);
 
     CHECK(policy.shard_count() == 2);
     CHECK(policy.stripe_unit() == kUnit);
@@ -156,8 +161,13 @@ void test_striped_placement() {
     std::vector<std::string> paths;
     CHECK(policy.paths_for_slot(5, &paths).ok());
     REQUIRE(paths.size() == 2);
-    CHECK(paths[0] == "/mnt/nvme0/st/slots/5.s0");
-    CHECK(paths[1] == "/mnt/nvme1/st/slots/5.s1");
+    // These paths are NOT this policy's choice: the striped resolver derives
+    // <mount_i>/striped/<name>.shard<i> from the URI itself, so the policy must
+    // reproduce them exactly. A divergence would have materialisation write one
+    // set of files while resolution maps another, leaving DMA pointed at
+    // unallocated extents.
+    CHECK(paths[0] == "/mnt/nvme0/st/striped/5.shard0");
+    CHECK(paths[1] == "/mnt/nvme1/st/striped/5.shard1");
     // Shards must live on DIFFERENT mounts, or striping buys nothing.
     CHECK(paths[0].rfind("/mnt/nvme0/", 0) == 0);
     CHECK(paths[1].rfind("/mnt/nvme1/", 0) == 0);
@@ -184,35 +194,41 @@ void test_striped_placement() {
     CHECK(!policy.geometry_valid(0));
 
     // A zero stripe unit is nonsense and must not be silently defaulted.
-    StripedPlacement no_unit(mounts, 0, "striped_local_nvme_file");
+    StripedPlacement no_unit(mounts, 0);
     CHECK(!no_unit.geometry_valid(kSlotBytes));
 
+    // The resolver requires a 4096-aligned stripe unit, so an unaligned one must
+    // be rejected at open() rather than on the first IO.
+    StripedPlacement unaligned(mounts, 1000);
+    CHECK(!unaligned.geometry_valid(kSlotBytes));
+
     // No mounts at all is a configuration error, reported rather than crashed.
-    StripedPlacement empty({}, kUnit, "striped_local_nvme_file");
+    StripedPlacement empty({}, kUnit);
     CHECK(empty.shard_count() == 0);
     CHECK(!empty.geometry_valid(kSlotBytes));
     std::vector<std::string> none;
     CHECK(!empty.paths_for_slot(0, &none).ok());
 
-    // The URI must carry the stripe unit and every shard path, since the
-    // resolver reconstructs the bundle from it.
+    // The URI must carry the name, the device list and the stripe unit in the
+    // exact shape the striped resolver parses:
+    //     striped://<name>?devs=<m1,m2,...>&unit=<bytes>
+    CHECK(policy.resolver_scheme() == "striped");
     const std::string uri = policy.uri_for_slot(5);
-    CHECK(uri.rfind("striped_local_nvme_file://", 0) == 0);
-    CHECK(uri.find("unit=65536") != std::string::npos);
-    CHECK(uri.find("/mnt/nvme0/st/slots/5.s0") != std::string::npos);
-    CHECK(uri.find("/mnt/nvme1/st/slots/5.s1") != std::string::npos);
+    CHECK(uri == "striped://5?devs=/mnt/nvme0/st,/mnt/nvme1/st&unit=65536");
+    CHECK(uri.rfind("striped://", 0) == 0);
+    CHECK(uri.find("?devs=") != std::string::npos);
+    CHECK(uri.find("&unit=65536") != std::string::npos);
     // A pure function of the slot number, so targets can be cached by slot.
     CHECK(policy.uri_for_slot(5) == uri);
     CHECK(policy.uri_for_slot(6) != uri);
 
     // --- four shards, the other deployed shape ---
-    StripedPlacement four({"/a", "/b", "/c", "/d"}, kUnit,
-                          "striped_local_nvme_file");
+    StripedPlacement four({"/a", "/b", "/c", "/d"}, kUnit);
     CHECK(four.shard_count() == 4);
     std::vector<std::string> fp;
     CHECK(four.paths_for_slot(9, &fp).ok());
     REQUIRE(fp.size() == 4);
-    CHECK(fp[3] == "/d/slots/9.s3");
+    CHECK(fp[3] == "/d/striped/9.shard3");
     CHECK(four.geometry_valid(kSlotBytes));   // 10 MiB / 4 / 64 KiB = 40 rounds
     CHECK(four.shard_file_bytes(kSlotBytes) ==
           ObjectHeaderLayout::kHeaderBytes + kPayload / 4);
@@ -220,7 +236,7 @@ void test_striped_placement() {
     // --- the two policies agree on what they must agree on ---
     // Both put the header at shard 0 offset 0 and start the payload at the same
     // logical offset, so the core needs no special casing.
-    SingleFilePlacement single("/mnt/nvme0/ns", "local_nvme_file");
+    SingleFilePlacement single("/mnt/nvme0/ns");
     CHECK(single.header_shard() == policy.header_shard());
     CHECK(single.header_offset_in_shard() == policy.header_offset_in_shard());
     CHECK(single.payload_offset() == policy.payload_offset());
@@ -302,7 +318,7 @@ void test_directories(const std::string& dir) {
 // ======================================================================
 void test_materialisation(const std::string& dir) {
     const std::string root = dir + "/mat";
-    SingleFilePlacement policy(root, "local_nvme_file");
+    SingleFilePlacement policy(root);
 
     std::vector<std::string> paths;
     REQUIRE(policy.paths_for_slot(0, &paths).ok());
@@ -365,8 +381,7 @@ void test_materialisation(const std::string& dir) {
     CHECK(!materialise_slot({}, kSmallSlot).ok());
 
     // --- striped materialisation creates every shard ---
-    StripedPlacement striped({dir + "/st0", dir + "/st1"}, 65536,
-                             "striped_local_nvme_file");
+    StripedPlacement striped({dir + "/st0", dir + "/st1"}, 65536);
     std::vector<std::string> shards;
     REQUIRE(striped.paths_for_slot(3, &shards).ok());
     REQUIRE(shards.size() == 2);
@@ -410,7 +425,7 @@ void test_materialisation(const std::string& dir) {
 // ======================================================================
 void test_header_io(const std::string& dir) {
     const std::string root = dir + "/hdr";
-    SingleFilePlacement policy(root, "local_nvme_file");
+    SingleFilePlacement policy(root);
     std::vector<std::string> paths;
     REQUIRE(policy.paths_for_slot(11, &paths).ok());
 
