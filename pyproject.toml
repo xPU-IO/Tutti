@@ -16,7 +16,8 @@ dependencies = []
 # 单一顶层包 tutti，所有子包均为常规包（带 __init__.py）。收进 tutti 命名空间
 # 后，顶层不再出现 engine / common / stores 这类易撞名的名字，历史上被
 # site-packages 顶层 engine.so 抢占的那类故障已结构性消除。
-where = ["python"]
+# 包就在仓库根（csrc/ + tutti/ + integration/ 的布局）
+where = ["."]
 include = ["tutti*"]
 
 # 不由本 distribution 打包的目录及原因：
@@ -25,6 +26,6 @@ include = ["tutti*"]
 #   integration/vllm-connector/scripts/    开发压测工具，不属于运行时包
 
 [tool.pytest.ini_options]
-testpaths = ["python/tests"]
+testpaths = ["tests/python"]
 # 不生成 .pytest_cache（env-tutti.sh 的 PYTEST_ADDOPTS 是全局兜底）
 addopts = "-p no:cacheprovider"

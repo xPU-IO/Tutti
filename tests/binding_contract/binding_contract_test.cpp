@@ -3,7 +3,7 @@
 // Contract tests for tutti/bindings/ext4_local_nvme/binding.h.
 // Plain C++17 executable, no GTest or third-party deps.
 
-#include <tutti/bindings/ext4_local_nvme/binding.h>
+#include <csrc/bindings/ext4_local_nvme/binding.h>
 
 #include <tutti/spi/storage_target_resolver.h>  // for mismatch test only
 

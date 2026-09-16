@@ -1,15 +1,15 @@
-#include "tutti/data_paths/data_path_factory.h"
+#include "csrc/data_paths/data_path_factory.h"
 
 #include <cstdio>
 #include <memory>
 #include <string>
 #include <utility>
 
-#include "tutti/resource/memory/memory_resource.h"
-#include "tutti/resource/nvme/nvme_resource.h"
+#include "csrc/resource/memory/memory_resource.h"
+#include "csrc/resource/nvme/nvme_resource.h"
 #if defined(TUTTI_TEST_HAS_LOCAL_NVME)
-#include "tutti/data_paths/local_nvme/local_nvme_data_path.h"
-#include "tutti/data_paths/striped_local_nvme/striped_data_path.h"
+#include "csrc/data_paths/local_nvme/local_nvme_data_path.h"
+#include "csrc/data_paths/striped_local_nvme/striped_data_path.h"
 #endif
 
 namespace {

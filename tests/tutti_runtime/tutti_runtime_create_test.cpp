@@ -8,12 +8,12 @@
 #include <utility>
 #include <vector>
 
-#include <tutti/data_paths/data_path_factory.h>
-#include <tutti/resolvers/resolver_factory.h>
+#include <csrc/data_paths/data_path_factory.h>
+#include <csrc/resolvers/resolver_factory.h>
 #include <tutti/storage_runtime.h>
 
-#include "tutti/testing/mock_data_path.h"
-#include "tutti/tutti_runtime/tutti_runtime_internal.h"
+#include "csrc/testing/mock_data_path.h"
+#include "csrc/tutti_runtime/tutti_runtime_internal.h"
 
 namespace {
 

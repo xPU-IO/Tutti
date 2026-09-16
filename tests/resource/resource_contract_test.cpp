@@ -6,8 +6,8 @@
 #include <vector>
 
 #include <tutti/resource.h>
-#include "tutti/resource/memory/memory_resource.h"
-#include "tutti/resource/nvme/nvme_resource_internal.h"
+#include "csrc/resource/memory/memory_resource.h"
+#include "csrc/resource/nvme/nvme_resource_internal.h"
 
 namespace {
 

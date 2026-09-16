@@ -4,10 +4,10 @@
 # tutti C++ build tree. This script never builds tutti itself.
 #
 # Environment variables:
-#   TUTTI_ROOT       repository root containing tutti/include (default:
+#   TUTTI_ROOT       repository root containing csrc/include (default:
 #                    three levels up from this file, i.e. the repo root)
 #   TUTTI_BUILD_DIR  existing tutti CMake build directory that contains
-#                    tutti/presets/libtutti_presets.a (default: probe
+#                    csrc/presets/libtutti_presets.a (default: probe
 #                    $TUTTI_ROOT/build)
 #
 # Prerequisite check (per task card): if libtutti_presets.a cannot be found,
@@ -41,7 +41,7 @@ def resolve_build_dir(tutti_root):
     if env:
         return os.path.abspath(env)
     p = os.path.join(tutti_root, "build")
-    if os.path.exists(os.path.join(p, "tutti", "presets", "libtutti_presets.a")):
+    if os.path.exists(os.path.join(p, "csrc", "presets", "libtutti_presets.a")):
         return p
     return None
 
@@ -86,11 +86,11 @@ if TUTTI_BUILD_DIR is None:
     die(
         "libtutti_presets.a not found. This binding does not build tutti "
         "itself; point TUTTI_BUILD_DIR at an existing tutti CMake build "
-        "directory (expected: $TUTTI_BUILD_DIR/tutti/presets/"
+        "directory (expected: $TUTTI_BUILD_DIR/csrc/presets/"
         "libtutti_presets.a), or configure/build tutti first."
     )
 
-PRESETS_LIB = os.path.join(TUTTI_BUILD_DIR, "tutti", "presets", "libtutti_presets.a")
+PRESETS_LIB = os.path.join(TUTTI_BUILD_DIR, "csrc", "presets", "libtutti_presets.a")
 if not os.path.exists(PRESETS_LIB):
     die(
         "libtutti_presets not found under %s (task prerequisite failed; "
@@ -99,27 +99,27 @@ if not os.path.exists(PRESETS_LIB):
 
 CUDA_ROOT = resolve_cuda_root(TUTTI_BUILD_DIR)
 ACCELERATOR_PROFILE = resolve_accelerator_profile(TUTTI_BUILD_DIR)
-TUTTI_INCLUDE = os.path.join(TUTTI_ROOT, "tutti", "include")
+TUTTI_INCLUDE = os.path.join(TUTTI_ROOT, "csrc", "include")
 
 CCCL_DIRS = sorted(
     glob.glob(os.path.join(CUDA_ROOT, "targets", "*", "include", "cccl"))
 )
 LIBNVM_DIR = os.path.join(
-    TUTTI_BUILD_DIR, "tutti", "device_manager", "nvme", "libnvm"
+    TUTTI_BUILD_DIR, "csrc", "device_manager", "nvme", "libnvm"
 )
 
 STATIC_LIBS = [
     PRESETS_LIB,
     os.path.join(
-        TUTTI_BUILD_DIR, "tutti", "data_paths", "local_nvme",
+        TUTTI_BUILD_DIR, "csrc", "data_paths", "local_nvme",
         "libtutti_local_nvme_datapath.a",
     ),
     os.path.join(
-        TUTTI_BUILD_DIR, "tutti", "data_paths", "striped_local_nvme",
+        TUTTI_BUILD_DIR, "csrc", "data_paths", "striped_local_nvme",
         "libtutti_striped_local_nvme_datapath.a",
     ),
     os.path.join(
-        TUTTI_BUILD_DIR, "tutti", "resolvers", "libtutti_resolver_factory.a",
+        TUTTI_BUILD_DIR, "csrc", "resolvers", "libtutti_resolver_factory.a",
     ),
 ]
 for lib in STATIC_LIBS:

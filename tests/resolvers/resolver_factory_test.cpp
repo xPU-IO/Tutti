@@ -1,4 +1,4 @@
-#include "tutti/resolvers/resolver_factory.h"
+#include "csrc/resolvers/resolver_factory.h"
 
 #include <cstdio>
 #include <memory>
@@ -6,12 +6,12 @@
 #include <utility>
 #include <vector>
 
-#include <tutti/resolvers/local_file/resolver.h>
-#include <tutti/resolvers/striped_file/resolver.h>
+#include <csrc/resolvers/local_file/resolver.h>
+#include <csrc/resolvers/striped_file/resolver.h>
 
-#include "tutti/resolvers/memfs/resolver.h"
-#include "tutti/resource/memory/memory_resource.h"
-#include "tutti/resource/nvme/nvme_resource.h"
+#include "csrc/resolvers/memfs/resolver.h"
+#include "csrc/resource/memory/memory_resource.h"
+#include "csrc/resource/nvme/nvme_resource.h"
 
 namespace {
 

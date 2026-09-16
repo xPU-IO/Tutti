@@ -56,7 +56,7 @@ if(BUILD_TESTING)
 endif()
 
 # The root owns project()/language initialization.  The target graph is kept
-# in tutti/CMakeLists.txt as a regular subdirectory (not a standalone entry).
+# in csrc/CMakeLists.txt as a regular subdirectory (not a standalone entry).
 
 # GCC 8 keeps std::filesystem in a separate libstdc++fs; GCC 9+ folds it into
 # libstdc++.  Detect and expose so filesystem-using targets link it explicitly.
@@ -65,4 +65,4 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_L
     set(TUTTI_FILESYSTEM_LIBS stdc++fs)
 endif()
 
-add_subdirectory(tutti)
+add_subdirectory(csrc)

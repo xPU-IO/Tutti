@@ -1,6 +1,6 @@
 #include <tutti/accelerator_device_guard.h>
 #include <tutti/storage_runtime.h>
-#include <tutti/testing/mock_data_path.h>
+#include <csrc/testing/mock_data_path.h>
 
 #include <atomic>
 #include <cstdio>

@@ -9,11 +9,11 @@
 #include <tutti/storage_runtime.h>
 #include <tutti/spi/data_path.h>
 #include <tutti/spi/storage_target_resolver.h>
-#include <tutti/bindings/ext4_local_nvme/binding.h>
-#include "tutti/data_paths/local_nvme/local_nvme_data_path.h"
-#include "tutti/data_paths/local_nvme/io/device_target.h"
-#include "tutti/data_paths/local_nvme/io/submit_one.cuh"
-#include "tutti/resolvers/local_file/resolver.h"
+#include <csrc/bindings/ext4_local_nvme/binding.h>
+#include "csrc/data_paths/local_nvme/local_nvme_data_path.h"
+#include "csrc/data_paths/local_nvme/io/device_target.h"
+#include "csrc/data_paths/local_nvme/io/submit_one.cuh"
+#include "csrc/resolvers/local_file/resolver.h"
 
 #include "../hardware_test_directory.h"
 #include "../nvme_test_cli.h"

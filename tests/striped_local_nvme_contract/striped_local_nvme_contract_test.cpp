@@ -38,10 +38,10 @@
 #include <tutti/storage_runtime.h>
 #include <tutti/io_types.h>
 #include <tutti/memory_types.h>
-#include "tutti/data_paths/striped_local_nvme/striped_data_path.h"
-#include "tutti/resolvers/striped_file/resolver.h"
-#include "tutti/resolvers/local_file/resolver.h"
-#include "tutti/bindings/striped_local_nvme/binding.h"
+#include "csrc/data_paths/striped_local_nvme/striped_data_path.h"
+#include "csrc/resolvers/striped_file/resolver.h"
+#include "csrc/resolvers/local_file/resolver.h"
+#include "csrc/bindings/striped_local_nvme/binding.h"
 
 #include "../hardware_test_directory.h"
 #include "../nvme_test_cli.h"

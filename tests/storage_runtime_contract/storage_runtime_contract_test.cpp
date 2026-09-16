@@ -5,7 +5,7 @@
 // Returns 0 on full pass, non-zero on any failure.
 
 #include <tutti/storage_runtime.h>
-#include <tutti/testing/mock_data_path.h>
+#include <csrc/testing/mock_data_path.h>
 
 #include <cstdio>
 #include <cstdlib>

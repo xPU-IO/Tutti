@@ -14,8 +14,8 @@
 
 #include <tutti/status.h>
 #include <tutti/spi/storage_target_resolver.h>
-#include <tutti/bindings/striped_local_nvme/binding.h>
-#include <tutti/resolvers/striped_file/resolver.h>
+#include <csrc/bindings/striped_local_nvme/binding.h>
+#include <csrc/resolvers/striped_file/resolver.h>
 
 #include <cstdio>
 #include <cstdint>

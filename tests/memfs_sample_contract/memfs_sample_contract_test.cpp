@@ -12,9 +12,9 @@
 //   4. Lease lifecycle (target invalid after close)
 
 #include <tutti/storage_runtime.h>
-#include "tutti/bindings/memfs/binding.h"
-#include "tutti/bindings/memfs/memfs_data_path.h"
-#include "tutti/resolvers/memfs/resolver.h"
+#include "csrc/bindings/memfs/binding.h"
+#include "csrc/bindings/memfs/memfs_data_path.h"
+#include "csrc/resolvers/memfs/resolver.h"
 
 #include <cstdio>
 #include <cstring>
