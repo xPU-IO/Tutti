@@ -16,6 +16,8 @@ add_library(tutti_storage_objects STATIC
     checkpoint_region.cpp
     residency_bitmap.cpp
     space_allocator.cpp
+    slot_placement_policy.cpp
+    slot_media.cpp
 )
 
 # Repo root on the include path so private headers are addressed as

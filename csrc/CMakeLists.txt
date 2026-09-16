@@ -411,6 +411,13 @@ if(BUILD_TESTING)
         "${TUTTI_REPOSITORY_ROOT}/tests/storage_objects_contract"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_storage_objects_contract"
     )
+    # Placement policies and physical media layer. Verifies materialisation
+    # allocates real blocks (FIEMAP cannot map holes) and that O_DIRECT
+    # alignment is enforced rather than worked around.
+    add_subdirectory(
+        "${TUTTI_REPOSITORY_ROOT}/tests/storage_objects_media_contract"
+        "${CMAKE_CURRENT_BINARY_DIR}/tests_storage_objects_media_contract"
+    )
     message(STATUS "Tutti: added tests/data_path_contract and tests/storage_runtime_contract")
 
     # Additional hardware-free contract tests (status, memory_types,
