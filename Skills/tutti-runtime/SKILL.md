@@ -1,6 +1,6 @@
 ---
 name: tutti-runtime
-description: Tutti GPU-direct NVMe KV cache offloading runtime. Use this skill when working in the Tutti repository — building it from scratch, bringing up the host environment (kernel modules, tutti_daemon, mounts), running the Python or C++ test suites, running vLLM KV-offload benchmarks, profiling with nsys or the torch profiler, or debugging symptoms such as zero cache hits, read-plan failures, ImportError on libnvm.so, or a first request far slower than steady state. Also use it when navigating the repository layout (csrc/ vs tutti/ vs scripts/) or adding support for an inference framework other than vLLM.
+description: Tutti GPU-direct NVMe KV cache offloading runtime. Use this skill when working in the Tutti repository — building it from scratch, bringing up the hardware and host environment (PCIe/IOMMU prerequisites, kernel modules, tutti_daemon, mounts) on a new or unknown machine, running the Python or C++ test suites, running vLLM KV-offload benchmarks, profiling with nsys or the torch profiler, or debugging symptoms such as zero cache hits, read-plan failures, ImportError on libnvm.so, EAGAIN on queue creation, or a first request far slower than steady state. Also use it before any privileged or destructive host action (unloading kernel modules, restarting the daemon, changing device PCI addresses), when navigating the repository layout (csrc/ vs tutti/ vs scripts/), or when adding support for an inference framework other than vLLM.
 ---
 
 # Tutti Runtime
@@ -23,7 +23,7 @@ and tests. Prefer it over hand-typed commands — it encodes the ordering
 constraints and verifies its own results.
 
 ```bash
-scripts/tutti-env.sh status        # 只读检查 14 项；退出码非 0 = 环境不完整
+scripts/tutti-env.sh status        # 只读检查宿主环境；退出码非 0 = 环境不完整
 scripts/tutti-env.sh bootstrap     # 从零：build -> build-ext -> modules -> daemon
 scripts/tutti-env.sh build         # cmake configure + 全部 C++ 目标（含内核模块）
 scripts/tutti-env.sh build-ext     # 两个 Python 扩展
@@ -53,7 +53,7 @@ activate the project venv.
 Prerequisites: CUDA toolkit + nvcc, a CUDA-capable `torch` in the target
 interpreter, kernel headers for the running kernel, `cmake` ≥ 3.20, and root/sudo
 for module load and daemon start. NVMe devices must be available for Tutti to
-claim (see `config/local/tutti_daemon.yaml`).
+claim, and each must sit under the same PCIe switch as the GPU that uses it.
 
 ```bash
 git clone <repo> && cd Tutti
@@ -70,6 +70,34 @@ exist yet.
 The script never signs kernel modules. If load fails and `dmesg` shows
 "Required key not available", sign `build/module/*.ko` per your site's procedure
 and retry.
+
+**On a machine that is not already known-good, read
+`references/hardware.md` first.** It covers the PCIe/IOMMU prerequisites, why
+`config/local/tutti_daemon.yaml` is the single source of truth for hardware
+facts, the module↔user-space ABI handshake, and an ordered new-machine checklist.
+A misconfigured host does not run slower — it fails, or destroys data.
+
+## Safety — Ask Before Doing
+
+Tutti's bring-up steps are **host-level and privileged**: they take devices from
+the kernel, affect every process on the machine, and some are irreversible. Do
+not perform these on your own initiative; state the intent and get explicit
+confirmation.
+
+- **Unloading kernel modules** — all `/dev/snvme*` vanish immediately and any
+  running workload dies. Check for other users (`pgrep -a -f 'vllm|tutti'`,
+  `mount | grep snvme`) and unmount first.
+- **Starting/stopping `tutti_daemon`** — shared host state, not per-venv.
+- **Changing `pci_addr`** — a claimed device is written as raw LBAs; the wrong
+  address destroys whatever is on that disk.
+- **Deleting `build/`** — breaks every deployed extension's RUNPATH. Never
+  `rm -rf` with a relative path from the repository root.
+- **`phoenixfs` + RDMA** — structurally mutually exclusive; `rmmod phoenixfs`
+  before any RDMA path, or pass `--no-phoenix`.
+
+Read-only investigation (`status`, `lspci`, `dmesg`, `py-spy`, reading logs) needs
+no confirmation — always prefer it first. Full rationale and the rest of the list
+are in `references/hardware.md`.
 
 ## Running a vLLM Benchmark
 
@@ -152,6 +180,27 @@ General method, in order: GPU utilisation timeline to decide host-blocked vs
 device-bound → `py-spy dump` for the Python stack → `perf record` for kernel
 hotspots → `eu-stack` for the native call chain. Use `nsys` for kernel/NVTX
 timelines, the torch profiler when Python-level stacks are needed.
+
+Before concluding a test failure is a regression, reproduce it on the previous
+commit (`git worktree add` a detached checkout and build there). A test can encode
+a hardware assumption that was never true on the current machine.
+
+### Recording new experience
+
+This skill is only worth loading if it stays true, so prefer making knowledge
+executable over writing it down. In order of preference:
+
+1. Can it be a check? → add it to `scripts/tutti-env.sh status`.
+2. Can it be an assertion? → add a test.
+3. Can it be a runtime guard? → fail closed, or warn.
+4. Only if none apply → add it here, **with the discriminating command** that
+   tells you whether you are looking at that failure. A conclusion without a way
+   to confirm it is nearly worthless, and actively harmful once stale.
+
+Do not record performance numbers, commit hashes, machine-specific paths, or the
+full story of a bug that the code now prevents. When adding an entry, re-run the
+discriminating commands of the existing ones and delete those that no longer
+apply — this file must not grow monotonically.
 
 ## Extending to Another Framework
 

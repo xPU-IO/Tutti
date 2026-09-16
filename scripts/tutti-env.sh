@@ -131,10 +131,23 @@ check_all() {
         [[ "$quiet" == "--quiet" ]] && return 0
         local mark
         case "$2" in
-            ok) mark='  OK  ' ;; skip) mark=' SKIP ' ;; *) mark=' FAIL ' ;;
+            ok) mark='  OK  ' ;; skip) mark=' SKIP ' ;; warn) mark=' WARN ' ;;
+            *) mark=' FAIL ' ;;
         esac
         printf '[%s] %-24s %s\n' "$mark" "$1" "$3"
     }
+
+    # --- 宿主前置 ---
+    # GPU-BAR 直通路径假设 phys == bus。IOMMU 启用但非 passthrough 会破坏该假设，
+    # 现象是 DMA 落到错地址而非报错，故必须前置检查。
+    if grep -qw 'iommu=pt' /proc/cmdline 2>/dev/null; then
+        _row 'IOMMU passthrough' ok 'iommu=pt'
+    elif [[ -n "$(ls -A /sys/class/iommu 2>/dev/null)" ]]; then
+        _row 'IOMMU passthrough' bad 'IOMMU 已启用但非 passthrough：GPU-BAR 路径假设 phys==bus，需内核参数 iommu=pt'
+        bad=$((bad + 1))
+    else
+        _row 'IOMMU passthrough' skip 'IOMMU 未启用（phys==bus 成立）'
+    fi
 
     # --- 构建产物 ---
     if [[ -x "$DAEMON_BIN" ]]; then
@@ -203,6 +216,12 @@ check_all() {
         _row phoenixfs skip '未加载（仅 Phoenix GDS 路径需要）'
     else
         _row phoenixfs skip '按 --no-phoenix 跳过'
+    fi
+    # phoenixfs 把整个 GPU BAR remap 出 struct page，使 NVIDIA peer-memory 的
+    # dma_map_resource 拒绝该地址 -> RDMA 注册显存 EIO。本地 NVMe 路径不受影响，
+    # 故只告警不计入异常：仅当该机器还要跑 RDMA 时才是阻塞问题。
+    if module_loaded phoenixfs && module_loaded nvidia_peermem; then
+        _row 'phoenixfs/peermem' warn '两者同时加载：RDMA 注册 GPU 显存会 EIO（本地 NVMe 路径不受影响；跑 RDMA 前 rmmod phoenixfs）'
     fi
     if module_loaded snvme_core && module_loaded snvme; then
         _row 'snvme 模块' ok 'snvme-core + snvme 已加载'

@@ -138,13 +138,22 @@ and hangs only after enough completions accumulate.
 
 - Run `scripts/tutti-env.sh status` first; a non-zero exit explains most
   "mysterious" failures immediately.
-- Kernel module removal makes `/dev/snvme*` and `/dev/ssnvme*` disappear; block
-  devices only exist after the daemon completes bring-up, so mounting earlier
-  fails.
 - Hardware contract tests need their mount points to exist and be writable
   (e.g. `/mnt/nvme0/GPU0`); a missing directory looks like a functional failure.
 - Before judging a test failure as a regression, **reproduce it on the previous
   commit** (`git worktree add` a detached checkout and build there). A test can
   encode a hardware assumption that was never true on this machine.
-- Batch deletes may be blocked by a safe-delete shim; use `shutil.rmtree` from
-  Python instead of `rm -rf`.
+
+Host-level and destructive behaviour — module removal making `/dev/snvme*`
+disappear, bring-up ordering, the module↔user-space ABI handshake, the
+`phoenixfs`/`nvidia_peermem` exclusion, safe-delete interception of bulk pool
+deletes — is in `hardware.md`, not duplicated here.
+
+## Adding an entry
+
+Include the **discriminating command** for the symptom, not only the fix: the
+value of this file is deciding *whether you are looking at this failure*. Prefer
+turning the observation into a `status` check, a test, or a runtime guard; write
+it here only when it genuinely needs human judgement. When you add one, re-run
+the discriminating commands of the existing entries and delete whatever no longer
+applies.
