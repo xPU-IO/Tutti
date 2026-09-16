@@ -80,6 +80,9 @@ modules.order
 doc/intergration/ai-orch/
 doc/intergration/rounds/
 
+# scripts/tutti-env.sh 的默认日志/PID 目录（TUTTI_LOG_DIR 可覆盖）
+.local/
+
 # pytest-benchmark 产物（即使没跑 benchmark 也会建空目录）
 .benchmarks/
 # pytest 缓存（pyproject 已加 -p no:cacheprovider，此为兜底）
