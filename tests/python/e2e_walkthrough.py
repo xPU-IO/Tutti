@@ -22,7 +22,7 @@ store 的演进项；当前 TuttiKVStore 支持 file:// 单盘 target。
    展示"DMA 完成但 scatter 未读完时，回绕波次被挡在槽外"。
 
 Run:
-    cd integration/vllm-connector && \
+    cd <repo-root> && \
     /data/home/ryeqiu/tutti-env/bin/python tests/e2e_walkthrough.py
 """
 

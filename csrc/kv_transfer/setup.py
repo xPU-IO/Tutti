@@ -20,7 +20,7 @@ setup(
     ext_modules=[
         CUDAExtension(
             "tutti_kv_transfer._native",
-            sources=["csrc/mem_kernels.cu"],
+            sources=["src/mem_kernels.cu"],
             include_dirs=["csrc"],
             extra_compile_args={
                 "cxx": ["-O3"],

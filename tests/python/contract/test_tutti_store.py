@@ -875,12 +875,9 @@ def _load_bindings_runtime():
     """导入 bindings 构建产物（需先 build_ext --inplace）。"""
     import sys
 
-    # bindings/ 是自带 setup.py 的独立 distribution，尚未随 Python 包迁移
-    # （归属 csrc/ 那一期），故这里显式指向仓库内的旧位置。
-    bindings = (
-        Path(__file__).resolve().parents[3]
-        / "integration" / "vllm-connector" / "bindings" / "python"
-    )
+    # csrc/python 是自带 setup.py 的独立 distribution（pybind 扩展 tutti_runtime），
+    # 不由根 pyproject 打包，故这里显式定位其源码树。
+    bindings = Path(__file__).resolve().parents[3] / "csrc" / "python"
     if str(bindings) not in sys.path:
         sys.path.insert(0, str(bindings))
     return pytest.importorskip("tutti_runtime")

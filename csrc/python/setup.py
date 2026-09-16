@@ -1,4 +1,4 @@
-# integration/vllm-connector/bindings/python/setup.py
+# csrc/python/setup.py
 #
 # Builds the pybind11 extension tutti_runtime._core against an existing
 # tutti C++ build tree. This script never builds tutti itself.
@@ -32,8 +32,8 @@ def resolve_tutti_root():
     env = os.environ.get("TUTTI_ROOT")
     if env:
         return os.path.abspath(env)
-    # integration/vllm-connector/bindings/python -> repo root is four levels up.
-    return os.path.abspath(os.path.join(HERE, "..", "..", "..", ".."))
+    # csrc/python -> repo root is two levels up.
+    return os.path.abspath(os.path.join(HERE, "..", ".."))
 
 
 def resolve_build_dir(tutti_root):

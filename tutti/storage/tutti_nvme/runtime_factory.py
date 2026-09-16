@@ -52,7 +52,7 @@ def build_runtime(preset: dict):
         import tutti_runtime  # bindings 构建产物（需在 sys.path/PYTHONPATH）
     except ImportError as exc:
         raise RuntimeError(
-            "tutti_runtime 绑定不可用：先构建 integration/vllm-connector/"
+            "tutti_runtime 绑定不可用：先构建 csrc/python/"
             "bindings/python 并将其加入 PYTHONPATH"
         ) from exc
 

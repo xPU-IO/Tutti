@@ -2,7 +2,7 @@
 """Tests: LMCache single_layer_kv_transfer port (tutti_kv_transfer).
 
 Run (GPU required for the kernel tests; they skip visibly without one):
-    cd integration/vllm-connector && \
+    cd <repo-root> && \
     /data/home/ryeqiu/tutti-env/bin/python -m pytest tests/transfer -v
 """
 
@@ -18,12 +18,9 @@ from tutti_kv_transfer import (
     single_layer_transfer,
 )
 
-# transfer/ 与 bindings/ 是自带 setup.py 的独立 distribution，尚未随 Python 包
-# 迁移（归属 csrc/ 那一期），故这里显式指向仓库内的旧位置。
-CSRC = (
-    Path(__file__).resolve().parents[3]
-    / "integration" / "vllm-connector" / "transfer" / "csrc"
-)
+# csrc/kv_transfer 是自带 setup.py 的独立 distribution（CUDA 扩展
+# tutti_kv_transfer），不由根 pyproject 打包，故这里显式定位其源码树。
+CSRC = Path(__file__).resolve().parents[3] / "csrc" / "kv_transfer" / "src"
 SENTINEL = 777.0
 
 requires_cuda = pytest.mark.skipif(

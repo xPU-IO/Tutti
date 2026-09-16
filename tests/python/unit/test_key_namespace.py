@@ -1,7 +1,7 @@
 """key 命名空间：ns 前缀入链式哈希 + 池归属 manifest + v2 版本头。
 
 Run:
-    cd integration/vllm-connector && \
+    cd <repo-root> && \
     /data/home/ryeqiu/tutti-env/bin/python -m pytest tests/unit/test_key_namespace.py -v
 """
 

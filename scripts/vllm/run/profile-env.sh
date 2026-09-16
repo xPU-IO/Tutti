@@ -17,7 +17,7 @@ export TUTTI_NVTX=1
 
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 export PATH="/data/home/ryeqiu/tutti-env/bin:/data/home/ryeqiu/tutti-compilers/bin:$_TUTTI_CUDA/bin:/data/home/ryeqiu/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
-export PYTHONPATH="/data/home/ryeqiu/Tutti/integration/vllm-connector/bindings/python/src:/data/home/ryeqiu/Tutti/integration/vllm-connector${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="/data/home/ryeqiu/Tutti/csrc/python/src:/data/home/ryeqiu/Tutti${PYTHONPATH:+:$PYTHONPATH}"
 export LD_LIBRARY_PATH="/data/home/ryeqiu/tutti-compilers/lib:$_TUTTI_CUDA/lib64:/usr/local/lib:/data/home/ryeqiu/Phoenix/build${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 mkdir -p "$TMPDIR" "$XDG_CACHE_HOME" "$TORCHINDUCTOR_CACHE_DIR" \

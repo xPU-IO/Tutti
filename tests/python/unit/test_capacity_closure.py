@@ -1,7 +1,7 @@
 """容量闭环：权威淘汰（物理执行）+ hit 刷新 + 镜像完整性修正。
 
 Run:
-    cd integration/vllm-connector && \
+    cd <repo-root> && \
     /data/home/ryeqiu/tutti-env/bin/python -m pytest tests/unit/test_capacity_closure.py -v
 """
 

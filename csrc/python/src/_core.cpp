@@ -1,4 +1,4 @@
-// integration/vllm-connector/bindings/python/src/_core.cpp
+// csrc/python/src/_core.cpp
 //
 // pybind11 extension `tutti_runtime._core`: wraps the tutti StorageRuntime
 // public facade (tutti/storage_runtime.h) and the preset assembly factories

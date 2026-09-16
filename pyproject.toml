@@ -21,9 +21,9 @@ where = ["."]
 include = ["tutti*"]
 
 # 不由本 distribution 打包的目录及原因：
-#   integration/vllm-connector/transfer/   自带 setup.py（tutti-kv-transfer，CUDA 扩展）
-#   integration/vllm-connector/bindings/   自带 setup.py（pybind 绑定）
-#   integration/vllm-connector/scripts/    开发压测工具，不属于运行时包
+#   csrc/python/        自带 setup.py（tutti_runtime，pybind 扩展）
+#   csrc/kv_transfer/   自带 setup.py（tutti-kv-transfer，CUDA 扩展）
+#   scripts/            开发压测工具，不属于运行时包
 
 [tool.pytest.ini_options]
 testpaths = ["tests/python"]

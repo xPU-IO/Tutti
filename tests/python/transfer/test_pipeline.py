@@ -5,7 +5,7 @@
 → paged 池，逐字节一致。块号取非连续分布，验证块表语义的正确性。
 
 Run（GPU required; skips visibly without one）:
-    cd integration/vllm-connector && \
+    cd <repo-root> && \
     /data/home/ryeqiu/tutti-env/bin/python -m pytest tests/transfer -v
 """
 

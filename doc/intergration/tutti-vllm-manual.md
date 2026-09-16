@@ -1,6 +1,6 @@
 # Tutti × vLLM 操作手册
 
-> 本机（TENCENT64）专用。权威架构：`integration/vllm-connector/ARCHITECTURE.md`；
+> 本机（TENCENT64）专用。权威架构：`doc/vllm-connector/Target_arch.md`；
 > 设计复盘：`doc/intergration/tutti-vllm-integration.md`；编排：`ai-orch/`。
 
 ## 0. 命名与位置（统一，勿混用）
@@ -12,9 +12,12 @@
 | rust | `/data/home/ryeqiu/.rustup` + `.cargo` | **就绪**（stable 1.97.1，`rustup default stable` 已设） |
 | 环境入口 | `/data/home/ryeqiu/env-tutti.sh` | 就绪（source 即用，见 §7） |
 | tutti 源码 | `/data/home/ryeqiu/Tutti` | 主仓库 |
-| tutti_runtime（pybind） | `Tutti/integration/vllm-connector/bindings/python` | **就绪**（T-101，editable 已装） |
-| connector 适配层 | `Tutti/integration/vllm-connector/adapter/` | R1 进行中 |
-| KV 引擎层 | `Tutti/integration/vllm-connector/engine/` | **就绪**（T-116：core/backend/memory_backend/chunk_index，59 tests 绿） |
+| tutti_runtime（pybind） | `Tutti/csrc/python` | **就绪**（T-101；自带 setup.py，不由根 pyproject 打包） |
+| KV transfer（CUDA 扩展） | `Tutti/csrc/kv_transfer` | 就绪（自带 setup.py） |
+| connector 适配层 | `Tutti/tutti/integration/vllm/` | 就绪（vLLM 专属；新增框架在 `tutti/integration/` 下平级扩展） |
+| KV 引擎层 | `Tutti/tutti/engine/` | 就绪（框架无关：core/completion/transfer/staging/metadata） |
+| 索引 / 存储层 | `Tutti/tutti/index/`、`Tutti/tutti/storage/` | 就绪（框架无关） |
+| vLLM 压测脚本 | `Tutti/scripts/vllm/` | 就绪（profile/smoke/convert + `run/` 机器本地配置） |
 | vLLM fork | `/data/home/ryeqiu/Tutti/third_pkgs/vllm` | **就绪**（0.1.dev20081+gb0e9cff5e，editable 已装） |
 | vendored CUDA | `/data/home/ryeqiu/Tutti/third_pkgs/nvidia/cuda-toolkit` | 就绪（CUDA 13.3） |
 | 模型 | `/data2/qwen`（Qwen2.5-14B、qwen2-5-7B）、`/data2/deepseek-ai`（DeepSeek-V3.1/V4-Flash）、`/data2/tencent`（Hy3、Hy3-FP8） | 冒烟候选：**qwen2-5-7B** |

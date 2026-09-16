@@ -5,7 +5,7 @@ save/load 数据流错层。本用例以 80 层（Hy3 几何）逐层数据流�
 层号全集完整、逐层写入互不覆盖、读回逐层内容一致。
 
 Run:
-    cd integration/vllm-connector && \
+    cd <repo-root> && \
     /data/home/ryeqiu/tutti-env/bin/python -m pytest tests/overlap -v
 """
 
