@@ -1082,9 +1082,13 @@ int main(int argc, char** argv) {
     }
 
     // =====================================================================
-    // 11. A 256 KiB registered IO slice needs 63 PRP-list entries. This is
-    //     the connector's Hy3 layer-segment geometry and must use one full,
-    //     page-aligned host PRP page rather than the removed 256B packing.
+    // 11. A 256 KiB registered IO slice is the connector's Hy3 layer-segment
+    //     geometry. It must be served entirely from pre-built, page-aligned
+    //     host PRP pages rather than the removed 256B packing — i.e. zero
+    //     dynamic-descriptor fallback. The number of sub-IOs is hardware
+    //     dependent (ceil(slice / MDTS)), so derive it from the driver
+    //     instead of hard-coding it: this deployment reports MDTS = 128 KiB,
+    //     which splits the slice into 2 pre-built sub-IOs of 32 pages each.
     // =====================================================================
     printf("--- 11. 256KiB prebuilt host PRP page ---\n");
     {
@@ -1117,8 +1121,11 @@ int main(int argc, char** argv) {
             CHECK(public_write(*rt, memory.value(), target.value(), buffer,
                                0, 0, kSegmentBytes, stream, 0xA6),
                   "256KiB prebuilt WRITE");
-            CHECK(dp.test_last_prebuilt_entry_count() == 1,
-                  "256KiB WRITE uses one prebuilt descriptor");
+            const std::uint64_t expected_prebuilt_ios =
+                (kSegmentBytes + dp.test_effective_mdts_bytes() - 1) /
+                dp.test_effective_mdts_bytes();
+            CHECK(dp.test_last_prebuilt_entry_count() == expected_prebuilt_ios,
+                  "256KiB WRITE uses only prebuilt descriptors");
             CHECK(dp.test_last_dynamic_entry_count() == 0,
                   "256KiB WRITE avoids dynamic descriptor fallback");
             CHECK(public_read_verify(*rt, memory.value(), target.value(),
@@ -1136,7 +1143,7 @@ int main(int argc, char** argv) {
 
     // =====================================================================
     // 12. Python supplies only the 4 MiB logical block size. The DataPath
-    //     reads the hardware MDTS (2 MiB on this deployment) and prebuilds
+    //     reads the hardware MDTS (128 KiB on this deployment) and prebuilds
     //     the required number of sub-IO descriptors itself.
     // =====================================================================
     printf("--- 12. logical block split by driver MDTS ---\n");
