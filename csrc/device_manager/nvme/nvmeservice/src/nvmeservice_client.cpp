@@ -327,13 +327,27 @@ void NvmeServiceClient::release_allocation(Allocation* allocation) {
 // Heartbeat
 // ---------------------------------------------------------------------------
 
+// 心跳线程是**自终止**的：live_sessions_ 一空它就置 hb_running_=false 并退出。
+// 这件事决定了下面两个入口都必须无条件 join，不能只看标志位——
+// std::thread 一旦 joinable 就再不能被覆盖或析构，否则 std::terminate：
+//
+//   * stop_heartbeat() 原先在 exchange(false) 返回 false 时提前 return。线程自行
+//     退出后标志已是 false，于是它跳过 join，随后 hb_thread_ 析构即
+//     std::terminate。析构路径正是这样走的。
+//   * ensure_heartbeat_started() 原先直接 move-assign 到 hb_thread_。线程自行退出
+//     后它仍 joinable，同一句 move-assign 就 std::terminate。
 void NvmeServiceClient::ensure_heartbeat_started() {
     if (hb_running_.exchange(true)) return;
+    // 回收上一次自行退出的线程：它可能刚跳出循环、尚未走完返回路径，join 顺带
+    // 保证顺序，不会与下面的新线程并发。
+    if (hb_thread_.joinable()) hb_thread_.join();
     hb_thread_ = std::thread(&NvmeServiceClient::heartbeat_loop, this);
 }
 
 void NvmeServiceClient::stop_heartbeat() {
-    if (!hb_running_.exchange(false)) return;
+    hb_running_.exchange(false);
+    // 不能因为标志位本来就是 false 就跳过 join：那正是"线程已自行退出"的状态，
+    // 而此处的 joinable 线程必须被回收，否则析构即 std::terminate。
     if (hb_thread_.joinable()) hb_thread_.join();
 }
 
@@ -344,6 +358,8 @@ void NvmeServiceClient::heartbeat_loop() {
         {
             std::lock_guard<std::mutex> lock(live_mtx_);
             if (live_sessions_.empty()) {
+                // 自行退出时必须把标志放下：否则 ensure_heartbeat_started() 会
+                // 误以为心跳仍在运行，新 session 将永远没有心跳。
                 hb_running_ = false;
                 break;
             }
