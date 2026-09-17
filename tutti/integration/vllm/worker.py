@@ -37,6 +37,45 @@ _LAYER_NAME_RE = re.compile(r"layers\.(\d+)")
 _WORKER_PENDING_MAX_AGE_STEPS = 2
 
 
+def _interleaved_kv_channels(reference: torch.Tensor) -> int | None:
+    """逐层切片若为 K/V 交织布局，返回单份（K 或 V）的通道数，否则 None。
+
+    存在两种都合法的交织形态，必须都支持：
+
+    1. ``[nb, bs, 2, C]`` —— K/V 作为独立的维 2，每份 C 通道。
+    2. ``[nb, bs, H, 2*D]`` —— vLLM 的 NHD 跨层池形态：维 2 是该 rank 的 KV
+       head 数，K 与 V **打包在最后一维**（``2*head_size``）。权威定义见
+       ``vllm/v1/attention/backends/flash_attn.py::get_kv_cache_shape``
+       （"K and V are packed into the content dim"）与
+       ``get_kv_cache_stride_order(include_num_layers_dimension=True)``，后者
+       给出 ``(num_blocks, num_layers, block_size, num_kv_heads, 2*head_size)``。
+
+    历史缺陷：原判据 ``dim() == 4 and shape[2] == 2`` 只认形态 1，且把形态 2 的
+    ``shape[2]``（KV head 数）误当作"K/V 两份"。TP4 下
+    ``num_key_value_heads/TP = 8/4 = 2`` 恰好等于 2 而侥幸通过；TP8 下变为 1，
+    同一张量遂被判为非交织，落入 ``discover_engine_format`` 并触发
+    "unsupported paged KV tensor rank 4 (shape=(19925, 64, 1, 256))"。
+
+    该缺陷此前不可见：vLLM 早期把原始 5-D 池交给连接器，直到它实现
+    ``prefer_cross_layer_blocks`` 的跨层单池分配（逐层切片因此降为 4-D）才暴露。
+    """
+    if reference.dim() != 4:
+        return None
+    if int(reference.shape[2]) == 2:
+        # 形态 1：K/V 独立成维。
+        return int(reference.shape[3])
+    packed = int(reference.shape[3])
+    if packed % 2 == 0:
+        # 形态 2：K/V 打包在最后一维。
+        return packed // 2
+    return None
+
+
+def _is_interleaved_kv(reference: torch.Tensor) -> bool:
+    """逐层切片是否为 K/V 交织布局（两种形态之一）。"""
+    return _interleaved_kv_channels(reference) is not None
+
+
 @dataclass(frozen=True)
 class _LogicalFailure:
     request_ordinal: int
@@ -236,11 +275,18 @@ class PagedTransferHooks:
         reference = layer_view(0)
         self._dtype = reference.dtype
         self._device = reference.device
-        if reference.dim() == 4 and reference.shape[2] == 2:
-            # 跨层交织池的逐层切片 [nb, bs, 2, kv]
+        kv_channels = _interleaved_kv_channels(reference)
+        if kv_channels is not None:
+            # 跨层交织池的逐层切片：[nb, bs, 2, C] 或 [nb, bs, H, 2*D]
             self._mode = self._INTERLEAVED
-            self._kv_channels = int(reference.shape[3])
-            self._staging_shape = (chunk_tokens, 2, self._kv_channels)
+            self._kv_channels = kv_channels
+            # staging 必须与 ``paged[block_ids, offsets]`` 的结果同形：该索引产出
+            # [tokens, *reference.shape[2:]]，而 _transfer_interleaved 走的是直接
+            # copy_/index_put_，不做 reshape。照搬尾部维度即可同时适配两种交织
+            # 形态，无需知道 K/V 是独立成维还是打包在末维。
+            self._staging_shape = (chunk_tokens, *tuple(
+                int(dim) for dim in reference.shape[2:]
+            ))
             if reference.shape[1] != block_size:
                 raise ValueError(
                     f"交织池块维 {reference.shape[1]} 与 block_size"
@@ -1685,7 +1731,7 @@ class WorkerImpl:
         layer_view = self._layer_view()
         if layer_view is not None and getattr(layer_view(0), "is_cuda", False):
             reference = layer_view(0)
-            interleaved = reference.dim() == 4 and reference.shape[2] == 2
+            interleaved = _is_interleaved_kv(reference)
             fmt = (
                 None if interleaved else discover_engine_format(
                     reference, use_mla=reference.dim() == 3

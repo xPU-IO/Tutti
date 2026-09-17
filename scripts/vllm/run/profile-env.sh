@@ -48,9 +48,14 @@ export CUDAHOSTCXX="$_TUTTI_GCC/bin/g++"
 export CC="$_TUTTI_GCC/bin/gcc"
 export CXX="$_TUTTI_GCC/bin/g++"
 
-# The repo root provides the `tutti` package; csrc/python/src provides the
-# compiled `tutti_runtime` extension.
-export PYTHONPATH="$_TUTTI_REPO/csrc/python/src:$_TUTTI_REPO${PYTHONPATH:+:$PYTHONPATH}"
+# Three separate source roots, all required:
+#   repo root          the `tutti` Python package
+#   csrc/python/src    the compiled `tutti_runtime` extension (control plane)
+#   csrc/kv_transfer   the compiled `tutti_kv_transfer` extension (data plane)
+# Omitting the last one fails only inside the workers, as
+# "No module named 'tutti_kv_transfer'" behind a generic
+# "Engine core initialization failed".
+export PYTHONPATH="$_TUTTI_REPO/csrc/python/src:$_TUTTI_REPO/csrc/kv_transfer:$_TUTTI_REPO${PYTHONPATH:+:$PYTHONPATH}"
 export LD_LIBRARY_PATH="$_TUTTI_GCC/lib64:$_TUTTI_CUDA/lib64:/usr/local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 export TUTTI_PYTHON="$_TUTTI_VENV/bin/python"
