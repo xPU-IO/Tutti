@@ -138,6 +138,26 @@ public:
         std::string allocation_id;
         std::vector<ClientNvmeSlice> slices;
 
+        /**
+         * Release the daemon-side reservation, reporting whether the daemon
+         * confirmed it.
+         *
+         * Explicit rather than destructor-only, because a destructor cannot
+         * report failure and callers must know the truth: until the daemon
+         * processes Release, it keeps charging this client for the slices and
+         * keeps them out of the free pool. A silently failed release therefore
+         * looks like a clean shutdown while leaking device capacity until the
+         * heartbeat reaper eventually collects it (or never, if the daemon was
+         * restarted with the reservation already gone).
+         *
+         * On success the handle is marked released, so the destructor sends no
+         * second Release. On failure the identity is kept so the caller may
+         * retry.
+         *
+         * `error`, when non-null, receives a description on failure.
+         */
+        bool release(std::string* error = nullptr);
+
         Allocation() = default;
         ~Allocation();
         Allocation(const Allocation&) = delete;
@@ -233,7 +253,10 @@ private:
     friend struct Session;
 
     void release_session(Session* sess);
-    void release_allocation(Allocation* allocation);
+
+    // Returns whether the daemon confirmed the release. Bounded internal retry
+    // for transport-level failures; application-level rejections are terminal.
+    bool release_allocation(Allocation* allocation, std::string* error);
 
     void ensure_heartbeat_started();
     void stop_heartbeat();

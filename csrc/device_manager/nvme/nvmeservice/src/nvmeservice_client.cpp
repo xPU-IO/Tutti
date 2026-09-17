@@ -3,6 +3,8 @@
 #include <chrono>
 #include <cstdio>
 #include <iostream>
+#include <string>
+#include <thread>
 #include <unistd.h>
 
 namespace nvmeservice {
@@ -27,7 +29,30 @@ NvmeServiceClient::Session::~Session() {
 }
 
 NvmeServiceClient::Allocation::~Allocation() {
-    if (owner != nullptr) owner->release_allocation(this);
+    // Cannot report failure from a destructor, so shout instead. Reaching here
+    // with a failure means the daemon still holds the reservation: it will keep
+    // those slices out of the free pool until the heartbeat reaper notices this
+    // client is gone.
+    std::string error;
+    if (!release(&error)) {
+        std::fprintf(stderr,
+                     "NvmeServiceClient: allocation %s could not be released "
+                     "(%s); the daemon may still hold the reservation until "
+                     "its lease expires\n",
+                     allocation_id.c_str(), error.c_str());
+    }
+}
+
+bool NvmeServiceClient::Allocation::release(std::string* error) {
+    if (owner == nullptr || allocation_id.empty()) return true;
+    const bool released = owner->release_allocation(this, error);
+    if (released) {
+        // Mark released so the destructor does not send a second Release. The
+        // daemon would reject the duplicate, which would then look like a
+        // failure at teardown.
+        allocation_id.clear();
+    }
+    return released;
 }
 
 // ---------------------------------------------------------------------------
@@ -303,24 +328,61 @@ void NvmeServiceClient::release_session(Session* sess) {
     }
 }
 
-void NvmeServiceClient::release_allocation(Allocation* allocation) {
-    if (!allocation || allocation->allocation_id.empty()) return;
+bool NvmeServiceClient::release_allocation(Allocation* allocation,
+                                           std::string* error) {
+    if (!allocation || allocation->allocation_id.empty()) return true;
+    const std::string allocation_id = allocation->allocation_id;
+
+    // Stop heartbeating this lease before telling the daemon to drop it:
+    // otherwise the heartbeat thread would race the Release and re-assert a
+    // lease the daemon is in the middle of forgetting.
     {
         std::lock_guard<std::mutex> lock(live_mtx_);
-        live_sessions_.erase(allocation->allocation_id);
+        live_sessions_.erase(allocation_id);
     }
-    grpc::ClientContext context;
-    ReleaseRequest request;
-    ReleaseResponse response;
-    request.set_allocation_id(allocation->allocation_id);
-    const auto status = stub_->Release(&context, request, &response);
-    if (!status.ok()) {
-        std::fprintf(stderr, "Release RPC failed: %s\n",
-                     status.error_message().c_str());
-    } else if (!response.success()) {
-        std::fprintf(stderr, "Release rejected: %s\n",
-                     response.error_message().c_str());
+
+    // Bounded retry, transport failures only. A daemon that is restarting or a
+    // momentarily stalled socket is exactly the case that used to leak the
+    // reservation for the whole lease timeout; a handful of quick retries
+    // covers it without holding up teardown indefinitely.
+    //
+    // Application-level rejections are terminal: retrying a rejection cannot
+    // change the daemon's mind, and it would multiply the log noise.
+    //
+    // Known ambiguity: if the daemon released successfully but the response was
+    // lost, the retry sees the allocation as unknown and this reports failure.
+    // That direction is deliberate -- the caller keeps the handle and can
+    // investigate, whereas reporting success on an unconfirmed release is the
+    // leak this function exists to prevent.
+    constexpr int kMaxAttempts = 3;
+    constexpr auto kRetryDelay = std::chrono::milliseconds(200);
+
+    std::string last_error;
+    for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
+        grpc::ClientContext context;
+        ReleaseRequest request;
+        ReleaseResponse response;
+        request.set_allocation_id(allocation_id);
+
+        const auto status = stub_->Release(&context, request, &response);
+        if (!status.ok()) {
+            last_error = "Release RPC failed: " + status.error_message();
+        } else if (!response.success()) {
+            last_error = "Release rejected: " + response.error_message();
+            break;  // terminal: the daemon declined on purpose
+        } else {
+            return true;
+        }
+
+        if (attempt < kMaxAttempts) {
+            std::this_thread::sleep_for(kRetryDelay);
+        }
     }
+
+    if (error != nullptr) *error = last_error;
+    std::fprintf(stderr, "NvmeServiceClient: release of %s failed: %s\n",
+                 allocation_id.c_str(), last_error.c_str());
+    return false;
 }
 
 // ---------------------------------------------------------------------------

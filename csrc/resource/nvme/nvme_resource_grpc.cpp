@@ -112,6 +112,24 @@ public:
     Status release(const std::string& allocation_id) override {
         const auto allocation = allocations_.find(allocation_id);
         if (allocation == allocations_.end()) return Status::Ok();
+
+        // Ask the daemon first, then drop the handle only if it confirmed.
+        //
+        // The previous order was erase-then-OK: erasing destroys the Allocation,
+        // whose destructor sends Release and can only print on failure, so this
+        // returned Ok() unconditionally. A failed release therefore looked like
+        // a clean shutdown while the daemon kept the slices reserved -- the
+        // caller marked the lease RELEASED and dropped the client, and the
+        // capacity stayed unavailable until the heartbeat reaper collected it.
+        // Not named `error`: a local of that name would shadow the error()
+        // helper this function needs to build the failure status.
+        std::string release_error;
+        if (!allocation->second->release(&release_error)) {
+            // Keep the handle so the caller can retry; NvmeResource propagates
+            // this status out of release_owned_allocation_().
+            return error(StatusCode::INTERNAL,
+                         "NVMe allocation release failed: " + release_error);
+        }
         allocations_.erase(allocation);
         return Status::Ok();
     }
