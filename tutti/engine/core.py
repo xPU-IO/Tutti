@@ -803,10 +803,11 @@ class KVEngine:
       链以其为前缀派生——不同命名空间（不同模型/几何复用同一池）
       的 key 天然隔离；支持持久层 manifest 的 store（可选实现）以之
       校验池归属。缺省无命名空间。
-    - direct_transfer：可选 bool。Tutti store 默认尝试 Python byte-range
-      direct backend；显式 false 关闭。准入失败时自动回退 staged。
-    - direct_transfer_strict：可选 bool。direct_transfer 能力缺失时失败，
-      用于硬件部署验收，避免误把 staged 当成 direct。
+    - direct_transfer：可选 bool。缺省（True）尝试 Python byte-range direct
+      backend。staged 暂存路径已退役，故显式 false 不再表示"改用 staged"，
+      而是配置错误（select_transfer 抛出）。
+    - direct_transfer_strict：**已冗余，不再被读取**。直连准入失败一律抛出，
+      恒等于原先的 strict 行为；保留该键只为兼容既有配置文件，设它无任何效果。
     - gather_fn / scatter_fn：可选搬运钩子（缺省 None，搬运为 no-op），
       语义见传输路径。
 
@@ -1100,14 +1101,25 @@ class KVEngine:
             self._transfer.validate_block_tables(block_tables)
 
     def fallback_from_direct(self, reason: Exception) -> None:
-        """Discard a pre-I/O direct binding so Worker can allocate staging."""
+        """直连准入失败时的处置：解除绑定后抛出，不再降级到 staged。
+
+        方法名保留为 ``fallback_...`` 是因为调用方（Worker 在提交前校验
+        block tables）的语义仍是"请求回退"；但自回退取消后，唯一的处置就是失败。
+        把这条契约留在 Engine 上而不是让 Worker 直接 raise，是为了让"直连一旦
+        绑定就不再降级"只在一处定义。
+
+        先 close 再抛：直连绑定已建立、池已注册，放弃时必须解除，否则会在 runtime
+        侧留下悬挂注册。这件事与"是否回退到 staged"无关，因此保留。
+
+        运行期触发条件是 block table 长度与该 chunk 的块数不符，即 chunk 不满。
+        而保存计划按包络推进、只统计完整 chunk，故该条件不应成立——真成立就意味着
+        上层契约被破坏，此时静默换路径只会掩盖缺陷。
+        """
         if not isinstance(self._transfer, DirectTransfer):
             return
-        if self._config.get("direct_transfer_strict"):
-            raise DirectTransferUnavailable(str(reason)) from reason
-        _LOG.warning("DIRECT_ADMISSION_FALLBACK reason=%s", reason)
         self._transfer.close()
         self._transfer = None
+        raise DirectTransferUnavailable(str(reason)) from reason
 
     def bind(
         self,

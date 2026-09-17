@@ -727,26 +727,30 @@ def test_direct_capacity_five_rejects_required_six():
         )
 
 
-def test_direct_capacity_five_falls_back_or_reports_strict_boundary():
+def test_direct_capacity_shortfall_is_always_loud():
+    """容量不足属于准入失败，必须以异常终止——不再静默退回 staged。
+
+    这里曾经是"默认回退、strict 才抛"的分叉，而分叉本身就是缺陷：store 已声明
+    直连能力，却因为运行期配额不足悄悄改用 staged（KV 数据经主机内存往返），
+    把"直连没生效"伪装成"跑得有点慢"。现在只有一种出口。
+
+    实测触发过：8 卡 TP8 下 in-flight 配额默认 4，而准入要求 2 x 80 层 = 160，
+    整个基准跑在 staged 上却只表现为"稍慢"。
+    """
     kwargs = dict(
         num_layers=3, blocks_per_chunk=2, chunk_tokens=256,
         segment_bytes=8192, max_chunks_per_wave=2,
     )
-    normal_store = FakeStoreOwner(FakeRuntime(in_flight=5))
-    transfer = select_transfer(FakePool(128), normal_store, {}, **kwargs)
-    assert isinstance(transfer, StagedTransfer)
-    assert normal_store._runtime.register_calls == []
-
-    strict_store = FakeStoreOwner(FakeRuntime(in_flight=5))
-    with pytest.raises(
-        DirectTransferUnavailable,
-        match=r"configured=5, required=6, num_layers=3",
-    ):
-        select_transfer(
-            FakePool(128), strict_store,
-            {"direct_transfer_strict": True}, **kwargs,
-        )
-    assert strict_store._runtime.register_calls == []
+    # 保持默认与显式要求 direct，两种配置下的行为必须一致。
+    for config in ({}, {"direct_transfer": True}):
+        store = FakeStoreOwner(FakeRuntime(in_flight=5))
+        with pytest.raises(
+            DirectTransferUnavailable,
+            match=r"configured=5, required=6, num_layers=3",
+        ):
+            select_transfer(FakePool(128), store, config, **kwargs)
+        # 失败路径不得留下注册痕迹。
+        assert store._runtime.register_calls == []
 
 
 def test_direct_capacity_is_distinct_from_batch_width():
@@ -759,7 +763,11 @@ def test_direct_capacity_is_distinct_from_batch_width():
         )
 
 
-def test_direct_normal_fallback_and_strict_reason_are_deterministic():
+def test_direct_admission_failure_reason_is_deterministic():
+    """准入失败的报错必须逐字稳定——它是排查"直连为何没生效"的唯一线索。
+
+    与容量不足同理：store 有直连能力即只有抛出一条路，不再因配置不同而分叉。
+    """
     pool = FakePool(128, base=0x21000)
     kwargs = dict(
         num_layers=3,
@@ -768,17 +776,11 @@ def test_direct_normal_fallback_and_strict_reason_are_deterministic():
         segment_bytes=8192,
         max_chunks_per_wave=2,
     )
-    transfer = select_transfer(
-        pool, FakeStoreOwner(FakeRuntime()), {}, **kwargs
-    )
-    assert isinstance(transfer, StagedTransfer)
-    with pytest.raises(DirectTransferUnavailable, match="64 KiB aligned"):
-        select_transfer(
-            pool,
-            FakeStoreOwner(FakeRuntime()),
-            {"direct_transfer_strict": True},
-            **kwargs,
-        )
+    for config in ({}, {"direct_transfer": True}):
+        with pytest.raises(DirectTransferUnavailable, match="64 KiB aligned"):
+            select_transfer(
+                pool, FakeStoreOwner(FakeRuntime()), config, **kwargs
+            )
 
 
 def test_direct_is_default_for_an_eligible_tutti_store():
@@ -872,7 +874,12 @@ def test_direct_close_failure_preserves_registration_for_retry():
     assert runtime.unregister_calls == [41]
 
 
-def test_direct_to_staged_fallback_unregisters_registered_pool():
+def test_direct_rejection_releases_registered_pool_before_raising():
+    """拒绝直连后先解除 runtime 注册、再抛出——不再静默换路径。
+
+    解除注册与"是否回退到 staged"无关：直连绑定已建立、池已注册，放弃时若不解除
+    就会留下悬挂注册。以前它配合 staged 回退，现在只配合异常。
+    """
     runtime = FakeRuntime()
     store = FakeEngineStore(runtime)
     engine = KVEngine(
@@ -885,7 +892,9 @@ def test_direct_to_staged_fallback_unregisters_registered_pool():
         store,
     )
     assert engine.try_bind_direct(FakePool(128), 3, 2)
-    engine.fallback_from_direct(DirectAdmissionError("late plan rejection"))
+    with pytest.raises(DirectTransferUnavailable, match="late plan rejection"):
+        engine.fallback_from_direct(DirectAdmissionError("late plan rejection"))
+    # 无悬挂注册，且引擎不再声称自己是直连。
     assert runtime.unregister_calls == [41]
     assert not engine.direct
 
@@ -1759,17 +1768,26 @@ def test_worker_logs_first_direct_compute_callback(caplog):
     assert "since_start_ms=" in messages[0]
 
 
-def test_worker_falls_back_before_first_io_for_invalid_direct_plan():
+def test_worker_fails_before_first_io_for_invalid_direct_plan():
+    """block tables 不合规时在提交前即失败——不再改绑 staged。
+
+    要点是"第一次 I/O 之前"：一旦 IO 已经发出再改路径，盘上就会留下半写数据，
+    而调用方以为走的是另一条路。所以校验必须前置，且失败只有一种出口。
+    """
     class Engine:
         direct = True
         max_in_flight_operations = 8
+
+        def __init__(self):
+            self.reason = None
 
         def validate_direct_block_tables(self, block_tables):
             raise DirectAdmissionError("direct block table length mismatch")
 
         def fallback_from_direct(self, reason):
-            self.direct = False
+            # 与真实 Engine 一致：记录原因后抛出（真实实现还会先解除池注册）。
             self.reason = str(reason)
+            raise DirectTransferUnavailable(str(reason)) from reason
 
     engine = Engine()
     worker = WorkerImpl(engine)
@@ -1777,8 +1795,11 @@ def test_worker_falls_back_before_first_io_for_invalid_direct_plan():
     worker._chunk_tokens = 256
     worker._chunk_kv_bytes = 3 * 8192
     worker._block_size = 128
+    # 若 Worker 仍在失败路径上补绑 staged，这里会记录到而不被发现。
     bound = []
     worker._bind_staged = lambda *args: bound.append(args)
-    worker._validate_direct_or_fallback([[1]])
+
+    with pytest.raises(DirectTransferUnavailable, match="block table length"):
+        worker._validate_direct_or_fail([[1]])
     assert "block table length" in engine.reason
-    assert bound == [(3, 8192, 2)]
+    assert bound == []

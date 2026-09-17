@@ -712,7 +712,7 @@ class WorkerImpl:
                 chunk_count=n_chunks,
             ))
         if keys:
-            self._validate_direct_or_fallback(block_tables)
+            self._validate_direct_or_fail(block_tables)
             self._load_keys = keys
             self._load_block_tables = block_tables
             self._pinned = True
@@ -917,7 +917,7 @@ class WorkerImpl:
             generations.extend(meta_generations or [""] * (end - start))
             block_tables.extend(self._chunk_block_tables(meta, end)[start:end])
         if keys:
-            self._validate_direct_or_fallback(block_tables)
+            self._validate_direct_or_fail(block_tables)
             plan = self._engine.plan_store(keys)
             if plan is not None and plan.evicted_keys:
                 # 漂移观测：本进程为腾容量驱逐的 chunk 上报调度侧比对。
@@ -1758,7 +1758,13 @@ class WorkerImpl:
         self._write_window = write_window
         self._bound = True
 
-    def _validate_direct_or_fallback(self, block_tables) -> None:
+    def _validate_direct_or_fail(self, block_tables) -> None:
+        """提交前校验直连 block tables；不符即失败，不再降级到 staged。
+
+        触发条件是 block table 长度与该 chunk 的块数不符，即 chunk 不满。保存
+        计划按包络推进、只统计完整 chunk，故该条件不该成立；真成立说明上层契约
+        已被破坏，此时静默换路径只会掩盖缺陷。
+        """
         if not bool(getattr(self._engine, "direct", False)):
             return
         validate = getattr(self._engine, "validate_direct_block_tables", None)
@@ -1767,15 +1773,12 @@ class WorkerImpl:
         try:
             validate(block_tables)
         except Exception as exc:
-            fallback = getattr(self._engine, "fallback_from_direct", None)
-            if not callable(fallback):
-                raise
-            fallback(exc)
-            segment_bytes = self._chunk_kv_bytes // self._num_layers
-            blocks_per_chunk = -(-self._chunk_tokens // self._block_size)
-            self._bind_staged(
-                self._num_layers, segment_bytes, blocks_per_chunk
-            )
+            # 仍经 Engine 抛出：它把"直连绑定后不再降级"这条契约收在一处，
+            # 并把原因包装成 DirectTransferUnavailable。
+            reject = getattr(self._engine, "fallback_from_direct", None)
+            if callable(reject):
+                reject(exc)
+            raise
 
     def _layer_view(self):
         """返回层序号 → paged 张量的访问器；未登记任何池时为 None。

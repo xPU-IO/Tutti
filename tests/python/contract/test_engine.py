@@ -933,7 +933,15 @@ class TestBind:
         with pytest.raises(DirectTransferUnavailable):
             engine.bind({}, window, NUM_LAYERS, 2)
 
-    def test_direct_request_falls_back_to_staged_without_capability(self):
+    def test_direct_required_without_capability_is_an_error(self):
+        """direct_transfer=True 表示"必须有直连"；store 无此能力即报错。
+
+        以前这一组合会静默回退到 staged，于是"我明确要求了直连"与"系统实际在做
+        暂存搬运"可以同时成立且毫无提示——正是要消除的那种静默降级。
+
+        未显式要求时不报错：store 没有直连能力属于能力协商（测试替身、其他后端
+        本就不提供），此时用 StagedTransfer 是协商结果而非降级。
+        """
         store = StoreSpy(MemoryKVStore(SEG, NUM_CHUNKS))
         config = {
             "chunk_tokens": CHUNK_TOKENS,
@@ -942,9 +950,12 @@ class TestBind:
             "direct_transfer": True,
         }
         engine = KVEngine(config, store)
-        engine.bind({}, RingWindow(bytearray(NUM_SLOTS * SEG), NUM_SLOTS, SEG),
-                    NUM_LAYERS, 2)
-        assert store.register_calls == [SEG]
+        with pytest.raises(DirectTransferUnavailable,
+                           match="未提供 create_direct_transfer"):
+            engine.bind({}, RingWindow(bytearray(NUM_SLOTS * SEG), NUM_SLOTS, SEG),
+                        NUM_LAYERS, 2)
+        # 失败发生在注册之前，不留半绑定状态。
+        assert store.register_calls == []
 
     def test_double_bind_rejected(self):
         engine, window, _ = _make_engine(MemoryKVStore(SEG, NUM_CHUNKS))

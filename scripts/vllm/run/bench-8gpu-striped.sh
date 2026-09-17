@@ -147,9 +147,8 @@ else
         # 并静默回退到 staged 暂存路径——这不是报错，只是一条 warning，很容易
         # 误以为在测直连。256 留出余量。
         --max-in-flight-operations 256
-        # 直连不可用时直接失败而非回退：本次实验要测的就是直连，静默走 staged
-        # 会让整组数字失去意义。
-        --direct-transfer-strict
+        # 不再需要 --direct-transfer-strict：staged 暂存路径已退役，直连准入
+        # 失败一律抛出，strict 成为恒真行为（该键仍被接受但不再读取）。
         --kv-load-failure-policy fail
     )
 fi
