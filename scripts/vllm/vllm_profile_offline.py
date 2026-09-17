@@ -94,6 +94,29 @@ def _distinct_pair(base_a: list[int], base_b: list[int], round_idx: int,
     return a, b
 
 
+def _start_bench_range() -> None:
+    """推入一个固定名 NVTX 范围，标记整个基准循环的起点。
+
+    存在的理由：nsys 要在只采集基准段的前提下给出可比报告。模型 299.9GB 的加载
+    会产生约 468GB 的 H2D 流量，若被整段采集就会淹没报告——实测 488MB 报告、
+    kernel 数是基准段报告的 60 倍，且与存储路径无关。
+
+    为什么不复用车请求范围作触发条件：请求名带轮次与类型后缀（A-cold|r0 等），
+    每个都不同；而本机 nsys 2025.3.2 **不支持 --nvtx-capture 通配符**，且必须
+    指定域（省略 @domain 一律匹配失败）——已用最小程序逐一验证。
+
+    只推入不弹出：配合 --capture-range-end=none，采集从本范围开始后持续到进程
+    结束，正好覆盖基准段（其后只剩汇总输出，无 GPU 工作）。
+    """
+    if os.environ.get("TUTTI_NVTX", "0").lower() not in {"1", "true", "yes", "on"}:
+        return
+    try:
+        import nvtx
+    except Exception:
+        return
+    nvtx.push_range(message="tutti.bench", domain="tutti")
+
+
 def _generate(
     llm: LLM,
     prompt_token_ids: list[int],
@@ -441,6 +464,7 @@ def main() -> int:
         llm.start_profile()
     walls_a: list[float] = []
     walls_b: list[float] = []
+    _start_bench_range()
     for round_idx in range(args.rounds):
         tokens_a, tokens_b = _distinct_pair(request_a, request_b, round_idx)
         suffix = "" if args.rounds == 1 else f"|r{round_idx}"

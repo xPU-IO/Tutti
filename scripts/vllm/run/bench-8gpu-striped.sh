@@ -97,8 +97,7 @@ ARGS=(
     --reuse-pct "$REUSE_PCT"
     --rounds "$ROUNDS"
     --max-tokens 8
-    # Round-to-round isolation: without this, round 2's request A would hit
-    # vLLM's HBM prefix cache from round 1 and stop measuring a cold request.
+    # 轮与轮之间重置：让下一轮的 A 仍是冷请求。
     --reset-local-prefix-between-rounds
     # The installed flashinfer predates the set_autotune_process_group symbol
     # this vLLM revision imports, so autotuning aborts every worker at warmup.
@@ -110,6 +109,14 @@ ARGS=(
 if [[ "$BASELINE" == 1 ]]; then
     ARGS+=( --without-tutti )
 else
+    # A 与 B 之间清掉 vLLM 自己的 HBM 前缀缓存，但保留 Tutti 缓存
+    # （reset_prefix_cache(reset_connector=False)）。
+    #
+    # 这一项决定整个实验是否成立：不加它，B 的复用全部来自 HBM 前缀缓存，
+    # Tutti 的读路径根本不会被触发——nsys 里表现为 io_kernel|op=read 完全缺失、
+    # 读计划 0 次，而 B 的墙钟又很漂亮（因为它确实复用了，只是没经过 NVMe），
+    # 于是极易误判为"直连读很快"。
+    ARGS+=( --reset-local-prefix-between-requests )
     # rank0-3 -> disks {0,1}, rank4-7 -> disks {2,3}. Each rank gets its own
     # pool root: several ranks sharing one root would append to the same files.
     #
@@ -162,13 +169,40 @@ cd "$REPO_ROOT"
 if [[ "$USE_NSYS" == 1 ]]; then
     REPORT="$TUTTI_PROFILE_ROOT/reports/$NAME"
     echo "[bench] nsys report: $REPORT.nsys-rep"
-    # --nvtx-capture limits ranges to Tutti's own domain; capturing everything
-    # buries the storage work in framework noise.
+    # 采集口径对齐历史可用报告（hy3-tp8-10k-striped2-nsys-multiround，约 210MB、
+    # GPU 活动仅 15.8s），三项设置各有实测依据：
+    #
+    #  ① 只采集基准段，跳过引擎预热
+    #     driver 在基准循环前推入固定名 NVTX 范围 "tutti.bench"（域 tutti），
+    #     基线与 Tutti 两侧都会发出，因此两份报告同口径。
+    #     --capture-range-end=none 让采集从该范围开始后持续到进程结束（其后只剩
+    #     汇总输出，无 GPU 工作）。
+    #
+    #     注意本机 nsys 2025.3.2 的两个限制（已用最小程序逐一验证）：
+    #     --nvtx-capture **不支持通配符**，且**必须写 @domain**（省略即匹配失败，
+    #     报 "No reports were generated"）。所以不能用请求范围 'tutti.request*'
+    #     作触发——请求名带轮次后缀（A-cold|r0 等）各不相同，无法用单个精确名
+    #     覆盖，这也是引入 "tutti.bench" 的原因。
+    #
+    #     不这么做时预热会被整段采集：模型 299.9GB 的加载产生 61 万次 768KB 的
+    #     H2D 拷贝（468GB）外加 110 万次 4 字节 H2D，在 166s 的报告里占 36-79s，
+    #     而真正的基准段只有 179-194s——报告 488MB vs 历史 210MB、kernel 数 60 倍
+    #     的差距主要来自这里，且与存储路径无关，纯属噪音。
+    #
+    #  ② 不采 osrt：它贡献 477 万条事件（历史同类报告仅 49 万），且 syscall 时间线
+    #     对判断 GPU 气泡无用——需要看主机阻塞时 py-spy 更直接。
+    #
+    #  ③ 不用 --nvtx-capture 做内容过滤：早期用过的 '*@tutti.*' 会把 NVTX 从
+    #     8.1 万条砍到 3.0 万条，连 tutti.striped_nvme.io_kernel|op=read 这类关键
+    #     范围一起滤掉，正好丢掉最该看的部分。这里的 --nvtx-capture 只作为采集
+    #     触发条件，不过滤内容。
     nsys profile \
         --output "$REPORT" \
         --force-overwrite true \
-        --trace cuda,nvtx,osrt \
-        --nvtx-capture='*@tutti.*' \
+        --trace cuda,nvtx \
+        --capture-range=nvtx \
+        --nvtx-capture='tutti.bench@tutti' \
+        --capture-range-end=none \
         --cuda-memory-usage false \
         --sample none \
         --cpuctxsw none \
