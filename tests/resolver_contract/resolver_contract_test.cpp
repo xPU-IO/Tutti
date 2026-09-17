@@ -27,11 +27,11 @@
 //  20. FIEMAP flag rejection via test-only fixture (UNWRITTEN, SHARED, etc.).
 //  21. payload type/version/key compatibility with LocalNvmeDataPath.
 
-#include <tutti/resolvers/local_file/resolver.h>
+#include <csrc/resolvers/local_file/resolver.h>
 
 #include <tutti/status.h>
 #include <tutti/spi/storage_target_resolver.h>
-#include <tutti/bindings/ext4_local_nvme/binding.h>
+#include <csrc/bindings/ext4_local_nvme/binding.h>
 
 #include "../hardware_test_directory.h"
 

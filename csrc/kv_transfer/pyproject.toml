@@ -1,0 +1,14 @@
+[build-system]
+# torch is taken from the active environment (--no-build-isolation);
+# listing it here would make isolated builds download a possibly wrong wheel.
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tutti-kv-transfer"
+version = "0.1.0"
+description = "gather/scatter CUDA kernels for the Tutti vLLM connector (single_layer_kv_transfer ported from LMCache, Apache-2.0)"
+requires-python = ">=3.10"
+
+[tool.setuptools]
+packages = ["tutti_kv_transfer"]

@@ -1,10 +1,6 @@
 # ============================================================================
 # layerwise_kv_overlap —— 单盘配置
 #
-# 运行示例：
-#   sudo ./build/cuda-module/bin/tutti_layerwise_kv_overlap --single \
-#     --config examples/layerwise_kv_overlap/tutti_layerwise_local.yaml \
-#     --directory /mnt/gpu0/ssnvme0
 # 字段解释见 tutti_layerwise_striped.yaml（两边结构一致，仅单盘差异处注明）
 # ============================================================================
 

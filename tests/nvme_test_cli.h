@@ -17,7 +17,6 @@ struct NvmeTestDevice {
     std::string backing_device;
     std::string mount_path;
     std::uint32_t block_size = 4096;
-    std::uint32_t bar0_size = 16384;
     std::uint32_t namespace_id = 1;
 };
 
@@ -56,8 +55,8 @@ inline bool parse_nvme_test_device(const char* value,
         begin = comma + 1;
     }
 
-    if (fields.size() < 4 || fields.size() > 7) {
-        *error = "expected 4 to 7 comma-separated fields";
+    if (fields.size() < 4 || fields.size() > 6) {
+        *error = "expected 4 to 6 comma-separated fields";
         return false;
     }
     for (const auto& field : fields) {
@@ -81,12 +80,7 @@ inline bool parse_nvme_test_device(const char* value,
         return false;
     }
     if (fields.size() >= 6 &&
-        (!parse_u32(fields[5], &parsed.bar0_size) || parsed.bar0_size == 0)) {
-        *error = "bar0_size must be a positive integer";
-        return false;
-    }
-    if (fields.size() >= 7 &&
-        (!parse_u32(fields[6], &parsed.namespace_id) ||
+        (!parse_u32(fields[5], &parsed.namespace_id) ||
          parsed.namespace_id == 0)) {
         *error = "namespace_id must be a positive integer";
         return false;
@@ -98,7 +92,7 @@ inline bool parse_nvme_test_device(const char* value,
 
 inline std::string nvme_test_device_format() {
     return "ssnvme_path,pci_bdf,backing_device,mount_path"
-           "[,block_size[,bar0_size[,namespace_id]]]";
+           "[,block_size[,namespace_id]]";
 }
 
 }  // namespace tutti::test_support

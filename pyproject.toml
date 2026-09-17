@@ -1,0 +1,31 @@
+[build-system]
+# torch / vllm 由 tutti-env 提供（third_pkgs 源码 editable 安装，
+# doc/intergration/tutti-vllm-manual.md）；隔离构建会去 PyPI 拉 cu130
+# wheel 而失败，故只声明 setuptools 并用 --no-build-isolation 安装。
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tutti"
+version = "0.1.0"
+description = "Tutti: GPU-direct NVMe KV cache offloading runtime (core + framework integrations)"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.setuptools.packages.find]
+# 单一顶层包 tutti，所有子包均为常规包（带 __init__.py）。收进 tutti 命名空间
+# 后，顶层不再出现 engine / common / stores 这类易撞名的名字，历史上被
+# site-packages 顶层 engine.so 抢占的那类故障已结构性消除。
+# 包就在仓库根（csrc/ + tutti/ + integration/ 的布局）
+where = ["."]
+include = ["tutti*"]
+
+# 不由本 distribution 打包的目录及原因：
+#   csrc/python/        自带 setup.py（tutti_runtime，pybind 扩展）
+#   csrc/kv_transfer/   自带 setup.py（tutti-kv-transfer，CUDA 扩展）
+#   scripts/            开发压测工具，不属于运行时包
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
+# 不生成 .pytest_cache（env-tutti.sh 的 PYTEST_ADDOPTS 是全局兜底）
+addopts = "-p no:cacheprovider"

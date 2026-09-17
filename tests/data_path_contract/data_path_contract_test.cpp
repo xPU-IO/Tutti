@@ -12,7 +12,7 @@
 #include <tutti/memory_types.h>
 #include <tutti/spi/storage_target_resolver.h>
 #include <tutti/spi/data_path.h>
-#include <tutti/testing/mock_data_path.h>
+#include <csrc/testing/mock_data_path.h>
 
 #include <cstdint>
 #include <cstdio>
