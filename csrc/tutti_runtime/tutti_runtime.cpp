@@ -27,7 +27,32 @@ void keep_first_error(Status& first_error, Status status) {
 TuttiRuntime::TuttiRuntime() = default;
 
 TuttiRuntime::~TuttiRuntime() {
-    (void)shutdown();
+    /*
+     * 析构无法返回状态，所以策略必须明确且自洽：先做**有界**阻塞 drain；
+     * 若仍有非终态 I/O，就**泄漏完整 ownership graph**。
+     *
+     * 为什么不是"只释放一部分"：这正是修复前的缺陷。StorageRuntime 内部
+     * 已经做了"宁可泄漏 runtime-owned memory 也不 UAF"的保护，但析构随后
+     * 仍销毁 DataPath / queue group / DMA registration / NVMe lease，把那份
+     * 保护抵消掉——GPU/NVMe 可能仍在向那些内存 DMA。
+     *
+     * 一次性的少量泄漏由进程退出时归还操作系统。相比在途 DMA 打向已释放的
+     * 内存，这是严格更好的结局。
+     */
+    (void)shutdown(kDefaultDrainTimeoutMs);
+    if (state_ == TuttiRuntimeState::STOPPED) return;
+
+    // 只可能由 TIMEOUT 到达这里：shutdown() 的其它出口都会推进到 STOPPED。
+    // 刻意 release 而不 reset：对象本身留活。
+    (void)runtime_.release();
+    for (auto& entry : resolvers_) (void)entry.second.release();
+    for (auto& entry : datapaths_) (void)entry.second.release();
+    for (auto& entry : resources_) (void)entry.second.release();
+    std::fprintf(stderr,
+                 "TuttiRuntime: drain timed out with non-terminal I/O; "
+                 "leaking the ownership graph (StorageRuntime, resolvers, "
+                 "DataPaths, Resources) rather than tearing down state that "
+                 "in-flight DMA may still reference\n");
 }
 
 Status TuttiRuntime::adopt_resource_(std::string id,
@@ -191,7 +216,7 @@ void TuttiRuntime::observe_(TuttiRuntimeShutdownStage stage) noexcept {
     }
 }
 
-Status TuttiRuntime::shutdown() {
+Status TuttiRuntime::shutdown(std::uint64_t drain_timeout_ms) {
     if (state_ == TuttiRuntimeState::STOPPED) {
         return Status::Ok();
     }
@@ -201,16 +226,30 @@ Status TuttiRuntime::shutdown() {
 
     observe_(TuttiRuntimeShutdownStage::STORAGE_RUNTIME_SHUTDOWN);
     if (runtime_) {
+        Status status;
         try {
-            Status status = runtime_shutdown_hook_
+            status = runtime_shutdown_hook_
                 ? runtime_shutdown_hook_(*runtime_)
-                : runtime_->shutdown(0);
-            keep_first_error(first_error, std::move(status));
+                : runtime_->shutdown(drain_timeout_ms);
         } catch (...) {
-            keep_first_error(first_error,
-                             lifecycle_error(StatusCode::INTERNAL,
-                                             "StorageRuntime shutdown threw"));
+            status = lifecycle_error(StatusCode::INTERNAL,
+                                     "StorageRuntime shutdown threw");
         }
+        if (status.code() == StatusCode::TIMEOUT) {
+            /*
+             * 提前返回，**不销毁任何东西**。
+             *
+             * 在途 I/O 仍可能正在 DMA 到 DataPath 与 Resource 所拥有的内存，
+             * 销毁它们会把 StorageRuntime 内部那份"宁可泄漏也不 UAF"的保护
+             * 抵消掉。状态留在 SHUTTING_DOWN，使调用方能在 I/O 完成后重试，
+             * 无需重建 runtime。
+             *
+             * 注意这里连 runtime_ 都不能 reset：它持有 datapath/resolver 的
+             * 借用指针，先于它们消亡即是悬垂。
+             */
+            return status;
+        }
+        keep_first_error(first_error, std::move(status));
         runtime_.reset();
     }
     observe_(TuttiRuntimeShutdownStage::STORAGE_RUNTIME_DESTROYED);

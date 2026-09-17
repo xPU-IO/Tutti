@@ -55,7 +55,25 @@ public:
         TuttiRuntimeCreateOptions options = {});
 
     ~TuttiRuntime();
-    Status shutdown();
+
+    // shutdown() 与析构路径共用的 drain 超时。
+    //
+    // 有界阻塞：仅在确有在途 I/O 时才会真的等待（无在途时立即完成），而那种
+    // 情形下等待几乎总是划算的——I/O 通常即将完成，等一会儿比泄漏整个对象图好。
+    // 上限保证析构不会无限期挂住。
+    static constexpr std::uint64_t kDefaultDrainTimeoutMs = 5000;
+
+    // 排空在途 I/O 后关闭。
+    //
+    // **超时返回 TIMEOUT，并保留完整对象图**——StorageRuntime、resolver、
+    // DataPath、Resource 与 NVMe lease 全部存活，状态留在 SHUTTING_DOWN。
+    // 调用方可在在途 I/O 完成后直接重试，无需重建整个 runtime。
+    //
+    // 为什么必须保留：StorageRuntime 内部已有"宁可泄漏 memory 也不 UAF"的保护，
+    // 但上层若在 TIMEOUT 后继续销毁 DataPath / queue group / DMA registration /
+    // NVMe lease，就等于把那份保护抵消掉，GPU/NVMe 仍在执行时可能 UAF 或错误
+    // DMA。销毁这些对象的唯一安全前提是确认没有非终态 I/O。
+    Status shutdown(std::uint64_t drain_timeout_ms = kDefaultDrainTimeoutMs);
 
     TuttiRuntimeState state() const noexcept { return state_; }
     StorageRuntime* storage_runtime() noexcept { return runtime_.get(); }
