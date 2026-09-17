@@ -11,8 +11,8 @@
 //      status OK rather than an error, and that the cross-rank residency
 //      query may only under-report.
 //
-// ResolvedTarget is only referenced by pointer in ObjectPlacement, so no
-// resolver implementation is needed here.
+// No resolver appears anywhere: ObjectPlacement identifies a slot by URI and
+// the runtime is what resolves it.
 
 #include <tutti/spi/storage_object_store.h>
 
@@ -115,6 +115,17 @@ static_assert(std::is_abstract<tutti::StorageObjectStore>::value,
               "StorageObjectStore must be an abstract interface");
 static_assert(std::has_virtual_destructor<tutti::StorageObjectStore>::value,
               "StorageObjectStore must have a virtual destructor");
+
+// This SPI must NOT drag in the resolver SPI. Resolution belongs to
+// StorageRuntime, which consumes the slot URIs this layer produces; resolving
+// here as well would resolve every object twice, and that path is
+// open + fstat + fsync + FIEMAP plus a globally-serialised peer-memory DMA
+// mapping. Asserted structurally so the dependency cannot creep back in:
+// ObjectPlacement must carry a URI, never a resolved target.
+static_assert(std::is_same<decltype(tutti::ObjectPlacement::uri),
+                           std::string>::value,
+              "ObjectPlacement must identify a slot by URI, leaving resolution "
+              "to the runtime");
 
 } // namespace
 
@@ -229,7 +240,8 @@ public:
                 continue;
             }
             tutti::ObjectPlacement p;
-            p.target = reinterpret_cast<const tutti::ResolvedTarget*>(this);
+            p.uri = "fake://slot/" + std::to_string(next_slot_);
+            p.slot = next_slot_++;
             p.offset = next_offset_;
             p.payload_bytes = config_.layout.payload_bytes();
             p.generation = ++generation_;
@@ -334,6 +346,7 @@ private:
     bool bitmap_usable_ = true;
     std::uint64_t capacity_objects_ = 0;
     std::uint64_t next_offset_ = 0;
+    std::uint64_t next_slot_ = 0;
     std::uint64_t generation_ = 0;
     std::unordered_map<std::string, tutti::ObjectPlacement> reserved_;
     std::unordered_map<std::string, tutti::ObjectPlacement> committed_;

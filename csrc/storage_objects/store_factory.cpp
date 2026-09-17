@@ -1,14 +1,14 @@
 // csrc/storage_objects/store_factory.cpp
 //
-// create_storage_object_store(): the SPI's entry point, selecting a backend by
-// URI scheme.
+// create_storage_object_store(): the SPI's entry point, selecting a layout by
+// scheme.
 //
-// Deliberately NOT built on resolvers::create_resolver(): that path needs
-// ResolverSpec/BackendSpec/Resource from the config system, which would make the
-// storage object layer depend on configuration parsing. Instead the returned
-// store constructs its own resolver during open(), from the devices declared in
-// StoreConfig -- so this layer depends on the resolvers but not on how a
-// deployment happens to describe them.
+// This layer does not construct resolvers and does not depend on
+// csrc/resolvers/ at all. Resolution belongs to StorageRuntime, which takes the
+// slot URIs this store hands out. Keeping it that way means an object is
+// resolved exactly once -- and resolution is open + fstat + fsync + FIEMAP plus
+// a globally-serialised peer-memory DMA mapping, so doing it twice would be a
+// multi-second cost on a cold pool, not a rounding error.
 
 #include <memory>
 #include <string>
@@ -22,9 +22,9 @@ namespace tutti {
 
 Result<std::unique_ptr<StorageObjectStore>> create_storage_object_store(
     std::string_view scheme) {
-    // Both supported schemes are served by the same core; which placement and
-    // resolver get built is decided at open() by StoreConfig::stripe_unit
-    // (0 selects the single-file layout) together with the device list.
+    // Both supported schemes are served by the same core; which placement gets
+    // built is decided at open() by StoreConfig::stripe_unit (0 selects the
+    // single-file layout) together with the device list.
     //
     // The scheme is therefore validated here rather than dispatched on: naming
     // a layout the store cannot provide should fail at creation, not silently

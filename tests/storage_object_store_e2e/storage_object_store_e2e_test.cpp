@@ -1,18 +1,17 @@
 // tests/storage_object_store_e2e/storage_object_store_e2e_test.cpp
 //
-// End-to-end test of ObjectStoreCore against a stub resolver.
+// End-to-end test of ObjectStoreCore.
 //
 // This is the first test that exercises the whole layer as one object:
 // reserve -> write payload -> commit -> restart -> recover. The units were
 // tested in isolation; what matters here is whether their COMPOSITION holds the
 // guarantees, especially across a simulated crash.
 //
-// The resolver is a stub rather than the real LocalFileResolver because the real
-// one needs an NVMe namespace and FIEMAP against a live block device. That is
-// hardware territory, covered by the existing hardware contract tests. What the
-// stub cannot verify is extent mapping; what it can verify -- and what the bugs
-// actually live in -- is the store's own bookkeeping, header/checkpoint
-// interplay, and recovery decisions.
+// No resolver is involved, because this layer does not resolve: it hands out
+// slot URIs and StorageRuntime turns those into tickets. Extent mapping is
+// therefore out of scope here and covered by the hardware contract tests. What
+// this test does cover -- and where the bugs actually live -- is the store's own
+// bookkeeping, the header/checkpoint interplay, and recovery decisions.
 //
 // Needs a filesystem supporting O_DIRECT; skips loudly otherwise, since a green
 // run that never touched the real write path would be worse than no run.
@@ -85,51 +84,6 @@ bool o_direct_supported(const std::string& dir) {
     return ok;
 }
 
-// -------------------------------------------------------------------------
-// StubResolver -- hands back a minimal ResolvedTarget per URI.
-//
-// Records every URI it was asked for, which lets the test assert that the store
-// caches targets per slot instead of re-resolving. Re-resolution is not merely
-// slow: on the real resolver it means a fresh open + fstat + fsync + FIEMAP per
-// access, which is what made the previous path-per-key design expensive.
-// -------------------------------------------------------------------------
-struct StubPayload {
-    std::string uri;
-};
-
-class StubResolver final : public StorageTargetResolver {
-public:
-    Result<ResolvedTarget> resolve(std::string_view uri,
-                                   const ResolveOptions& options) override {
-        ++calls_;
-        seen_.push_back(std::string(uri));
-        last_scheme_ = options.scheme;
-        if (fail_next_) {
-            fail_next_ = false;
-            return Result<ResolvedTarget>::Failure(
-                Status(StatusCode::DEVICE_ERROR, "injected resolve failure"));
-        }
-        auto payload = std::make_shared<StubPayload>();
-        payload->uri = std::string(uri);
-        // make() already returns a Result, so hand it straight back.
-        return ResolvedTarget::make<StubPayload, StubPayload>(
-            "stub", "stub_payload", 1, /*logical_size=*/0, "stub_dp", payload,
-            payload);
-    }
-
-    std::uint64_t calls() const { return calls_; }
-    const std::vector<std::string>& seen() const { return seen_; }
-    const std::string& last_scheme() const { return last_scheme_; }
-    void fail_next() { fail_next_ = true; }
-    void reset_counts() { calls_ = 0; seen_.clear(); }
-
-private:
-    std::uint64_t calls_ = 0;
-    std::vector<std::string> seen_;
-    std::string last_scheme_;
-    bool fail_next_ = false;
-};
-
 constexpr std::uint64_t kSegmentBytes = 8192;
 constexpr std::uint32_t kSegmentCount = 4;
 constexpr std::uint64_t kPayload = kSegmentBytes * kSegmentCount;   // 32 KiB
@@ -152,10 +106,9 @@ StoreConfig make_config(const std::string& root, std::uint64_t slots) {
     return cfg;
 }
 
-std::unique_ptr<ObjectStoreCore> make_store(const std::string& root,
-                                            std::shared_ptr<StubResolver> r) {
+std::unique_ptr<ObjectStoreCore> make_store(const std::string& root) {
     return std::make_unique<ObjectStoreCore>(
-        std::make_unique<SingleFilePlacement>(root), std::move(r));
+        std::make_unique<SingleFilePlacement>(root));
 }
 
 // Write recognisable bytes into an object's payload, the way a real caller would
@@ -194,25 +147,23 @@ std::uint8_t read_payload_byte(const std::string& root, std::uint64_t slot) {
 // ======================================================================
 void test_basic_cycle(const std::string& base) {
     const std::string root = base + "/basic";
-    auto resolver = std::make_shared<StubResolver>();
-    auto store = make_store(root, resolver);
+    auto store = make_store(root);
 
     StoreConfig cfg = make_config(root, 8);
     REQUIRE(store->open(cfg).ok());
 
-    // The stub is handed the scheme the placement policy declares, and a
-    // "file://" URI -- the format the real local-file resolver parses.
     const ObjectKey a = key_of(0xA1);
     auto res = store->reserve(&a, 1);
     REQUIRE(res.ok());
     REQUIRE(res.value().accepted.size() == 1);
     CHECK(res.value().rejected_count == 0);
-    CHECK(resolver->last_scheme() == "file");
-    CHECK(!resolver->seen().empty());
-    CHECK(resolver->seen().back().rfind("file://", 0) == 0);
-
     const ObjectPlacement& p = res.value().accepted[0];
     CHECK(p.valid());
+    // A URI in the format the local-file resolver parses, for the runtime to
+    // open. The store itself never resolves it.
+    CHECK(p.uri.rfind("file://", 0) == 0);
+    CHECK(p.uri == "file://" + root + "/slots/0.obj");
+    CHECK(p.slot == 0);
     // Segment 0 starts after the header, so payload IO is 4096-aligned.
     CHECK(p.offset == 4096);
     CHECK(p.payload_bytes == kPayload);
@@ -235,12 +186,12 @@ void test_basic_cycle(const std::string& base) {
     CHECK(store->usage().committed_bytes == kSlotBytes);
     CHECK(store->usage().reserved_bytes == 0);
 
-    // Targets are cached per slot: a second lookup must not re-resolve, since on
-    // the real resolver that is an open + fstat + fsync + FIEMAP.
-    const std::uint64_t before = resolver->calls();
-    CHECK(store->lookup(a).ok());
-    CHECK(store->lookup(a).ok());
-    CHECK(resolver->calls() == before);
+    // The URI is a pure function of the slot, so a caller may cache tickets on
+    // it and lookup stays free of IO.
+    auto again = store->lookup(a);
+    REQUIRE(again.ok());
+    CHECK(again.value().uri == found.value().uri);
+    CHECK(again.value().slot == found.value().slot);
 
     CHECK(store->close().ok());
 }
@@ -255,8 +206,7 @@ void test_restart_recovery(const std::string& base) {
     const ObjectKey uncommitted = key_of(0xB3);
 
     {
-        auto resolver = std::make_shared<StubResolver>();
-        auto store = make_store(root, resolver);
+        auto store = make_store(root);
         REQUIRE(store->open(make_config(root, 8)).ok());
 
         const ObjectKey keys[2] = {a, b};
@@ -276,8 +226,7 @@ void test_restart_recovery(const std::string& base) {
     }
 
     {
-        auto resolver = std::make_shared<StubResolver>();
-        auto store = make_store(root, resolver);
+        auto store = make_store(root);
         REQUIRE(store->open(make_config(root, 8)).ok());
 
         const RecoveryReport& report = store->recovery_report();
@@ -319,8 +268,7 @@ void test_crash_before_commit(const std::string& base) {
     const ObjectKey ghost = key_of(0xC1);
 
     {
-        auto resolver = std::make_shared<StubResolver>();
-        auto store = make_store(root, resolver);
+        auto store = make_store(root);
         REQUIRE(store->open(make_config(root, 4)).ok());
         auto res = store->reserve(&ghost, 1);
         REQUIRE(res.ok());
@@ -334,8 +282,7 @@ void test_crash_before_commit(const std::string& base) {
     }
 
     {
-        auto resolver = std::make_shared<StubResolver>();
-        auto store = make_store(root, resolver);
+        auto store = make_store(root);
         REQUIRE(store->open(make_config(root, 4)).ok());
         // The object must not reappear. Its payload is on media, but without a
         // header it is indistinguishable from never-written space -- and that is
@@ -358,8 +305,7 @@ void test_corrupted_header(const std::string& base) {
     const ObjectKey bad = key_of(0xD2);
 
     {
-        auto resolver = std::make_shared<StubResolver>();
-        auto store = make_store(root, resolver);
+        auto store = make_store(root);
         REQUIRE(store->open(make_config(root, 4)).ok());
         const ObjectKey keys[2] = {good, bad};
         auto res = store->reserve(keys, 2);
@@ -389,8 +335,7 @@ void test_corrupted_header(const std::string& base) {
     }
 
     {
-        auto resolver = std::make_shared<StubResolver>();
-        auto store = make_store(root, resolver);
+        auto store = make_store(root);
         REQUIRE(store->open(make_config(root, 4)).ok());
         const RecoveryReport& report = store->recovery_report();
         CHECK(report.checkpoint_entries == 2);
@@ -409,8 +354,7 @@ void test_corrupted_header(const std::string& base) {
 // ======================================================================
 void test_capacity(const std::string& base) {
     const std::string root = base + "/capacity";
-    auto resolver = std::make_shared<StubResolver>();
-    auto store = make_store(root, resolver);
+    auto store = make_store(root);
     REQUIRE(store->open(make_config(root, 3)).ok());   // room for exactly 3
 
     std::vector<ObjectKey> keys;
@@ -459,8 +403,7 @@ void test_reclaim_and_aba(const std::string& base) {
     const ObjectKey first = key_of(0xE1);
     const ObjectKey second = key_of(0xE2);
 
-    auto resolver = std::make_shared<StubResolver>();
-    auto store = make_store(root, resolver);
+    auto store = make_store(root);
     REQUIRE(store->open(make_config(root, 2)).ok());
 
     auto res = store->reserve(&first, 1);
@@ -494,8 +437,7 @@ void test_reclaim_and_aba(const std::string& base) {
     CHECK(store->close().ok());
 
     {
-        auto r2 = std::make_shared<StubResolver>();
-        auto reopened = make_store(root, r2);
+        auto reopened = make_store(root);
         REQUIRE(reopened->open(make_config(root, 2)).ok());
         CHECK(!reopened->contains(first));   // the old occupant stays gone
         CHECK(reopened->contains(second));
@@ -512,8 +454,7 @@ void test_fingerprint(const std::string& base) {
     const ObjectKey a = key_of(0xF1);
 
     {
-        auto resolver = std::make_shared<StubResolver>();
-        auto store = make_store(root, resolver);
+        auto store = make_store(root);
         REQUIRE(store->open(make_config(root, 4)).ok());
         auto res = store->reserve(&a, 1);
         REQUIRE(res.ok());
@@ -526,8 +467,7 @@ void test_fingerprint(const std::string& base) {
     {
         // A different geometry against the same namespace. Recovery must not
         // accept objects whose recorded size no longer matches.
-        auto resolver = std::make_shared<StubResolver>();
-        auto store = make_store(root, resolver);
+        auto store = make_store(root);
         StoreConfig cfg = make_config(root, 4);
         cfg.layout.segment_count = kSegmentCount * 2;
         REQUIRE(store->open(cfg).ok());
@@ -539,8 +479,7 @@ void test_fingerprint(const std::string& base) {
     {
         // Reopening with the original geometry, the object is still there: the
         // rejected open changed nothing on media.
-        auto resolver = std::make_shared<StubResolver>();
-        auto store = make_store(root, resolver);
+        auto store = make_store(root);
         REQUIRE(store->open(make_config(root, 4)).ok());
         CHECK(store->contains(a));
         CHECK(read_payload_byte(root, 0) == 0x99);
@@ -562,8 +501,7 @@ void test_fingerprint(const std::string& base) {
 // ======================================================================
 void test_pin_and_abort(const std::string& base) {
     const std::string root = base + "/pin";
-    auto resolver = std::make_shared<StubResolver>();
-    auto store = make_store(root, resolver);
+    auto store = make_store(root);
     REQUIRE(store->open(make_config(root, 4)).ok());
 
     const ObjectKey live = key_of(0x21);
@@ -599,8 +537,7 @@ void test_pin_and_abort(const std::string& base) {
 // ======================================================================
 void test_prefix_queries(const std::string& base) {
     const std::string root = base + "/prefix";
-    auto resolver = std::make_shared<StubResolver>();
-    auto store = make_store(root, resolver);
+    auto store = make_store(root);
     REQUIRE(store->open(make_config(root, 8)).ok());
 
     std::vector<ObjectKey> keys;
@@ -631,8 +568,7 @@ void test_configuration_errors(const std::string& base) {
     const std::string root = base + "/config";
 
     {
-        auto resolver = std::make_shared<StubResolver>();
-        auto store = make_store(root, resolver);
+        auto store = make_store(root);
         StoreConfig cfg = make_config(root, 4);
         cfg.layout.segment_bytes = 1000;   // not 4096-aligned
         const Status s = store->open(cfg);
@@ -640,47 +576,26 @@ void test_configuration_errors(const std::string& base) {
         CHECK(s.code() == StatusCode::INVALID_ARGUMENT);
     }
     {
-        auto resolver = std::make_shared<StubResolver>();
-        auto store = make_store(root, resolver);
+        auto store = make_store(root);
         StoreConfig cfg = make_config(root, 4);
         cfg.capacity_bytes = kSlotBytes - 1;   // cannot hold one object
         CHECK(!store->open(cfg).ok());
     }
     {
-        auto resolver = std::make_shared<StubResolver>();
-        auto store = make_store(root, resolver);
+        auto store = make_store(root);
         StoreConfig cfg = make_config(root, 4);
         cfg.uri.clear();
         CHECK(!store->open(cfg).ok());
     }
     {
         // Operations before open() are refused rather than crashing.
-        auto resolver = std::make_shared<StubResolver>();
-        auto store = make_store(root, resolver);
+        auto store = make_store(root);
         const ObjectKey k = key_of(0x01);
         auto res = store->reserve(&k, 1);
         CHECK(!res.ok());
         CHECK(res.status().code() == StatusCode::NOT_READY);
         CHECK(!store->commit(&k, 1).ok());
         CHECK(!store->checkpoint().ok());
-    }
-    {
-        // A resolve failure rejects that key instead of failing the batch: one
-        // unusable slot must not cost the whole write.
-        auto resolver = std::make_shared<StubResolver>();
-        auto store = make_store(root + "/resolvefail", resolver);
-        REQUIRE(store->open(make_config(root + "/resolvefail", 4)).ok());
-        resolver->fail_next();
-        const ObjectKey k = key_of(0x02);
-        auto res = store->reserve(&k, 1);
-        REQUIRE(res.ok());
-        CHECK(res.value().accepted.empty());
-        CHECK(res.value().rejected_count == 1);
-        // The next attempt succeeds, so the store is not left poisoned.
-        auto retry = store->reserve(&k, 1);
-        REQUIRE(retry.ok());
-        CHECK(retry.value().accepted.size() == 1);
-        CHECK(store->close().ok());
     }
 }
 

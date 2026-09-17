@@ -19,20 +19,18 @@
 // cross-checks every entry against its object header. Steady-state reads never
 // touch metadata media, which is what keeps the hot path free of scans.
 //
-// TARGET OWNERSHIP. ObjectPlacement carries a borrowed ResolvedTarget pointer,
-// so the store owns a per-slot cache of resolved targets and hands out pointers
-// into it. This is safe across rehashing because std::unordered_map only
-// invalidates references to erased elements.
+// NO RESOLUTION HAPPENS HERE. StorageRuntime owns that: it takes a URI, selects
+// a resolver by scheme, and mints the ticket the data path uses. This core hands
+// out slot URIs and lets the runtime resolve them once. Resolving here as well
+// would double the cost of a path that is open + fstat + fsync + FIEMAP plus a
+// globally-serialised peer-memory DMA mapping -- historically the source of a
+// multi-second stall on the first write.
 //
-// The cache never needs invalidating on reuse: slot paths are stable (named by
-// slot number, not by key) and reclaim rewrites zeros in place without
-// reallocating extents, so a slot's ResolvedTarget stays correct for the
-// lifetime of the store. That is a direct payoff of the rename-free layout --
-// the previous path-per-key design invalidated its target cache on every
-// allocation.
+// Everything this core still does is host-side metadata: object headers,
+// checkpoint containers, the residency bitmap, and space accounting. None of it
+// needs extents.
 
 #include <cstdint>
-#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -40,7 +38,6 @@
 #include <vector>
 
 #include <tutti/spi/storage_object_store.h>
-#include <tutti/spi/storage_target_resolver.h>
 
 #include "csrc/storage_objects/checkpoint_region.h"
 #include "csrc/storage_objects/object_header_codec.h"
@@ -63,17 +60,14 @@ struct RecoveryReport {
 
 class ObjectStoreCore final : public StorageObjectStore {
 public:
-    // Deferred form, used by create_storage_object_store(): placement and
-    // resolver are built during open() from StoreConfig::devices, because until
-    // then neither the mount paths nor the device identities are known.
+    // Deferred form, used by create_storage_object_store(): the placement policy
+    // is built during open() from StoreConfig::devices, because until then the
+    // mount paths are not known.
     ObjectStoreCore();
 
-    // Injected form: the core takes both dependencies directly. Keeps it
-    // testable with a stub resolver and lets a deployment supply its own. The
-    // resolver scheme comes from the placement policy, which is what knows the
-    // URI format its resolver expects.
-    ObjectStoreCore(std::unique_ptr<SlotPlacementPolicy> placement,
-                    std::shared_ptr<StorageTargetResolver> resolver);
+    // Injected form: the core takes its placement policy directly. Keeps it
+    // testable and lets a deployment supply its own layout.
+    explicit ObjectStoreCore(std::unique_ptr<SlotPlacementPolicy> placement);
     ~ObjectStoreCore() override;
 
     // ---- StorageObjectStore ----
@@ -126,16 +120,12 @@ private:
     static std::string index_key(const ObjectKey& key);
 
     Status ensure_layout_locked();
-    // Build placement and resolver from config_.devices when they were not
-    // injected. No-op for the injected form.
+    // Build the placement policy from config_.devices when it was not injected.
+    // No-op for the injected form.
     Status build_backend_locked();
     Status materialise_through_locked(std::uint64_t slot_exclusive_end);
-    // Const because the target map is a cache: resolving is logically a read.
-    // Needed on the lookup path, which must work after a restart when recovery
-    // has rebuilt the index but no targets are resolved yet.
-    Result<const ResolvedTarget*> target_for_slot_locked(std::uint64_t slot) const;
-    ObjectPlacement placement_locked(std::uint64_t slot, std::uint64_t generation,
-                                     const ResolvedTarget* target) const;
+    ObjectPlacement placement_locked(std::uint64_t slot,
+                                     std::uint64_t generation) const;
     Status write_header_locked(std::uint64_t slot, const ObjectKey& key,
                                std::uint64_t generation, std::uint64_t commit_seq);
     Status load_checkpoint_locked();
@@ -151,7 +141,6 @@ private:
     mutable std::mutex mutex_;
 
     std::unique_ptr<SlotPlacementPolicy> placement_;
-    std::shared_ptr<StorageTargetResolver> resolver_;
 
     StoreConfig config_;
     bool opened_ = false;
@@ -169,11 +158,6 @@ private:
     std::unordered_map<std::string, Entry> index_;
     std::unordered_map<std::uint64_t, std::string> slot_owner_;
     std::unordered_map<std::string, std::uint32_t> pins_;
-
-    // Slot -> resolved target. Node-based, so handing out pointers into it is
-    // safe across insertion. Mutable because it is a cache filled on demand,
-    // including from the const lookup path.
-    mutable std::unordered_map<std::uint64_t, ResolvedTarget> targets_;
 
     ResidencyBitmap own_residency_;
     std::vector<ResidencyBitmap> peer_residency_;

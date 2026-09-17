@@ -5,8 +5,6 @@
 #include <algorithm>
 #include <utility>
 
-#include "csrc/resolvers/local_file/resolver.h"
-#include "csrc/resolvers/striped_file/resolver.h"
 #include "csrc/storage_objects/slot_media.h"
 
 namespace tutti::storage_objects {
@@ -35,9 +33,8 @@ constexpr std::uint32_t kMaxKeyBytes = 256;
 ObjectStoreCore::ObjectStoreCore() = default;
 
 ObjectStoreCore::ObjectStoreCore(
-    std::unique_ptr<SlotPlacementPolicy> placement,
-    std::shared_ptr<StorageTargetResolver> resolver)
-    : placement_(std::move(placement)), resolver_(std::move(resolver)) {}
+    std::unique_ptr<SlotPlacementPolicy> placement)
+    : placement_(std::move(placement)) {}
 
 ObjectStoreCore::~ObjectStoreCore() {
     // No implicit checkpoint: persisting during destruction would make an error
@@ -192,39 +189,28 @@ Status ObjectStoreCore::close() {
     (void)own_residency_.sync();
     own_residency_.close();
     peer_residency_.clear();
-    targets_.clear();
     opened_ = false;
     return {};
 }
 
 Status ObjectStoreCore::build_backend_locked() {
     // Already injected: nothing to build. This is the path tests take.
-    if (placement_ != nullptr && resolver_ != nullptr) return {};
+    if (placement_ != nullptr) return {};
 
     if (config_.devices.empty()) {
         return Status(StatusCode::INVALID_ARGUMENT,
                       "at least one device must be configured");
     }
     for (const StoreDevice& device : config_.devices) {
-        // Each of these is required by the resolver to prove that a file's
-        // FIEMAP extents belong to the namespace it was configured for. Missing
-        // identity would let a file be mapped onto the wrong device.
-        if (device.mount_path.empty() || device.backing_device_path.empty() ||
-            device.block_size == 0) {
+        // mount_path is what this layer needs. The remaining device identity
+        // (controller, namespace, block size) is carried in StoreConfig for the
+        // runtime's resolver, which is the component that must prove a file's
+        // FIEMAP extents belong to the namespace it was configured for.
+        if (device.mount_path.empty()) {
             return Status(StatusCode::INVALID_ARGUMENT,
-                          "device needs mount_path, backing_device_path and "
-                          "block_size");
+                          "device needs a mount_path");
         }
     }
-
-    auto make_local = [](const StoreDevice& device) {
-        resolvers::local_file::BackingDeviceConfig backing;
-        backing.backing_device_path = device.backing_device_path;
-        backing.namespace_base_bytes = device.namespace_base_bytes;
-        return std::make_unique<resolvers::local_file::LocalFileResolver>(
-            device.controller_pci_addr, device.namespace_id, device.block_size,
-            std::move(backing));
-    };
 
     if (config_.stripe_unit == 0) {
         if (config_.devices.size() != 1) {
@@ -234,22 +220,16 @@ Status ObjectStoreCore::build_backend_locked() {
         }
         placement_ = std::make_unique<SingleFilePlacement>(
             config_.devices[0].mount_path);
-        resolver_ = make_local(config_.devices[0]);
         return {};
     }
 
     std::vector<std::string> mounts;
-    std::vector<std::unique_ptr<StorageTargetResolver>> shard_resolvers;
     mounts.reserve(config_.devices.size());
-    shard_resolvers.reserve(config_.devices.size());
     for (const StoreDevice& device : config_.devices) {
         mounts.push_back(device.mount_path);
-        shard_resolvers.push_back(make_local(device));
     }
     placement_ =
         std::make_unique<StripedPlacement>(mounts, config_.stripe_unit);
-    resolver_ = std::make_shared<resolvers::striped_file::StripedResolver>(
-        std::move(shard_resolvers), config_.stripe_unit);
     return {};
 }
 
@@ -293,34 +273,17 @@ Status ObjectStoreCore::materialise_through_locked(
     return {};
 }
 
-Result<const ResolvedTarget*> ObjectStoreCore::target_for_slot_locked(
-    std::uint64_t slot) const {
-    auto it = targets_.find(slot);
-    if (it != targets_.end()) {
-        return Result<const ResolvedTarget*>::Success(&it->second);
-    }
-
-    ResolveOptions options;
-    options.scheme = placement_->resolver_scheme();
-    auto resolved = resolver_->resolve(placement_->uri_for_slot(slot), options);
-    if (!resolved.ok()) {
-        return Result<const ResolvedTarget*>::Failure(resolved.status());
-    }
-
-    auto inserted = targets_.emplace(slot, std::move(resolved).value());
-    return Result<const ResolvedTarget*>::Success(&inserted.first->second);
-}
-
 ObjectPlacement ObjectStoreCore::placement_locked(
-    std::uint64_t slot, std::uint64_t generation,
-    const ResolvedTarget* target) const {
+    std::uint64_t slot, std::uint64_t generation) const {
     ObjectPlacement p;
-    p.target = target;
+    // A URI, not a resolved target: the runtime owns resolution, and doing it
+    // here too would pay the FIEMAP plus peer-memory mapping cost twice.
+    p.uri = placement_->uri_for_slot(slot);
     // Skip the header so segment 0 begins exactly at p.offset.
     p.offset = placement_->payload_offset();
     p.payload_bytes = config_.layout.payload_bytes();
+    p.slot = slot;
     p.generation = generation;
-    (void)slot;
     return p;
 }
 
@@ -389,21 +352,10 @@ Result<ObjectPlacement> ObjectStoreCore::lookup(const ObjectKey& key) const {
         return Result<ObjectPlacement>::Failure(
             Status(StatusCode::NOT_FOUND, "object not committed"));
     }
-    auto target = targets_.find(it->second.slot);
-    if (target == targets_.end()) {
-        // Not cached yet -- normal right after a restart, where recovery
-        // rebuilt the index without resolving anything. Resolve on demand.
-        auto resolved = target_for_slot_locked(it->second.slot);
-        if (!resolved.ok()) {
-            return Result<ObjectPlacement>::Failure(resolved.status());
-        }
-        return Result<ObjectPlacement>::Success(
-            placement_locked(it->second.slot, it->second.generation,
-                             resolved.value()));
-    }
+    // Returning a URI rather than a resolved target means lookup works
+    // immediately after a restart, with no resolution on this path at all.
     return Result<ObjectPlacement>::Success(
-        placement_locked(it->second.slot, it->second.generation,
-                         &target->second));
+        placement_locked(it->second.slot, it->second.generation));
 }
 
 StoreUsage ObjectStoreCore::usage() const {
@@ -460,14 +412,8 @@ Result<ReserveOutcome> ObjectStoreCore::reserve(const ObjectKey* keys,
         if (existing != index_.end()) {
             // Already reserved or committed: hand back the existing placement
             // rather than consuming more space.
-            auto target = target_for_slot_locked(existing->second.slot);
-            if (!target.ok()) {
-                ++out.rejected_count;
-                continue;
-            }
             out.accepted.push_back(placement_locked(existing->second.slot,
-                                                    existing->second.generation,
-                                                    target.value()));
+                                                    existing->second.generation));
             out.accepted_keys.push_back(keys[i]);
             continue;
         }
@@ -495,13 +441,6 @@ Result<ReserveOutcome> ObjectStoreCore::reserve(const ObjectKey* keys,
             }
         }
 
-        auto target = target_for_slot_locked(slot);
-        if (!target.ok()) {
-            allocator_.abort(&slot, 1);
-            ++out.rejected_count;
-            continue;
-        }
-
         Entry entry;
         entry.slot = slot;
         entry.generation = generation;
@@ -509,7 +448,7 @@ Result<ReserveOutcome> ObjectStoreCore::reserve(const ObjectKey* keys,
         index_.emplace(ik, entry);
         slot_owner_[slot] = ik;
 
-        out.accepted.push_back(placement_locked(slot, generation, target.value()));
+        out.accepted.push_back(placement_locked(slot, generation));
         out.accepted_keys.push_back(keys[i]);
     }
     return Result<ReserveOutcome>::Success(std::move(out));

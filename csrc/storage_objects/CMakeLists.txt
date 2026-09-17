@@ -33,6 +33,13 @@ target_link_libraries(tutti_storage_objects PUBLIC
     tutti_spi
 )
 
+# Deliberately NOT linked against the resolvers. Resolution belongs to
+# StorageRuntime, which consumes the slot URIs this layer produces; resolving
+# here as well would resolve every object twice, and that path is
+# open + fstat + fsync + FIEMAP plus a globally-serialised peer-memory DMA
+# mapping. The absent dependency is the enforcement -- adding it would fail to
+# link nothing, so it is asserted in tests/header_hygiene instead.
+
 set_target_properties(tutti_storage_objects PROPERTIES
     CXX_STANDARD 17
     CXX_STANDARD_REQUIRED ON

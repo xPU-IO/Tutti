@@ -63,8 +63,8 @@ public:
     // per-shard share plus the reserved header prefix.
     virtual std::uint64_t shard_file_bytes(std::uint64_t slot_bytes) const = 0;
 
-    // URI to hand the resolver to obtain this slot's ResolvedTarget. Its format
-    // is fixed by the resolver, not chosen here.
+    // URI identifying this slot, for the runtime to open. Its format is fixed by
+    // the resolver that will parse it, not chosen here.
     virtual std::string uri_for_slot(std::uint64_t slot) const = 0;
 
     // Where the object header lives: which shard, and at what offset in that

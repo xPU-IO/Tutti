@@ -11,11 +11,13 @@
 //
 //   StorageTargetResolver  name -> ResolvedTarget          (read-only)
 //   StorageObjectStore     key  -> ObjectPlacement         (this header)
-//   DataPath               placement + memory -> IO
+//   StorageRuntime         uri  -> ticket -> IO
 //
 // StorageTargetResolver requires the file to already exist with physical
 // blocks allocated; it cannot create, size, or invalidate anything. This SPI
-// supplies the missing verbs and keeps the resolver as its own lower layer.
+// supplies the missing verbs. It deliberately does NOT resolve: the runtime
+// owns that, and doing it here would resolve every object twice. See
+// ObjectPlacement.
 //
 // Correctness boundary: this layer guarantees METADATA self-consistency, not
 // payload correctness. Payload is never checksummed -- doing so would route
@@ -23,8 +25,8 @@
 // commentary on ObjectHeaderLayout.
 //
 // No transport-private, device-private, or kernel-private types appear here.
-// Allowed includes: <tutti/status.h>, <tutti/spi/storage_target_resolver.h>,
-// and the C++17 standard library.
+// Allowed includes: <tutti/status.h>, <tutti/spi/object_digest.h>, and the
+// C++17 standard library.
 
 #include <cstddef>
 #include <cstdint>
@@ -35,7 +37,6 @@
 
 #include <tutti/status.h>
 #include <tutti/spi/object_digest.h>
-#include <tutti/spi/storage_target_resolver.h>
 
 namespace tutti {
 
@@ -100,17 +101,18 @@ struct ObjectLayout {
 // -------------------------------------------------------------------------
 // StoreDevice -- one backing device.
 //
-// Deployment facts the store cannot derive: which filesystem directory holds
-// slot files, and which NVMe namespace those files must resolve into. The
-// resolver needs the controller identity to prove that FIEMAP physical offsets
-// belong to the namespace it was configured for; without it a file could be
-// mapped onto the wrong device.
+// mount_path is what this layer uses: it decides where slot files live. The
+// remaining fields are deployment facts the RUNTIME's resolver needs -- the
+// controller identity lets it prove a file's FIEMAP extents belong to the
+// namespace it was configured for, so a file cannot be mapped onto the wrong
+// device. They travel here because the caller configures one store, not two
+// subsystems, but this layer only reads mount_path.
 // -------------------------------------------------------------------------
 struct StoreDevice {
-    // Directory holding this device's slot files.
+    // Directory holding this device's slot files. Required.
     std::string mount_path;
 
-    // NVMe namespace identity, used by the resolver to validate extents.
+    // NVMe namespace identity, for the runtime's resolver.
     std::string controller_pci_addr;
     std::uint32_t namespace_id = 0;
     std::uint32_t block_size = 0;
@@ -176,27 +178,44 @@ struct StoreConfig {
 };
 
 // -------------------------------------------------------------------------
-// ObjectPlacement -- everything needed to submit IO against an object.
+// ObjectPlacement -- where an object's payload lives.
 //
-// `target` is a resolver-produced ResolvedTarget (LBA extents already
-// resolved), borrowed from the store; it stays valid until the object is
-// released or the store closes. Callers form per-segment IO as:
+// Carries a URI plus an offset rather than a resolved target, because
+// RESOLUTION BELONGS TO THE RUNTIME. StorageRuntime::open_batch() takes URIs,
+// looks up a resolver by scheme, and mints the ticket that the data path
+// actually uses. If this layer resolved as well, every object would be resolved
+// twice -- and resolution is open + fstat + fsync + FIEMAP, plus a
+// peer-memory DMA mapping serialised by a global driver lock. Doing it twice is
+// not a minor waste; that path is historically where a first write stalled for
+// tens of seconds.
 //
+// So the division is: this layer decides WHICH slot an object occupies and
+// whether it is valid; the runtime decides how that slot's bytes reach the GPU.
+//
+// Callers form per-segment IO as:
+//     ticket        = runtime.open(placement.uri)      // cached per slot
 //     target_offset = placement.offset + segment_index * layout.segment_bytes
-//
-// `offset` already skips the object header, so segment 0 starts exactly at
-// `offset`.
 // -------------------------------------------------------------------------
 struct ObjectPlacement {
-    const ResolvedTarget* target = nullptr;
+    // Slot URI in the scheme the configured backend expects. A pure function of
+    // the slot number, so a caller may cache tickets keyed by this string.
+    std::string uri;
+
+    // Payload start within the object's logical address space: already past
+    // the object header, so segment 0 begins exactly here.
     std::uint64_t offset = 0;
     std::uint64_t payload_bytes = 0;
+
+    // Slot number. Exposed because the residency bitmap is indexed by it and
+    // because a caller may want to key its own ticket cache on it rather than
+    // on the URI string.
+    std::uint64_t slot = 0;
 
     // Space generation, bumped whenever the underlying space is recycled.
     // Detects ABA reuse: a stale placement carries a stale generation.
     std::uint64_t generation = 0;
 
-    bool valid() const noexcept { return target != nullptr; }
+    bool valid() const noexcept { return !uri.empty(); }
 };
 
 // -------------------------------------------------------------------------
