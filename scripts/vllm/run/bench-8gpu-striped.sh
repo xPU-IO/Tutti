@@ -44,6 +44,15 @@ TAG=""
 POOL_TAG="${POOL_TAG:-v1}"
 MODEL="${MODEL:-/mnt/nvme4/models/Hy3-FP8}"
 TP_SIZE=8
+# 直连准入要求 >= 2 * num_layers（80 层模型 = 160），这是下限。
+#
+# 显存代价（实测三点、完全线性）：arena 槽位 = 2 x 本值，每槽位 576 KiB。
+#   160 -> 320 槽位 -> 180 MiB      （下限，够用）
+#   256 -> 512 槽位 -> 288 MiB
+#   4096 -> 8192 槽位 -> 4608 MiB   （比下限多 4.4 GiB，实测峰值 90405->94833 MiB，
+#                                     占 95.6 GiB 的 96.9%，逼近上限）
+# 该内存与 KV cache 争同一块余量，故取"刚够"而非"越大越安全"。
+MAX_IN_FLIGHT="${MAX_IN_FLIGHT:-}"   # 空 = 用生产侧按 2 x num_layers 的推导值
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -141,16 +150,19 @@ else
         # Per device. The default of 32 would have 4 ranks x 32 = 128 queues on a
         # disk whose usable pool is 119, which fails with EAGAIN.
         --num-queues 8
-        # 直连路径要求在飞操作配额 >= 2 * num_layers（读写各一份，80 层 = 160）。
-        # 不传时 runtime 只报 4，于是 select_transfer 判定
-        # "direct operation capacity is insufficient: configured=4, required=160"
-        # 并静默回退到 staged 暂存路径——这不是报错，只是一条 warning，很容易
-        # 误以为在测直连。256 留出余量。
-        --max-in-flight-operations 256
+        # 默认不传 --max-in-flight-operations：生产侧（factory）已按
+        # 2 x num_layers 推导出下限，此处保持默认即是在验证那条路径。
+        # MAX_IN_FLIGHT=N 可显式覆盖，用于实验更大配额。
         # 不再需要 --direct-transfer-strict：staged 暂存路径已退役，直连准入
         # 失败一律抛出，strict 成为恒真行为（该键仍被接受但不再读取）。
         --kv-load-failure-policy fail
     )
+fi
+
+# 仅在显式指定时覆盖推导值——默认留空才能验证生产推导路径。
+if [[ -n "${MAX_IN_FLIGHT:-}" ]]; then
+    ARGS+=( --max-in-flight-operations "$MAX_IN_FLIGHT" )
+    echo "[bench] 显式覆盖 max_in_flight_operations=$MAX_IN_FLIGHT"
 fi
 
 # No deletion path on purpose. A populated pool holds ~10k slot files per rank,

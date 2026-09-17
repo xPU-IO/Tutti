@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from tutti.integration.vllm import worker as worker_module
+from tutti.integration.vllm.factory import _apply_direct_admission_floor
 from tutti.integration.vllm.worker import WorkerImpl
 from tutti.engine.core import KVEngine, _DirectAllLayerReadPlan, _ReadPlan
 from tutti.engine.transfer import (
@@ -1803,3 +1804,52 @@ def test_worker_fails_before_first_io_for_invalid_direct_plan():
         worker._validate_direct_or_fail([[1]])
     assert "block table length" in engine.reason
     assert bound == []
+
+def test_admission_floor_derived_from_layer_count_when_unset():
+    """未显式配置时，在飞配额必须被抬到直连准入下限 2 x num_layers。
+
+    这是唯一能让默认配置可用的地方：直连一次提交整个请求的全部层，而 preset
+    是 C 侧结构、不知道模型层数，其硬编码默认值（4）比 80 层模型需要的 160 小
+    40 倍。少了这步，默认配置要么静默回退 staged（改动前），要么直接抛错（改动后）。
+    """
+    options = {"preset": {"stripe_unit": 65536}}
+    _apply_direct_admission_floor(options, 80)
+    assert options["preset"]["max_in_flight_operations"] == 160
+
+    # 层数不同则下限随之变化——不能是固定常量。
+    small = {"preset": {}}
+    _apply_direct_admission_floor(small, 3)
+    assert small["preset"]["max_in_flight_operations"] == 6
+
+
+def test_admission_floor_never_overrides_explicit_value():
+    """显式配置优先，且允许高于下限（更大配额 = 更多并发，代价是显存）。
+
+    不把显式值往上下钳：低于下限时由准入检查如实报错（"configured=4,
+    required=160"），比在这里悄悄改掉用户的选择更便于排查。
+    """
+    explicit = {"preset": {"max_in_flight_operations": 4096}}
+    _apply_direct_admission_floor(explicit, 80)
+    assert explicit["preset"]["max_in_flight_operations"] == 4096
+
+    too_low = {"preset": {"max_in_flight_operations": 4}}
+    _apply_direct_admission_floor(too_low, 80)
+    assert too_low["preset"]["max_in_flight_operations"] == 4
+
+
+def test_admission_floor_is_inert_without_a_preset_dict():
+    """没有 preset dict 时不动手：内联 yaml/json 文本形式由规范化路径负责，
+    在这里解析会与那条路径重复；那时用户已给出整个 preset，下限由他自己负责。"""
+    inline = {"preset": "stripe_unit: 65536\n"}
+    _apply_direct_admission_floor(inline, 80)
+    assert inline["preset"] == "stripe_unit: 65536\n"
+
+    absent: dict = {}
+    _apply_direct_admission_floor(absent, 80)
+    assert "preset" not in absent
+
+    # 非法层数不产生荒谬配置（0 -> 0 会让准入永不可能通过）。
+    for bad in (0, -1):
+        guarded = {"preset": {}}
+        _apply_direct_admission_floor(guarded, bad)
+        assert "max_in_flight_operations" not in guarded["preset"]

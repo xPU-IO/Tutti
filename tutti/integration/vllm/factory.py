@@ -25,6 +25,37 @@ _ENGINE_CACHE: dict[int, tuple[Any, dict[tuple, Any]]] = {}
 _SCHEDULER_CACHE: dict[int, tuple[Any, dict[tuple, Any]]] = {}
 
 
+def _apply_direct_admission_floor(options: dict, num_layers: int) -> None:
+    """未显式配置时，把在飞配额抬到直连准入的下限 ``2 * num_layers``。
+
+    直连一次提交整个请求的全部层（读 80 + 写 80），故运行时的并发在飞配额必须
+    容得下 ``2 * num_layers``。而 preset 是 C 侧结构，不知道模型层数，其硬编码
+    默认值（4）远低于该要求——实测 80 层模型需要 160，相差 40 倍。
+
+    不在此推导的后果：默认配置下直连准入必失败。改动前它会静默回退到 staged
+    暂存路径（KV 经主机内存往返）而只表现为"稍慢"；改动后则直接抛错。两种都
+    不可接受，所以下限必须由知道层数的一方补齐。
+
+    显存代价（实测三点、完全线性）：arena 槽位 = 2 x 本值，每槽位 576 KiB，
+    故 2 x num_layers 在 80 层模型下为 160 -> 320 槽位 -> 180 MiB。这与 KV
+    cache 争同一块显存余量，因此取"刚够"而非放大。
+
+    只补下限、不覆盖用户值：显式配置优先，且允许高于下限（更大配额 = 更多
+    并发，代价是显存）。
+    """
+    if num_layers <= 0:
+        return
+    preset = options.get("preset")
+    if not isinstance(preset, dict):
+        # preset 也可能是内联 yaml/json 文本（_normalize_preset 会解析），
+        # 此处不解析以避免与那条规范化路径重复；那种形式下用户已显式给出
+        # 整个 preset，下限由他自己负责。
+        return
+    if preset.get("max_in_flight_operations") is not None:
+        return
+    preset["max_in_flight_operations"] = 2 * int(num_layers)
+
+
 def worker_engine_for(vllm_config, extra: dict):
     """取同进程共享的引擎实例；extra 可直传实例绕过构造。
 
@@ -72,6 +103,8 @@ def worker_engine_for(vllm_config, extra: dict):
                 f"推导值 {segment_bytes} 不一致"
             )
         options["segment_bytes"] = segment_bytes
+        # 数据面 store 才需要直连准入下限；调度侧的元数据 store 不做 IO。
+        _apply_direct_admission_floor(options, int(extra["num_layers"]))
         store = create_store(store_spec["type"], options)
         # 可选层数预告：查询侧（不做 bind）的驱逐展开与冷启动完整性
         # 判定依赖层数；与缓存键无关（同配置实例共享同引擎）。
