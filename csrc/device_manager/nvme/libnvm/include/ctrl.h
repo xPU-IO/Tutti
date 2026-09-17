@@ -500,9 +500,22 @@ inline Controller::~Controller()
         }
     }
 
-    int ret = Host_file_system_exit(dev_path);
-    if(ret < 0)
-        exit(-1);
+    /*
+     * Best-effort unmount; never fatal.
+     *
+     * Two things changed here. First, a failure no longer calls exit(-1):
+     * this is a destructor, and terminating the process from a library
+     * destructor turns an unmount hiccup into a crash of the whole host
+     * process. Second, the argument is the mount point rather than the device
+     * node -- umount2(2) takes a path, and a device node is not one, so the
+     * old call could only ever fail (the `umount` *command* does translate a
+     * device to its mount point, but that translation is user-space and this
+     * path no longer shells out).
+     */
+    if (Host_file_system_exit(dev_mount_path.c_str()) < 0) {
+        printf("Controller release: unmount of %s did not complete; "
+               "continuing teardown\n", dev_mount_path.c_str());
+    }
     printf("Controller release\n");
     nvm_ctrl_free(ctrl);
 
