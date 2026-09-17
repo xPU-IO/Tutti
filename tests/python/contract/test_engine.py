@@ -920,6 +920,70 @@ class TestBind:
         assert [entry[0] for entry in store.backend.calls] == ["get", "put"]
         assert store.backend.registered[1]["num_layers"] == NUM_LAYERS
 
+    def test_direct_path_ignores_a_lone_wait_write_event(self):
+        """只有 wait_write_event 不得改变直连路径——这条 fence 的两半不对称。
+
+        直连 fence 是"产生事件"→"写等待它"。没有 record_compute_event 就没有
+        事件可等，wait_write_event 存在与否都无关，应照走普通路径。
+
+        这条断言来自一次真实回归：给参考内存后端补上 wait_write_event 后，凡是
+        继承它的 store（如 DirectStore）都从"两者皆无"掉进原先那条"非两者皆备
+        即报错"的分支。原先的写法把无害的不对称和危险的不对称混为一谈。
+        """
+        config = {
+            "chunk_tokens": CHUNK_TOKENS,
+            "chunk_kv_bytes": SEG * NUM_LAYERS,
+            "max_chunks_per_wave": MAX_WAVE,
+            "direct_transfer": True,
+        }
+
+        # 继承 MemoryKVStore 即带有 wait_write_event，但无 record_compute_event。
+        inherited = DirectStore(SEG, NUM_CHUNKS)
+        assert callable(getattr(inherited, "wait_write_event", None))
+        assert not callable(getattr(inherited, "record_compute_event", None))
+
+        # 显式抹掉 wait_write_event：走同一条普通路径，结果必须一致。
+        class NoWaitStore(DirectStore):
+            wait_write_event = None
+
+        results = []
+        for store in (inherited, NoWaitStore(SEG, NUM_CHUNKS)):
+            engine = KVEngine(config, store)
+            window = RingWindow(bytearray(NUM_SLOTS * SEG), NUM_SLOTS, SEG)
+            engine.bind({"layer.0": object()}, window, NUM_LAYERS, 2)
+            keys = _chunk_keys(engine, 3, 1)
+            engine.load_layer(keys, 1, [[9, 10]]).wait()
+            engine.store_layer(keys, 2, [[9, 10]]).wait()
+            results.append([entry[0] for entry in store.backend.calls])
+        assert results[0] == results[1] == ["get", "put"]
+
+    def test_direct_path_refuses_record_without_wait(self):
+        """能记录却无法等待时必须报错——这才是危险的那一侧。
+
+        这种组合下"compute 先完成、写后提交"的顺序会被静默丢掉，比缺一条
+        快捷路径严重得多，所以不能与无害的不对称共用一条错误分支。
+        """
+        class RecordOnlyStore(DirectStore):
+            # 覆盖继承来的实现，构造出"只有 record、没有 wait"的组合。
+            wait_write_event = None
+
+            def record_compute_event(self):
+                return object()
+
+        config = {
+            "chunk_tokens": CHUNK_TOKENS,
+            "chunk_kv_bytes": SEG * NUM_LAYERS,
+            "max_chunks_per_wave": MAX_WAVE,
+            "direct_transfer": True,
+        }
+        store = RecordOnlyStore(SEG, NUM_CHUNKS)
+        engine = KVEngine(config, store)
+        window = RingWindow(bytearray(NUM_SLOTS * SEG), NUM_SLOTS, SEG)
+        engine.bind({"layer.0": object()}, window, NUM_LAYERS, 2)
+        keys = _chunk_keys(engine, 3, 1)
+        with pytest.raises(RuntimeError, match="cannot make the write wait"):
+            engine.store_layer(keys, 2, [[9, 10]])
+
     def test_direct_strict_rejects_store_without_capability(self):
         config = {
             "chunk_tokens": CHUNK_TOKENS,

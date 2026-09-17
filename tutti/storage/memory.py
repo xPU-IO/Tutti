@@ -151,6 +151,25 @@ class MemoryKVStore:
         if callable(synchronize):
             synchronize()
 
+    def wait_write_event(self, event) -> None:
+        """Fence the write path in the test/reference backend.
+
+        Same reasoning as ``wait_read_event``: this backend performs writes as
+        synchronous host memcpy, so there is nothing left to wait for by the
+        time control returns. The hook exists because ``KVEngine`` requires it
+        to exist at all.
+
+        It is not optional. Without this method (and without a ``wait_event``
+        fallback) the engine refuses the write path outright with "write stream
+        fence bridge is unavailable", which is what broke
+        ``tests/python/transfer/test_pipeline.py``: the reference backend could
+        not perform staged writes at all, so three pipeline tests failed on
+        every run and were mistaken for harness noise.
+        """
+        synchronize = getattr(event, "synchronize", None)
+        if callable(synchronize):
+            synchronize()
+
     def _require_open(self) -> None:
         if not self._opened:
             raise RuntimeError("store 未 open（或已 close），数据面操作不可用")

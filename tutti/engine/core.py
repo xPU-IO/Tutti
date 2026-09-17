@@ -1456,14 +1456,31 @@ class KVEngine:
                         begin(keys, "write")
                 record_compute = getattr(self._store, "record_compute_event", None)
                 wait_write = getattr(self._store, "wait_write_event", None)
-                if not callable(record_compute) and not callable(wait_write):
+                # 两半能力的要求**不对称**，理由在语义而不在对称美观：
+                #
+                #   record_compute 缺失 → 无从产生事件 → 这条 fence 无法建立，走
+                #     普通路径由 store 自行保证顺序（参考内存后端即是同步写）。
+                #     此时 wait_write 有没有都无所谓：没有事件可等。
+                #
+                #   record_compute 存在但没有 wait_write → 能记录却无法让写等待，
+                #     "compute 先完成、写后提交"这一顺序会被静默丢掉。这才是真正
+                #     危险的一侧，必须报错。
+                #
+                # 曾经这里写成"非两者皆备即报错"，把无害的不对称（只有 wait）
+                # 与危险的不对称混为一谈：参考内存后端补上 wait_write_event 后，
+                # 立刻从"两者皆无"掉进这条错误分支。
+                if not callable(record_compute):
                     completion = self._transfer.store_layer(
                         keys, layer_idx, src_first_blocks
                     )
                     self._inflight.append(completion)
                     return completion
-                if not callable(record_compute) or not callable(wait_write):
-                    raise RuntimeError("direct compute-to-write event bridge unavailable")
+                if not callable(wait_write):
+                    raise RuntimeError(
+                        "direct store can record a compute fence but cannot "
+                        "make the write wait on it; refusing to drop the "
+                        "compute-to-write ordering"
+                    )
                 fence_started_ns = time.perf_counter_ns()
                 with nvtx_range(
                     f"tutti.direct.record_fence|direction=write|layer={layer_idx}"
