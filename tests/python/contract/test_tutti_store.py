@@ -903,6 +903,117 @@ def test_preset_optional_fields_parse(tmp_path):
     assert "unknown preset key" not in str(excinfo.value)
 
 
+@pytest.mark.parametrize(
+    "key",
+    [
+        # gpu_id is deliberately absent: it is std::int32_t, so -1 is a legal
+        # value rather than a wrap, and there is a separate assertion below
+        # pinning that. Only the unsigned fields belong here.
+        "num_queues",
+        "max_batch_entries",
+        "max_in_flight_operations",
+        "threads_per_block",
+        "handle_cache_capacity",
+        "prp_cache_capacity",
+    ],
+)
+def test_preset_rejects_negative_unsigned_fields(tmp_path, key):
+    """负数必须被拒绝，而不是静默 wrap 成超大无符号值。
+
+    `static_cast<T>(int64)` 对负数是回绕的：num_queues=-1 曾变成 4294967295，
+    该值随后进入队列预算与 arena 尺寸计算。回绕在调用点完全不可见，后续报错也
+    不会提到原始输入，所以拒绝必须发生在解析处——那里还知道 preset key 的名字。
+
+    断言包含 key 名与 "out of range"：只断言"抛异常"是不够的，因为无硬件环境下
+    构造本就会因设备打不开而抛，那样这条测试会永远通过。
+    """
+    tutti_runtime = _load_bindings_runtime()
+    preset = {
+        "device": {"pci_bdf": "0000:00:00.0", "mount_path": str(tmp_path)},
+        key: -1,
+    }
+    with pytest.raises(Exception) as excinfo:
+        tutti_runtime.make_local_nvme_runtime(preset)
+    message = str(excinfo.value)
+    assert key in message, message
+    assert "out of range" in message, message
+
+
+@pytest.mark.parametrize("key", ["namespace_id", "block_size"])
+def test_preset_rejects_negative_device_fields(tmp_path, key):
+    """设备子字典里的无符号字段同样拒绝负数（它们走同一个转换函数）。"""
+    tutti_runtime = _load_bindings_runtime()
+    preset = {
+        "device": {
+            "pci_bdf": "0000:00:00.0",
+            "mount_path": str(tmp_path),
+            key: -1,
+        }
+    }
+    with pytest.raises(Exception) as excinfo:
+        tutti_runtime.make_local_nvme_runtime(preset)
+    message = str(excinfo.value)
+    assert key in message, message
+    assert "out of range" in message, message
+
+
+def test_preset_rejects_out_of_range_unsigned_field(tmp_path):
+    """超出目标类型上限的值也要拒绝，而不只是负数。
+
+    2**63 落在 int64 表示范围内（Python int 无界，取到 int64 后仍为正），
+    但远超 uint32 字段的容量，必须在这里挡住。
+    """
+    tutti_runtime = _load_bindings_runtime()
+    preset = {
+        "device": {"pci_bdf": "0000:00:00.0", "mount_path": str(tmp_path)},
+        "num_queues": 2**40,
+    }
+    with pytest.raises(Exception) as excinfo:
+        tutti_runtime.make_local_nvme_runtime(preset)
+    message = str(excinfo.value)
+    assert "num_queues" in message, message
+    assert "out of range" in message, message
+
+
+def test_preset_accepts_negative_gpu_id(tmp_path):
+    """gpu_id 是有符号的，-1 必须照常通过解析。
+
+    与上一组测试成对：把校验做成"拒绝一切负数"就会误伤它。gpu_id 是下标型字段，
+    负值在某些部署里表示"未绑定"，所以它不该被无符号规则覆盖。
+
+    失败（若有）应来自设备打开，而不是解析层。
+    """
+    tutti_runtime = _load_bindings_runtime()
+    preset = {
+        "device": {"pci_bdf": "0000:00:00.0", "mount_path": str(tmp_path)},
+        "gpu_id": -1,
+    }
+    with pytest.raises(Exception) as excinfo:
+        tutti_runtime.make_local_nvme_runtime(preset)
+    message = str(excinfo.value)
+    assert "gpu_id" not in message, message
+    assert "out of range" not in message, message
+
+
+def test_preset_still_accepts_valid_bounds(tmp_path):
+    """边界内的合法值不受影响——校验不能过严。
+
+    0 与 1 都必须通过解析；失败（若有）应来自设备打开，而不是解析层。
+    这条同时防止"把校验写成拒绝一切"这种过度收紧。
+    """
+    tutti_runtime = _load_bindings_runtime()
+    for value in (0, 1):
+        preset = {
+            "device": {"pci_bdf": "0000:00:00.0", "mount_path": str(tmp_path)},
+            "num_queues": value,
+            "max_in_flight_operations": value,
+        }
+        with pytest.raises(Exception) as excinfo:
+            tutti_runtime.make_local_nvme_runtime(preset)
+        message = str(excinfo.value)
+        assert "out of range" not in message, message
+
+
 # ---------- preset 推导（daemon_config + device_id） ----------
 
 

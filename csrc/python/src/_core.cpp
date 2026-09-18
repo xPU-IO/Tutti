@@ -16,6 +16,8 @@
 #include <tutti/storage_runtime.h>
 
 #include <cstdint>
+#include <limits>
+#include <type_traits>
 #include <cstdlib>
 #include <memory>
 #include <stdexcept>
@@ -592,6 +594,29 @@ std::int64_t get_int_field(const py::dict& d, const std::string& key) {
     return v.cast<std::int64_t>();
 }
 
+// Converts a Python int to T, refusing anything that does not fit T.
+//
+// A plain static_cast silently wraps: num_queues=-1 became 4294967295, which
+// then flowed into the queue budget and arena sizing. The wrap is invisible both
+// at the call site and in whatever error surfaces later, so the rejection has to
+// happen here, while the preset key is still known and nameable.
+template <typename T>
+T checked_int_cast(std::int64_t value, const std::string& key) {
+    static_assert(std::is_integral<T>::value, "checked_int_cast needs an integer");
+    constexpr std::int64_t kMax =
+        static_cast<std::int64_t>(std::numeric_limits<T>::max());
+    // Only meaningful for signed T narrower than int64; for wider T the bound
+    // is INT64_MIN and the comparison is vacuous, which is correct.
+    constexpr std::int64_t kMin =
+        static_cast<std::int64_t>(std::numeric_limits<T>::min());
+    if (value > kMax || value < kMin) {
+        value_error("preset key '" + key + "' out of range for its field (" +
+                    std::to_string(value) + " not in [" +
+                    std::to_string(kMin) + ", " + std::to_string(kMax) + "])");
+    }
+    return static_cast<T>(value);
+}
+
 // Optional int: keep the C++ struct default when the key is absent.
 template <typename T>
 void opt_int_field(const py::dict& d, const std::string& key, T& target) {
@@ -600,7 +625,7 @@ void opt_int_field(const py::dict& d, const std::string& key, T& target) {
     if (py::isinstance<py::bool_>(v) || !py::isinstance<py::int_>(v)) {
         value_error("preset key '" + key + "' must be an int");
     }
-    target = static_cast<T>(v.cast<std::int64_t>());
+    target = checked_int_cast<T>(v.cast<std::int64_t>(), key);
 }
 
 void opt_bool_field(const py::dict& d, const std::string& key, bool& target) {
