@@ -66,8 +66,20 @@ endif()
 
 option(TUTTI_FEATURE_LOCAL_NVME "Include local-NVMe DataPath and dependencies" ON)
 option(TUTTI_FEATURE_MEMFS_SAMPLE "Include memfs sample extension" ON)
+# Default follows the profile. The snvme kernel module drives a GPU P2P
+# backend, so a HOST configure has nothing to build here -- yet the default was
+# ON, and the validation below turns that into a hard configuration failure.
+# A user who genuinely wants it on a non-HOST profile can still ask; the
+# validation remains the guard for that request.
+if(TUTTI_ACCELERATOR STREQUAL "HOST")
+    set(_tutti_kernel_module_default OFF)
+else()
+    set(_tutti_kernel_module_default ON)
+endif()
 option(TUTTI_BUILD_KERNEL_MODULE
-    "Configure snvme kernel-module build/load targets" ON)
+    "Configure snvme kernel-module build/load targets"
+    ${_tutti_kernel_module_default})
+unset(_tutti_kernel_module_default)
 
 # System packages are preferred. If a required package is unavailable, use an
 # already-populated repository vcpkg tree as a local fallback; no toolchain
@@ -331,7 +343,33 @@ endif()
 # Hardware tests cover real FIEMAP mounts and local-NVMe GPU+snvme paths.
 # The default hardware build registers them with CTest labels
 # "hardware;resolver" and "hardware;local_nvme".
-option(TUTTI_BUILD_HARDWARE_TESTS "Register hardware-dependent tests" ON)
+#
+# The default FOLLOWS the profile rather than being unconditionally ON. Several
+# of these tests need the hardware stack (CUDA sources, striped targets), so
+# enabling them under a HOST configure broke CMake generation outright: a HOST
+# build could not be configured without also passing
+# -DTUTTI_BUILD_HARDWARE_TESTS=OFF, which is a poor thing to require of anyone
+# who just asked for the host profile.
+#
+# Not written as option(...) with a computed default because option() is a no-op
+# once the cache holds a value: a user who passed -DTUTTI_BUILD_HARDWARE_TESTS
+# explicitly keeps that choice, which is what should happen -- the profile
+# supplies a default, it does not overrule an explicit request.
+if(NOT DEFINED TUTTI_BUILD_HARDWARE_TESTS)
+    set(TUTTI_BUILD_HARDWARE_TESTS "${TUTTI_BUILD_HARDWARE_STACK}" CACHE BOOL
+        "Register hardware-dependent tests (default follows TUTTI_BUILD_HARDWARE_STACK)")
+endif()
+
+# If they were asked for anyway without the stack to support them, say so here.
+# The alternative is a generation failure deep inside a hardware subdirectory
+# that names a missing CUDA source rather than the actual mismatch.
+if(TUTTI_BUILD_HARDWARE_TESTS AND NOT TUTTI_BUILD_HARDWARE_STACK)
+    message(FATAL_ERROR
+        "TUTTI_BUILD_HARDWARE_TESTS=ON requires TUTTI_BUILD_HARDWARE_STACK=ON. "
+        "The tests for the hardware stack (FIEMAP mounts, local-NVMe GPU+snvme "
+        "paths) cannot be built without it. Drop the option to follow the "
+        "profile default, or build with TUTTI_ACCELERATOR=CUDA.")
+endif()
 
 if(BUILD_TESTING)
     add_subdirectory(
