@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <fstream>
 #include <mntent.h>
+#include <sys/sysmacros.h>   // major()/minor(): device identity for R3's check
 #include <sstream>
 #include <string>
 #include <sys/mount.h>
@@ -51,49 +52,138 @@ bool path_is_prefix(const std::string& path, const std::string& prefix) {
     return path[prefix.size()] == '/';
 }
 
+std::string decode_mountinfo_escapes(const std::string& field) {
+    // \040 = space, \011 = tab, \012 = newline, \134 = backslash.
+    std::string out;
+    out.reserve(field.size());
+    for (size_t i = 0; i < field.size(); ++i) {
+        if (field[i] == '\\' && i + 3 < field.size() && field[i + 1] == '0') {
+            const int hi = field[i + 2] - '0';
+            const int lo = field[i + 3] - '0';
+            if (hi >= 0 && hi <= 7 && lo >= 0 && lo <= 7) {
+                out += static_cast<char>(hi * 8 + lo);
+                i += 3;
+                continue;
+            }
+        }
+        out += field[i];
+    }
+    return out;
+}
+
+bool parse_major_minor(const std::string& field, unsigned long* major_out,
+                       unsigned long* minor_out) {
+    const size_t colon = field.find(':');
+    if (colon == std::string::npos) return false;
+    try {
+        *major_out = std::stoul(field.substr(0, colon));
+        *minor_out = std::stoul(field.substr(colon + 1));
+    } catch (...) {
+        return false;
+    }
+    return true;
+}
+
+// Parses one /proc/self/mountinfo line into the fields this file needs.
+//
+// Field layout (proc(5)): mount_id parent_id major:minor root mount_point
+// mount_options [optional fields...] - fs_type source super_options
+//
+// Parsed as tokens rather than by positional scanning because the optional
+// fields between mount_options and the "-" separator are variable in count:
+// the previous approach walked four spaces and assumed the next token was the
+// mount point, which held only because nothing after it mattered.
+bool parse_mountinfo_line(const std::string& line, MountEntry* out) {
+    if (out == nullptr) return false;
+    std::vector<std::string> tokens;
+    size_t pos = 0;
+    while (pos < line.size()) {
+        const size_t space = line.find(' ', pos);
+        if (space == std::string::npos) {
+            tokens.push_back(line.substr(pos));
+            break;
+        }
+        if (space > pos) tokens.push_back(line.substr(pos, space - pos));
+        pos = space + 1;
+    }
+    // minimum: id parent dev root mp opts - fstype source superopts
+    if (tokens.size() < 10) return false;
+
+    if (!parse_major_minor(tokens[2], &out->major, &out->minor)) return false;
+    out->mount_point = decode_mountinfo_escapes(tokens[4]);
+
+    // The separator is a lone "-" token; everything after it is fs_type,
+    // source, super_options.
+    size_t sep = 0;
+    bool found_sep = false;
+    for (size_t i = 6; i + 2 < tokens.size(); ++i) {
+        if (tokens[i] == "-") { sep = i; found_sep = true; break; }
+    }
+    if (!found_sep) return false;
+    out->fs_type = tokens[sep + 1];
+    out->source = tokens[sep + 2];
+    return true;
+}
+
 } // namespace
+
+// ---------------------------------------------------------------------------
+// Existing-mount validation
+// ---------------------------------------------------------------------------
+
+bool existing_mount_acceptable(const MountEntry& entry,
+                               const std::string& expected_fs_type,
+                               unsigned long expected_major,
+                               unsigned long expected_minor,
+                               std::string* reason) {
+    const auto fail = [reason](std::string message) {
+        if (reason != nullptr) *reason = std::move(message);
+        return false;
+    };
+
+    if (entry.fs_type != expected_fs_type) {
+        return fail("is mounted as '" + entry.fs_type + "', expected '" +
+                    expected_fs_type + "'");
+    }
+    // Device identity, not path text: two paths can name the same device and
+    // one path can be re-pointed at a different device between runs. major:minor
+    // is what the kernel actually mounted.
+    if (entry.major != expected_major || entry.minor != expected_minor) {
+        return fail("is mounted from device " + std::to_string(entry.major) +
+                    ":" + std::to_string(entry.minor) + " (source '" +
+                    entry.source + "'), expected " +
+                    std::to_string(expected_major) + ":" +
+                    std::to_string(expected_minor));
+    }
+    return true;
+}
+
+// Looks up the mountinfo entry for an exact mount point.
+bool MountManager::lookup_mount(const std::string& mount_path, MountEntry* out) {
+    std::ifstream f("/proc/self/mountinfo");
+    if (!f.is_open()) return false;
+    std::string line;
+    while (std::getline(f, line)) {
+        MountEntry entry;
+        if (!parse_mountinfo_line(line, &entry)) continue;
+        if (entry.mount_point == mount_path) {
+            if (out != nullptr) *out = entry;
+            return true;
+        }
+    }
+    return false;
+}
 
 MountManager::MountManager(const UnmountRetryConfig& retry_cfg)
     : retry_cfg_(retry_cfg) {}
 
 bool MountManager::is_mounted(const std::string& mount_path) {
-    // Round 17 S1: /proc/self/mountinfo format differs from /etc/mtab:
-    //   mount_id parent_id major:minor root mount_point ...
-    // We need field 5 (mount_point), which may contain spaces
-    // encoded as \040.  Parse line-by-line.
-    std::ifstream f("/proc/self/mountinfo");
-    if (!f.is_open()) return false;
-    std::string line;
-    while (std::getline(f, line)) {
-        // Skip fields 1-4 (mount_id parent_id major:minor root),
-        // then field 5 is the mount point.
-        // Fields are space-separated; mount point is the 5th.
-        size_t pos = 0;
-        for (int field = 0; field < 4; ++field) {
-            pos = line.find(' ', pos);
-            if (pos == std::string::npos) break;
-            pos += 1;  // skip the space
-        }
-        if (pos == std::string::npos) continue;
-        // Now extract the mount point (up to the next space).
-        size_t end = line.find(' ', pos);
-        std::string mp = (end == std::string::npos)
-                         ? line.substr(pos)
-                         : line.substr(pos, end - pos);
-        // Decode octal escapes (\040 = space, etc.)
-        std::string decoded;
-        for (size_t i = 0; i < mp.size(); ++i) {
-            if (mp[i] == '\\' && i + 3 < mp.size() &&
-                mp[i+1] == '0' && mp[i+2] == '4' && mp[i+3] == '0') {
-                decoded += ' ';
-                i += 3;
-            } else {
-                decoded += mp[i];
-            }
-        }
-        if (decoded == mount_path) return true;
-    }
-    return false;
+    // Shares the tokenising parser with lookup_mount() rather than keeping a
+    // second, subtly different one. The old version scanned forward four
+    // spaces and took the next token as the mount point, which only worked
+    // because it never needed anything after it. (Round 17 S1 introduced it
+    // when /proc/self/mountinfo replaced /etc/mtab.)
+    return lookup_mount(mount_path, nullptr);
 }
 
 MountResult MountManager::mount_one(const std::string& block_device,
@@ -122,12 +212,49 @@ MountResult MountManager::mount_one(const std::string& block_device,
         return res;
     }
 
-    // 2. Check if already mounted (by a previous operator or daemon).
+    // 2. If already mounted (by a previous operator or daemon), adopt it ONLY
+    //    if it is the mount we asked for.
+    //
+    //    Accepting any pre-existing mount was the bug: the daemon goes on to
+    //    publish accelerator views on that filesystem and hand its extents to
+    //    the storage path, so a tmpfs, an overlay, or a stale mount from a
+    //    previous layout would be silently treated as the target NVMe. Fail
+    //    closed instead -- an operator can then look at the path and decide.
     if (is_mounted(mount_path)) {
-        res.already_mounted = true;
-        TUTTI_INFO("mount_manager: %s already mounted at %s (not taking ownership)\n",
-                   block_device.c_str(), mount_path.c_str());
-        return res;
+        MountEntry entry;
+        if (!lookup_mount(mount_path, &entry)) {
+            // is_mounted() said yes using the same parser, so this is a race
+            // (unmounted in between). Treat as not mounted.
+            TUTTI_INFO("mount_manager: %s disappeared between checks\n",
+                       mount_path.c_str());
+        } else {
+            // Device numbers of the device we were asked to mount. A failed
+            // stat is itself disqualifying: we cannot prove the existing mount
+            // is ours, and guessing yes is what this check exists to stop.
+            struct stat dev_st;
+            if (::stat(block_device.c_str(), &dev_st) != 0) {
+                res.error = "stat " + block_device + " failed: " +
+                            std::strerror(errno) +
+                            " (cannot verify existing mount at " + mount_path + ")";
+                return res;
+            }
+            std::string reason;
+            if (!existing_mount_acceptable(entry, "ext4",
+                                           major(dev_st.st_rdev),
+                                           minor(dev_st.st_rdev), &reason)) {
+                res.error = mount_path + " already exists but " + reason +
+                            "; refusing to adopt it. Unmount it or point the "
+                            "configuration elsewhere.";
+                TUTTI_INFO("mount_manager: %s\n", res.error.c_str());
+                return res;
+            }
+            res.already_mounted = true;
+            TUTTI_INFO("mount_manager: %s already mounted at %s from %s "
+                       "(verified, not taking ownership)\n",
+                       block_device.c_str(), mount_path.c_str(),
+                       entry.source.c_str());
+            return res;
+        }
     }
 
     // 3. mount(2) — ext4, default options.

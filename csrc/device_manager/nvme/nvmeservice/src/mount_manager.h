@@ -51,12 +51,45 @@ struct MountResult {
     std::string block_device;                // e.g. "/dev/snvme0n1"
 };
 
+// The parts of a /proc/self/mountinfo entry this file cares about.
+//
+// `major`/`minor` are the mounted device's numbers, which is the only reliable
+// identity: a mount *path* can be moved to another device between runs, and two
+// paths can name the same device.
+struct MountEntry {
+    std::string   mount_point;
+    std::string   fs_type;
+    std::string   source;   // device path or "none"/"tmpfs"/...
+    unsigned long major = 0;
+    unsigned long minor = 0;
+};
+
+// Decides whether a pre-existing mount at the target path is the one we asked
+// for. Free function, and pure, so the decision can be tested without
+// privileges -- see the note on mount_one().
+//
+// Returns true when acceptable; otherwise fills `reason` (when non-null).
+bool existing_mount_acceptable(const MountEntry& entry,
+                               const std::string& expected_fs_type,
+                               unsigned long expected_major,
+                               unsigned long expected_minor,
+                               std::string* reason);
+
 class MountManager {
 public:
     explicit MountManager(const UnmountRetryConfig& retry_cfg);
 
     // Mount a single device.  block_device e.g. "/dev/snvme0n1".
     // mount_path e.g. "/mnt/nvme1".  Records ownership if successful.
+    //
+    // If the path is already mounted, the existing mount is only accepted when
+    // it is ext4 AND comes from `block_device` -- verified by device number,
+    // not by path text. Anything else (tmpfs, another block device, a stale
+    // mount from a previous layout) fails closed rather than being adopted,
+    // because the daemon is about to publish accelerator views on that
+    // filesystem and a wrong one means KV lands somewhere Tutti cannot
+    // legitimately map.
+    //
     // Returns MountResult describing the outcome.
     MountResult mount_one(const std::string& block_device,
                           const std::string& mount_path);
@@ -78,6 +111,10 @@ public:
 
     // Check if a path is already a mount point (uses /proc/self/mountinfo).
     static bool is_mounted(const std::string& mount_path);
+
+    // Full mountinfo entry for an exact mount point. Returns false when the
+    // path is not a mount point (or mountinfo is unreadable).
+    static bool lookup_mount(const std::string& mount_path, MountEntry* out);
 
 private:
     struct OwnedMount {
