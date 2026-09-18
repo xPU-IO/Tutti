@@ -33,6 +33,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <deque>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -1166,8 +1167,18 @@ public:
             if (!status.ok()) return status;
         }
         entry.data_path_operations.clear();
-        released_results_[handle_key_(handle)] = IoResult{
+        const std::uint64_t released_key = handle_key_(handle);
+        released_results_[released_key] = IoResult{
             entry.state, entry.io_status, entry.completion_detail};
+        released_result_order_.push_back(released_key);
+        // Evict oldest-first back down to the bound. max_terminal_results == 0
+        // therefore retains nothing, which is the caller asking for the
+        // smallest possible footprint rather than a special case here.
+        while (released_result_order_.size() >
+               static_cast<std::size_t>(config_.max_terminal_results)) {
+            released_results_.erase(released_result_order_.front());
+            released_result_order_.pop_front();
+        }
         entry.released = true;
         entry.active = false;
         if (terminal_result_count_ > 0) {
@@ -1319,6 +1330,7 @@ private:
         initialized_data_paths_.clear();
         progress_gates_.clear();
         released_results_.clear();
+        released_result_order_.clear();
         state_.store(RuntimeState::STOPPED);
         (void)lock;
         return Status::Ok();
@@ -2544,9 +2556,20 @@ private:
     std::uint64_t target_gen_counter_ = 0;
     std::uint64_t io_gen_counter_ = 0;
     std::uint64_t terminal_result_count_ = 0;
-    // Retain structured terminal results after release_io(). Entries are
-    // keyed by the immutable handle identity and cleared at shutdown.
+    // Retain structured terminal results after release_io(). Entries are keyed
+    // by the immutable handle identity.
+    //
+    // BOUNDED, by the same config_.max_terminal_results the pre-release path
+    // honours, with insertion-ordered eviction (released_result_order_ mirrors
+    // insertion order; std::unordered_map does not).
+    //
+    // Unbounded was wrong for the case this runtime actually serves: a serving
+    // process releases per layer per wave, so one entry per released I/O
+    // accumulates for the whole process lifetime without ever being read back.
+    // Bounding reuses the existing knob rather than adding another, and keeps
+    // the post-release query window consistent with the pre-release one.
     std::unordered_map<std::uint64_t, IoResult> released_results_;
+    std::deque<std::uint64_t> released_result_order_;
 };
 
 // =========================================================================
@@ -2574,6 +2597,15 @@ struct StorageRuntimeTestAccess {
                                              std::move(detail));
     }
 
+    // How many terminal results are retained past release_io().
+    //
+    // The defect being guarded was unbounded growth, and "bounded" can only be
+    // asserted by reading the size -- measuring process RSS would be flaky at
+    // the scale a unit test can drive. The count is the invariant; the memory
+    // follows from it, one small struct per entry.
+    static std::size_t released_result_count(const StorageRuntime& rt) {
+        return rt.released_results_.size();
+    }
 };
 
 } // namespace testing

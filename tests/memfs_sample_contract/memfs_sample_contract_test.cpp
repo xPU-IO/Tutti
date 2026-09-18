@@ -516,6 +516,88 @@ static int test_borrowed_assembly_leaves_components_alone() {
     return 0;
 }
 
+// =====================================================================
+// Test 8: released-result retention is bounded
+//
+// The defect: released_results_ took one entry per released I/O and held it for
+// the runtime's whole lifetime. A serving process releases per layer per wave,
+// so a long-running one accumulates entries indefinitely, and nothing ever
+// reads them back -- retained diagnostics turning into a slow leak. The Python
+// binding had the same shape in terminal_results_, plus it survived shutdown.
+//
+// Asserted by COUNT, not by RSS: at the scale a unit test can drive, RSS deltas
+// are noise, whereas the count is the invariant that actually broke. The memory
+// follows from it one small struct at a time.
+// =====================================================================
+static int test_released_results_are_bounded() {
+    using namespace tutti::binding::memfs;
+    using namespace tutti::resolver::memfs;
+
+    MemfsResolver resolver;
+    MemfsDataPath data_path;
+    tutti::RuntimeComponents components;
+    components.resolvers.push_back({"memfs", &resolver});
+    components.data_paths.push_back({"memfs", &data_path, {}});
+
+    // A deliberately small window so the bound is crossed cheaply.
+    tutti::RuntimeConfig config;
+    config.max_terminal_results = 8;
+
+    auto rt_result = tutti::StorageRuntime::create(config, std::move(components));
+    CHECK_STATUS(rt_result);
+    auto rt = std::move(rt_result).value();
+
+    auto open_result = rt->open("memfs://4096", {"memfs"});
+    CHECK_STATUS(open_result);
+    auto target = open_result.value();
+
+    std::vector<std::uint8_t> write_buf(4096, 0x5A);
+    auto mem = rt->register_memory(
+        make_host_view(write_buf.data(), write_buf.size()));
+    CHECK_STATUS(mem);
+
+    auto retained = [&rt] {
+        return tutti::testing::StorageRuntimeTestAccess::released_result_count(*rt);
+    };
+
+    // 8x the bound, so an unbounded implementation would sit at 64 and a
+    // bounded one at 8 -- the two are not close.
+    constexpr int kIterations = 64;
+    int released = 0;
+    for (int i = 0; i < kIterations; ++i) {
+        tutti::IoRequest req{tutti::IoDirection::WRITE, mem.value(), 0, target,
+                             0, 4096};
+        auto submit = rt->submit(&req, 1, host_ctx());
+        if (!submit.status.ok() || !submit.io.has_value()) break;
+        auto wait = rt->wait(submit.io.value(), 5000);
+        if (!wait.observation_status.ok()) break;
+        if (!rt->release_io(submit.io.value()).ok()) break;
+        ++released;
+    }
+    CHECK(released == kIterations);
+
+    // Not merely "under the bound": after crossing it 8x over, it sits exactly
+    // AT the bound, which is what distinguishes eviction from an early exit.
+    CHECK(static_cast<int>(retained()) == config.max_terminal_results);
+
+    // Still functional: the runtime keeps serving after eviction has been
+    // running for a while.
+    {
+        tutti::IoRequest req{tutti::IoDirection::WRITE, mem.value(), 0, target,
+                             0, 4096};
+        auto submit = rt->submit(&req, 1, host_ctx());
+        CHECK(submit.status.ok());
+        CHECK(submit.io.has_value());
+        auto wait = rt->wait(submit.io.value(), 5000);
+        CHECK(wait.observation_status.ok());
+        CHECK(wait.result.has_value());
+        CHECK(wait.result->state == tutti::IoState::COMPLETED);
+        CHECK(rt->release_io(submit.io.value()).ok());
+    }
+    CHECK(static_cast<int>(retained()) == config.max_terminal_results);
+    return 0;
+}
+
 int main() {
     std::printf("=== memfs sample contract tests ===\n");
 
@@ -528,6 +610,7 @@ int main() {
              test_owning_assembly_destroys_components);
     run_test("borrowed_assembly_leaves_components_alone",
              test_borrowed_assembly_leaves_components_alone);
+    run_test("released_results_are_bounded", test_released_results_are_bounded);
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

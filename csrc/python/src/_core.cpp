@@ -20,6 +20,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <deque>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -301,6 +302,21 @@ public:
         return out;
     }
 
+    // Retain a terminal result for post-release queries, bounded.
+    //
+    // Tickets are unique per submit, so an entry is never re-inserted; the
+    // order deque therefore matches the map's insertion order and evicting its
+    // front is evicting the oldest entry. (std::unordered_map has no order of
+    // its own, which is why the deque exists at all.)
+    void retain_terminal_(std::uint64_t ticket, WaitResult result) {
+        terminal_results_[ticket] = std::move(result);
+        terminal_order_.push_back(ticket);
+        while (terminal_order_.size() > kRetainedTerminalResults) {
+            terminal_results_.erase(terminal_order_.front());
+            terminal_order_.pop_front();
+        }
+    }
+
     // ---- io lifecycle ----
     void release_io(std::uint64_t ticket) {
         const IoHandle handle = lookup_io_(ticket);
@@ -313,7 +329,7 @@ public:
         }
         if (observed.observation == "OK" &&
             (observed.state == "COMPLETED" || observed.state == "FAILED")) {
-            terminal_results_[ticket] = std::move(observed);
+            retain_terminal_(ticket, std::move(observed));
         }
         ios_.erase(ticket);
     }
@@ -367,7 +383,7 @@ public:
             result.first_failed_entry = detail.first_failed_entry;
         }
         result.message = outcome.result->status.message();
-        terminal_results_[ticket] = result;
+        retain_terminal_(ticket, result);
         return result;
     }
 
@@ -388,6 +404,10 @@ public:
         targets_.clear();
         memories_.clear();
         ios_.clear();
+        // Was missing: the retained terminal results outlived shutdown, holding
+        // WaitResult objects that describe a runtime which no longer exists.
+        terminal_results_.clear();
+        terminal_order_.clear();
     }
 
     // ---- testing-only hook (stub mode) ----
@@ -530,7 +550,15 @@ private:
     std::unordered_map<std::uint64_t, TargetHandle> targets_;
     std::unordered_map<std::uint64_t, MemoryHandle> memories_;
     std::unordered_map<std::uint64_t, IoHandle> ios_;
+    // How many released/observed terminal results the binding remembers so a
+    // post-release query still answers. Mirrors RuntimeConfig's default
+    // max_terminal_results: this is a diagnostics window, not a ledger, and it
+    // was previously unbounded, so every released I/O in a long-serving process
+    // added an entry that was never read back.
+    static constexpr std::size_t kRetainedTerminalResults = 64;
     std::unordered_map<std::uint64_t, WaitResult> terminal_results_;
+    // Insertion order for terminal_results_, so eviction is oldest-first.
+    std::deque<std::uint64_t> terminal_order_;
 };
 
 // ---------------------------------------------------------------------------
