@@ -90,6 +90,42 @@ struct RuntimeComponents {
     ResourceProvider* resources = nullptr;
 };
 
+// Owning counterpart to RuntimeComponents, for callers that build components
+// on the runtime's behalf and have nobody else to hold them.
+//
+// Two arrangements are legitimate and a single entry point cannot express both:
+//
+//   * Someone else owns the components (TuttiRuntime keeps them in its own
+//     registries and passes raw pointers). RuntimeComponents says exactly that,
+//     and must keep saying it -- making create() own them would double-free
+//     against those registries.
+//
+//   * Nobody else owns them (the preset factories construct them inline). There
+//     was no way to express this, so the components were raw `new`ed and never
+//     deleted: leaked on success, and leaked again when initialization failed.
+//
+// Hence a separate assembly type rather than a changed contract.
+struct OwnedResolver {
+    std::string scheme;
+    std::unique_ptr<StorageTargetResolver> resolver;
+};
+
+struct OwnedDataPath {
+    std::string key;
+    std::unique_ptr<DataPath> data_path;
+    DataPathConfig config;
+};
+
+struct OwnedComponents {
+    std::vector<OwnedResolver> resolvers;
+    std::vector<OwnedDataPath> data_paths;
+    std::unique_ptr<ResourceProvider> resources;
+
+    bool empty() const {
+        return resolvers.empty() && data_paths.empty() && resources == nullptr;
+    }
+};
+
 struct CudaLikeProfileInfo {
     std::string profile_name;
     int device_count = 0;
@@ -241,6 +277,44 @@ public:
                 std::move(status));
         }
         return Result<std::unique_ptr<StorageRuntime>>(std::move(runtime));
+    }
+
+    // Creates a runtime that TAKES OWNERSHIP of the components passed in, for
+    // callers that construct them inline and have nobody else to hold them.
+    //
+    // Added alongside create() rather than folded into it, because ownership
+    // cannot be guessed: TuttiRuntime keeps its components in its own
+    // registries and passes raw pointers, so a create() that assumed ownership
+    // would double-free against them.
+    //
+    // Destruction order is ensured by construction: the components live in
+    // owned_, which is declared ahead of the raw-pointer views, so the views
+    // are destroyed first and the components last -- and only after the
+    // destructor body's shutdown() has run.
+    static Result<std::unique_ptr<StorageRuntime>> create_owning(
+        RuntimeConfig config, OwnedComponents owned) {
+        // Borrowed view over what we are about to own.
+        RuntimeComponents borrowed;
+        borrowed.resolvers.reserve(owned.resolvers.size());
+        for (const OwnedResolver& entry : owned.resolvers) {
+            borrowed.resolvers.push_back(
+                ResolverBinding{entry.scheme, entry.resolver.get()});
+        }
+        borrowed.data_paths.reserve(owned.data_paths.size());
+        for (const OwnedDataPath& entry : owned.data_paths) {
+            borrowed.data_paths.push_back(
+                DataPathBinding{entry.key, entry.data_path.get(), entry.config});
+        }
+        borrowed.resources = owned.resources.get();
+
+        auto created = create(std::move(config), std::move(borrowed));
+        if (!created.ok()) {
+            // `owned` dies with this frame, which is the point: the preset path
+            // used to leak every component when initialization failed.
+            return created;
+        }
+        created.value()->owned_ = std::move(owned);
+        return created;
     }
 
     // If the runtime was not explicitly shut down (state != STOPPED),
@@ -2448,6 +2522,16 @@ private:
     std::mutex datapath_open_mutex_;
     ResourceProvider default_resources_;
     ResourceProvider* resources_ = &default_resources_;
+
+    // Components this runtime owns, populated only by create_owning().
+    //
+    // Declared AHEAD of the raw-pointer views below on purpose: members are
+    // destroyed in reverse declaration order, so the views go first and this
+    // last -- and only after the destructor body has run shutdown(). Reversing
+    // these two lines would destroy the components while the views still
+    // pointed at them.
+    OwnedComponents owned_;
+
     std::unordered_map<std::string, StorageTargetResolver*> resolvers_;
     std::unordered_map<std::string, DataPath*> data_paths_;
     std::vector<DataPath*> initialized_data_paths_;

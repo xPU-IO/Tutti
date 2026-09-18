@@ -117,13 +117,19 @@ RuntimeWithTelemetry make_local_nvme_runtime(const LocalNvmePreset& p) {
         p.device.block_size,
         BackingDeviceConfig{p.device.backing_device, 0});
 
-    RuntimeComponents comps;
-    comps.resolvers.push_back({"file", resolver});
-    comps.data_paths.push_back({"local-nvme-ext4", dp, DataPathConfig{"local_nvme"}});
+    // Constructed here and owned by nobody else, so hand them to the runtime.
+    // Previously these were raw `new`ed and never deleted: leaked on success,
+    // and leaked again whenever initialize_components_() failed.
+    OwnedComponents owned;
+    owned.resolvers.push_back(OwnedResolver{
+        "file", std::unique_ptr<StorageTargetResolver>(resolver)});
+    owned.data_paths.push_back(OwnedDataPath{
+        "local-nvme-ext4", std::unique_ptr<DataPath>(dp),
+        DataPathConfig{"local_nvme"}});
 
     RuntimeConfig runtime_config;
     runtime_config.accel_id = p.gpu_id;
-    auto created = StorageRuntime::create(runtime_config, std::move(comps));
+    auto created = StorageRuntime::create_owning(runtime_config, std::move(owned));
     if (!created.ok()) {
         RuntimeWithTelemetry result;
         result.creation_status = created.status();
@@ -168,14 +174,20 @@ RuntimeWithTelemetry make_striped_nvme_runtime(const StripedNvmePreset& p) {
     }
     auto* resolver = new StripedResolver(std::move(sub_resolvers), p.stripe_unit);
 
-    RuntimeComponents comps;
-    comps.resolvers.push_back({"striped", resolver});
-    comps.data_paths.push_back({std::string(tutti::binding::striped_local_nvme::kRecommendedDataPathKey),
-                                 dp, DataPathConfig{"striped-nvme"}});
+    // Same reasoning as the single-device factory above: inline construction
+    // with no other owner, so the runtime takes them and frees them after
+    // shutdown(). Note the striped resolver's sub-resolvers are already
+    // unique_ptr-held inside it, so only the top level changes here.
+    OwnedComponents owned;
+    owned.resolvers.push_back(OwnedResolver{
+        "striped", std::unique_ptr<StorageTargetResolver>(resolver)});
+    owned.data_paths.push_back(OwnedDataPath{
+        std::string(tutti::binding::striped_local_nvme::kRecommendedDataPathKey),
+        std::unique_ptr<DataPath>(dp), DataPathConfig{"striped-nvme"}});
 
     RuntimeConfig runtime_config;
     runtime_config.accel_id = p.gpu_id;
-    auto created = StorageRuntime::create(runtime_config, std::move(comps));
+    auto created = StorageRuntime::create_owning(runtime_config, std::move(owned));
     if (!created.ok()) {
         RuntimeWithTelemetry result;
         result.creation_status = created.status();

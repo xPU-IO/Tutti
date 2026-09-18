@@ -420,6 +420,102 @@ static int test_partial_submit() {
 // Main
 // =====================================================================
 
+// =====================================================================
+// Component ownership
+//
+// Two assembly contracts that must never be conflated:
+//
+//   create_owning  TAKES the components and destroys them after shutdown().
+//                  This is what the preset factories use, and before it
+//                  existed those components were raw `new`ed and never freed.
+//
+//   create         BORROWS the components; destroying them is the caller's
+//                  job. TuttiRuntime relies on this -- it keeps its components
+//                  in its own registries -- so a create() that assumed
+//                  ownership would free memory those registries still own.
+//
+// Both halves are asserted here because the failure mode of getting them
+// backwards is silent memory corruption, and because the obvious
+// "simplification" (fold the two entry points into one) is exactly what breaks
+// it. Counting destructor calls distinguishes all three outcomes: zero means a
+// leak, one means correct, two means a double free.
+// =====================================================================
+
+namespace {
+
+struct TrackingResolver : tutti::resolver::memfs::MemfsResolver {
+    int* destroys;
+    explicit TrackingResolver(int* counter) : destroys(counter) {}
+    ~TrackingResolver() override {
+        if (destroys != nullptr) ++*destroys;
+    }
+};
+
+struct TrackingDataPath : tutti::binding::memfs::MemfsDataPath {
+    int* destroys;
+    explicit TrackingDataPath(int* counter) : destroys(counter) {}
+    ~TrackingDataPath() override {
+        if (destroys != nullptr) ++*destroys;
+    }
+};
+
+} // namespace
+
+static int test_owning_assembly_destroys_components() {
+    int resolver_destroys = 0;
+    int datapath_destroys = 0;
+    {
+        tutti::OwnedComponents owned;
+        owned.resolvers.push_back(tutti::OwnedResolver{
+            "memfs", std::make_unique<TrackingResolver>(&resolver_destroys)});
+        owned.data_paths.push_back(tutti::OwnedDataPath{
+            "memfs", std::make_unique<TrackingDataPath>(&datapath_destroys),
+            tutti::DataPathConfig{}});
+
+        auto created = tutti::StorageRuntime::create_owning(
+            tutti::RuntimeConfig{}, std::move(owned));
+        CHECK(created.ok());
+        // Still alive: the runtime is using them.
+        CHECK(resolver_destroys == 0);
+        CHECK(datapath_destroys == 0);
+    }
+    // Exactly once each: leaked would be 0, double-freed would be 2.
+    CHECK(resolver_destroys == 1);
+    CHECK(datapath_destroys == 1);
+    return 0;
+}
+
+static int test_borrowed_assembly_leaves_components_alone() {
+    int resolver_destroys = 0;
+    int datapath_destroys = 0;
+
+    // Declared in THIS scope, not the inner one, on purpose: the counters must
+    // only move if the runtime deletes them, and a component declared inside
+    // the inner block would increment its own counter on scope exit and make
+    // this assertion meaningless. (That mistake is what made this test fail on
+    // first run.)
+    TrackingResolver resolver(&resolver_destroys);
+    TrackingDataPath data_path(&datapath_destroys);
+
+    {
+        tutti::RuntimeComponents components;
+        components.resolvers.push_back({"memfs", &resolver});
+        components.data_paths.push_back({"memfs", &data_path, {}});
+
+        auto created = tutti::StorageRuntime::create(
+            tutti::RuntimeConfig{}, std::move(components));
+        CHECK(created.ok());
+    }   // runtime destroyed here; the components outlive it
+
+    // The runtime must NOT have deleted what it only borrowed. A future change
+    // that gives create() ownership lands here as 1 instead of 0 -- and in
+    // production it would be a double free against TuttiRuntime's registries,
+    // so this assertion is the cheap stand-in for that.
+    CHECK(resolver_destroys == 0);
+    CHECK(datapath_destroys == 0);
+    return 0;
+}
+
 int main() {
     std::printf("=== memfs sample contract tests ===\n");
 
@@ -428,6 +524,10 @@ int main() {
     run_test("boundary_rejection", test_boundary_rejection);
     run_test("lease_lifecycle", test_lease_lifecycle);
     run_test("partial_submit", test_partial_submit);
+    run_test("owning_assembly_destroys_components",
+             test_owning_assembly_destroys_components);
+    run_test("borrowed_assembly_leaves_components_alone",
+             test_borrowed_assembly_leaves_components_alone);
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
