@@ -1,4 +1,4 @@
-// tutti/presets/compute_kernels.cu
+// csrc/presets/compute_kernels.cu
 //
 // CUDA kernels used by the preset layer's helper functions.
 // Compiled by nvcc; linked into tutti_presets.

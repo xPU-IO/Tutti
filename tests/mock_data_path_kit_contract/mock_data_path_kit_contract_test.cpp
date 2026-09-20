@@ -8,7 +8,7 @@
 
 #include <tutti/spi/data_path.h>
 #include <tutti/spi/storage_target_resolver.h>
-#include <csrc/testing/mock_data_path.h>
+#include "csrc/testing/mock_data_path.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -111,8 +111,8 @@ int main() {
         CHECK(!out.status.ok());
         CHECK(out.op.has_value());
         CHECK(out.initial_states.size() == 4);
-        CHECK(out.initial_states[0].state == RequestState::ACCEPTED);
-        CHECK(out.initial_states[3].state == RequestState::REJECTED);
+        CHECK(out.initial_states[0].state == IoRequestState::ACCEPTED);
+        CHECK(out.initial_states[3].state == IoRequestState::REJECTED);
         CHECK(out.initial_states[0].status.ok());
         CHECK(!out.initial_states[3].status.ok());
     }
@@ -232,7 +232,7 @@ int main() {
         auto out = dp.submit(reqs.data(), reqs.size(), host_ctx());
         CHECK(!out.status.ok());
         CHECK(!out.op.has_value());
-        CHECK(out.initial_states[0].state == RequestState::REJECTED);
+        CHECK(out.initial_states[0].state == IoRequestState::REJECTED);
     }
 
     // 18. Call counters track all SPI methods.

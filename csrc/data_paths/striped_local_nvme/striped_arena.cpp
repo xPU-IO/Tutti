@@ -1,10 +1,8 @@
-// tutti/data_paths/striped_local_nvme/striped_arena.cpp
+// csrc/data_paths/striped_local_nvme/striped_arena.cpp
 
 #include "csrc/data_paths/striped_local_nvme/striped_arena.h"
 
 #include <tutti/cuda_like.h>
-#include <nvm_types.h>
-#include <nvm_dma.h>
 
 #include "csrc/data_paths/local_nvme/io/nvme_submit_primitives.cuh"
 #include "csrc/data_paths/striped_local_nvme/fused_submit_kernel.cuh"
@@ -20,18 +18,14 @@ StripedArena::~StripedArena() {
     shutdown();
 }
 
-bool StripedArena::init(const Config& cfg, const std::vector<nvm_ctrl_t*>& ctrls) {
+bool StripedArena::init(const Config& cfg) {
     if (initialized_) return false;
-    if (cfg.num_slots == 0 || cfg.max_entries_per_slot == 0 || ctrls.empty() ||
+    if (cfg.num_slots == 0 || cfg.max_entries_per_slot == 0 ||
         cfg.dev_table_capacity_per_slot == 0) {
         return false;
     }
-    for (auto* c : ctrls) {
-        if (c == nullptr) return false;
-    }
 
     cfg_ = cfg;
-    ctrls_ = ctrls;
 
     int prev_dev = -1;
     cudaError_t ce = cudaGetDevice(&prev_dev);
@@ -190,7 +184,6 @@ void StripedArena::shutdown(bool skip_prp) {
     cudaSetDevice(prev_dev);
 
     free_list_.clear();
-    ctrls_.clear();
     initialized_ = false;
 }
 

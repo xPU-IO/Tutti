@@ -138,7 +138,7 @@ tutti::config::NvmeResourceConfig valid_config() {
     config.provider.type = "nvme-service";
     config.provider.endpoint = "fake-endpoint";
     config.allocation.selection = NvmeSelection::Explicit;
-    config.allocation.device_ids = {0};
+    config.allocation.nvme_device_ids = {0};
     config.allocation.queues_per_controller = 4;
     return config;
 }

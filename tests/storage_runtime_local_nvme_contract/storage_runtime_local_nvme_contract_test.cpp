@@ -28,10 +28,10 @@
 
 #include "csrc/data_paths/local_nvme/local_nvme_data_path.h"
 #include "csrc/data_paths/local_nvme/io/submit_one.cuh"
-#include <csrc/resolvers/local_file/resolver.h>
+#include "csrc/resolvers/local_file/resolver.h"
 
-#include "../hardware_test_directory.h"
-#include "../nvme_test_cli.h"
+#include "tests/hardware_test_directory.h"
+#include "tests/nvme_test_cli.h"
 
 #include <tutti/cuda_like.h>
 

@@ -1,4 +1,4 @@
-# tutti/device_manager/nvme/nvmeservice/CMakeLists.txt
+# csrc/device_manager/nvme/nvmeservice/CMakeLists.txt
 # NVMeService: Cross-process daemon providing Level-1 queue arbitration
 #
 # Layer 2 component: gRPC server + client library

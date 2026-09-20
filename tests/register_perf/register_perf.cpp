@@ -22,7 +22,7 @@
 #include <tutti/memory_types.h>
 
 #include "csrc/data_paths/local_nvme/local_nvme_data_path.h"
-#include <csrc/resolvers/local_file/resolver.h>
+#include "csrc/resolvers/local_file/resolver.h"
 
 using namespace tutti;
 using tutti::data_paths::local_nvme::LocalNvmeDataPath;

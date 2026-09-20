@@ -1,4 +1,4 @@
-// tutti/data_paths/striped_local_nvme/striped_data_path.cpp
+// csrc/data_paths/striped_local_nvme/striped_data_path.cpp
 //
 // StripedDataPath implementation — single-kernel fused submission across
 // N NVMe devices.
@@ -12,7 +12,7 @@
 #include "csrc/data_paths/local_nvme/metadata/prp_page_cache.h"
 #include "csrc/data_paths/local_nvme/io/nvme_queue_group.h"
 #include "csrc/data_paths/striped_local_nvme/fused_submit_kernel.cuh"
-#include "csrc/bindings/ext4_local_nvme/binding.h"
+#include "csrc/payloads/ext4_local_nvme/payload.h"
 
 #include <nvm_ctrl.h>
 #include <nvm_dma.h>
@@ -91,8 +91,8 @@ void set_completion_failure(IoCompletionDetail& detail,
 
 } // namespace
 
-using namespace tutti::binding::ext4_local_nvme;
-using namespace tutti::binding::striped_local_nvme;
+using namespace tutti::payloads::ext4_local_nvme;
+using namespace tutti::payloads::striped_local_nvme;
 using tutti::data_paths::local_nvme::DeviceTargetHandle;
 using tutti::data_paths::local_nvme::DeviceLbaExtent;
 using tutti::data_paths::local_nvme::EntryCompletionStatus;
@@ -114,7 +114,6 @@ StripedDataPath::StripedDataPath(std::vector<DeviceDescriptor> devices,
                                  std::uint32_t cq_poll_budget,
                                  std::uint32_t max_batch_entries,
                                  std::uint32_t max_in_flight_operations,
-                                 std::uint32_t handle_cache_capacity,
                                  std::uint32_t prp_cache_capacity,
                                  std::uint32_t threads_per_block)
     : device_descs_(std::move(devices)),
@@ -125,7 +124,6 @@ StripedDataPath::StripedDataPath(std::vector<DeviceDescriptor> devices,
       max_in_flight_operations_(max_in_flight_operations == 0
                                  ? 16 : max_in_flight_operations),
       threads_per_block_(threads_per_block),
-      handle_cache_capacity_(handle_cache_capacity),
       prp_cache_capacity_(prp_cache_capacity) {
 
     caps_.name = "striped-local-nvme";
@@ -266,7 +264,7 @@ SubmitOutcome StripedDataPath::submit(const DataPathRequest* requests,
         result.status = guard.status();
         result.initial_states.resize(count);
         for (auto& state : result.initial_states) {
-            state.state = RequestState::REJECTED;
+            state.state = IoRequestState::REJECTED;
             state.status = result.status;
         }
         return result;
@@ -506,9 +504,19 @@ Status StripedDataPath::initialize_impl_(const DataPathConfig& config,
 
     // Arena init: dev_table_capacity_per_slot = N (one submit's device
     // table spans exactly the striped target's N shards).
-    std::vector<nvm_ctrl_t*> ctrls;
-    ctrls.reserve(devices_.size());
-    for (auto& d : devices_) ctrls.push_back(d.ctrl);
+    // 控制器校验原先在 StripedArena::init 内完成；arena 不再持有控制器
+    // 句柄后，这里显式校验（行为不变：空设备/空控制器都 fail-closed）。
+    if (devices_.empty()) {
+        rollback_devices();
+        return Status(StatusCode::NOT_READY, "no devices attached");
+    }
+    for (auto& d : devices_) {
+        if (d.ctrl == nullptr) {
+            rollback_devices();
+            return Status(StatusCode::NOT_READY,
+                          "device controller is null");
+        }
+    }
 
     StripedArena::Config arena_cfg;
     arena_cfg.num_slots = max_in_flight_operations_ * 2;
@@ -524,7 +532,7 @@ Status StripedDataPath::initialize_impl_(const DataPathConfig& config,
         std::max(static_cast<std::uint32_t>(2048),
                  max_batch_entries_ *
                      static_cast<std::uint32_t>(devices_.size()));
-    if (!arena_.init(arena_cfg, ctrls)) {
+    if (!arena_.init(arena_cfg)) {
         rollback_devices();
         return Status(StatusCode::NOT_READY, "StripedArena init failed");
     }
@@ -567,7 +575,7 @@ Status StripedDataPath::shutdown_impl_(std::uint64_t timeout_ns) {
 
     auto has_inflight = [&]() -> bool {
         for (const auto& [tok, op] : ops_) {
-            if (op.state == OpState::IN_FLIGHT) return true;
+            if (op.state == IoState::IN_FLIGHT) return true;
         }
         return false;
     };
@@ -649,7 +657,7 @@ Result<DataPathTarget> StripedDataPath::open_impl_(const ResolvedTarget& target)
             Status(StatusCode::NOT_READY, "not initialized"));
     }
 
-    auto payload_result = tutti::binding::striped_local_nvme::view_payload(target);
+    auto payload_result = tutti::payloads::striped_local_nvme::view_payload(target);
     if (!payload_result.ok()) {
         return Result<DataPathTarget>::Failure(
             Status(payload_result.status().code(),
@@ -689,7 +697,7 @@ Result<DataPathTarget> StripedDataPath::open_impl_(const ResolvedTarget& target)
         }
     }
 
-    std::uint64_t tok = next_target_++;
+    std::uint64_t tok = next_target_token_++;
     tgt.generation = 1;
     // Domain shared by all targets of this DataPath (device-set keyed, see
     // device_domain_key_): memory registration maps the buffer for every
@@ -707,7 +715,7 @@ bool StripedDataPath::build_shard_handle_(
     const ResolvedTarget& shard_target,
     StripedTarget& out) {
 
-    auto ep = tutti::binding::ext4_local_nvme::view_payload(shard_target);
+    auto ep = tutti::payloads::ext4_local_nvme::view_payload(shard_target);
     if (!ep.ok()) return false;
     const Ext4LocalNvmePayload* ext = ep.value();
 
@@ -914,7 +922,7 @@ Result<DataPathMemory> StripedDataPath::register_memory_impl_(
         mem.dmas[i] = dma;
     }
 
-    std::uint64_t tok = next_memory_++;
+    std::uint64_t tok = next_memory_token_++;
     mem.generation = 1;
 
     // Round 16 S5 (V3): pre-build per-device AddressDescriptor[] if
@@ -1124,14 +1132,14 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
     auto reject_all = [&](StatusCode code, const std::string& msg) {
         outcome.status = Status(code, msg);
         for (std::size_t i = 0; i < count; ++i) {
-            outcome.initial_states[i].state = RequestState::REJECTED;
+            outcome.initial_states[i].state = IoRequestState::REJECTED;
             outcome.initial_states[i].status = Status(code, msg);
         }
     };
     StatusCode first_rejected_code = StatusCode::OK;
     std::string first_rejected_msg;
     auto reject_one = [&](std::size_t i, StatusCode code, const std::string& msg) {
-        outcome.initial_states[i].state = RequestState::REJECTED;
+        outcome.initial_states[i].state = IoRequestState::REJECTED;
         outcome.initial_states[i].status = Status(code, msg);
         if (first_rejected_code == StatusCode::OK) {
             first_rejected_code = code;
@@ -1180,7 +1188,7 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
 
     std::uint64_t in_flight_count = 0;
     for (const auto& [tok, op] : ops_) {
-        if (op.state == OpState::IN_FLIGHT) ++in_flight_count;
+        if (op.state == IoState::IN_FLIGHT) ++in_flight_count;
     }
     if (in_flight_count >= max_in_flight_operations_) {
         reject_all(StatusCode::RESOURCE_EXHAUSTED,
@@ -1459,7 +1467,7 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
         }
         if (!req_ok) { has_rejection = true; continue; }
 
-        outcome.initial_states[i].state = RequestState::ACCEPTED;
+        outcome.initial_states[i].state = IoRequestState::ACCEPTED;
         outcome.initial_states[i].status = Status::Ok();
     }
 
@@ -1691,7 +1699,7 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
     // P0-2 fix: record all accepted requests' memory tokens so
     // memory_has_inflight_ops_() can prevent unregister during in-flight ops.
     for (std::size_t i = 0; i < count; ++i) {
-        if (outcome.initial_states[i].state == RequestState::ACCEPTED) {
+        if (outcome.initial_states[i].state == IoRequestState::ACCEPTED) {
             op.memory_tokens.push_back(requests[i].memory.token());
         }
     }
@@ -1704,7 +1712,7 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
         // Same conservative fallback as LocalNvmeDataPath: sync the stream.
         cudaError_t sync_err = cudaStreamSynchronize(ctx.stream);
         if (sync_err != cudaSuccess) cudaGetLastError();
-        op.state = (sync_err == cudaSuccess) ? OpState::COMPLETED : OpState::FAILED;
+        op.state = (sync_err == cudaSuccess) ? IoState::COMPLETED : IoState::FAILED;
         op.status = (sync_err == cudaSuccess)
             ? Status::Ok()
             : Status(StatusCode::DEVICE_ERROR, "stream sync failed after event record failure");
@@ -1716,7 +1724,7 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
                                    IoFailureKind::CUDA_QUERY_ERROR, 0);
         }
     } else {
-        op.state = OpState::IN_FLIGHT;
+        op.state = IoState::IN_FLIGHT;
         op.status = Status::Ok();
     }
     ops_[op_token] = std::move(op);
@@ -1743,7 +1751,7 @@ Result<ProgressResult> StripedDataPath::progress_impl_(ProgressBudget budget) {
     ProgressResult result{};
     if (budget.max_work_units == 0 || budget.timeout_ns == 0) {
         for (const auto& [tok, op] : ops_) {
-            if (op.state == OpState::IN_FLIGHT) { result.more_work_likely = true; break; }
+            if (op.state == IoState::IN_FLIGHT) { result.more_work_likely = true; break; }
         }
         return Result<ProgressResult>::Success(std::move(result));
     }
@@ -1757,7 +1765,7 @@ Result<ProgressResult> StripedDataPath::progress_impl_(ProgressBudget budget) {
             result.more_work_likely = true;
             break;
         }
-        if (op.state != OpState::IN_FLIGHT) continue;
+        if (op.state != IoState::IN_FLIGHT) continue;
         if (work_done >= budget.max_work_units) {
             result.more_work_likely = true;
             break;
@@ -1774,7 +1782,7 @@ Result<ProgressResult> StripedDataPath::progress_impl_(ProgressBudget budget) {
         } else if (ce == cudaErrorNotReady) {
             ++result.operations_advanced;
         } else {
-            op.state = OpState::FAILED;
+            op.state = IoState::FAILED;
             op.status = Status(StatusCode::DEVICE_ERROR,
                                "cudaEventQuery error: " +
                                std::string(cudaGetErrorString(ce)));
@@ -1789,7 +1797,7 @@ Result<ProgressResult> StripedDataPath::progress_impl_(ProgressBudget budget) {
 
     result.work_units_consumed = work_done;
     for (const auto& [tok, op] : ops_) {
-        if (op.state == OpState::IN_FLIGHT) { result.more_work_likely = true; break; }
+        if (op.state == IoState::IN_FLIGHT) { result.more_work_likely = true; break; }
     }
     return Result<ProgressResult>::Success(std::move(result));
 }
@@ -1801,7 +1809,7 @@ Result<ProgressResult> StripedDataPath::progress_impl_(ProgressBudget budget) {
 void StripedDataPath::aggregate_completion_status_(OpEntry& op) {
     op.completion_detail = IoCompletionDetail{};
     if (!op.d_status || op.entry_count == 0) {
-        op.state = OpState::COMPLETED;
+        op.state = IoState::COMPLETED;
         op.status = Status::Ok();
         op.bytes_transferred = op.total_bytes;
         op.completion_detail.confirmed_bytes = op.total_bytes;
@@ -1814,7 +1822,7 @@ void StripedDataPath::aggregate_completion_status_(OpEntry& op) {
                                cudaMemcpyDeviceToHost);
     if (ce != cudaSuccess) {
         cudaGetLastError();
-        op.state = OpState::FAILED;
+        op.state = IoState::FAILED;
         op.status = Status(StatusCode::DEVICE_ERROR,
                           "D2H completion status failed: " +
                           std::string(cudaGetErrorString(ce)));
@@ -1854,7 +1862,7 @@ void StripedDataPath::aggregate_completion_status_(OpEntry& op) {
     }
 
     if (any_failed) {
-        op.state = OpState::FAILED;
+        op.state = IoState::FAILED;
         op.status = Status(StatusCode::DEVICE_ERROR, first_error);
         op.bytes_transferred = confirmed_bytes;
         set_completion_failure(
@@ -1862,7 +1870,7 @@ void StripedDataPath::aggregate_completion_status_(OpEntry& op) {
             completion_failure_kind(first_failure_result), confirmed_bytes,
             op.has_timeout, first_failed_entry, first_raw_cq_status);
     } else {
-        op.state = OpState::COMPLETED;
+        op.state = IoState::COMPLETED;
         op.status = Status::Ok();
         op.bytes_transferred = confirmed_bytes;
         op.completion_detail.confirmed_bytes = confirmed_bytes;
@@ -1892,7 +1900,7 @@ Status StripedDataPath::release_impl_(DataPathOp op) {
     if (!entry) {
         return Status(StatusCode::NOT_FOUND, "release: op not found");
     }
-    if (entry->state == OpState::IN_FLIGHT) {
+    if (entry->state == IoState::IN_FLIGHT) {
         return Status(StatusCode::BUSY, "release: op is still in flight");
     }
     if (entry->arena_slot != UINT32_MAX) {
@@ -1967,13 +1975,13 @@ StripedDataPath::OpEntry* StripedDataPath::find_op_(DataPathOp op) {
 }
 bool StripedDataPath::target_has_inflight_ops_(std::uint64_t token) const {
     for (const auto& [tok, op] : ops_) {
-        if (op.state == OpState::IN_FLIGHT && op.target_token == token) return true;
+        if (op.state == IoState::IN_FLIGHT && op.target_token == token) return true;
     }
     return false;
 }
 bool StripedDataPath::memory_has_inflight_ops_(std::uint64_t token) const {
     for (const auto& [tok, op] : ops_) {
-        if (op.state != OpState::IN_FLIGHT) continue;
+        if (op.state != IoState::IN_FLIGHT) continue;
         for (auto t : op.memory_tokens)
             if (t == token) return true;
     }

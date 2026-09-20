@@ -1,4 +1,4 @@
-// tutti/data_paths/striped_local_nvme/fused_submit_kernel.cu
+// csrc/data_paths/striped_local_nvme/fused_submit_kernel.cu
 //
 // Host launcher for the fused multi-device submit kernel.
 // Compiled by nvcc; links against libnvm + CUDA runtime.

@@ -1,7 +1,7 @@
-# tutti/CMakeLists.txt -- Tutti target graph
+# csrc/CMakeLists.txt -- Tutti target graph
 #
 # The active graph is organized around public API/SPI contracts, accelerator
-# profiles, target resolvers, bindings, and DataPath packages. The older
+# profiles, target resolvers, payloads, and DataPath packages. The older
 # L0-L6 directories remain behind TUTTI_BUILD_HARDWARE_STACK as migration
 # references; they do not define the target architecture.
 #
@@ -216,14 +216,14 @@ target_link_libraries(tutti_spi INTERFACE tutti_api)
 # ---------------------------------------------------------------------------
 # Private package targets (new architecture)
 #
-# These are hardware-free header-only targets that provide the binding
-# payload contract and the file resolver.  They do NOT propagate to
+# These are hardware-free header-only targets that provide the payload
+# contract and the file resolver.  They do NOT propagate to
 # tutti_api / tutti_spi / install public headers.
 # ---------------------------------------------------------------------------
 
-add_subdirectory(bindings/ext4_local_nvme)
+add_subdirectory(payloads/ext4_local_nvme)
 add_subdirectory(resolvers/local_file)
-add_subdirectory(bindings/striped_local_nvme)
+add_subdirectory(payloads/striped_local_nvme)
 add_subdirectory(resolvers/striped_file)
 add_subdirectory(resolvers)
 add_subdirectory(data_paths)
@@ -304,13 +304,13 @@ if(TUTTI_BUILD_HARDWARE_STACK)
             include("${TUTTI_SOURCE_DIR}/cmake/SNVMeModule.cmake")
         endif()
 
-        # LocalNvmeDataPath package — needs libnvm + binding + resolver,
+        # LocalNvmeDataPath package — needs libnvm + payload + resolver,
         # all already defined upstream.
         add_subdirectory(data_paths/local_nvme)
 
         # StripedDataPath package (Round 15 S5): single-kernel fused
         # multi-device submission. Needs tutti_local_nvme_datapath (shared
-        # device primitives) + the striped binding/resolver already defined
+        # device primitives) + the striped payload/resolver already defined
         # above (lines ~170-171).
         add_subdirectory(data_paths/striped_local_nvme)
 
@@ -386,7 +386,7 @@ if(BUILD_TESTING)
     # processed after include(CTest) has enabled testing.
     # Gated by TUTTI_FEATURE_MEMFS_SAMPLE.
     if(TUTTI_FEATURE_MEMFS_SAMPLE)
-        add_subdirectory(bindings/memfs)
+        add_subdirectory(payloads/memfs)
     endif()
 
     # ---- Hardware-free contract tests (all profiles) ----
@@ -465,7 +465,7 @@ if(BUILD_TESTING)
     message(STATUS "Tutti: added tests/data_path_contract and tests/storage_runtime_contract")
 
     # Additional hardware-free contract tests (status, memory_types,
-    # io_types, storage_target_resolver, binding).
+    # io_types, storage_target_resolver, payload).
     add_subdirectory(
         "${TUTTI_REPOSITORY_ROOT}/tests/status_contract"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_status_contract"
@@ -483,10 +483,10 @@ if(BUILD_TESTING)
         "${CMAKE_CURRENT_BINARY_DIR}/tests_storage_target_resolver_contract"
     )
     add_subdirectory(
-        "${TUTTI_REPOSITORY_ROOT}/tests/binding_contract"
-        "${CMAKE_CURRENT_BINARY_DIR}/tests_binding_contract"
+        "${TUTTI_REPOSITORY_ROOT}/tests/payload_contract"
+        "${CMAKE_CURRENT_BINARY_DIR}/tests_payload_contract"
     )
-    message(STATUS "Tutti: added hardware-free contract tests (status, memory_types, io_types, storage_target_resolver, binding)")
+    message(STATUS "Tutti: added hardware-free contract tests (status, memory_types, io_types, storage_target_resolver, payload)")
 
     # UAPI contract test (hardware-free; verifies shared tutti_snvme.h layout,
     # ABI version, capability bits, and static_assert locks).

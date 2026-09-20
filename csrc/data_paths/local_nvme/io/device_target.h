@@ -1,6 +1,6 @@
 #pragma once
 
-// tutti/data_paths/local_nvme/io/device_target.h
+// csrc/data_paths/local_nvme/io/device_target.h
 //
 // GPU-resident NVMe target handle — ported from main's NvmeFileDeviceHandle.
 //

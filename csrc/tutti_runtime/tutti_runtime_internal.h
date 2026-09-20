@@ -8,8 +8,8 @@
 #include <vector>
 
 #include <tutti/config/tutti_runtime_spec.h>
-#include <csrc/data_paths/data_path_factory.h>
-#include <csrc/resolvers/resolver_factory.h>
+#include "csrc/data_paths/data_path_factory.h"
+#include "csrc/resolvers/resolver_factory.h"
 #include <tutti/spi/data_path.h>
 #include <tutti/spi/storage_target_resolver.h>
 #include <tutti/storage_runtime.h>

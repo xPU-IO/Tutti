@@ -11,7 +11,7 @@ int main() {
     NvmeResourceConfig resource;
     resource.provider = {"nvme-service", "endpoint"};
     resource.allocation.selection = NvmeSelection::Striped;
-    resource.allocation.device_ids = {0, 1};
+    resource.allocation.nvme_device_ids = {0, 1};
     resource.allocation.queues_per_controller = 4;
     spec.storage.resources.push_back({"nvme", "nvme", resource});
     spec.storage.resolvers.push_back(

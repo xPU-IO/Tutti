@@ -1,4 +1,4 @@
-# tutti/data_paths/local_nvme/CMakeLists.txt
+# csrc/data_paths/local_nvme/CMakeLists.txt
 #
 # Private DataPath target: LocalNvmeDataPath with CUDA + libnvm.
 # Only built when TUTTI_BUILD_HARDWARE_STACK is ON (requires CUDA + libnvm).
@@ -6,8 +6,8 @@
 # Consumers link tutti_local_nvme_datapath to obtain:
 #   - the compiled DataPath implementation (local_nvme_data_path.cpp + io/*.cu)
 #   - libnvm include path (PUBLIC: the header includes <nvm_ctrl.h> etc.)
-#   - tutti_local_file_binding + tutti_local_file_resolver (PUBLIC: header deps)
-#   - tutti_spi (transitively via binding/resolver)
+#   - tutti_local_file_payload + tutti_local_file_resolver (PUBLIC: header deps)
+#   - tutti_spi (transitively via payload/resolver)
 #
 # ${TUTTI_ACCEL_RUNTIME_LIBS} is PRIVATE: only .cpp/.cu sources need it; the header
 # uses void* for CUDA types.
@@ -46,7 +46,7 @@ target_include_directories(tutti_local_nvme_datapath PRIVATE
 
 target_link_libraries(tutti_local_nvme_datapath
     PUBLIC
-        tutti_local_file_binding
+        tutti_local_file_payload
         tutti_local_file_resolver
         libnvm
     PRIVATE

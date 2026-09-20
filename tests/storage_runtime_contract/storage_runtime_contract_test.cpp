@@ -5,7 +5,7 @@
 // Returns 0 on full pass, non-zero on any failure.
 
 #include <tutti/storage_runtime.h>
-#include <csrc/testing/mock_data_path.h>
+#include "csrc/testing/mock_data_path.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -275,6 +275,55 @@ static int test_open_close() {
 
     auto info2 = rt->query_target(target);
     if (info2.ok()) return 1;
+    return 0;
+}
+
+// 7b. close_batch(): 整批尽力关闭——单个无效句柄或在途 target 不会让
+//     后面的条目漏关；返回首个错误。
+static int test_close_batch() {
+    auto rt = std::move(tutti::StorageRuntime::create()).value();
+
+    auto t1 = rt->open("stub://batch-a", tutti::OpenOptions{"stub"});
+    auto t2 = rt->open("stub://batch-b", tutti::OpenOptions{"stub"});
+    auto t3 = rt->open("stub://batch-c", tutti::OpenOptions{"stub"});
+    if (!t1.ok() || !t2.ok() || !t3.ok()) return 1;
+    const tutti::TargetHandle a = t1.value();
+    const tutti::TargetHandle b = t2.value();
+    const tutti::TargetHandle c = t3.value();
+
+    // 空批恒成功。
+    if (!rt->close_batch({}).ok()) return 1;
+
+    // 中间夹一个无效句柄：返回首个错误，但三个有效 target 全部关闭。
+    const tutti::TargetHandle bogus{};
+    auto st = rt->close_batch({a, bogus, b, c});
+    if (st.code() != tutti::StatusCode::NOT_FOUND) return 1;
+    if (rt->query_target(a).ok()) return 1;
+    if (rt->query_target(b).ok()) return 1;
+    if (rt->query_target(c).ok()) return 1;
+
+    // 全有效批：返回 OK。
+    auto t4 = rt->open("stub://batch-d", tutti::OpenOptions{"stub"});
+    auto t5 = rt->open("stub://batch-e", tutti::OpenOptions{"stub"});
+    if (!t4.ok() || !t5.ok()) return 1;
+    if (!rt->close_batch({t4.value(), t5.value()}).ok()) return 1;
+    if (rt->query_target(t4.value()).ok()) return 1;
+    if (rt->query_target(t5.value()).ok()) return 1;
+
+    // 在途 IO 的 target 得 BUSY 且保持打开；同批其余条目照常关闭。
+    char buf[64];
+    auto mem = rt->register_memory(make_host_view(buf, sizeof(buf))).value();
+    auto t6 = rt->open("stub://batch-f", tutti::OpenOptions{"stub"}).value();
+    auto t7 = rt->open("stub://batch-g", tutti::OpenOptions{"stub"}).value();
+    tutti::IoRequest req{tutti::IoDirection::READ, mem, 0, t6, 0, 64};
+    tutti::HostSubmitContext ctx{
+        tutti::ExecutionDomain::HOST_EXECUTION, 0, nullptr};
+    if (!submit_one(*rt, req, ctx).valid()) return 1;
+
+    auto st2 = rt->close_batch({t6, t7});
+    if (st2.code() != tutti::StatusCode::BUSY) return 1;
+    if (!rt->query_target(t6).ok()) return 1;  // 在途，未被关闭
+    if (rt->query_target(t7).ok()) return 1;   // 同批其余照常关闭
     return 0;
 }
 
@@ -1095,7 +1144,7 @@ static int test_component_runtime_partial_commit() {
 static int test_structured_terminal_detail_survives_release() {
     RuntimeFakeResolver resolver;
     RuntimeFakeDataPath data_path;
-    data_path.terminal_state = tutti::OpState::FAILED;
+    data_path.terminal_state = tutti::IoState::FAILED;
     data_path.terminal_status =
         tutti::Status(tutti::StatusCode::DEVICE_ERROR, "injected cq error");
     data_path.terminal_detail.failure_kind = tutti::IoFailureKind::NVME_CQ_ERROR;
@@ -1687,6 +1736,7 @@ int main() {
         test_phase1_datapath_binding_preflight,  // 85
         test_phase1_same_accel_multiple_datapaths,// 86
         test_phase1_device_memory_is_not_faked,  // 87
+        test_close_batch,                        // 88
     };
 
     const int n = static_cast<int>(sizeof(tests) / sizeof(tests[0]));

@@ -1,4 +1,4 @@
-# tutti/data_paths/striped_local_nvme/CMakeLists.txt
+# csrc/data_paths/striped_local_nvme/CMakeLists.txt
 #
 # Private DataPath target: StripedDataPath -- single-kernel fused submission
 # across N NVMe devices. Only built when TUTTI_BUILD_HARDWARE_STACK is ON
@@ -35,7 +35,7 @@ target_include_directories(tutti_striped_local_nvme_datapath PRIVATE
 target_link_libraries(tutti_striped_local_nvme_datapath
     PUBLIC
         tutti_local_nvme_datapath
-        tutti_striped_local_nvme_binding
+        tutti_striped_local_nvme_payload
         tutti_striped_file_resolver
         libnvm
     PRIVATE

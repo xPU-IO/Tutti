@@ -156,7 +156,7 @@ bool validate_config_pair(Options& options) {
         }
         const auto* nvme = std::get_if<tutti::config::NvmeResourceConfig>(
             &specs[index].storage.resources.front().config);
-        if (nvme == nullptr || nvme->allocation.device_ids.empty()) {
+        if (nvme == nullptr || nvme->allocation.nvme_device_ids.empty()) {
             std::fprintf(stderr,
                          "Config %zu must explicitly select NVMe devices\n",
                          index);
@@ -164,10 +164,10 @@ bool validate_config_pair(Options& options) {
         }
         const bool explicit_local =
             nvme->allocation.selection == tutti::config::NvmeSelection::Explicit &&
-            nvme->allocation.device_ids.size() == 1;
+            nvme->allocation.nvme_device_ids.size() == 1;
         const bool striped =
             nvme->allocation.selection == tutti::config::NvmeSelection::Striped &&
-            nvme->allocation.device_ids.size() >= 2;
+            nvme->allocation.nvme_device_ids.size() >= 2;
         if (!explicit_local && !striped) {
             std::fprintf(stderr,
                          "Config %zu must use one explicit device or at least "
@@ -176,15 +176,15 @@ bool validate_config_pair(Options& options) {
             return false;
         }
         if (options.directories[index].size() !=
-            nvme->allocation.device_ids.size()) {
+            nvme->allocation.nvme_device_ids.size()) {
             std::fprintf(stderr,
                          "Config %zu selects %zu devices but received %zu "
                          "directories\n",
-                         index, nvme->allocation.device_ids.size(),
+                         index, nvme->allocation.nvme_device_ids.size(),
                          options.directories[index].size());
             return false;
         }
-        options.device_ids[index] = nvme->allocation.device_ids;
+        options.device_ids[index] = nvme->allocation.nvme_device_ids;
         options.striped[index] = striped;
         if (striped) {
             if (specs[index].storage.backends.size() != 1) {

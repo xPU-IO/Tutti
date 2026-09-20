@@ -49,7 +49,7 @@ Status validate_provider_snapshot(
         return Status::Ok();
     }
 
-    for (std::int32_t device_id : allocation.device_ids) {
+    for (std::int32_t device_id : allocation.nvme_device_ids) {
         const auto resource = std::find_if(
             resources.begin(), resources.end(),
             [&](const NvmeProviderResource& row) {
@@ -159,14 +159,14 @@ Status NvmeResource::validate_allocation_metadata_() const {
 
     if (allocation_.selection == config::NvmeSelection::Striped) {
         if (impl_->allocation.slices.size() !=
-            allocation_.device_ids.size()) {
+            allocation_.nvme_device_ids.size()) {
             return error(StatusCode::INVALID_ARGUMENT,
                          "striped allocation slice count does not match request");
         }
         for (std::size_t index = 0;
              index < impl_->allocation.slices.size(); ++index) {
             if (impl_->allocation.slices[index].device_id !=
-                allocation_.device_ids[index]) {
+                allocation_.nvme_device_ids[index]) {
                 return error(StatusCode::INVALID_ARGUMENT,
                              "striped allocation slice order does not match request");
             }
@@ -175,9 +175,9 @@ Status NvmeResource::validate_allocation_metadata_() const {
         return error(StatusCode::INVALID_ARGUMENT,
                      "single-device selection must return exactly one slice");
     } else if (allocation_.selection == config::NvmeSelection::Explicit) {
-        if (allocation_.device_ids.size() != 1 ||
+        if (allocation_.nvme_device_ids.size() != 1 ||
             impl_->allocation.slices.front().device_id !=
-                allocation_.device_ids.front()) {
+                allocation_.nvme_device_ids.front()) {
             return error(StatusCode::INVALID_ARGUMENT,
                          "explicit allocation device does not match request");
         }
@@ -268,7 +268,7 @@ Status NvmeResource::initialize() {
         auto acquired = impl_->client->acquire_nvme_slices(
             runtime_accel_id_,
             allocation_.selection,
-            allocation_.device_ids,
+            allocation_.nvme_device_ids,
             allocation_.queues_per_controller);
         if (!acquired.ok()) {
             impl_->state = ResourceState::FAILED;

@@ -1,4 +1,4 @@
-# tutti/device_manager/CMakeLists.txt
+# csrc/device_manager/CMakeLists.txt
 #
 # Layer 2 container — shrunk by T-041 (Round 10 Session 2).
 #

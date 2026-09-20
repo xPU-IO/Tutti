@@ -1,4 +1,5 @@
 #include <tutti/config/tutti_runtime_config_parser.h>
+#include "csrc/common/backend_ids.h"
 
 #include <limits>
 #include <string>
@@ -8,6 +9,10 @@
 #include "csrc/config/parser/parser_internal.h"
 
 namespace tutti::config {
+
+// E2：后端标识常量的唯一来源（parser 的分派与校验共用）。
+namespace backend_ids = tutti::detail::backend_ids;
+
 namespace detail {
 
 Status parse_error(std::string message) {
@@ -139,15 +144,15 @@ Status parse_resolver(const YAML::Node& node, std::size_t index,
                                           resolver.scheme);
     if (!status.ok()) return status;
     const YAML::Node config = node["config"];
-    if (resolver.type == "local-file") {
+    if (resolver.type == tutti::detail::backend_ids::kExt4ResolverType) {
         return detail::parse_local_file_resolver(config, path + ".config",
                                                  resolver);
     }
-    if (resolver.type == "striped-file") {
+    if (resolver.type == tutti::detail::backend_ids::kStripedResolverType) {
         return detail::parse_striped_file_resolver(config, path + ".config",
                                                    resolver);
     }
-    if (resolver.type == "memfs") {
+    if (resolver.type == backend_ids::kMemfsResolverType) {
         return detail::parse_memfs_resolver(config, path + ".config", resolver);
     }
     return detail::parse_error(path + ".type is unknown: " + resolver.type);
@@ -166,15 +171,15 @@ Status parse_datapath(const YAML::Node& node, std::size_t index,
     status = detail::read_required_string(node, "type", path, datapath.type);
     if (!status.ok()) return status;
     const YAML::Node config = node["config"];
-    if (datapath.type == "local-nvme") {
+    if (datapath.type == tutti::detail::backend_ids::kExt4DataPathType) {
         return detail::parse_local_nvme_datapath(config, path + ".config",
                                                  datapath);
     }
-    if (datapath.type == "striped-local-nvme") {
+    if (datapath.type == backend_ids::kStripedDataPathType) {
         return detail::parse_striped_local_nvme_datapath(
             config, path + ".config", datapath);
     }
-    if (datapath.type == "memfs") {
+    if (datapath.type == backend_ids::kMemfsDataPathType) {
         return detail::parse_memfs_datapath(config, path + ".config", datapath);
     }
     return detail::parse_error(path + ".type is unknown: " + datapath.type);
@@ -204,23 +209,21 @@ Status parse_backend(const YAML::Node& node, std::size_t index,
                                           backend.resource);
     if (!status.ok()) return status;
     const YAML::Node config = node["config"];
-    if (backend.contract == "ext4-local-nvme") {
+    if (backend.contract == backend_ids::kExt4Contract) {
         return detail::parse_ext4_local_nvme_backend(
             config, path + ".config", backend);
     }
-    if (backend.contract == "striped-local-nvme") {
+    if (backend.contract == backend_ids::kStripedContract) {
         return detail::parse_striped_local_nvme_backend(
             config, path + ".config", backend);
     }
-    if (backend.contract == "memfs") {
+    if (backend.contract == backend_ids::kMemfsContract) {
         return detail::parse_memfs_backend(config, path + ".config", backend);
     }
-    if (config) {
-        status = detail::validate_keys(config, path + ".config", {});
-        if (!status.ok()) return status;
-    }
-    backend.config = Ext4LocalNvmeBackendConfig{};
-    return Status::Ok();
+    // 已知契约之外没有兜底：给未知 contract 塞一个 Ext4 配置会让校验
+    // 阶段看到与配置文本不符的 backend，这里改为 fail-closed（J3）。
+    return detail::parse_error(path + ".contract is unknown: " +
+                               backend.contract);
 }
 
 Status parse_storage(const YAML::Node& node, StorageSpec& storage) {

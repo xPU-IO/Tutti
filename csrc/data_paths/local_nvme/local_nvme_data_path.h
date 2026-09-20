@@ -1,6 +1,6 @@
 #pragma once
 
-// tutti/data_paths/local_nvme/local_nvme_data_path.h
+// csrc/data_paths/local_nvme/local_nvme_data_path.h
 //
 // First DataPath: LocalNvmeDataPath.
 //
@@ -22,7 +22,7 @@
 #include <tutti/io_types.h>
 #include <tutti/spi/data_path.h>
 #include <tutti/spi/storage_target_resolver.h>
-#include <csrc/bindings/ext4_local_nvme/binding.h>
+#include "csrc/payloads/ext4_local_nvme/payload.h"
 
 #include "csrc/data_paths/local_nvme/metadata/metadata_arena.h"
 #include "csrc/data_paths/local_nvme/metadata/handle_workspace_cache.h"
@@ -50,7 +50,7 @@ struct DeviceSubmitEntry;
 struct EntryCompletionStatus;
 
 // -------------------------------------------------------------------------
-// LbaExtent -- block-unit extent (converted from binding's byte-unit Extent)
+// LbaExtent -- block-unit extent (converted from payload's byte-unit Extent)
 //
 // Mirrors the old NvmeFileDeviceHandle's LbaExtent semantics:
 //   start_lba      = device_offset / block_size
@@ -72,7 +72,7 @@ struct LbaExtent {
 // (cudaMalloc + extent H2D + d_qps) is deferred to the IO submission task.
 // -------------------------------------------------------------------------
 struct LocalNvmeTargetState {
-    binding::ext4_local_nvme::NamespaceIdentity ns;
+    payloads::ext4_local_nvme::NamespaceIdentity ns;
     std::uint64_t file_size_bytes = 0;
     std::uint32_t block_size_log  = 0;  // log2(block_size) for fast conversion
     std::vector<LbaExtent> lba_extents;
@@ -357,7 +357,7 @@ private:
 
     DataPathCapabilities caps_{};
     bool initialized_ = false;
-    std::uint64_t next_token_ = 1;
+    std::uint64_t next_target_token_ = 1;
 
     // token -> target state.  Removal from this map on close() fully
     // invalidates the identity: any subsequent lookup by the old
@@ -425,7 +425,7 @@ private:
     enum class CompletionMode { EVENT, STREAM_QUERY };
 
     struct OpEntry {
-        OpState state = OpState::IN_FLIGHT;
+        IoState state = IoState::IN_FLIGHT;
         Status status;
         std::uint64_t bytes_transferred = 0;
         std::uint64_t total_bytes = 0;       // target bytes for completion verification

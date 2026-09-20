@@ -19,7 +19,7 @@ tutti::config::TuttiRuntimeSpec local_spec() {
     NvmeResourceConfig resource;
     resource.provider = {"nvme-service", "endpoint"};
     resource.allocation.selection = NvmeSelection::Explicit;
-    resource.allocation.device_ids = {0};
+    resource.allocation.nvme_device_ids = {0};
     resource.allocation.queues_per_controller = 4;
     spec.storage.resources.push_back({"resource", "nvme", resource});
     spec.storage.resolvers.push_back(
@@ -103,7 +103,7 @@ int main() {
         auto& resource = std::get<NvmeResourceConfig>(
             spec.storage.resources.front().config);
         resource.allocation.selection = NvmeSelection::Striped;
-        resource.allocation.device_ids = {0};
+        resource.allocation.nvme_device_ids = {0};
         spec.storage.resolvers.front() =
             {"resolver", "striped-file", "striped",
              StripedFileResolverConfig{}};

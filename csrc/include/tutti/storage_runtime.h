@@ -181,11 +181,8 @@ struct TargetInfo {
     int inflight_count = 0;
 };
 
-enum class IoState {
-    IN_FLIGHT,
-    COMPLETED,
-    FAILED,
-};
+// IoState 定义在 SPI 头（<tutti/spi/data_path.h>）：DataPath 与 Runtime
+// 共用同一套状态枚举，避免两份逐值同构的双名定义。
 
 struct IoSnapshot {
     IoState state = IoState::IN_FLIGHT;
@@ -222,15 +219,8 @@ struct WaitOutcome {
 //   4. Accepted requests are observable via the returned IoHandle.
 //   5. count == 0 => io == nullopt, status OK, initial_states empty.
 // -------------------------------------------------------------------------
-enum class IoRequestState {
-    ACCEPTED,  // issued or will be issued; observable via the IoHandle
-    REJECTED,  // validation failed before any irreversible issue
-};
-
-struct IoRequestInitialState {
-    IoRequestState state = IoRequestState::REJECTED;
-    Status status;  // OK for ACCEPTED; error code+message for REJECTED
-};
+// IoRequestState / IoRequestInitialState 同样来自 SPI 头（与 DataPath 的
+// SubmitOutcome 共用同一套请求初态）。
 
 struct IoSubmitOutcome {
     Status status;
@@ -900,28 +890,25 @@ public:
 
     Status close(const TargetHandle& handle) {
         std::lock_guard<std::mutex> lock(registry_mutex_);
-        if (!validate_target_(handle)) {
-            return Status(StatusCode::NOT_FOUND, "invalid target handle");
-        }
-        TargetEntry& entry = target_entries_[handle.slot_];
-        if (entry.inflight_count > 0) {
-            return Status(StatusCode::BUSY,
-                          "target has inflight operations");
-        }
-        if (entry.data_path != nullptr) {
-            Status status = call_data_path_status_(
-                *entry.data_path,
-                [&] { return entry.data_path->close(entry.data_path_target); });
-            if (!status.ok()) {
-                return status;
+        return close_locked_(handle);
+    }
+
+    // 批量关闭：逐条走 close() 的同一路径，但**不在首个失败处提前返回**——
+    // 否则列表里一个坏句柄或 BUSY 的 target 会让后面全部泄漏。返回首个
+    // 失败的 Status；全部成功（含空批）返回 OK。
+    //
+    // 逐条语义与 close() 完全一致：无效句柄返回 NOT_FOUND、有在途 IO 返回
+    // BUSY，且两种情况都不改动该 entry。
+    Status close_batch(const std::vector<TargetHandle>& handles) {
+        std::lock_guard<std::mutex> lock(registry_mutex_);
+        Status first_error = Status::Ok();
+        for (const TargetHandle& handle : handles) {
+            Status status = close_locked_(handle);
+            if (!status.ok() && first_error.ok()) {
+                first_error = std::move(status);
             }
-            entry.resolved_target.reset();
-            entry.data_path = nullptr;
-            entry.data_path_target = DataPathTarget{};
-            entry.registration_domain = RegistrationDomainKey{};
         }
-        entry.active = false;
-        return Status::Ok();
+        return first_error;
     }
 
     Result<TargetInfo> query_target(const TargetHandle& handle) const {
@@ -2035,15 +2022,15 @@ private:
             bool group_has_accepted = false;
             for (std::size_t local = 0; local < group.indices.size(); ++local) {
                 const std::size_t index = group.indices[local];
-                const RequestInitialState& state = submitted.initial_states[local];
-                if (state.state == RequestState::ACCEPTED && has_op) {
+                const IoRequestInitialState& state = submitted.initial_states[local];
+                if (state.state == IoRequestState::ACCEPTED && has_op) {
                     outcome.initial_states[index].state = IoRequestState::ACCEPTED;
                     outcome.initial_states[index].status = Status::Ok();
                     any_accepted = true;
                     group_has_accepted = true;
                     // Credit already granted; keep it.
                 } else {
-                    reject_one(index, state.state == RequestState::REJECTED
+                    reject_one(index, state.state == IoRequestState::REJECTED
                                       ? state.status
                                       : Status(StatusCode::INTERNAL,
                                                "DataPath accepted request without operation"));
@@ -2227,18 +2214,18 @@ private:
                 }
                 continue;
             }
-            if (snapshot.value().state == OpState::IN_FLIGHT) {
+            if (snapshot.value().state == IoState::IN_FLIGHT) {
                 all_terminal = false;
                 continue;
             }
 
             const std::uint64_t sub_confirmed =
-                (snapshot.value().state == OpState::COMPLETED &&
+                (snapshot.value().state == IoState::COMPLETED &&
                  snapshot.value().detail.confirmed_bytes == 0)
                     ? snapshot.value().bytes_transferred
                     : snapshot.value().detail.confirmed_bytes;
             confirmed_bytes += sub_confirmed;
-            if (snapshot.value().state == OpState::FAILED) {
+            if (snapshot.value().state == IoState::FAILED) {
                 failed = true;
                 IoCompletionDetail detail = snapshot.value().detail;
                 if (detail.failure_scope == IoFailureScope::REQUEST_INDICES) {
@@ -2438,6 +2425,33 @@ private:
         // io_gen_counter_ is monotonic within a Runtime, so generation alone
         // is an immutable, collision-free key until uint64 wraparound.
         return h.generation_;
+    }
+
+    // close() 与 close_batch() 共用的单条关闭实现；调用方须持有
+    // registry_mutex_。
+    Status close_locked_(const TargetHandle& handle) {
+        if (!validate_target_(handle)) {
+            return Status(StatusCode::NOT_FOUND, "invalid target handle");
+        }
+        TargetEntry& entry = target_entries_[handle.slot_];
+        if (entry.inflight_count > 0) {
+            return Status(StatusCode::BUSY,
+                          "target has inflight operations");
+        }
+        if (entry.data_path != nullptr) {
+            Status status = call_data_path_status_(
+                *entry.data_path,
+                [&] { return entry.data_path->close(entry.data_path_target); });
+            if (!status.ok()) {
+                return status;
+            }
+            entry.resolved_target.reset();
+            entry.data_path = nullptr;
+            entry.data_path_target = DataPathTarget{};
+            entry.registration_domain = RegistrationDomainKey{};
+        }
+        entry.active = false;
+        return Status::Ok();
     }
 
     bool validate_target_(const TargetHandle& h) const {

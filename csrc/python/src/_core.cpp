@@ -190,14 +190,19 @@ public:
         for (std::uint64_t ticket : tickets) {
             handles.push_back(lookup_target_(ticket, "target"));
         }
-        for (std::size_t i = 0; i < tickets.size(); ++i) {
-            tutti::Status status = rt_->close(handles[i]);
-            if (!status.ok()) {
-                throw_status("close_batch failed at ticket[" +
-                             std::to_string(i) + "]", status);
-            }
-            targets_.erase(tickets[i]);
+        // 转发生效的 C++ 批量关闭：逐条尽力关闭后返回首个错误，单个坏句柄
+        // 或在途 IO 不会让整批停下（见 StorageRuntime::close_batch）。
+        const tutti::Status status = rt_->close_batch(handles);
+        if (status.ok()) {
+            for (std::uint64_t ticket : tickets) targets_.erase(ticket);
+            return;
         }
+        // 部分失败：逐个探测句柄是否已失效，失效的才从票据表移除；仍有效的
+        // 保留下来供调用方重试（重复关闭得 NOT_FOUND，仍有在途 IO 得 BUSY）。
+        for (std::size_t i = 0; i < tickets.size(); ++i) {
+            if (!rt_->query_target(handles[i]).ok()) targets_.erase(tickets[i]);
+        }
+        throw_status("close_batch failed", status);
     }
 
     // ---- memory ----
@@ -717,6 +722,8 @@ tutti::presets::NvmeDeviceConfig parse_device(const py::dict& d) {
 }
 
 tutti::presets::LocalNvmePreset parse_local_preset(const py::dict& d) {
+    // 配置键保留历史名 "gpu_id"（既有部署脚本/YAML 使用），映射到 C++
+    // 侧统一后的 accel_id 字段（命名统一 N2；键名兼容不变）。
     check_unknown_keys(
         d,
         {"device", "gpu_id", "num_queues", "max_batch_entries",
@@ -725,7 +732,7 @@ tutti::presets::LocalNvmePreset parse_local_preset(const py::dict& d) {
         "local nvme preset");
     tutti::presets::LocalNvmePreset p;  // C++ 默认：预算字段的单一来源
     p.device = parse_device(get_dict_field(d, "device"));
-    opt_int_field(d, "gpu_id", p.gpu_id);
+    opt_int_field(d, "gpu_id", p.accel_id);
     opt_int_field(d, "num_queues", p.num_queues);
     opt_int_field(d, "max_batch_entries", p.max_batch_entries);
     opt_int_field(d, "max_in_flight_operations", p.max_in_flight_operations);
@@ -758,7 +765,7 @@ tutti::presets::StripedNvmePreset parse_striped_preset(const py::dict& d) {
                 devices.attr("__getitem__")(i),
                 "devices[" + std::to_string(i) + "]")));
     }
-    opt_int_field(d, "gpu_id", p.gpu_id);
+    opt_int_field(d, "gpu_id", p.accel_id);
     opt_int_field(d, "num_queues", p.num_queues);
     opt_int_field(d, "stripe_unit", p.stripe_unit);
     opt_int_field(d, "max_batch_entries", p.max_batch_entries);
@@ -781,7 +788,7 @@ PyRuntime make_local_nvme_runtime(const py::dict& preset) {
     }
     return PyRuntime(std::move(assembled.runtime), /*stub=*/false,
                      p.max_batch_entries, p.max_in_flight_operations,
-                     p.gpu_id, /*max_concurrent_streams=*/2);
+                     p.accel_id, /*max_concurrent_streams=*/2);
 }
 
 PyRuntime make_striped_nvme_runtime(const py::dict& preset) {
@@ -793,7 +800,7 @@ PyRuntime make_striped_nvme_runtime(const py::dict& preset) {
     }
     return PyRuntime(std::move(assembled.runtime), /*stub=*/false,
                      p.max_batch_entries, p.max_in_flight_operations,
-                     p.gpu_id, /*max_concurrent_streams=*/2);
+                     p.accel_id, /*max_concurrent_streams=*/2);
 }
 
 PyRuntime make_stub_runtime(std::int32_t accel_id) {

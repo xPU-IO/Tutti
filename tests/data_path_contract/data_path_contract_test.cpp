@@ -12,7 +12,7 @@
 #include <tutti/memory_types.h>
 #include <tutti/spi/storage_target_resolver.h>
 #include <tutti/spi/data_path.h>
-#include <csrc/testing/mock_data_path.h>
+#include "csrc/testing/mock_data_path.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -155,17 +155,17 @@ int main() {
         CHECK(out.op.has_value());                     // op still present
         CHECK(out.op->valid());
         CHECK(out.initial_states.size() == 4);         // one per request, in order
-        CHECK(out.initial_states[0].state == tutti::RequestState::ACCEPTED);
-        CHECK(out.initial_states[1].state == tutti::RequestState::ACCEPTED);
-        CHECK(out.initial_states[2].state == tutti::RequestState::ACCEPTED);
-        CHECK(out.initial_states[3].state == tutti::RequestState::REJECTED);
+        CHECK(out.initial_states[0].state == tutti::IoRequestState::ACCEPTED);
+        CHECK(out.initial_states[1].state == tutti::IoRequestState::ACCEPTED);
+        CHECK(out.initial_states[2].state == tutti::IoRequestState::ACCEPTED);
+        CHECK(out.initial_states[3].state == tutti::IoRequestState::REJECTED);
         CHECK(out.initial_states[0].status.ok());
         CHECK(!out.initial_states[3].status.ok());
 
         // the first 3 (issued) remain queryable via the op.
         auto q = dp.query(*out.op);
         CHECK(q.ok());
-        CHECK(q.value().state == tutti::OpState::IN_FLIGHT);
+        CHECK(q.value().state == tutti::IoState::IN_FLIGHT);
     }
 
     // ------------------------------------------------------------------
@@ -188,8 +188,8 @@ int main() {
         CHECK(!out.status.ok());
         CHECK(!out.op.has_value());            // zero issued
         CHECK(out.initial_states.size() == 2);
-        CHECK(out.initial_states[0].state == tutti::RequestState::REJECTED);
-        CHECK(out.initial_states[1].state == tutti::RequestState::REJECTED);
+        CHECK(out.initial_states[0].state == tutti::IoRequestState::REJECTED);
+        CHECK(out.initial_states[1].state == tutti::IoRequestState::REJECTED);
     }
 
     // ------------------------------------------------------------------
@@ -203,8 +203,8 @@ int main() {
         auto q1 = dp.query(*out.op);
         auto q2 = dp.query(*out.op);
         CHECK(q1.ok() && q2.ok());             // still queryable after first query
-        CHECK(q1.value().state == tutti::OpState::IN_FLIGHT);
-        CHECK(q2.value().state == tutti::OpState::IN_FLIGHT);
+        CHECK(q1.value().state == tutti::IoState::IN_FLIGHT);
+        CHECK(q2.value().state == tutti::IoState::IN_FLIGHT);
         CHECK(dp.total_op_count() == 1);       // not erased
         // release before terminal must fail (op still alive).
         CHECK(dp.release(*out.op).code() == tutti::StatusCode::BUSY);
@@ -227,7 +227,7 @@ int main() {
         CHECK(p.value().operations_terminal == 1);
         auto q = dp.query(*out.op);
         CHECK(q.ok());
-        CHECK(q.value().state == tutti::OpState::COMPLETED);
+        CHECK(q.value().state == tutti::IoState::COMPLETED);
         // terminal -> release OK
         CHECK(dp.release(*out.op).ok());
         CHECK(dp.total_op_count() == 0);

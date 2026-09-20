@@ -1,6 +1,6 @@
 #pragma once
 
-// tutti/data_paths/striped_local_nvme/striped_arena.h
+// csrc/data_paths/striped_local_nvme/striped_arena.h
 //
 // Per-DataPath, bounded StripedArena for StripedDataPath.
 //
@@ -22,8 +22,6 @@
 #include <deque>
 #include <mutex>
 #include <vector>
-
-#include <nvm_types.h>
 
 namespace tutti::data_paths::local_nvme {
 struct DeviceTargetHandle;
@@ -92,11 +90,10 @@ public:
     StripedArena(const StripedArena&) = delete;
     StripedArena& operator=(const StripedArena&) = delete;
 
-    // Pre-allocate GPU metadata memory and events. `ctrls` remains for source
-    // compatibility; no PRP DMA mapping is created. Must be called after all N
-    // controllers are attached.  Returns false on any CUDA/DMA failure
-    // (rolls back partial allocations).
-    bool init(const Config& cfg, const std::vector<nvm_ctrl_t*>& ctrls);
+    // Pre-allocate GPU metadata memory and events. No PRP DMA mapping is
+    // created. Returns false on any CUDA/DMA failure (rolls back partial
+    // allocations).
+    bool init(const Config& cfg);
 
     // Free all resources. Idempotent. Caller must ensure no in-flight GPU
     // work touches arena memory (sync all streams first).
@@ -116,7 +113,6 @@ public:
 
 private:
     Config cfg_{};
-    std::vector<nvm_ctrl_t*> ctrls_;  // borrowed, one per device
     bool initialized_ = false;
 
     std::vector<void*> events_;  // cudaEvent_t stored as void*
