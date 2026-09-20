@@ -171,6 +171,79 @@ def expand_placeholders(value, vllm_config=None, *, rank: str | None = None):
     return value
 
 
+def apply_capacity_bytes(options: dict, *, segment_bytes: int,
+                         num_layers: int) -> dict:
+    """把 ``capacity_bytes``（物理总容量，方案 A）换算成 ``num_chunks``。
+
+    语义：``capacity_bytes`` 是**数据盘上的物理总量**（用户视角的总占用），
+    换算成槽位数后交给对象层——底层仍只按槽位数创建文件（Python 层负责
+    换算，与 ``apply_device_groups`` 之前调用：当时 ``preset.device_groups``
+    仍完整，可算出总盘数）。
+
+    换算依据条带几何：一个 slot 的 payload 按组内盘数分摊到每盘，再向上
+    对齐到 ``stripe_unit``（与 C++ ``StripedPlacement::shard_file_bytes``
+    同式），于是
+
+        每盘字节 = num_chunks × 每盘每 slot 字节
+        物理总量 = 每盘字节 × 总盘数
+
+    对 HY3 的实例：payload 10 MiB ÷ 2 盘 = 5 MiB/盘/槽，4 盘共 4 TiB 时
+    num_chunks = 4 TiB ÷ (5 MiB × 4) = 209716。
+    """
+    if "capacity_bytes" not in options:
+        return options
+    capacity_bytes = options.pop("capacity_bytes")
+    if (not isinstance(capacity_bytes, int) or isinstance(capacity_bytes, bool)
+            or capacity_bytes <= 0):
+        raise ValueError(
+            f"store options.capacity_bytes 须为正整数，got {capacity_bytes!r}"
+        )
+    if "num_chunks" in options:
+        raise ValueError(
+            "store options 的 capacity_bytes 与 num_chunks 互斥："
+            "前者是物理总量（自动换算），后者是槽位数"
+        )
+    if segment_bytes <= 0 or num_layers <= 0:
+        raise ValueError(
+            f"capacity_bytes 换算需要正的正几何，got segment_bytes="
+            f"{segment_bytes}, num_layers={num_layers}"
+        )
+
+    preset = options.get("preset")
+    preset = preset if isinstance(preset, dict) else {}
+    groups = preset.get("device_groups")
+    if isinstance(groups, (list, tuple)) and groups:
+        group_disks = len(groups[0])
+        total_disks = sum(len(group) for group in groups)
+    else:
+        devices = preset.get("devices")
+        group_disks = len(devices) if isinstance(devices, (list, tuple)) else 0
+        total_disks = group_disks
+    if group_disks <= 0 or total_disks <= 0:
+        raise ValueError(
+            "capacity_bytes 换算需要数据盘信息（preset.device_groups 或 "
+            "preset.devices）"
+        )
+
+    stripe_unit = int(
+        options.get("stripe_unit") or preset.get("stripe_unit") or 65536
+    )
+    # 条带布局（组内多盘）才需要按 unit 对齐：一个 slot 的 payload 先按
+    # 组内盘数分摊，再向上对齐到条带粒度；单盘部署每盘就是整块 payload。
+    per_disk = segment_bytes * num_layers
+    if group_disks > 1:
+        per_disk = cdiv(cdiv(per_disk, group_disks), stripe_unit) * stripe_unit
+
+    num_chunks = capacity_bytes // (per_disk * total_disks)
+    if num_chunks < 1:
+        raise ValueError(
+            f"capacity_bytes({capacity_bytes}) 小于单槽位物理占用"
+            f"({per_disk * total_disks} 字节 × 槽位)"
+        )
+    options["num_chunks"] = int(num_chunks)
+    return options
+
+
 def apply_device_groups(options: dict, *, rank: str, tp_size: int) -> dict:
     """按 rank 把 preset.device_groups 展开为 preset.devices。
 

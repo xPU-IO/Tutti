@@ -9,6 +9,7 @@ import pytest
 
 from tutti.integration.vllm.connector import (
     TuttiConnectorV1,
+    _apply_capacity_bytes,
     _apply_device_groups,
     _deployment_rank,
     _expand_placeholders,
@@ -339,3 +340,84 @@ class TestDeviceGroups:
         options = {"preset": {"device_groups": []}}
         with pytest.raises(ValueError, match="非空"):
             _apply_device_groups(options, rank="0", tp_size=8)
+
+
+class TestCapacityBytesToChunks:
+    """``capacity_bytes``（数据盘物理总量）→ ``num_chunks`` 的换算。
+
+    方案 A 语义：用户按"这些盘一共占多少"给值；Python 层按条带几何换算成
+    槽位数，底层仍只按槽位数建文件（不感知容量单位）。
+    """
+
+    # HY3 几何：80 层 × 128 KiB = 10 MiB/槽；device_groups=[[0,1],[2,3]]
+    # 表示组内 2 盘、共 4 盘 → 每槽每盘 5 MiB。
+    SEGMENT_BYTES = 131072
+    NUM_LAYERS = 80
+    TI_BYTES = 1024 ** 4
+
+    @staticmethod
+    def _base_options():
+        return {
+            "stripe_unit": 65536,
+            "preset": {
+                "type": "striped",
+                "gpu_id": "{LOCAL_RANK}",
+                "device_groups": [[0, 1], [2, 3]],
+                "stripe_unit": 65536,
+            },
+        }
+
+    def _convert(self, options):
+        return _apply_capacity_bytes(
+            options, segment_bytes=self.SEGMENT_BYTES,
+            num_layers=self.NUM_LAYERS,
+        )
+
+    def test_four_tib_fills_four_disks(self):
+        """4 TiB → 每盘约 1 TiB（209715 槽 × 5 MiB，误差 < 一个槽位）。"""
+        options = self._base_options()
+        options["capacity_bytes"] = 4 * self.TI_BYTES
+        got = self._convert(options)
+        assert got["num_chunks"] == 209715
+        per_disk = got["num_chunks"] * 5 * 1024 * 1024
+        assert per_disk <= self.TI_BYTES
+        assert self.TI_BYTES - per_disk < 5 * 1024 * 1024
+
+    def test_absent_key_leaves_options_untouched(self):
+        got = self._convert(self._base_options())
+        assert "num_chunks" not in got
+        assert "capacity_bytes" not in got
+
+    def test_mutually_exclusive_with_num_chunks(self):
+        options = self._base_options()
+        options["capacity_bytes"] = self.TI_BYTES
+        options["num_chunks"] = 8
+        with pytest.raises(ValueError, match="互斥"):
+            self._convert(options)
+
+    def test_rejects_non_positive(self):
+        options = self._base_options()
+        options["capacity_bytes"] = 0
+        with pytest.raises(ValueError, match="正整数"):
+            self._convert(options)
+
+    def test_rejects_capacity_smaller_than_one_slot(self):
+        options = self._base_options()
+        options["capacity_bytes"] = 1024
+        with pytest.raises(ValueError, match="小于单槽位"):
+            self._convert(options)
+
+    def test_rejects_without_disk_shape(self):
+        with pytest.raises(ValueError, match="数据盘"):
+            self._convert({"capacity_bytes": self.TI_BYTES})
+
+    def test_single_disk_uses_whole_payload_per_slot(self):
+        """单盘部署不做条带分摊：每盘每槽就是整块 payload（10 MiB）。"""
+        options = {
+            "capacity_bytes": self.TI_BYTES,
+            "preset": {"devices": [{"device_id": 0}]},
+        }
+        got = self._convert(options)
+        assert got["num_chunks"] == (
+            self.TI_BYTES // (self.SEGMENT_BYTES * self.NUM_LAYERS)
+        )

@@ -13,6 +13,7 @@ from typing import Any
 from tutti.integration.vllm.geometry import (
     _ENGINE_KEYS,
     _ENGINE_OPTIONAL_KEYS,
+    apply_capacity_bytes,
     apply_device_groups,
     deployment_rank,
     expand_placeholders,
@@ -85,6 +86,14 @@ def worker_engine_for(vllm_config, extra: dict):
             dict(store_spec.get("options") or {}), vllm_config,
             rank=worker_rank,
         )
+        segment_bytes = extra["chunk_kv_bytes"] // extra["num_layers"]
+        # capacity_bytes（数据盘物理总量）→ num_chunks：必须在
+        # apply_device_groups 之前换算——那时 preset.device_groups 仍完整，
+        # 才算得出总盘数（它决定同样的槽位数铺满多少物理盘）。
+        options = apply_capacity_bytes(
+            options, segment_bytes=segment_bytes,
+            num_layers=int(extra["num_layers"]),
+        )
         if store_spec["type"] == "tutti_nvme":
             tp_size = int(getattr(
                 getattr(vllm_config, "parallel_config", None),
@@ -95,7 +104,6 @@ def worker_engine_for(vllm_config, extra: dict):
             )
             options.setdefault("rank_id", int(worker_rank))
             options.setdefault("tp_size", tp_size)
-        segment_bytes = extra["chunk_kv_bytes"] // extra["num_layers"]
         configured_segment = options.get("segment_bytes")
         if configured_segment is not None and configured_segment != segment_bytes:
             raise ValueError(
@@ -145,6 +153,12 @@ def scheduler_index_for(vllm_config, extra: dict):
 
         store_spec = extra.get("store") or {"type": "memory", "options": {}}
         raw_options = dict(store_spec.get("options") or {})
+        segment_bytes = extra["chunk_kv_bytes"] // extra["num_layers"]
+        # 与 worker 侧同序：换算必须在 apply_device_groups 之前（见上）。
+        raw_options = apply_capacity_bytes(
+            raw_options, segment_bytes=segment_bytes,
+            num_layers=int(extra["num_layers"]),
+        )
         tp_size = int(getattr(
             getattr(vllm_config, "parallel_config", None),
             "tensor_parallel_size", 1,
@@ -180,7 +194,6 @@ def scheduler_index_for(vllm_config, extra: dict):
             options = expand_placeholders(
                 raw_options, vllm_config, rank=deployment_rank(vllm_config)
             )
-        segment_bytes = extra["chunk_kv_bytes"] // extra["num_layers"]
         configured_segment = options.get("segment_bytes")
         if configured_segment is not None and configured_segment != segment_bytes:
             raise ValueError(

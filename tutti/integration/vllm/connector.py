@@ -22,6 +22,7 @@ from vllm.logger import init_logger
 
 from tutti.integration.vllm.factory import scheduler_index_for, worker_engine_for
 from tutti.integration.vllm.geometry import (
+    apply_capacity_bytes,
     apply_device_groups,
     cdiv,
     deployment_rank,
@@ -45,6 +46,7 @@ _resolve_geometry = resolve_geometry
 _deployment_rank = deployment_rank
 _expand_placeholders = expand_placeholders
 _apply_device_groups = apply_device_groups
+_apply_capacity_bytes = apply_capacity_bytes
 _worker_engine_for = worker_engine_for
 _scheduler_index_for = scheduler_index_for
 

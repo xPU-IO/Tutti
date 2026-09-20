@@ -42,21 +42,24 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-$((MAX_PROMPT_TOKENS + 16))}"
 #   * < 测试集总 blocks（SAMPLES × 每请求 blocks），否则不会发生淘汰。
 NUM_GPU_BLOCKS_OVERRIDE="${NUM_GPU_BLOCKS_OVERRIDE:-768}"
 
-# 工作集 = 每轮全部请求的 chunk 集合（流量是同一组 prompt 反复发，
-# chunk key 不变，故这是上界）。
+# 数据盘物理总量（方案 A）：直接写"这些盘一共占多少"，由 Python 层按条带
+# 几何换算成槽位数（geometry.apply_capacity_bytes）。默认 4 TiB → 四盘各
+# 约 1 TiB。用了它就不要同时给 num_chunks（两者互斥）。
+CAPACITY_BYTES="${CAPACITY_BYTES:-$(( 4 * 1024 * 1024 * 1024 * 1024 ))}"
+# 物化预热槽位数：默认全量（4 TiB 对应的槽数），启动一次付清；否则长跑
+# 期间每个新槽位会在写路径上按需物化（~44ms 实零写，见 space_allocator）。
+HIGH_WATERMARK="${HIGH_WATERMARK:-209715}"
+# 工作集（仅用于日志展示）
 CHUNKS_PER_REQ=$(( (MAX_PROMPT_TOKENS + CHUNK_TOKENS - 1) / CHUNK_TOKENS ))
 WORKING_SET=$(( SAMPLES * CHUNKS_PER_REQ ))
-NUM_CHUNKS="${NUM_CHUNKS:-$(( WORKING_SET + WORKING_SET / 4 + 64 ))}"
-INITIAL_SLOTS="${INITIAL_SLOTS:-$(( CHUNKS_PER_REQ + 8 ))}"
-HIGH_WATERMARK="${HIGH_WATERMARK:-$(( WORKING_SET + 64 ))}"
-LOW_WATERMARK="${LOW_WATERMARK:-$(( CHUNKS_PER_REQ / 2 + 1 ))}"
 
 echo "[serve] model=$MODEL tp=$TP_SIZE port=$PORT max_model_len=$MAX_MODEL_LEN"
 echo "[serve] HBM KV 上限: ${NUM_GPU_BLOCKS_OVERRIDE} blocks" \
      "(${NUM_GPU_BLOCKS_OVERRIDE} × 64 = $(( NUM_GPU_BLOCKS_OVERRIDE * 64 )) tokens)"
 echo "[serve] chunks_per_req=$CHUNKS_PER_REQ working_set=$WORKING_SET"
-echo "[serve] pool: num_chunks=$NUM_CHUNKS initial_slots=$INITIAL_SLOTS" \
-     "high_watermark=$HIGH_WATERMARK low_watermark=$LOW_WATERMARK"
+echo "[serve] pool: capacity_bytes=$CAPACITY_BYTES" \
+     "($(( CAPACITY_BYTES / 1024 / 1024 / 1024 / 1024 )) TiB 总量)" \
+     "prewarm_slots=$HIGH_WATERMARK"
 echo "[serve] pool_tag=$POOL_TAG (换 tag = 全新冷池，脚本不删旧池)"
 
 # shellcheck source=/dev/null
@@ -95,10 +98,8 @@ read -r -d '' KV_CONFIG <<JSON || true
       "type": "tutti_nvme",
       "options": {
         "root": "/mnt/nvme0/tutti-kv-online-${POOL_TAG}-{LOCAL_RANK}",
-        "num_chunks": $NUM_CHUNKS,
-        "initial_slots": $INITIAL_SLOTS,
+        "capacity_bytes": $CAPACITY_BYTES,
         "high_watermark": $HIGH_WATERMARK,
-        "low_watermark": $LOW_WATERMARK,
         "io_stream": "auto",
         "layout": "striped",
         "stripe_unit": 65536,
