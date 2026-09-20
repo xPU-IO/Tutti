@@ -114,9 +114,9 @@ Runtime、运行中的 accelerator 迁移，以及 daemon 侧 I/O 调度都不�
 
 ## 5. daemon 配置模型
 
-生产入口使用 `nvmeservice::parse_config_file()` 读取 daemon YAML。canonical 配置可参考
-`config/local/daemon_2disk.yaml`、`config/local/daemon_4disk.yaml` 和
-`config/local_nvme_config.yaml`。
+生产入口使用 `nvmeservice::parse_config_file()` 读取 daemon YAML。唯一 canonical
+模板是 `config/local_nvme_config.yaml`；部署步骤见
+[`../tutti_daemon.md`](../tutti_daemon.md)。
 
 ```yaml
 grpc:

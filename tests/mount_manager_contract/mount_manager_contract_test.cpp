@@ -273,11 +273,22 @@ static void test_mount_lifecycle() {
     CHECK(mrc == 0, "mount tmpfs");
     if (mrc != 0) { ::rmdir(mnt_dir); return; }
 
-    // Now use mount_one() with the SAME path — it should detect
-    // "already mounted" and NOT take ownership.
-    auto mr = mgr.mount_one("none", mnt_dir);
-    CHECK(mr.already_mounted, "mount_one detects already-mounted");
-    CHECK(!mr.mounted_by_daemon, "mount_one does NOT take ownership of pre-existing");
+    // mount_one() must REFUSE this path, not adopt it.
+    //
+    // The path holds a tmpfs while we were asked to mount ext4, so it is the
+    // exact shape of the bug this asserts against: adopting any pre-existing
+    // mount means the daemon then publishes accelerator views on a filesystem
+    // that is not the target device.
+    //
+    // /dev/null is passed as the device so stat() succeeds and the *filesystem
+    // type* is what rejects the mount; with a nonexistent path the check would
+    // stop earlier, at "cannot verify", and prove less.
+    auto mr = mgr.mount_one("/dev/null", mnt_dir);
+    CHECK(!mr.already_mounted, "mount_one does NOT adopt a wrong-fstype mount");
+    CHECK(!mr.mounted_by_daemon, "mount_one takes no ownership of it");
+    CHECK(!mr.error.empty(), "mount_one reports why it refused");
+    CHECK(mr.error.find("tmpfs") != std::string::npos,
+          "refusal names the actual filesystem type");
 
     // unmount_all() should do nothing (no owned mounts).
     int remaining = mgr.unmount_all();
@@ -340,6 +351,103 @@ static void test_scan_holders_cwd() {
     ::waitpid(pid, nullptr, 0);
 }
 
+// =====================================================================
+// Test 10: existing_mount_acceptable — the adoption decision, in isolation.
+//
+// Pure, hence no privileges needed: the point is that a tmpfs or a foreign
+// block device must never be adopted, and proving that should not require
+// CAP_SYS_ADMIN to actually mount one. Test 7 covers the integrated path when
+// the environment permits it.
+// =====================================================================
+static void test_existing_mount_decision() {
+    std::fprintf(stderr, "=== Test 10: existing-mount decision ===\n");
+
+    const auto make = [](const char* fs_type, const char* source,
+                         unsigned long major, unsigned long minor) {
+        nvmeservice::MountEntry e;
+        e.mount_point = "/mnt/nvme0";
+        e.fs_type = fs_type;
+        e.source = source;
+        e.major = major;
+        e.minor = minor;
+        return e;
+    };
+
+    // The intended mount: ext4 from the very device we asked for.
+    std::string reason;
+    CHECK(nvmeservice::existing_mount_acceptable(
+              make("ext4", "/dev/snvme0n1", 259, 1), "ext4", 259, 1, &reason),
+          "matching ext4 mount is accepted");
+
+    // Wrong filesystem type — tmpfs, overlay, a leftover xfs, whatever.
+    reason.clear();
+    CHECK(!nvmeservice::existing_mount_acceptable(
+              make("tmpfs", "tmpfs", 0, 55), "ext4", 259, 1, &reason),
+          "tmpfs is refused");
+    CHECK(reason.find("tmpfs") != std::string::npos,
+          "refusal names the filesystem type it found");
+
+    // Right filesystem, WRONG device: this is the case a path-only check cannot
+    // see, and the reason the comparison uses major:minor rather than the
+    // source string. A stale mount from a previous disk layout looks perfectly
+    // healthy by path.
+    reason.clear();
+    CHECK(!nvmeservice::existing_mount_acceptable(
+              make("ext4", "/dev/snvme1n1", 259, 2), "ext4", 259, 1, &reason),
+          "ext4 from a different device is refused");
+    CHECK(reason.find("259:2") != std::string::npos,
+          "refusal names the device it found");
+
+    // Same device numbers but a different source path spelling: accepted, since
+    // device identity is what the kernel mounted. Guards against "fixing" the
+    // check back to string comparison.
+    CHECK(nvmeservice::existing_mount_acceptable(
+              make("ext4", "/dev/disk/by-id/whatever", 259, 1), "ext4", 259, 1,
+              nullptr),
+          "device identity decides, not the source string");
+
+    // reason is optional.
+    CHECK(!nvmeservice::existing_mount_acceptable(
+              make("tmpfs", "tmpfs", 0, 1), "ext4", 259, 1, nullptr),
+          "refusal works without a reason out-param");
+}
+
+// =====================================================================
+// Test 11: lookup_mount parses real /proc/self/mountinfo
+//
+// Exercises the tokenising parser against real kernel output rather than
+// fixtures: /proc is always mounted, and procfs is a case where the fs_type
+// follows the variable-length optional-fields section, which is what the old
+// fixed-offset scan could not have handled.
+// =====================================================================
+static void test_lookup_mount_real_mountinfo() {
+    std::fprintf(stderr, "=== Test 11: lookup_mount on real mountinfo ===\n");
+
+    nvmeservice::MountEntry entry;
+    CHECK(nvmeservice::MountManager::lookup_mount("/proc", &entry),
+          "lookup_mount finds /proc");
+    CHECK(entry.mount_point == "/proc", "mount_point parsed correctly");
+    CHECK(entry.fs_type == "proc", "fs_type parsed correctly");
+    CHECK(entry.source == "proc", "source parsed correctly");
+
+    // Device numbers are present (0:3 for proc in a typical namespace) and must
+    // not both be unset, which is what a failed parse would leave behind.
+    CHECK(entry.major != 0 || entry.minor != 0,
+          "device numbers were parsed, not left at zero");
+
+    // Agrees with is_mounted, since the latter is built on it now.
+    CHECK(nvmeservice::MountManager::is_mounted("/proc"),
+          "is_mounted agrees with lookup_mount");
+
+    // A path that exists but is not a mount point.
+    CHECK(!nvmeservice::MountManager::lookup_mount("/proc/self", &entry),
+          "/proc/self is inside a mount, not a mount point");
+
+    // null out-param is allowed (is_mounted relies on it).
+    CHECK(nvmeservice::MountManager::lookup_mount("/proc", nullptr),
+          "lookup_mount works without an out-param");
+}
+
 int main() {
     test_config_parsing();
     test_config_defaults();
@@ -350,6 +458,8 @@ int main() {
     test_mount_lifecycle();
     test_force_exit();
     test_scan_holders_cwd();
+    test_existing_mount_decision();
+    test_lookup_mount_real_mountinfo();
 
     std::fprintf(stderr, "\n=== Summary: %d passed, %d failed ===\n",
                  g_pass, g_fail);

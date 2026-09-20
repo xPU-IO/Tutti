@@ -8,12 +8,12 @@
 #include <utility>
 #include <vector>
 
-#include <tutti/data_paths/data_path_factory.h>
-#include <tutti/resolvers/resolver_factory.h>
+#include <csrc/data_paths/data_path_factory.h>
+#include <csrc/resolvers/resolver_factory.h>
 #include <tutti/storage_runtime.h>
 
-#include "tutti/testing/mock_data_path.h"
-#include "tutti/tutti_runtime/tutti_runtime_internal.h"
+#include "csrc/testing/mock_data_path.h"
+#include "csrc/tutti_runtime/tutti_runtime_internal.h"
 
 namespace {
 
@@ -413,12 +413,66 @@ void check_real_factories_assemble_memfs() {
 
 } // namespace
 
+// drain 超时后必须**保留完整对象图**，并允许在 I/O 完成后重试。
+//
+// 这是本测试最重要的断言。修复前 shutdown() 固定调 StorageRuntime::shutdown(0)
+// 且无论结果都继续销毁 DataPath / Resource / NVMe lease：StorageRuntime 内部
+// "宁可泄漏 memory 也不 UAF"的保护被上层抵消，GPU/NVMe 仍在执行时可能 UAF。
+void check_shutdown_timeout_keeps_ownership_graph() {
+    auto state = std::make_shared<State>();
+    // 共享标志模拟"在途 I/O 尚未终态"；用 shared_ptr 而非引用捕获，避免
+    // 被 std::function 持有后悬垂。
+    auto inflight = std::make_shared<bool>(true);
+
+    auto options = injected_options(state);
+    options.runtime_shutdown_hook = [inflight](tutti::StorageRuntime&) {
+        if (*inflight) {
+            return tutti::Status(tutti::StatusCode::TIMEOUT,
+                                 "inflight operations remain");
+        }
+        return tutti::Status::Ok();
+    };
+
+    auto result = tutti::testing::TuttiRuntimeTestAccess::create(
+        memfs_spec(), std::move(options));
+    CHECK(result.ok());
+    if (!result.ok()) return;
+    auto runtime = std::move(result).value();
+
+    const tutti::Status first = runtime->shutdown();
+    CHECK(first.code() == tutti::StatusCode::TIMEOUT);
+
+    // 组件全部存活——它们正是在途 DMA 的目标。
+    CHECK(runtime->state() == tutti::TuttiRuntimeState::SHUTTING_DOWN);
+    CHECK(runtime->storage_runtime() != nullptr);
+    CHECK(runtime->resource_infos().size() == 1);
+    CHECK(tutti::testing::TuttiRuntimeTestAccess::resolver_count(*runtime) == 1);
+    CHECK(tutti::testing::TuttiRuntimeTestAccess::data_path_count(*runtime) == 1);
+    CHECK(tutti::testing::TuttiRuntimeTestAccess::resolver(
+              *runtime, "memfs-resolver") == state->resolver);
+    CHECK(tutti::testing::TuttiRuntimeTestAccess::data_path(
+              *runtime, "memfs-datapath") == state->data_path);
+    // 且确实什么都没销毁。
+    CHECK(state->resolver_destroy_calls == 0);
+    CHECK(state->data_path_destroy_calls == 0);
+    CHECK(state->resource_shutdown_calls == 0);
+
+    // 在途 I/O 完成后重试：无需重建 runtime 即可关干净。
+    *inflight = false;
+    CHECK(runtime->shutdown().ok());
+    CHECK(runtime->state() == tutti::TuttiRuntimeState::STOPPED);
+    CHECK(state->resolver_destroy_calls == 1);
+    CHECK(state->data_path_destroy_calls == 1);
+    CHECK(state->resource_shutdown_calls == 1);
+}
+
 int main() {
     check_invalid_spec_stops_before_factories();
     check_resolver_failure_rolls_back_resource();
     check_null_datapath_rolls_back_resolver_and_resource();
     check_runtime_factory_throw_rolls_back_registries();
     check_successful_assembly();
+    check_shutdown_timeout_keeps_ownership_graph();
 #if defined(TUTTI_USE_HOST)
     check_real_factories_assemble_memfs();
 #endif

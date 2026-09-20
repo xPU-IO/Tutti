@@ -28,8 +28,8 @@
 #include <tutti/io_types.h>
 #include <tutti/memory_types.h>
 
-#include "tutti/data_paths/local_nvme/local_nvme_data_path.h"
-#include <tutti/resolvers/local_file/resolver.h>
+#include "csrc/data_paths/local_nvme/local_nvme_data_path.h"
+#include <csrc/resolvers/local_file/resolver.h>
 
 #include "../hardware_test_directory.h"
 

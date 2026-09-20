@@ -68,7 +68,7 @@ Resolver factory        DataPath factory
 | 数据层次 | 典型内容 | 产生者 | 生命周期 |
 | --- | --- | --- | --- |
 | 期望配置 | accelerator、resource selection、请求队列数、组件 ID、类型、引用关系、调优参数 | YAML/parser，或调用方直接构造 spec | 创建期 value object |
-| 运行期事实 | allocation ID、PCI BDF、字符/块设备路径、namespace、BAR0、MDTS、实际 granted queues | daemon，经 NVMe Resource 获取和验证 | Resource lease 生命周期 |
+| 运行期事实 | allocation ID、PCI BDF、字符/块设备路径、namespace、MDTS、实际 granted queues | daemon，经 NVMe Resource 获取和验证 | Resource lease 生命周期 |
 | 装配结果 | Resolver/DataPath 实例、路由 scheme、DataPath key、`DataPathConfig` | 两个 factory 和 `TuttiRuntime` | `TuttiRuntime`/`StorageRuntime` 生命周期 |
 
 静态 spec 不保存 daemon grant，daemon grant 也不回写 spec。二者只在 Resource 和组件
@@ -335,7 +335,7 @@ StorageRuntime。
 - 每个 controller 请求的 queue 数；
 - `runtime.accel_id`，由顶层 Runtime 配置提供。
 
-PCI BDF、设备节点路径、mount/view 路径、namespace、block size、BAR0 size、MDTS 和实际
+PCI BDF、设备节点路径、mount/view 路径、namespace、block size、MDTS 和实际
 grant queue 数都不属于 YAML。
 
 ### 7.3 NVMe Resource 初始化与 daemon grant
@@ -364,11 +364,11 @@ device_id, accel_id, allowed_accel_ids,
 pci_bdf, chrdev_path, block_path,
 backing_mount_path, view_path,
 namespace_id, logical_block_size,
-bar0_size, max_data_size, granted_queues
+max_data_size, granted_queues
 ```
 
 Resource 会校验 allocation ID、slice 数量/顺序、accelerator 和 ACL、所有必要路径、
-namespace、block size、BAR0、MDTS、queue grant，以及多 slice block size 一致性。
+namespace、block size、MDTS、queue grant，以及多 slice block size 一致性。
 如果 grant 已取得但后续验证失败，Resource 立即 release allocation。
 
 daemon client 将 allocation handle 保存在 client 内部；`release(allocation_id)` 通过销毁
@@ -381,10 +381,10 @@ daemon client 将 allocation handle 保存在 client 内部；`release(allocatio
 | View | 提供字段 | 消费者 |
 | --- | --- | --- |
 | `NvmeResolverResourceView` | device ID、PCI BDF、block path、mount/view path、namespace、logical block size | Resolver factory |
-| `NvmeDataPathResourceView` | device ID、PCI BDF、accel ID、character device path、namespace、logical block size、BAR0、MDTS、granted queues | DataPath factory |
+| `NvmeDataPathResourceView` | device ID、PCI BDF、accel ID、character device path、namespace、logical block size、MDTS、granted queues | DataPath factory |
 
 这两个 view 只能在 Resource 为 `INITIALIZED` 时取得，并以 value snapshot 的形式返回。
-Resolver 无法通过其 view 取得 BAR0 或字符设备，DataPath 也不依赖文件系统 mount
+Resolver 无法通过其 view 取得字符设备，DataPath 也不依赖文件系统 mount
 信息。该隔离是 Resource 模块的主要边界，而不仅是类型转换便利。
 
 ## 8. Resolver factory 边界
@@ -478,7 +478,7 @@ Result<CreatedDataPath> create_data_path(
 local-nvme 组合要求一个 slice。构造 DataPath 时，factory 合并：
 
 - spec tuning：cache capacity、threads per block、in-flight/batch 上限等；
-- daemon grant：character device path、BAR0 size、accel ID、granted queues、namespace、
+- daemon grant：character device path、accel ID、granted queues、namespace、
   logical block size、MDTS、PCI BDF。
 
 striped-local-nvme 组合要求至少两个 slice。Factory 为每个 slice 构造 device descriptor，
@@ -669,7 +669,7 @@ runtime.accel_id = 0
        |   -> LocalFileResolver(data_path_key =
        |                        "example-local-nvme-datapath")
        |
-       | datapath view: chrdev, BAR0, accel, queues, NSID, block size, MDTS, BDF
+       | datapath view: chrdev, accel, queues, NSID, block size, MDTS, BDF
        |   + DataPathSpec tuning
        |   -> LocalNvmeDataPath + DataPathConfig{"local_nvme"}
        v

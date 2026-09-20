@@ -186,3 +186,97 @@ User: rt.open("memfs://4096", {"memfs"})
 - [ ] No core files modified (`git diff` shows only new files + one line)
 - [ ] Contract tests pass
 - [ ] Existing tests still pass (no regression)
+
+## SNVMe driver smoke tests
+
+本节只说明 SNVMe 驱动 smoke test。标准构建、模块产物和 daemon 启动见
+[`getting-started.md`](getting-started.md)。驱动代码修改后的重编译、reload 与 baseline
+诊断见 [`advanced-build.md`](advanced-build.md)。
+
+> 文中的 PCI BDF、磁盘和挂载路径均为示例。运行 bind 或写盘测试前，必须确认目标是
+> 可清空的测试 NVMe。
+
+### 1. 前置条件
+
+先按 [`getting-started.md`](getting-started.md) 完成默认构建并加载驱动，然后检查：
+
+```bash
+lsmod | grep snvme
+ls -l /dev/snvm_control
+```
+
+### 2. 编译 smoke test
+
+```bash
+make -C tutti/device_manager/nvme/kernel_modules/test
+make -C tutti/device_manager/nvme/kernel_modules/test gpu
+```
+
+测试二进制：
+
+| 二进制 | bind | 写盘 | 用途 |
+| --- | --- | --- | --- |
+| `snvme_smoke` | 否 | 否 | UAPI、host memory map 与 BAR0 mmap |
+| `snvme_smoke_qgroup` | 否 | 否 | queue-group 生命周期 |
+| `snvme_smoke_gpu` | 否/是 | 否 | GPU P2P memory map 路径 |
+| `snvme_smoke_addq` | 是 | 否 | B3 `NVM_ADD_USER_QUEUE` |
+| `snvme_smoke_io` | 是 | 是 | CPU 端到端读写和逐字节校验 |
+| `snvme_ubind` | — | 否 | owner-side unbind/reset helper |
+
+按顺序运行：先安全测试，再运行 bind 测试，最后才运行写盘测试。
+
+### 3. 选择测试设备
+
+```bash
+sudo bash scripts/pci_topology_check.sh
+export TGT=0000:e3:00.0  # 替换为可清空的测试 NVMe PCI BDF
+```
+
+> `snvme_smoke_io` 会写入磁盘。确认目标盘不含重要数据后再继续。
+
+### 4. 安全测试
+
+不 bind 控制器，不会接管内核 `nvme` 驱动：
+
+```bash
+cd tutti/device_manager/nvme/kernel_modules/test
+sudo ./snvme_smoke "$TGT"
+sudo ./snvme_smoke_qgroup "$TGT"
+sudo ./snvme_smoke_gpu --gpu 0 "$TGT"
+```
+
+每项成功时退出码为 `0`。
+
+### 5. bind 与写盘测试
+
+以下测试会接管目标控制器；`snvme_smoke_io` 会写入 LBA：
+
+```bash
+# bind + user queue，不写 LBA
+sudo ./snvme_smoke_addq "$TGT"
+
+# CPU 端到端读写校验，会写盘
+sudo ./snvme_smoke_io "$TGT"
+
+# GPU P2P 完整轮次，会 bind，但不写 LBA
+sudo ./snvme_smoke_gpu --gpu 0 --rounds 4 "$TGT"
+```
+
+若出现 `no room for user queues`，将内核 IO queue cap 降低后重试：
+
+```bash
+SNVME_TEST_KERNEL_IOQ_CAP=16 sudo ./snvme_smoke_addq "$TGT"
+SNVME_TEST_KERNEL_IOQ_CAP=16 sudo ./snvme_smoke_io "$TGT"
+```
+
+### 6. 清理与恢复
+
+测试异常退出后可执行：
+
+```bash
+sudo ./snvme_ubind "$TGT"
+echo "$TGT" | sudo tee /sys/bus/pci/drivers/nvme/bind
+```
+
+完整驱动 reset、直接 Kbuild 重编译和 kernel baseline 选择见
+[`advanced-build.md`](advanced-build.md)。

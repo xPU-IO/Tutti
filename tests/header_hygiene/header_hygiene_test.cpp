@@ -27,6 +27,7 @@
 #include <tutti/config/tutti_runtime_spec.h>
 #include <tutti/resource.h>
 #include <tutti/spi/data_path.h>
+#include <tutti/spi/storage_object_store.h>
 #include <tutti/spi/storage_target_resolver.h>
 #include <tutti/storage_runtime.h>
 #include <tutti/tutti_runtime.h>
@@ -50,6 +51,32 @@
 #  endif
 #  if __has_include(<tutti/resource/nvme/nvme_resource.h>)
 #    error "HYGIENE VIOLATION: NVMe Resource implementation is publicly reachable"
+#  endif
+
+// --- storage-object-store implementation internals ---
+//
+// Only <tutti/spi/storage_object_store.h> is public. The backends, the shared
+// core (object header codec, checkpoint region, residency bitmap, space
+// allocator) and the placement policy are implementation detail: consumers
+// must reach them solely through the SPI. Asserted here before the
+// implementation exists so the boundary cannot be crossed by accident later.
+#  if __has_include(<tutti/storage_objects/object_store_core.h>)
+#    error "HYGIENE VIOLATION: object store core is publicly reachable"
+#  endif
+#  if __has_include(<tutti/storage_objects/object_header_codec.h>)
+#    error "HYGIENE VIOLATION: object header codec is publicly reachable"
+#  endif
+#  if __has_include(<tutti/storage_objects/checkpoint_region.h>)
+#    error "HYGIENE VIOLATION: checkpoint region is publicly reachable"
+#  endif
+#  if __has_include(<tutti/storage_objects/residency_bitmap.h>)
+#    error "HYGIENE VIOLATION: residency bitmap is publicly reachable"
+#  endif
+#  if __has_include(<tutti/storage_objects/slot_placement_policy.h>)
+#    error "HYGIENE VIOLATION: slot placement policy is publicly reachable"
+#  endif
+#  if __has_include(<tutti/storage_objects/local_nvme_file/store.h>)
+#    error "HYGIENE VIOLATION: local_nvme_file backend is publicly reachable"
 #  endif
 
 // --- libnvm private headers (tutti/device_manager/nvme/libnvm/include/) ---

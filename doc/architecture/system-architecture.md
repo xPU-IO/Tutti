@@ -169,15 +169,16 @@ stream semantics.
 
 ## 4. Deployment topology
 
-- **Daemon**: one `tutti_daemon` per host owns the controllers
-  (`sys_config.yaml`; gRPC on 127.0.0.1:50051).
-- **Devices**: `/dev/snvme0n1`… mounted at `/mnt/nvme0…` (ext4);
-  striped targets span up to 4 mounts.
-- **Build profiles**: CUDA (production), HOST (contract tests without a
-  GPU SDK); hardware tests gated by `-DTUTTI_BUILD_HARDWARE_TESTS=ON`.
-- **Contract suites**: hardware-independent SPI/API contracts plus
-  hardware gates (datapath / runtime E2E / striped / resolver /
-  layerwise KV overlap) — see [../build_and_test.md](../build_and_test.md).
+- **Daemon**: one `tutti_daemon` per host owns the controllers; the canonical
+  deployment template is `config/local_nvme_config.yaml` (gRPC defaults to
+  127.0.0.1:50051).
+- **Devices**: daemon-published block and view paths are authoritative;
+  striped targets span multiple backing mounts when configured.
+- **Build**: one default CUDA hardware build includes the module, daemon,
+  local-NVMe targets, and hardware tests in `build/`.
+- **Contract suites**: SPI/API contracts plus hardware gates (datapath /
+  runtime E2E / striped / resolver). Build and test commands are centralized
+  in [../getting-started.md](../getting-started.md).
 
 ## 5. Source map
 
