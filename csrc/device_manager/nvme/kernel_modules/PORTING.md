@@ -3,8 +3,8 @@
 
 > **EN** — This tree replaces the three per-kernel-version copies
 > (`snvme-5.4.241-1-tlinux4-0017/`, `snvme-5.15.0-public/`,
-> `snvme-6.8.0-public/`, all kept frozen as fallback) with a **single
-> source tree**: one copy of the snvme-private code at the root, and
+> `snvme-6.8.0-public/`, since removed — recoverable from git history)
+> with a **single source tree**: one copy of the snvme-private code at the root, and
 > per-kernel-lineage copies of the *upstream* NVMe driver under
 > `baseline/<tag>/`.  For background on what snvme changes on top of
 > upstream NVMe (queue groups, GPU P2P, char-device/ioctl surface), the
@@ -15,7 +15,7 @@
 >
 > **中文** — 本源码树用**单一源码树**取代原来三个按内核版本各存一份的副本
 > （`snvme-5.4.241-1-tlinux4-0017/`、`snvme-5.15.0-public/`、
-> `snvme-6.8.0-public/`，三者均冻结保留作为回退）：snvme 私有代码只保留
+> `snvme-6.8.0-public/`，三者已删除，可从 git 历史取回）：snvme 私有代码只保留
 > 一份放在根目录，*上游* NVMe 驱动按内核血统存放在 `baseline/<tag>/`。
 > 关于 snvme 在上游 NVMe 之上做了哪些修改（队列组、GPU P2P、字符设备/
 > ioctl 接口）的背景（函数级 diff 清单、踩坑记录）保留在 git 历史中
@@ -86,16 +86,6 @@ kernel_modules/
 │       │                  (ioctl stays inside core.c until upstream 5.14)
 │       ├── 5.15/          + ioctl.c, hwmon.c, zns.c
 │       └── 6.8/           + sysfs.c, pr.c, auth.*, constants.c
-│
-└── snvme-5.4.241-1-tlinux4-0017/   ── DEPRECATED, frozen · 已废弃，冻结 ──
-    snvme-5.15.0-public/               (each carries a DEPRECATED marker
-    snvme-6.8.0-public/                file; kept only as fallback/diff
-                                        reference until the matching
-                                        baseline is verified; will be
-                                        REMOVED — do not land changes)
-                                        （各树带 DEPRECATED 标记；仅作
-                                        回退/对比参考，验证通过后删除；
-                                        不要在旧树提交新改动）
 ```
 
 > **EN** What lives where: **Root** = snvme-private code, must compile

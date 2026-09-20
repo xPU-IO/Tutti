@@ -1,10 +1,9 @@
 /*
- * tutti/include/uapi/tutti_snvme.h
+ * csrc/include/uapi/tutti_snvme.h
  *
  * Shared UAPI header for the snvme kernel module and libnvm userspace.
  *
- * BOTH the kernel module (snvme-5.15.0-public/pci.c,
- * snvme-5.4.241-1-tlinux4-0017/pci.c)
+ * BOTH the kernel module (unified snvme/ tree, baseline/<tag>/pci.c)
  * AND userspace (libnvm/src/linux/device.cpp, etc.) include THIS FILE
  * as the single source of truth for all ioctl command numbers, struct
  * layouts, and ABI version/capability negotiation.
