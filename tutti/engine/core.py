@@ -16,7 +16,7 @@ from tutti.engine.transfer import (
     StagedTransfer,
     select_transfer,
 )
-from tutti.engine.nvtx import range as nvtx_range
+from tutti.common.nvtx import range as nvtx_range
 from tutti.common.utils import (
     flatten_block_ids as _flatten_block_ids,
     group_scan,
@@ -417,8 +417,8 @@ class _DirectAllLayerReadPlan:
 
     def _run_feeder(self) -> None:
         _bind_thread_cuda_device(getattr(self.engine, "_store", None))
+        started_ns = time.perf_counter_ns()
         try:
-            started_ns = time.perf_counter_ns()
             for callback in range(1, self.layer_count):
                 if self._feeder_stop.is_set() or self.terminal_failure is not None:
                     break
@@ -427,7 +427,6 @@ class _DirectAllLayerReadPlan:
             self._record_failure(exc)
             self._feeder_stop.set()
         finally:
-            started_ns = locals().get("started_ns", time.perf_counter_ns())
             self._submit_all_total_ms = (
                 time.perf_counter_ns() - started_ns
             ) / 1_000_000
@@ -658,16 +657,11 @@ class _EngineStepIO:
                 time.monotonic_ns(), callback, physical, self._current_stream(),
             )
         slots = self._slots[callback]
-        event = None
         transfer = self._engine._transfer
         if transfer is not None:
-            event = transfer.gather(
-                self._keys, physical, self._block_tables, slots
-            )
-        if event is not None:
-            # The ready signal is enqueued on the same compute stream after
-            # gather; no host synchronization and no feeder-stream deadlock.
-            pass
+            # gather 的 ready signal 已排在同一 compute stream 上；无主机
+            # 同步、无 feeder 流死锁，无需显式等待。
+            transfer.gather(self._keys, physical, self._block_tables, slots)
         self._inner.signal_layer(callback, self._current_stream())
         if _FEEDER_DIAG:
             _LOG.warning(
@@ -844,8 +838,6 @@ class KVEngine:
     - direct_transfer：可选 bool。缺省（True）尝试 Python byte-range direct
       backend。staged 暂存路径已退役，故显式 false 不再表示"改用 staged"，
       而是配置错误（select_transfer 抛出）。
-    - direct_transfer_strict：**已冗余，不再被读取**。直连准入失败一律抛出，
-      恒等于原先的 strict 行为；保留该键只为兼容既有配置文件，设它无任何效果。
     - gather_fn / scatter_fn：可选搬运钩子（缺省 None，搬运为 no-op），
       语义见传输路径。
 
@@ -863,10 +855,11 @@ class KVEngine:
             fn = config.get(name)
             if fn is not None and not callable(fn):
                 raise ValueError(f"config[{name!r}] 须为可调用或 None，got {fn!r}")
-        for name in ("direct_transfer", "direct_transfer_strict"):
-            value = config.get(name, False)
-            if not isinstance(value, bool):
-                raise ValueError(f"config[{name!r}] 须为 bool，got {value!r}")
+        direct_transfer = config.get("direct_transfer", False)
+        if not isinstance(direct_transfer, bool):
+            raise ValueError(
+                f"config['direct_transfer'] 须为 bool，got {direct_transfer!r}"
+            )
         self._config = dict(config)
         self._store = store
         self._closed = False
@@ -895,8 +888,6 @@ class KVEngine:
         )
         self._index = ChunkIndex(store.capacity_chunks, self._chunk_tokens,
                                  namespace=namespace)
-        # 冷启动分组：层数定案前暂存；层集合不完整的 chunk 视为缺失。
-        self._scan_groups = group_scan(store)
         self._restored = False
         # 上次对账判完整的组（完整性翻转修正的基准）与因 pin 保护
         # 未遂的移除项（下次对账重试）。
@@ -1316,7 +1307,7 @@ class KVEngine:
                         f"tutti.direct.record_fence|direction=read|layer={layer_idx}"
                     ):
                         recorded = record_read(fence_event)
-                    _LOG.info(
+                    _LOG.debug(
                         "DIRECT_EVENT_RECORD direction=read layer=%d elapsed_ms=%.3f",
                         layer_idx,
                         (time.perf_counter_ns() - fence_started_ns) / 1_000_000,
@@ -1524,7 +1515,7 @@ class KVEngine:
                     f"tutti.direct.record_fence|direction=write|layer={layer_idx}"
                 ):
                     compute_done = record_compute()
-                _LOG.info(
+                _LOG.debug(
                     "DIRECT_EVENT_RECORD direction=write layer=%d elapsed_ms=%.3f",
                     layer_idx,
                     (time.perf_counter_ns() - fence_started_ns) / 1_000_000,
@@ -1909,7 +1900,6 @@ class KVEngine:
         self._pending_forget = set(self._index.forget(stale))
         self._index.restore(full_keys)
         self._synced_full = full
-        self._scan_groups = groups
         self._restored = True
 
     def _deferred_restore(self) -> None:

@@ -31,8 +31,8 @@ from .runtime_factory import (
     preset_mounts,
 )
 
-from tutti.engine.nvtx import range as nvtx_range
-from tutti.engine.transfer import DirectTransferUnavailable
+from tutti.common.errors import DirectTransferUnavailable
+from tutti.common.nvtx import range as nvtx_range
 from tutti.index.chunk_index import decode_io_key, derive_io_key
 
 #: 运行日志（池归属校验等部署问题的非静默说明）。
@@ -1101,7 +1101,8 @@ class TuttiKVStore:
                  high_watermark=None, max_slots=None,
                  pool_wait_timeout_s: float = 5.0,
                  allocator_enabled: bool = True,
-                 rank_id: int = 0, tp_size: int = 1):
+                 rank_id: int = 0, tp_size: int = 1,
+                 defer_writes_after_reads: bool | None = None):
         """preset 为 dict 时优先于 TUTTI_NVME_PRESET 环境变量构造 runtime。
 
         preset 的字符串值恰为纯十进制整数时转为 int（配置占位符替换后
@@ -1218,10 +1219,20 @@ class TuttiKVStore:
         # 明显下降。开启后 worker 在写流上插一次 wait_event(最新读层 fence)，
         # 由设备侧保证"先读后写"（Python 不缓冲、不轮询）。实测：读写重叠
         # 40/80 → 7/80，写 kernel 0.81→0.61ms、读 2.62→2.38ms，墙钟中性。
-        # 设为 0 可关（读写持续并发的负载若出现写饥饿，用它回退）。
-        self._defer_writes_after_reads = (
-            os.environ.get("TUTTI_DEFER_WRITES_AFTER_READS", "1") != "0"
-        )
+        # 配置优先级：store options 的 defer_writes_after_reads（显式 bool）
+        # > TUTTI_DEFER_WRITES_AFTER_READS 环境变量（测试后门）> 默认 True。
+        # 读写持续并发的负载若出现写饥饿，显式关掉它回退。
+        if defer_writes_after_reads is None:
+            env = os.environ.get("TUTTI_DEFER_WRITES_AFTER_READS")
+            self._defer_writes_after_reads = True if env is None else env != "0"
+        elif isinstance(defer_writes_after_reads, bool):
+            self._defer_writes_after_reads = defer_writes_after_reads
+        else:
+            raise ValueError(
+                "defer_writes_after_reads 须为 bool，"
+                f"got {defer_writes_after_reads!r}"
+            )
+        self._defer_warned = False
 
     # ---------- 生命周期 ----------
 
@@ -1231,7 +1242,7 @@ class TuttiKVStore:
 
     @property
     def defer_writes_after_reads(self) -> bool:
-        """写批是否应排在读批之后（见 TUTTI_DEFER_WRITES_AFTER_READS）。"""
+        """写批是否应排在读批之后（配置键 defer_writes_after_reads）。"""
         return self._defer_writes_after_reads
 
     def wait_write_stream_event(self, event) -> None:
@@ -1243,6 +1254,16 @@ class TuttiKVStore:
         stream = self._write_stream_obj
         wait = getattr(stream, "wait_event", None)
         if stream is None or not callable(wait):
+            # 写排序静默失效：只观测一次，防止将来流配置变化让性能悄悄
+            # 回退（对齐读侧的 DIRECT_THREAD_DEVICE_BIND_FAILED）。
+            if not self._defer_warned:
+                self._defer_warned = True
+                _LOG.debug(
+                    "DIRECT_WRITE_DEFER_UNAVAILABLE reason=%s"
+                    "（写排序未生效，写与读可能重新并发）",
+                    "write stream 缺失" if stream is None
+                    else "write stream 无 wait_event",
+                )
             return
         wait(event)
 

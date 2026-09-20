@@ -154,7 +154,7 @@ else
         # 2 x num_layers 推导出下限，此处保持默认即是在验证那条路径。
         # MAX_IN_FLIGHT=N 可显式覆盖，用于实验更大配额。
         # 不再需要 --direct-transfer-strict：staged 暂存路径已退役，直连准入
-        # 失败一律抛出，strict 成为恒真行为（该键仍被接受但不再读取）。
+        # 失败一律抛出，strict 成为恒真行为（该 CLI 参数保留但仅声明直连）。
         --kv-load-failure-policy fail
     )
 fi

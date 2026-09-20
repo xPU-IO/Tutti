@@ -3,6 +3,9 @@
 Set ``TUTTI_NVTX=1`` to expose request, layer, transfer, and completion
 boundaries in Nsight Systems.  Profiling remains opt-in and degrades to a
 no-op when CUDA/NVTX is unavailable.
+
+放在 ``common/`` 而非 ``engine/``：``storage/`` 层也要打点，而 storage 是
+engine 的下层——分层图要求底层不反向 import 上层。
 """
 
 from __future__ import annotations

@@ -862,7 +862,6 @@ def test_engine_direct_strict_preserves_admission_reason():
             "chunk_kv_bytes": 3 * 8192,
             "max_chunks_per_wave": 2,
             "num_layers": 3,
-            "direct_transfer_strict": True,
         },
         store,
     )

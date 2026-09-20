@@ -141,15 +141,11 @@ class MemoryKVStore:
         so a CUDA stream wait cannot order the next overwrite. This fallback
         is intentionally outside the production NVMe/read-copy path.
         """
-        synchronize = getattr(event, "synchronize", None)
-        if callable(synchronize):
-            synchronize()
+        self._synchronize(event)
 
     def wait_read_copy_event(self, event) -> None:
         """Compatibility hook for the synchronous reference backend."""
-        synchronize = getattr(event, "synchronize", None)
-        if callable(synchronize):
-            synchronize()
+        self._synchronize(event)
 
     def wait_write_event(self, event) -> None:
         """Fence the write path in the test/reference backend.
@@ -166,6 +162,10 @@ class MemoryKVStore:
         not perform staged writes at all, so three pipeline tests failed on
         every run and were mistaken for harness noise.
         """
+        self._synchronize(event)
+
+    def _synchronize(self, event) -> None:
+        """参考后端的等待原语：event 只需暴露 ``synchronize``。"""
         synchronize = getattr(event, "synchronize", None)
         if callable(synchronize):
             synchronize()

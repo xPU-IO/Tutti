@@ -23,7 +23,7 @@ from tutti_kv_transfer import (
 
 from tutti.engine.staging import RingWindow
 from tutti.engine.core import LoadGateError
-from tutti.engine.nvtx import range as nvtx_range
+from tutti.common.nvtx import range as nvtx_range
 from tutti.integration.vllm.worker_meta import TuttiWorkerMetadata
 
 #: 单步内块表缓存上限（超出即整体重建，防无界增长）。
@@ -438,7 +438,7 @@ class WorkerImpl:
     """worker 角色的执行编排器。
 
     契约：
-    - 构造注入引擎与在途句柄上限（max_in_flight_layers，0 = 不限）。
+    - 构造注入引擎；在途上限由引擎（store 的 max_in_flight_operations）决定。
     - 显存对象经两个登记回调进入（单块跨层池或逐层映射，二选一）；
       首个执行回调触发惰性绑定（分配 staging 环窗显存并接入引擎）。
     - 读取流程：start_load_kv 构建并提交完整层计划；
@@ -450,21 +450,12 @@ class WorkerImpl:
       上报，由上层重算兜底。
     """
 
-    def __init__(self, engine, max_in_flight_layers: int | None = None,
+    def __init__(self, engine,
                  lookahead_k: int | None = None,
                  failure_coordinator=None,
                  failure_collective_timeout_s: float = 30.0):
         """构造 worker；lookahead_k 仅保留为兼容配置别名。"""
-        if max_in_flight_layers is None:
-            max_in_flight_layers = int(
-                getattr(engine, "max_in_flight_operations", 0) or 0
-            )
-        if not isinstance(max_in_flight_layers, int) or max_in_flight_layers < 0:
-            raise ValueError(
-                f"max_in_flight_layers 须为非负整数，got {max_in_flight_layers!r}"
-            )
         self._engine = engine
-        self._max_in_flight = max_in_flight_layers
         if lookahead_k is None:
             engine_config = getattr(engine, "_config", {})
             lookahead_k = engine_config.get(
@@ -1356,13 +1347,14 @@ class WorkerImpl:
 
     def _on_async_read_failure(self, error) -> None:
         """Record an asynchronous read failure without blocking callbacks."""
-        if isinstance(error, LoadGateError):
-            self._mark_load_failure(error)
-        else:
-            self._mark_load_failure(error)
+        self._mark_load_failure(error)
 
     def _prefetch_load_layers(self, first_idx: int) -> None:
-        """提交从 ``first_idx`` 起的有限层窗口。
+        """提交从 ``first_idx`` 起的有限层窗口（**仅测试使用**）。
+
+        生产路径不调用它（09-18 review R4 复核：调用者只有
+        tests/python 的 adapter 测试）。它通过 ``_compat_prefetch_active``
+        开启 callback 路径的兼容等待分支，用于覆盖无 fence 的旧式后端。
 
         staging 环窗本身对波次覆盖负责背压；这里仅限制层级在途数，
         因而不会创建无界 async bulk 队列。若环窗容量不足，底层

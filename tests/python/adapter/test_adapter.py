@@ -898,8 +898,8 @@ class TestEndToEnd:
         assert read.buffer is write.buffer
         assert len(read.buffer) == 4 * MAX_WAVE * (SEG * NUM_LAYERS // NUM_LAYERS)
 
-    def test_max_in_flight_layers_caps(self):
-        h = _make_harness(extra={"max_in_flight_layers": 1})
+    def test_sequential_saves_settle_on_wait(self):
+        h = _make_harness()
         prompt = list(range(CHUNK_TOKENS))
         req = _fake_request("r1", prompt)
         h.scheduler.update_state_after_alloc(req, object(), 0)
@@ -914,7 +914,7 @@ class TestEndToEnd:
         for layer in range(NUM_LAYERS):
             h.hooks.source[(keys[0], layer)] = _segment(0, layer)
         h.worker.save_kv_layer(h.layer_names[0])
-        h.worker.save_kv_layer(h.layer_names[1])  # 超限：最旧句柄被等待
+        h.worker.save_kv_layer(h.layer_names[1])
         h.worker.save_kv_layer(h.layer_names[2])
         h.worker.wait_for_save()
         assert set(h.store.scan()) == {

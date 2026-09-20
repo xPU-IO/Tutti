@@ -66,7 +66,3 @@ class TuttiWorkerMetadata(KVConnectorWorkerMetadata):
             forgotten=self.forgotten | other.forgotten,
             evicted=self.evicted | other.evicted,
         )
-
-    def is_empty(self) -> bool:
-        return (not self.committed and not self.failed
-                and not self.forgotten and not self.evicted)
