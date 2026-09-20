@@ -2,7 +2,7 @@
 
 #include "csrc/data_paths/local_nvme/io/device_target.h"
 
-// tutti/data_paths/local_nvme/metadata/handle_workspace_cache.h
+// csrc/data_paths/local_nvme/metadata/handle_workspace_cache.h
 //
 // Two-tier GPU LRU cache for device target handles (DeviceTargetHandle +
 // overflow extents).  Round 16 S6b: L2 host-pinned content backup added
@@ -39,7 +39,7 @@
 //   An entry is evictable only when pin_count == 0 AND open_refcount == 0.
 //   This prevents the reopen→eviction UAF: after close(A)→open(A), the
 //   reopened entry has open_refcount > 0, so a subsequent open(B) cannot
-//   evict it even though the old close already set in_use=false.
+//   evict it even though close(A) had already made it evictable.
 
 #include <cstdint>
 #include <cstdio>
@@ -89,7 +89,6 @@ public:
         std::uint64_t overflow_bytes = 0;  // Round 16 S6b: for L2 save/restore
         std::uint32_t pin_count = 0;
         std::uint32_t open_refcount = 0;  // >0 while one or more targets reference this entry
-        bool in_use = false;  // deprecated: kept for backward compat, superseded by open_refcount
     };
 
     HandleWorkspaceCache() = default;
@@ -175,7 +174,6 @@ public:
             std::uint32_t slot = it->second;
             Entry& hit = entries_[slot];
             ++hit.open_refcount;  // P0-1: reopen increments refcount
-            hit.in_use = true;    // backward compat
             // Remove from LRU if present — open entries are not evictable.
             remove_from_lru_(slot);
             ++stats_.hits;
@@ -191,7 +189,6 @@ public:
         e.key = key;
         e.pin_count = 0;
         e.open_refcount = 1;  // P0-1: new entry starts with one open reference
-        e.in_use = true;  // backward compat
         e.overflow_bytes = 0;
 
         // L2 hit → promote (memcpy restore).  The L2 record is RETAINED
@@ -232,7 +229,7 @@ public:
         // downgrade of an entry that skipped admission).
         if (l2_enabled()) admit_to_l2_(key, e);
         index_[key] = slot;
-        // Do NOT add to LRU yet — entry is in_use (target open).
+        // Do NOT add to LRU yet — entry has an open reference (target open).
         // release_entry() adds it to LRU when the target is closed.
         ++stats_.entries;
         return &e;
@@ -245,7 +242,6 @@ public:
         if (!e) return;
         std::lock_guard<std::mutex> lock(mtx_);
         if (e->open_refcount > 0) --e->open_refcount;
-        e->in_use = (e->open_refcount > 0);  // backward compat
         if (e->open_refcount == 0 && e->pin_count == 0) {
             std::uint32_t slot = static_cast<std::uint32_t>(e - entries_.data());
             if (index_.count(e->key) && !lru_pos_.count(slot)) {
@@ -437,8 +433,8 @@ private:
         }
         // Evict LRU entry that is both unpinned AND has no open references.
         // P0-1: previously only checked pin_count==0, missing the
-        // reopen→eviction UAF (open_refcount > 0 but in_use was false
-        // after close, making the entry a false LRU candidate).
+        // reopen→eviction UAF (an entry with open_refcount > 0 could be
+        // inserted into LRU after close, making it a false candidate).
         // LRU only contains entries with open_refcount==0 (release_entry
         // and unpin gate LRU insertion on open_refcount==0), so any LRU
         // entry is safe to evict.

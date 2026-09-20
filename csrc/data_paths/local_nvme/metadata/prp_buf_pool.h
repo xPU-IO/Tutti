@@ -1,6 +1,6 @@
 #pragma once
 
-// tutti/data_paths/local_nvme/metadata/prp_buf_pool.h
+// csrc/data_paths/local_nvme/metadata/prp_buf_pool.h
 //
 // Host-pinned PRP-list buffer pool — replaces per-registration
 // nvm_dma_map_data_host for pre-built PRP-list pages.

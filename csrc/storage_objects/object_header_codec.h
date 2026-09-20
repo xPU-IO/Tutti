@@ -53,8 +53,6 @@ enum class HeaderRejection {
     kTruncatedBuffer,    // caller supplied fewer than kHeaderBytes
 };
 
-const char* to_string(HeaderRejection rejection) noexcept;
-
 // Decoded header contents. Only produced when validation fully succeeded.
 struct ObjectHeaderFields {
     std::uint64_t identity = 0;

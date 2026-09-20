@@ -1,6 +1,6 @@
 #pragma once
 
-// tutti/data_paths/local_nvme/metadata/metadata_arena.h
+// csrc/data_paths/local_nvme/metadata/metadata_arena.h
 //
 // Per-device, bounded MetadataArena for LocalNvmeDataPath.
 //
@@ -21,8 +21,6 @@
 #include <deque>
 #include <mutex>
 #include <vector>
-
-#include <nvm_types.h>
 
 namespace tutti::data_paths::local_nvme {
 
@@ -74,10 +72,9 @@ public:
     MetadataArena(const MetadataArena&) = delete;
     MetadataArena& operator=(const MetadataArena&) = delete;
 
-    // Pre-allocate GPU entry/status/descriptor memory and events. `ctrl` is
-    // retained in the signature for source compatibility and is not mapped.
+    // Pre-allocate GPU entry/status/descriptor memory and events.
     // Returns false on any CUDA/DMA failure.
-    bool init(const Config& cfg, nvm_ctrl_t* ctrl);
+    bool init(const Config& cfg);
 
     // Free all resources. Idempotent. Caller must ensure no in-flight
     // GPU work touches arena memory (sync all streams first).
@@ -105,7 +102,6 @@ public:
 
 private:
     Config cfg_{};
-    nvm_ctrl_t* ctrl_ = nullptr;
     bool initialized_ = false;
 
     // Events: pre-created, one per slot.
