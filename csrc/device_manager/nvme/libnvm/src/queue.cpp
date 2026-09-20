@@ -10,43 +10,6 @@
 
 
 
-int nvm_queue_clear(nvm_queue_t* queue, const nvm_ctrl_t* ctrl, bool cq, uint16_t no, uint32_t qs, 
-        bool local, volatile void* vaddr, uint64_t ioaddr)
-{
-    if (qs < 2 || qs > 0x10000)
-    {
-        return EINVAL;
-    }
-
-    queue->no = no;
-    queue->qs = qs;
-    queue->es = cq ? sizeof(nvm_cpl_t) : sizeof(nvm_cmd_t);
-    queue->head = 0;
-    queue->tail = 0;
-    queue->last = 0;
-    queue->phase = 1;
-    queue->local = !!local;
-    queue->head_lock = 0;
-    queue->tail_lock = 0;
-    // queue->head_copy = 0;
-    // queue->tail_copy = 0;
-    queue->in_ticket = 0;
-    queue->cid_ticket = 0;
-
-    queue->db = (cq ? CQ_DBL(ctrl->mm_ptr, queue->no, ctrl->dstrd) : SQ_DBL(ctrl->mm_ptr, queue->no, ctrl->dstrd));
-    queue->vaddr = vaddr;
-    queue->ioaddr = ioaddr;
-    if(!cq)
-    {
-        // printf("nvm_queue_clear qid is %u, addr is %lx\n",queue->no,queue->ioaddr);
-    }
-    // printf("queue->no is %u, queue->qs is %u,queue->es is %u,queue->local is %u,ctrl->dstrd is %u\nqueue->db is %lx,queue->vaddr is %lx,queue->ioaddr is %lx\n\n",queue->no,queue->qs,queue->es,queue->local,ctrl->dstrd,queue->db,queue->vaddr,queue->ioaddr); 
-    // printf("mm_ptr start at %lx, vaddr is %lx\n",ctrl->mm_ptr,vaddr);
-    return 0;
-}
-
-
-
 void nvm_queue_reset(nvm_queue_t* queue)
 {
     queue->head = 0;

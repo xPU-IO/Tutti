@@ -63,22 +63,6 @@ struct device
 
 
 /*
- * NVM admin queue-pair reference handle.
- *
- * As only a single process can be responsible of resetting the controller and
- * setting administration queues, this structure represents a remote handle to
- * that process. It is used as a descriptor for executing RPC calls to the 
- * remote process owning the admin queues.
- *
- * Note: This structure will be allocated by the API and needs to be released
- *       by the API.
- */
-struct nvm_admin_reference;
-typedef struct nvm_admin_reference* nvm_aq_ref;
-
-
-
-/*
  * DMA mapping descriptor.
  *
  * This structure describes a region of memory that is accessible for the

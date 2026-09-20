@@ -4,7 +4,7 @@
  * All snvme UAPI definitions (structs, ioctl command numbers, ABI
  * version/capability, static_asserts) now live in the shared header:
  *
- *   tutti/include/uapi/tutti_snvme.h
+ *   csrc/include/uapi/tutti_snvme.h
  *
  * This file remains as a compatibility shim so that existing
  *   #include "ioctl.h"

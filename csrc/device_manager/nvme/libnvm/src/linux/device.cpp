@@ -296,110 +296,6 @@ int nvm_device_unbind(nvm_ctrl_t* ctrl){
 }
 
 
-static inline int ioctl_queue_helper(nvm_ctrl_t* ctrl, int arg, enum nvm_ioctl_type type)
-{
-    struct controller* container;
-    int err;
-
-    container = ctrl_to_controller(ctrl);
-    if (container == NULL){
-        nvm_error("container error!");
-        return -1;
-    }
-
-    switch (type) {
-        case NVM_SET_SHARE_REG: {
-            /* SET_SHARE_REG still uses the legacy "pack into
-             * nvm_ioctl_map.ioq_idx" pattern: it carries one bool
-             * (the use_sreg flag), no per-ctrl knobs. */
-            struct nvm_ioctl_map request;
-            memset(&request, 0, sizeof(request));
-            request.ioq_idx = arg;
-            err = ioctl(container->device->fd_dev, type, &request);
-            break;
-        }
-        case NVM_CLEAR_IOQ_NUM: {
-            struct nvm_ioctl_dev request;
-            memset(&request, 0, sizeof(request));
-            err = ioctl(container->device->fd_dev, type, &request);
-            break;
-        }
-        case NVM_SET_IOQ_NUM: {
-            /* Convenience entry point: same intent as the legacy
-             * "set total user IOQ count" call, but submitted through
-             * the new struct nvm_ioctl_setup payload so kernel
-             * unpacks a single ABI.  Callers that need to populate
-             * cap_kernel_ioq / nr_write / nr_poll / groups should
-             * use nvm_queue_setup() instead. */
-            struct nvm_ioctl_setup setup;
-            memset(&setup, 0, sizeof(setup));
-            setup.ioq_num = (uint32_t)arg;
-            setup.flags   = ctrl->on_host ? NVM_QUEUE_SETUP_F_ON_HOST : 0;
-            /* cap_kernel_ioq = 0 -> kernel applies its default of
-             * num_possible_cpus().  Callers that need a tighter cap
-             * must use nvm_queue_setup() below. */
-            err = ioctl(container->device->fd_dev, type, &setup);
-            break;
-        }
-        default:
-            return EINVAL;
-    }
-
-    if (err < 0){
-        int saved_errno = errno;
-        nvm_error("ioctl_queue_helper ioctl type=0x%x failed: errno=%d (%s)",
-                  type, saved_errno, strerror(saved_errno));
-        return saved_errno;
-    }
-
-    return 0;
-}
-
-int nvm_queue_set(nvm_ctrl_t* ctrl, int q_num){
-    return ioctl_queue_helper(ctrl, q_num, NVM_SET_IOQ_NUM);
-}
-
-/*
- * Full-fidelity NVM_SET_IOQ_NUM entry point.  Callers that need to
- * pin the kernel-side IO-queue budget (cap_kernel_ioq) or partition
- * the user share across multiple GPUs (groups) must use this
- * instead of nvm_queue_set().
- *
- * setup must have setup->ioq_num populated; on_host comes from
- * ctrl->on_host (caller stays the source of truth) unless setup->
- * flags has already been set, in which case the caller-provided
- * flags win.
- */
-int nvm_queue_setup(nvm_ctrl_t* ctrl, struct nvm_ioctl_setup* setup){
-    struct controller* container;
-    int err;
-
-    if (ctrl == NULL || setup == NULL){
-        return EINVAL;
-    }
-    container = ctrl_to_controller(ctrl);
-    if (container == NULL){
-        nvm_error("container error!");
-        return -1;
-    }
-    if (setup->flags == 0 && ctrl->on_host){
-        setup->flags |= NVM_QUEUE_SETUP_F_ON_HOST;
-    }
-    err = ioctl(container->device->fd_dev, NVM_SET_IOQ_NUM, setup);
-    if (err < 0){
-        printf("nvm_queue_setup err is %d\n", errno);
-        return errno;
-    }
-    return 0;
-}
-
-int nvm_queue_clear(nvm_ctrl_t* ctrl){
-    return ioctl_queue_helper(ctrl, 0, NVM_CLEAR_IOQ_NUM);
-}
-int nvm_queue_share(nvm_ctrl_t *ctrl){
-    return ioctl_queue_helper(ctrl, 1, NVM_SET_SHARE_REG);
-}
-
 int nvm_ctrl_init(nvm_ctrl_t** ctrl, int snvme_c_fd, int snvme_d_fd)
 {
     int err;
@@ -482,24 +378,6 @@ int nvm_ctrl_init(nvm_ctrl_t** ctrl, int snvme_c_fd, int snvme_d_fd)
     return 0;
 }
 
-int nvm_device_init(nvm_ctrl_t* ctrl){
-    int status;
-
-    status = nvm_queue_share(ctrl);
-    if (status != 0){
-        nvm_error("Failed to set reg snvme");
-        return EFAULT;
-    }
-
-    status = nvm_device_bind(ctrl);
-    if (status != 0){
-        nvm_error("Failed to bind device");
-        return EFAULT;
-    }
-    sleep(3);
-    return 0;
-}
-
 /* ===================================================================
  * Queue-group and fd-scoped thin ioctl wrappers.
  *
@@ -508,10 +386,11 @@ int nvm_device_init(nvm_ctrl_t* ctrl){
  * here in linux/device.cpp because they all need fd_dev (or fd_control)
  * out of `struct controller`, which is a libnvm-internal type.
  *
- * Compared to the legacy nvm_queue_share / nvm_queue_set / nvm_device_init
- * triplet above, these do NOT push the controller through a hidden state
- * machine: the caller drives the sequence (CAP -> BIND -> GET_DEV_INFO
- * -> CREATE_QUEUE_GROUP -> ADD_USER_QUEUE) explicitly.
+ * Unlike the retired legacy bring-up triad (nvm_queue_share /
+ * nvm_queue_set / nvm_device_init, removed with the S7 cleanup), these
+ * do NOT push the controller through a hidden state machine: the caller
+ * drives the sequence (CAP -> BIND -> GET_DEV_INFO -> CREATE_QUEUE_GROUP
+ * -> ADD_USER_QUEUE) explicitly.
  * =================================================================== */
 
 int nvm_set_kernel_ioq_cap_fd(int fd_dev, uint32_t cap)
