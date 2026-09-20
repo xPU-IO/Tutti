@@ -1363,6 +1363,43 @@ def _all_layer_worker(engine, plan, *, save_keys):
     return worker
 
 
+def test_worker_defers_write_stream_behind_latest_read_event(monkeypatch):
+    """开启写延后时，写流被设备侧排到"最新已提交读层"之后。
+
+    机制：worker 每次 save 前取读计划最新读层的 fence 事件，在写流上插一次
+    ``wait_event``（同一事件不重复插）——读与写因此不混跑（NVMe 混跑实测读
+    +52%、写 +31%）。Python 不做缓冲、不轮询，顺序完全由设备侧保证。
+    """
+    log = []
+    engine = _direct_engine(log)
+    monkeypatch.setattr("torch.cuda.is_available", lambda: True)
+    monkeypatch.setattr("torch.cuda.Event", lambda enable_timing=False: object())
+
+    waits = []
+    store = engine._store          # 复用假 store，只加延后相关的钩子
+    store.defer_writes_after_reads = True
+    store.wait_write_stream_event = waits.append
+    plan = _DirectAllLayerReadPlan(
+        engine, [b"v" * 16], [[2, 7]], (0, 1, 2)
+    )
+    worker = _all_layer_worker(engine, plan, save_keys=[b"w" * 16])
+    plan.join_feeder()
+    latest = plan.latest_read_event()
+    assert latest is not None
+
+    worker.save_kv_layer("model.layers.0.self_attn")
+    assert waits == [latest], "写流应排到最新读层之后"
+
+    # 同一个事件不重复插入（每层一次 wait_event 就够，多插无意义）
+    worker.save_kv_layer("model.layers.1.self_attn")
+    assert waits == [latest]
+
+    # 关掉开关：不再插入任何设备侧等待
+    store.defer_writes_after_reads = False
+    worker.save_kv_layer("model.layers.2.self_attn")
+    assert waits == [latest]
+
+
 def test_worker_host_enqueue_order_is_all_read_then_compute_then_write(
         monkeypatch):
     log = []
