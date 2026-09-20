@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, TYPE_CHECKING
@@ -174,6 +176,22 @@ class TuttiConnectorV1(KVConnectorBase_V1):
         # 命中统计（原先是每请求一条 info 日志，改为累计计数 + debug）
         self._hit_tokens_total = 0
         self._hit_requests_total = 0
+        # 长跑健康摘要（见 _maybe_log_health）：默认 INFO、按时间节流，与
+        # 每步 debug 明细分工不同——长跑不需要每步细节，但需要"不开 DEBUG
+        # 也能看到"的周期性体检（容量逼近、命中衰减、驱逐漂移、预留回收）。
+        self._steps_total = 0
+        self._evicted_total = 0
+        try:
+            self._health_interval_s = max(
+                1.0, float(os.environ.get("TUTTI_HEALTH_INTERVAL_S", "30"))
+            )
+        except ValueError:
+            self._health_interval_s = 30.0
+        self._health_started_ns = time.monotonic_ns()
+        self._health_last_ns = self._health_started_ns
+        self._health_last = {
+            "steps": 0, "hit_tokens": 0, "hit_requests": 0, "evicted": 0
+        }
         # worker metadata 类型失配只告警一次（热路径，避免刷屏）
         self._meta_type_warned = False
         # worker 角色实现
@@ -337,12 +355,20 @@ class TuttiConnectorV1(KVConnectorBase_V1):
             )
 
     def _log_step_summary(self, scheduler_output) -> None:
-        """每步容量/命中汇总（debug；原先是完全静默）。
+        """每步容量/命中汇总：debug 明细 + info 级长跑体检。
 
         长稳问题（容量泄漏、假命中、驱逐漂移）在线上都表现为"命中率缓慢
-        下降"，没有这行日志只能靠猜。级别取 debug：默认不产生输出，需要
-        时开 VLLM_LOGGING_LEVEL=DEBUG 即可。
+        下降"，没有这行日志只能靠猜。分两级输出：
+        - debug：每步明细（需 VLLM_LOGGING_LEVEL=DEBUG）；
+        - info：按时间节流的体检摘要（默认可见，见 _maybe_log_health）。
         """
+        self._steps_total += 1
+        # 体检摘要在 debug 门控之前：长跑观测恰恰要在"不开 DEBUG"时可用。
+        # 每步成本只有一次 monotonic_ns 比较，快照仅在窗口到达时才取。
+        if (time.monotonic_ns() - self._health_last_ns
+                >= int(self._health_interval_s * 1e9)):
+            _stats = getattr(self._index, "stats", None)
+            self._maybe_log_health(_stats() if callable(_stats) else {})
         if not logger.isEnabledFor(logging.DEBUG):
             return
         stats = getattr(self._index, "stats", None)
@@ -363,6 +389,48 @@ class TuttiConnectorV1(KVConnectorBase_V1):
             snapshot.get("eviction_drift_total"),
             snapshot.get("pending_reclaimed_total"),
         )
+
+    def _maybe_log_health(self, snapshot: dict) -> None:
+        """长跑体检：默认 INFO、按时间节流（TUTTI_HEALTH_INTERVAL_S，默认 30s）。
+
+        只关心"长时间运行会不会坏"：容量是否逼近上限（resident/capacity）、
+        命中是否衰减、是否出现驱逐漂移（两侧 LRU 牺牲者选择不一致）或预留
+        回收（某 rank 未回报）。累计值与窗口增量一起打印，趋势一眼可见。
+
+        与 _log_step_summary 的 debug 明细分工：那条是每步事实，这条是
+        周期趋势；长跑默认只看这条，无须开 DEBUG。
+        """
+        now = time.monotonic_ns()
+        prev = self._health_last
+        resident = snapshot.get("resident")
+        capacity = snapshot.get("capacity")
+        used_pct = (
+            100.0 * resident / capacity if resident and capacity else 0.0
+        )
+        logger.info(
+            "[tutti] health uptime=%.0fs steps=%d(+%d) "
+            "resident=%s/%s(%.1f%%) pending=%s pinned=%s "
+            "hit_tokens=%d(+%d) hit_reqs=%d(+%d) evicted=%d(+%d) "
+            "drift=%s reclaimed=%s",
+            (now - self._health_started_ns) / 1e9,
+            self._steps_total, self._steps_total - prev["steps"],
+            resident, capacity, used_pct,
+            snapshot.get("pending"), snapshot.get("pinned"),
+            self._hit_tokens_total,
+            self._hit_tokens_total - prev["hit_tokens"],
+            self._hit_requests_total,
+            self._hit_requests_total - prev["hit_requests"],
+            self._evicted_total, self._evicted_total - prev["evicted"],
+            snapshot.get("eviction_drift_total"),
+            snapshot.get("pending_reclaimed_total"),
+        )
+        self._health_last_ns = now
+        self._health_last = {
+            "steps": self._steps_total,
+            "hit_tokens": self._hit_tokens_total,
+            "hit_requests": self._hit_requests_total,
+            "evicted": self._evicted_total,
+        }
 
     def build_connector_meta(self, scheduler_output) -> TuttiConnectorMetadata:
         """把本步调度结果折叠为传输计划；调用即重置调度侧记账。"""
@@ -447,6 +515,7 @@ class TuttiConnectorV1(KVConnectorBase_V1):
             else:
                 # 调度侧选定的牺牲者下发给 worker 执行（两侧 LRU 收敛）。
                 evicted_keys = list(plan.evicted_keys)
+                self._evicted_total += len(evicted_keys)
                 if not plan.new_keys:
                     # 全部已驻留：本步无需重复写入
                     for meta, _keys in save_specs:
