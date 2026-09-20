@@ -1,12 +1,14 @@
 #include "csrc/resolvers/resolver_factory.h"
 
+#include "csrc/common/backend_ids.h"
+
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
-#include <csrc/resolvers/local_file/resolver.h>
-#include <csrc/resolvers/striped_file/resolver.h>
+#include "csrc/resolvers/local_file/resolver.h"
+#include "csrc/resolvers/striped_file/resolver.h"
 
 #include "csrc/resolvers/memfs/resolver.h"
 #include "csrc/resource/memory/memory_resource.h"
@@ -15,6 +17,7 @@
 namespace tutti::resolvers {
 namespace {
 
+namespace backend_ids = tutti::detail::backend_ids;
 namespace local_file = tutti::resolvers::local_file;
 namespace memory_resource = tutti::resources::memory;
 namespace nvme_resource = tutti::resources::nvme;
@@ -64,9 +67,9 @@ Result<std::unique_ptr<const ResourceView>> resolver_view(
 Result<std::unique_ptr<StorageTargetResolver>> create_local_file(
     const config::ResolverSpec& spec,
     const ResolverCreateContext& context) {
-    if (spec.type != "local-file" ||
+    if (spec.type != tutti::detail::backend_ids::kExt4ResolverType ||
         !std::holds_alternative<config::LocalFileResolverConfig>(spec.config) ||
-        context.relation.contract != "ext4-local-nvme" ||
+        context.relation.contract != backend_ids::kExt4Contract ||
         !std::holds_alternative<config::Ext4LocalNvmeBackendConfig>(
             context.relation.config)) {
         return failure<std::unique_ptr<StorageTargetResolver>>(
@@ -106,9 +109,9 @@ Result<std::unique_ptr<StorageTargetResolver>> create_striped_file(
     const auto* relation =
         std::get_if<config::StripedLocalNvmeBackendConfig>(
             &context.relation.config);
-    if (spec.type != "striped-file" ||
+    if (spec.type != tutti::detail::backend_ids::kStripedResolverType ||
         !std::holds_alternative<config::StripedFileResolverConfig>(spec.config) ||
-        context.relation.contract != "striped-local-nvme" ||
+        context.relation.contract != backend_ids::kStripedContract ||
         relation == nullptr) {
         return failure<std::unique_ptr<StorageTargetResolver>>(
             invalid("striped-file ResolverSpec does not match backend relation"));

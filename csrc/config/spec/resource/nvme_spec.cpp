@@ -23,7 +23,7 @@ Status validate_nvme_resource(const ResourceSpec& spec,
     }
 
     std::unordered_set<std::int32_t> device_ids;
-    for (const std::int32_t id : config->allocation.device_ids) {
+    for (const std::int32_t id : config->allocation.nvme_device_ids) {
         if (id < 0) {
             return invalid_spec(path +
                                 ".allocation.device_ids entries must be non-negative");
@@ -34,7 +34,7 @@ Status validate_nvme_resource(const ResourceSpec& spec,
         }
     }
 
-    const std::size_t count = config->allocation.device_ids.size();
+    const std::size_t count = config->allocation.nvme_device_ids.size();
     switch (config->allocation.selection) {
     case NvmeSelection::Allowed:
         if (count != 0) {

@@ -29,9 +29,7 @@ tutti/device_manager/
 │       ├── local_nvme_virtual.cpp      # Allocator implementation
 │       └── queue_acquire_helper_impl.cuh # Helper implementations
 ├── kernel_modules/                      # snvme kernel module
-│   ├── snvme-5.15.0-public/            # Linux 5.15.0 version
-│   ├── snvme-5.4.241-1-tlinux4-0017/   # Linux 5.4.241 version
-│   ├── snvme-6.8.0-public/             # Linux 6.8 version
+│   ├── snvme/                           # unified tree (baseline/<tag>/ per kernel lineage)
 │   ├── PORTING.md                       # Kernel porting guide
 │   └── test/                            # Kernel module tests
 ├── libnvm/                              # User-space NVMe library

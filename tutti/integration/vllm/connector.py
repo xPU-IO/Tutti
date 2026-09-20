@@ -37,11 +37,8 @@ logger = init_logger("vllm.tutti.connector")
 if TYPE_CHECKING:
     from tutti.integration.vllm.worker import WorkerImpl
 
-# 兼容别名：配置解析已迁至 adapter.geometry / adapter.factory，这里保留
-# 同名私有符号供既有调用点与测试使用（行为完全一致）。
-_cdiv = cdiv
-_flatten_blocks = flatten_blocks
-_extra_config = extra_config
+# 兼容别名：配置解析已迁至 adapter.geometry / adapter.factory，以下同名
+# 私有符号保留供既有调用点与测试 import 使用（行为完全一致）。
 _resolve_geometry = resolve_geometry
 _deployment_rank = deployment_rank
 _expand_placeholders = expand_placeholders
@@ -76,9 +73,9 @@ class _RequestTracker:
         """
         self.token_ids.extend(new_token_ids)
         if replace_blocks:
-            self.block_ids = _flatten_blocks(new_block_ids)
+            self.block_ids = flatten_blocks(new_block_ids)
         else:
-            self.block_ids.extend(_flatten_blocks(new_block_ids))
+            self.block_ids.extend(flatten_blocks(new_block_ids))
 
     def advance_save(self, chunk_tokens: int) -> tuple[int, int]:
         """推进可保存边界，返回 (起始 chunk 序号, 本次可保存 chunk 数)。
@@ -87,7 +84,7 @@ class _RequestTracker:
         的区间不重复保存。
         """
         token_len = len(self.token_ids)
-        boundary = _cdiv(self.saved_tokens + 1, chunk_tokens) * chunk_tokens
+        boundary = cdiv(self.saved_tokens + 1, chunk_tokens) * chunk_tokens
         if token_len < boundary:
             return self.saved_tokens // chunk_tokens, 0
         target = token_len // chunk_tokens * chunk_tokens
@@ -132,7 +129,7 @@ class TuttiConnectorV1(KVConnectorBase_V1):
     def __init__(self, vllm_config, role, kv_cache_config=None):
         """三参与 vLLM 工厂签名对齐；role 决定本实例承载的回调面。"""
         super().__init__(vllm_config, role, kv_cache_config)
-        extra = _resolve_geometry(_extra_config(vllm_config), kv_cache_config)
+        extra = _resolve_geometry(extra_config(vllm_config), kv_cache_config)
         dcp = getattr(
             getattr(vllm_config, "parallel_config", None),
             "decode_context_parallel_size",
@@ -186,7 +183,6 @@ class TuttiConnectorV1(KVConnectorBase_V1):
 
             self._impl = WorkerImpl(
                 self._data_engine,
-                max_in_flight_layers=extra.get("max_in_flight_layers"),
                 lookahead_k=extra.get(
                     "lookahead_k", extra.get("prefetch_k", 2)
                 ),
@@ -382,7 +378,7 @@ class TuttiConnectorV1(KVConnectorBase_V1):
             self._load_starts.pop(req_id, None)
         scheduled: list[str] = []
         for new_req in scheduler_output.scheduled_new_reqs:
-            block_ids = _flatten_blocks(new_req.block_ids)
+            block_ids = flatten_blocks(new_req.block_ids)
             cap = len(block_ids) * self._block_size
             tokens = list(new_req.prompt_token_ids)[:cap]
             self._trackers[new_req.req_id] = _RequestTracker(

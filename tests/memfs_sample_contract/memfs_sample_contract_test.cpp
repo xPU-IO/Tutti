@@ -12,8 +12,8 @@
 //   4. Lease lifecycle (target invalid after close)
 
 #include <tutti/storage_runtime.h>
-#include "csrc/bindings/memfs/binding.h"
-#include "csrc/bindings/memfs/memfs_data_path.h"
+#include "csrc/payloads/memfs/payload.h"
+#include "csrc/payloads/memfs/memfs_data_path.h"
 #include "csrc/resolvers/memfs/resolver.h"
 
 #include <cstdio>
@@ -129,7 +129,7 @@ static int test_uri_parsing() {
 // =====================================================================
 
 static int test_e2e_roundtrip() {
-    using namespace tutti::binding::memfs;
+    using namespace tutti::payloads::memfs;
     using namespace tutti::resolver::memfs;
 
     MemfsResolver resolver;
@@ -237,7 +237,7 @@ static int test_e2e_roundtrip() {
 // =====================================================================
 
 static int test_boundary_rejection() {
-    using namespace tutti::binding::memfs;
+    using namespace tutti::payloads::memfs;
     using namespace tutti::resolver::memfs;
 
     MemfsResolver resolver;
@@ -321,7 +321,7 @@ static int test_boundary_rejection() {
 // =====================================================================
 
 static int test_lease_lifecycle() {
-    using namespace tutti::binding::memfs;
+    using namespace tutti::payloads::memfs;
     using namespace tutti::resolver::memfs;
 
     MemfsResolver resolver;
@@ -367,7 +367,7 @@ static int test_lease_lifecycle() {
 // =====================================================================
 
 static int test_partial_submit() {
-    using namespace tutti::binding::memfs;
+    using namespace tutti::payloads::memfs;
     using namespace tutti::resolver::memfs;
 
     MemfsResolver resolver;
@@ -451,7 +451,7 @@ struct TrackingResolver : tutti::resolver::memfs::MemfsResolver {
     }
 };
 
-struct TrackingDataPath : tutti::binding::memfs::MemfsDataPath {
+struct TrackingDataPath : tutti::payloads::memfs::MemfsDataPath {
     int* destroys;
     explicit TrackingDataPath(int* counter) : destroys(counter) {}
     ~TrackingDataPath() override {
@@ -530,7 +530,7 @@ static int test_borrowed_assembly_leaves_components_alone() {
 // follows from it one small struct at a time.
 // =====================================================================
 static int test_released_results_are_bounded() {
-    using namespace tutti::binding::memfs;
+    using namespace tutti::payloads::memfs;
     using namespace tutti::resolver::memfs;
 
     MemfsResolver resolver;

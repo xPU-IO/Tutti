@@ -94,22 +94,6 @@ HeaderRejection validate_structure(const std::uint8_t* data,
 
 } // namespace
 
-const char* to_string(HeaderRejection rejection) noexcept {
-    switch (rejection) {
-        case HeaderRejection::kNone: return "none";
-        case HeaderRejection::kEmptySlot: return "empty_slot";
-        case HeaderRejection::kBadMagic: return "bad_magic";
-        case HeaderRejection::kUnsupportedVersion: return "unsupported_version";
-        case HeaderRejection::kBadHeaderCrc: return "bad_header_crc";
-        case HeaderRejection::kIdentityMismatch: return "identity_mismatch";
-        case HeaderRejection::kKeyCrcMismatch: return "key_crc_mismatch";
-        case HeaderRejection::kPayloadBytesMismatch: return "payload_bytes_mismatch";
-        case HeaderRejection::kGenerationMismatch: return "generation_mismatch";
-        case HeaderRejection::kTruncatedBuffer: return "truncated_buffer";
-    }
-    return "unknown";
-}
-
 bool encode_object_header(std::uint8_t* out, std::size_t out_bytes,
                           const ObjectKey& key, std::uint64_t payload_bytes,
                           std::uint64_t generation,

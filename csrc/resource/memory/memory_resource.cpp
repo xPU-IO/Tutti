@@ -57,7 +57,7 @@ Status MemoryResource::shutdown() {
         return error(StatusCode::BUSY,
                      "memory Resource shutdown is already in progress");
     }
-    state_ = ResourceState::SHUTTING_DOWN;
+    // 本实现没有异步收尾：直接进入终态，不经过中间态再覆盖（J1）。
     state_ = ResourceState::STOPPED;
     return Status::Ok();
 }

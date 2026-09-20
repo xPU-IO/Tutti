@@ -14,6 +14,7 @@
 #include <string>
 #include <string_view>
 
+#include "csrc/common/backend_ids.h"
 #include <tutti/spi/storage_object_store.h>
 
 #include "csrc/storage_objects/object_store_core.h"
@@ -29,7 +30,8 @@ Result<std::unique_ptr<StorageObjectStore>> create_storage_object_store(
     // The scheme is therefore validated here rather than dispatched on: naming
     // a layout the store cannot provide should fail at creation, not silently
     // resolve to something else.
-    if (scheme == "local_nvme_file" || scheme == "striped_local_nvme_file") {
+    if (scheme == tutti::detail::backend_ids::kExt4StoreScheme ||
+        scheme == tutti::detail::backend_ids::kStripedStoreScheme) {
         return Result<std::unique_ptr<StorageObjectStore>>::Success(
             std::make_unique<storage_objects::ObjectStoreCore>());
     }

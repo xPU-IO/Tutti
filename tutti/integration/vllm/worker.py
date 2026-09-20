@@ -23,7 +23,7 @@ from tutti_kv_transfer import (
 
 from tutti.engine.staging import RingWindow
 from tutti.engine.core import LoadGateError
-from tutti.engine.nvtx import range as nvtx_range
+from tutti.common.nvtx import range as nvtx_range
 from tutti.integration.vllm.worker_meta import TuttiWorkerMetadata
 
 #: 单步内块表缓存上限（超出即整体重建，防无界增长）。
@@ -438,7 +438,7 @@ class WorkerImpl:
     """worker 角色的执行编排器。
 
     契约：
-    - 构造注入引擎与在途句柄上限（max_in_flight_layers，0 = 不限）。
+    - 构造注入引擎；在途上限由引擎（store 的 max_in_flight_operations）决定。
     - 显存对象经两个登记回调进入（单块跨层池或逐层映射，二选一）；
       首个执行回调触发惰性绑定（分配 staging 环窗显存并接入引擎）。
     - 读取流程：start_load_kv 构建并提交完整层计划；
@@ -450,21 +450,12 @@ class WorkerImpl:
       上报，由上层重算兜底。
     """
 
-    def __init__(self, engine, max_in_flight_layers: int | None = None,
+    def __init__(self, engine,
                  lookahead_k: int | None = None,
                  failure_coordinator=None,
                  failure_collective_timeout_s: float = 30.0):
         """构造 worker；lookahead_k 仅保留为兼容配置别名。"""
-        if max_in_flight_layers is None:
-            max_in_flight_layers = int(
-                getattr(engine, "max_in_flight_operations", 0) or 0
-            )
-        if not isinstance(max_in_flight_layers, int) or max_in_flight_layers < 0:
-            raise ValueError(
-                f"max_in_flight_layers 须为非负整数，got {max_in_flight_layers!r}"
-            )
         self._engine = engine
-        self._max_in_flight = max_in_flight_layers
         if lookahead_k is None:
             engine_config = getattr(engine, "_config", {})
             lookahead_k = engine_config.get(
@@ -536,6 +527,8 @@ class WorkerImpl:
         # 本步写入批是否已准备（每步在 start_load_kv 复位）
         self._write_batch_prepared = False
         self._save_inflight: list = []
+        # 已用于排序写流的读层 fence 事件（TUTTI_DEFER_WRITES_AFTER_READS）。
+        self._defer_write_event = None
         self._save_seen_callbacks: set[int] = set()
         self._save_error = None
         self._kv_group_layer_names: tuple[str, ...] = ()
@@ -1042,6 +1035,7 @@ class WorkerImpl:
                 return
         if not self._save_keys:
             return
+        self._defer_write_stream_behind_reads()
         try:
             with nvtx_range(
                 f"tutti.request.save|layer={idx}|chunks={len(self._save_keys)}"
@@ -1056,6 +1050,34 @@ class WorkerImpl:
             self._load_failed = True
             raise
         self._save_inflight.append(handle)
+
+    def _defer_write_stream_behind_reads(self) -> None:
+        """把写流排到"最新已提交的读层"之后（设备侧等待，主机不阻塞）。
+
+        NVMe 读写混跑会互相拖慢：同一 rank 实测读 kernel +52%
+        （2.08→3.16ms）、写 +31%（0.71→0.93ms）。写批仍按原来的节奏下发，但在
+        写流上插入一次 ``wait_event(读层 fence)``——读与写的顺序由设备侧保证，
+        Python 不做任何缓冲/轮询。
+
+        feeder 会把全部读层在请求开头提交完，因此随着它推进，每层写批都比
+        "当时最新的读层"更晚开始；最后一层读提交后，这个等待就等价于
+        "写全部排在读之后"。
+        """
+        store = getattr(self._engine, "_store", None)
+        if store is None or not getattr(
+                store, "defer_writes_after_reads", False):
+            return
+        getter = getattr(self._read_plan, "latest_read_event", None)
+        if not callable(getter):
+            return
+        event = getter()
+        if event is None or event is self._defer_write_event:
+            return
+        hook = getattr(store, "wait_write_stream_event", None)
+        if not callable(hook):
+            return
+        hook(event)
+        self._defer_write_event = event
 
     def wait_for_save(self) -> None:
         """等待全部写入完成并结算。"""
@@ -1147,6 +1169,7 @@ class WorkerImpl:
                 self._save_keys, ok=first_error is None
             )
         self._save_inflight = []
+        self._defer_write_event = None
         self._save_seen_callbacks = set()
         self._save_error = None
         self._save_keys = None
@@ -1324,13 +1347,14 @@ class WorkerImpl:
 
     def _on_async_read_failure(self, error) -> None:
         """Record an asynchronous read failure without blocking callbacks."""
-        if isinstance(error, LoadGateError):
-            self._mark_load_failure(error)
-        else:
-            self._mark_load_failure(error)
+        self._mark_load_failure(error)
 
     def _prefetch_load_layers(self, first_idx: int) -> None:
-        """提交从 ``first_idx`` 起的有限层窗口。
+        """提交从 ``first_idx`` 起的有限层窗口（**仅测试使用**）。
+
+        生产路径不调用它（09-18 review R4 复核：调用者只有
+        tests/python 的 adapter 测试）。它通过 ``_compat_prefetch_active``
+        开启 callback 路径的兼容等待分支，用于覆盖无 fence 的旧式后端。
 
         staging 环窗本身对波次覆盖负责背压；这里仅限制层级在途数，
         因而不会创建无界 async bulk 队列。若环窗容量不足，底层
@@ -1402,6 +1426,7 @@ class WorkerImpl:
                 pass
             self._record_store_outcome(self._save_keys, ok=False)
         self._save_inflight = []
+        self._defer_write_event = None
         self._save_seen_callbacks = set()
         self._save_error = None
         self._save_keys = None

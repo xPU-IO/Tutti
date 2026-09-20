@@ -1,6 +1,6 @@
 #pragma once
 
-// tutti/data_paths/local_nvme/io/tutti_gpu_primitives.cuh
+// csrc/data_paths/local_nvme/io/tutti_gpu_primitives.cuh
 //
 // GPU device-side primitives abstraction layer (PTX/MUSA replacement point).
 //

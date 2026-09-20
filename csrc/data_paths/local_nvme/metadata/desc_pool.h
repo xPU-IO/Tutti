@@ -1,6 +1,6 @@
 #pragma once
 
-// tutti/data_paths/local_nvme/metadata/desc_pool.h
+// csrc/data_paths/local_nvme/metadata/desc_pool.h
 //
 // GPU descriptor pool — replaces per-registration cudaMalloc for
 // pre-built AddressDescriptor[] arrays.

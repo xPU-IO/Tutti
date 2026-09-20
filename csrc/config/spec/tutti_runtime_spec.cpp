@@ -1,4 +1,6 @@
 #include <tutti/config/tutti_runtime_spec.h>
+#include "csrc/common/ascii.h"
+#include "csrc/common/backend_ids.h"
 
 #include <algorithm>
 #include <array>
@@ -12,21 +14,16 @@
 #include "csrc/config/spec/spec_internal.h"
 
 namespace tutti::config {
+
+// E2：后端标识常量的唯一来源（契约表与分派统一引用）。
+namespace backend_ids = tutti::detail::backend_ids;
+
 namespace {
 
 constexpr std::size_t kMaximumIdLength = 255;
 
-std::string upper_ascii(std::string value) {
-    for (char& ch : value) {
-        ch = static_cast<char>(
-            std::toupper(static_cast<unsigned char>(ch)));
-    }
-    return value;
-}
-
 template <typename Spec>
-Status validate_identity(const Spec& spec, const std::string& path,
-                         const char* kind) {
+Status validate_identity(const Spec& spec, const std::string& path) {
     if (spec.id.empty()) {
         return detail::invalid_spec(path + ".id must not be empty");
     }
@@ -36,7 +33,6 @@ Status validate_identity(const Spec& spec, const std::string& path,
     if (spec.type.empty()) {
         return detail::invalid_spec(path + ".type must not be empty");
     }
-    (void)kind;
     return Status::Ok();
 }
 
@@ -64,7 +60,7 @@ Status validate_backend_identity(const BackendSpec& spec,
 }
 
 Status validate_resource(const ResourceSpec& spec, const std::string& path) {
-    Status status = validate_identity(spec, path, "resource");
+    Status status = validate_identity(spec, path);
     if (!status.ok()) return status;
     if (spec.type == "nvme") {
         return detail::validate_nvme_resource(spec, path);
@@ -76,33 +72,33 @@ Status validate_resource(const ResourceSpec& spec, const std::string& path) {
 }
 
 Status validate_resolver(const ResolverSpec& spec, const std::string& path) {
-    Status status = validate_identity(spec, path, "resolver");
+    Status status = validate_identity(spec, path);
     if (!status.ok()) return status;
     if (spec.scheme.empty()) {
         return detail::invalid_spec(path + ".scheme must not be empty");
     }
-    if (spec.type == "local-file") {
+    if (spec.type == tutti::detail::backend_ids::kExt4ResolverType) {
         return detail::validate_local_file_resolver(spec, path);
     }
-    if (spec.type == "striped-file") {
+    if (spec.type == tutti::detail::backend_ids::kStripedResolverType) {
         return detail::validate_striped_file_resolver(spec, path);
     }
-    if (spec.type == "memfs") {
+    if (spec.type == backend_ids::kMemfsResolverType) {
         return detail::validate_memfs_resolver(spec, path);
     }
     return detail::invalid_spec(path + ".type is unknown: " + spec.type);
 }
 
 Status validate_datapath(const DataPathSpec& spec, const std::string& path) {
-    Status status = validate_identity(spec, path, "datapath");
+    Status status = validate_identity(spec, path);
     if (!status.ok()) return status;
-    if (spec.type == "local-nvme") {
+    if (spec.type == tutti::detail::backend_ids::kExt4DataPathType) {
         return detail::validate_local_nvme_datapath(spec, path);
     }
-    if (spec.type == "striped-local-nvme") {
+    if (spec.type == backend_ids::kStripedDataPathType) {
         return detail::validate_striped_local_nvme_datapath(spec, path);
     }
-    if (spec.type == "memfs") {
+    if (spec.type == backend_ids::kMemfsDataPathType) {
         return detail::validate_memfs_datapath(spec, path);
     }
     return detail::invalid_spec(path + ".type is unknown: " + spec.type);
@@ -210,12 +206,15 @@ Status invalid_spec(std::string message) {
 
 const SpecContract* find_spec_contract(std::string_view name) {
     static constexpr std::array<SpecContract, 3> contracts{{
-        {"ext4-local-nvme", "local-file", "file", "local-nvme", "nvme",
+        {backend_ids::kExt4Contract, backend_ids::kExt4ResolverType,
+         backend_ids::kExt4Scheme, backend_ids::kExt4DataPathType, "nvme",
          1, 1},
-        {"striped-local-nvme", "striped-file", "striped",
-         "striped-local-nvme", "nvme", 2,
-         std::numeric_limits<std::size_t>::max()},
-        {"memfs", "memfs", "memfs", "memfs", "memory", 1, 1},
+        {backend_ids::kStripedContract, backend_ids::kStripedResolverType,
+         backend_ids::kStripedScheme, backend_ids::kStripedDataPathType,
+         "nvme", 2, std::numeric_limits<std::size_t>::max()},
+        {backend_ids::kMemfsContract, backend_ids::kMemfsResolverType,
+         backend_ids::kMemfsScheme, backend_ids::kMemfsDataPathType,
+         "memory", 1, 1},
     }};
     const auto found = std::find_if(
         contracts.begin(), contracts.end(),
@@ -227,7 +226,7 @@ const SpecContract* find_spec_contract(std::string_view name) {
 
 Status TuttiRuntimeSpec::validate() const {
     // 1. Top-level fields.
-    const std::string profile = upper_ascii(accelerator.profile);
+    const std::string profile = tutti::detail::upper_ascii(accelerator.profile);
     if (profile != "HOST" && profile != "CUDA" &&
         profile != "MUSA" && profile != "MACA") {
         return detail::invalid_spec("accelerator.profile is unknown: " +
@@ -323,10 +322,10 @@ Status TuttiRuntimeSpec::validate() const {
                                         " types do not match contract " +
                                         backend.contract);
         }
-        if (backend.contract == "ext4-local-nvme") {
+        if (backend.contract == backend_ids::kExt4Contract) {
             status = detail::validate_ext4_local_nvme_backend(
                 resource, backend, *contract, path);
-        } else if (backend.contract == "striped-local-nvme") {
+        } else if (backend.contract == backend_ids::kStripedContract) {
             status = detail::validate_striped_local_nvme_backend(
                 resource, backend, *contract, path);
         } else {
@@ -411,7 +410,7 @@ Result<std::string> TuttiRuntimeSpec::to_debug_string() const {
             string_line(output, path + ".allocation.selection",
                         selection_name(config->allocation.selection));
             device_ids_line(output, path + ".allocation.device_ids",
-                            config->allocation.device_ids);
+                            config->allocation.nvme_device_ids);
             line(output, path + ".allocation.queues_per_controller",
                  config->allocation.queues_per_controller);
         } else {

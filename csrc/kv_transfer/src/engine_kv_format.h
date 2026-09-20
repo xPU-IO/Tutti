@@ -102,29 +102,6 @@ enum class EngineKVFormat : int {
   physical shape per layer: [num_blocks, block_size, num_heads, head_size]
   */
 
-  NL_X_NB_NH_BS_TWO_HS = 10,
-  /*
-  DEPRECATED: superseded by NL_X_NB_NH_BS_CS; no longer produced by detection.
-  used by:
-  - vLLM non-MLA blocks-first attention with K/V fused into the trailing dim
-  physical shape per layer: [num_blocks, num_heads, block_size, 2, head_size]
-  (recovered by splitting the fused trailing [block_size, 2 * head_size]).
-  The device transfer kernels treat it as HND with kv_size == 1 and
-  hs == 2 * head_size (the K/V axis stays packed inside each head copy).
-  */
-
-  NL_X_NB_BS_NH_TWO_HS = 11,
-  /*
-  DEPRECATED: superseded by NL_X_NB_BS_NH_CS; no longer produced by detection.
-  used by:
-  - vLLM non-MLA blocks-first attention (NHD layout) with K/V fused into the
-    trailing dim
-  physical shape per layer: [num_blocks, block_size, num_heads, 2, head_size]
-  (recovered by splitting the fused trailing [num_heads, 2 * head_size]).
-  Like NL_X_NB_NH_BS_TWO_HS but tokens before heads; the device transfer
-  kernels treat it as NHD with kv_size == 1 and hs == 2 * head_size.
-  */
-
   NL_X_NB_NH_BS_CS = 12,
   /*
   used by:
@@ -232,15 +209,6 @@ LMC_KV_FORMAT_HD constexpr FormatFacts format_facts(EngineKVFormat f) {
       break;
     case EngineKVFormat::TWO_X_NL_X_NB_BS_NH_HS:
       facts.is_kv_list = true;
-      break;
-    case EngineKVFormat::NL_X_NB_NH_BS_TWO_HS:
-      facts.is_layer_list = true;
-      facts.is_hnd = true;
-      facts.is_fused_packed = true;
-      break;
-    case EngineKVFormat::NL_X_NB_BS_NH_TWO_HS:
-      facts.is_layer_list = true;
-      facts.is_fused_packed = true;
       break;
     case EngineKVFormat::NL_X_NB_NH_BS_CS:
       facts.is_layer_list = true;

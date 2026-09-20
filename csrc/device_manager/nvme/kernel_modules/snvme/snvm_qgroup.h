@@ -165,8 +165,6 @@ struct snvm_qgroup {
 	struct snvm_user_queue {
 		uint16_t qid;
 		uint16_t alive;     /* 1 once Create I/O SQ committed */
-		uint64_t sq_vaddr;  /* echoed back so destroy / recycle  */
-		uint64_t cq_vaddr;  /* can recover the rings if needed   */
 	} queues[NVM_MAX_QUEUES_PER_GROUP];
 	unsigned int		cur_queues; /* number of slots currently alive */
 };

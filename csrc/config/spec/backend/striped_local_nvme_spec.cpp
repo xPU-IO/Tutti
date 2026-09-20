@@ -21,7 +21,7 @@ Status validate_striped_local_nvme_backend(const ResourceSpec& resource,
     if (config == nullptr) {
         return invalid_spec(path + ".resource does not reference nvme config");
     }
-    const std::size_t cardinality = config->allocation.device_ids.size();
+    const std::size_t cardinality = config->allocation.nvme_device_ids.size();
     if (config->allocation.selection != NvmeSelection::Striped ||
         cardinality < contract.minimum_cardinality ||
         cardinality > contract.maximum_cardinality) {

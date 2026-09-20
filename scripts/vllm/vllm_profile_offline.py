@@ -160,7 +160,10 @@ def main() -> int:
     parser.add_argument(
         "--block-size", type=int, choices=(64, 128, 256), default=64
     )
-    parser.add_argument("--direct-transfer-strict", action="store_true")
+    parser.add_argument(
+        "--direct-transfer-strict", action="store_true",
+        help="已恒真（直连准入失败一律抛出）；保留以兼容既有脚本。",
+    )
     parser.add_argument(
         "--without-tutti",
         action="store_true",
@@ -406,10 +409,9 @@ def main() -> int:
             },
         }
         if args.direct_transfer_strict:
-            connector_extra.update({
-                "direct_transfer": True,
-                "direct_transfer_strict": True,
-            })
+            # strict 语义已恒真（准入失败一律抛出）；保留 CLI 参数避免
+            # 打断既有脚本，这里只再声明 direct 准入。
+            connector_extra["direct_transfer"] = True
         kv_transfer_config = KVTransferConfig(
             kv_connector="TuttiConnectorV1",
             kv_connector_module_path="tutti.integration.vllm.connector",

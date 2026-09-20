@@ -1,6 +1,6 @@
 #pragma once
 
-// tutti/data_paths/local_nvme/io/prp_builder.h
+// csrc/data_paths/local_nvme/io/prp_builder.h
 //
 // Private PRP descriptor builder — ported from main:
 //   memory/include/memory_subsystem.h:93-98  (AddressDescriptor)

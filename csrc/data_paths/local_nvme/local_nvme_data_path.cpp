@@ -1,4 +1,4 @@
-// tutti/data_paths/local_nvme/local_nvme_data_path.cpp
+// csrc/data_paths/local_nvme/local_nvme_data_path.cpp
 //
 // LocalNvmeDataPath implementation.
 
@@ -209,7 +209,7 @@ LocalNvmeDataPath::~LocalNvmeDataPath() {
     // fence before tearing down.  This may block, but it prevents UAF.
     bool has_inflight = false;
     for (const auto& [tok, op] : ops_) {
-        if (op.state == OpState::IN_FLIGHT) {
+        if (op.state == IoState::IN_FLIGHT) {
             has_inflight = true;
             break;
         }
@@ -226,7 +226,7 @@ LocalNvmeDataPath::~LocalNvmeDataPath() {
         // Collect unique streams from in-flight ops and synchronize each.
         std::set<cudaStream_t> inflight_streams;
         for (const auto& [tok, op] : ops_) {
-            if (op.state == OpState::IN_FLIGHT && op.stream) {
+            if (op.state == IoState::IN_FLIGHT && op.stream) {
                 inflight_streams.insert(
                     static_cast<cudaStream_t>(op.stream));
             }
@@ -248,7 +248,7 @@ LocalNvmeDataPath::~LocalNvmeDataPath() {
         // Mark all as terminal (sync succeeded → IO completed).
         // D2H per-entry status to detect device-side failures.
         for (auto& [tok, op] : ops_) {
-            if (op.state == OpState::IN_FLIGHT) {
+            if (op.state == IoState::IN_FLIGHT) {
                 aggregate_completion_status_(op);
             }
         }
@@ -384,7 +384,7 @@ SubmitOutcome LocalNvmeDataPath::submit(const DataPathRequest* requests,
         result.status = guard.status();
         result.initial_states.resize(count);
         for (auto& state : result.initial_states) {
-            state.state = RequestState::REJECTED;
+            state.state = IoRequestState::REJECTED;
             state.status = result.status;
         }
         return result;
@@ -588,7 +588,7 @@ Status LocalNvmeDataPath::initialize_impl_(const DataPathConfig& config,
             arena_cfg.max_entries_per_slot = max_batch_entries_;
             arena_cfg.page_size = static_cast<std::uint32_t>(ctrl_->page_size);
             arena_cfg.cuda_device = cuda_device_;
-            if (!arena_.init(arena_cfg, ctrl_)) {
+            if (!arena_.init(arena_cfg)) {
                 nvm_ctrl_free_client(ctrl_);
                 ctrl_ = nullptr;
                 return Status(StatusCode::NOT_READY,
@@ -639,7 +639,7 @@ Status LocalNvmeDataPath::shutdown_impl_(std::uint64_t timeout_ns) {
     // Check for in-flight ops.
     auto has_inflight = [&]() -> bool {
         for (const auto& [tok, op] : ops_) {
-            if (op.state == OpState::IN_FLIGHT) return true;
+            if (op.state == IoState::IN_FLIGHT) return true;
         }
         return false;
     };
@@ -736,7 +736,7 @@ Result<DataPathTarget> LocalNvmeDataPath::open_impl_(const ResolvedTarget& targe
                    "DataPath not initialized"));
     }
 
-    auto payload_result = binding::ext4_local_nvme::view_payload(target);
+    auto payload_result = payloads::ext4_local_nvme::view_payload(target);
     if (!payload_result.ok()) {
         return Result<DataPathTarget>::Failure(
             Status(payload_result.status().code(),
@@ -807,7 +807,7 @@ Result<DataPathTarget> LocalNvmeDataPath::open_impl_(const ResolvedTarget& targe
         state.lba_extents.push_back(lba);
     }
 
-    std::uint64_t token = next_token_++;
+    std::uint64_t token = next_target_token_++;
     std::uint64_t generation = 1;
     state.token = token;
     state.generation = generation;
@@ -1295,14 +1295,14 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
     auto reject_all = [&](StatusCode code, const std::string& msg) {
         outcome.status = Status(code, msg);
         for (std::size_t i = 0; i < count; ++i) {
-            outcome.initial_states[i].state = RequestState::REJECTED;
+            outcome.initial_states[i].state = IoRequestState::REJECTED;
             outcome.initial_states[i].status = Status(code, msg);
         }
     };
 
     auto reject_one = [&](std::size_t i, StatusCode code,
                           const std::string& msg) {
-        outcome.initial_states[i].state = RequestState::REJECTED;
+        outcome.initial_states[i].state = IoRequestState::REJECTED;
         outcome.initial_states[i].status = Status(code, msg);
     };
 
@@ -1363,7 +1363,7 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
     // consumes the advertised concurrent-operation quota.
     std::uint64_t in_flight_count = 0;
     for (const auto& [token, op] : ops_) {
-        if (op.state == OpState::IN_FLIGHT) {
+        if (op.state == IoState::IN_FLIGHT) {
             ++in_flight_count;
         }
     }
@@ -1403,7 +1403,29 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
         std::vector<std::uint64_t> lengths;
     };
 
-    std::vector<PendingReq> pending(count);
+    // 复用 thread_local 缓冲：PendingReq 内含 4 个 vector，原先每个 submit
+    // 都重新分配 1+4N 个缓冲区（N = 请求数）。容量跨 submit 保留，元素在
+    // 这里显式重置；每线程一份，无需加锁。
+    static thread_local std::vector<PendingReq> pending_scratch;
+    // 必须无条件 resize（可增可减）：下游有多处 `for (pr : pending)` 按整个
+    // 数组遍历，若只在变小时扩，尾部残留的旧元素会被当成本次请求处理。
+    // 缩小时 vector 只析构多余元素、保留容量，同 workload 下 count 稳定，
+    // 缓冲区复用不受影响。
+    pending_scratch.resize(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        PendingReq& pr = pending_scratch[i];
+        pr.accepted = false;
+        pr.mreg = nullptr;
+        pr.tstate = nullptr;
+        pr.total_bytes = 0;
+        pr.target_token = 0;
+        pr.memory_token = 0;
+        pr.entries.clear();
+        pr.list_infos.clear();
+        pr.dynamic_descs.clear();
+        pr.lengths.clear();
+    }
+    std::vector<PendingReq>& pending = pending_scratch;
     std::uint32_t total_entries = 0;
     std::uint32_t total_list_ios = 0;
     bool has_rejection = false;
@@ -1910,7 +1932,7 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
 
         std::uint64_t op_token = next_op_token_++;
         OpEntry op;
-        op.state = (sync_err == cudaSuccess) ? OpState::COMPLETED : OpState::FAILED;
+        op.state = (sync_err == cudaSuccess) ? IoState::COMPLETED : IoState::FAILED;
         op.status = (sync_err == cudaSuccess)
             ? Status::Ok()
             : Status(StatusCode::DEVICE_ERROR,
@@ -1970,7 +1992,7 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
             op_token, 1);
         for (std::size_t i = 0; i < count; ++i) {
             if (pending[i].accepted) {
-                outcome.initial_states[i].state = RequestState::ACCEPTED;
+                outcome.initial_states[i].state = IoRequestState::ACCEPTED;
                 outcome.initial_states[i].status = Status::Ok();
             }
         }
@@ -1980,7 +2002,7 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
     // 8. Success: store op.
     std::uint64_t op_token = next_op_token_++;
     OpEntry op;
-    op.state = OpState::IN_FLIGHT;
+    op.state = IoState::IN_FLIGHT;
     op.status = Status::Ok();
     op.bytes_transferred = 0;
     op.total_bytes = total_bytes;
@@ -2029,7 +2051,7 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
         op_token, 1);
     for (std::size_t i = 0; i < count; ++i) {
         if (pending[i].accepted) {
-            outcome.initial_states[i].state = RequestState::ACCEPTED;
+            outcome.initial_states[i].state = IoRequestState::ACCEPTED;
             outcome.initial_states[i].status = Status::Ok();
         }
     }
@@ -2048,7 +2070,7 @@ Result<ProgressResult> LocalNvmeDataPath::progress_impl_(ProgressBudget budget) 
     if (budget.max_work_units == 0 || budget.timeout_ns == 0) {
         // Still report whether there's in-flight work.
         for (const auto& [tok, op] : ops_) {
-            if (op.state == OpState::IN_FLIGHT) {
+            if (op.state == IoState::IN_FLIGHT) {
                 result.more_work_likely = true;
                 break;
             }
@@ -2068,7 +2090,7 @@ Result<ProgressResult> LocalNvmeDataPath::progress_impl_(ProgressBudget budget) 
             break;
         }
 
-        if (op.state != OpState::IN_FLIGHT) continue;
+        if (op.state != IoState::IN_FLIGHT) continue;
 
 
         // Check work cap before each query.
@@ -2109,7 +2131,7 @@ Result<ProgressResult> LocalNvmeDataPath::progress_impl_(ProgressBudget budget) 
             // rewritten to NotReady, leaving the op stuck IN_FLIGHT forever.
             // We record the terminal state, then clear the sticky error so it
             // does not pollute subsequent queries in this loop.
-            op.state = OpState::FAILED;
+            op.state = IoState::FAILED;
             op.status = Status(StatusCode::DEVICE_ERROR,
                                "cudaEventQuery error: " +
                                std::string(cudaGetErrorString(ce)));
@@ -2126,7 +2148,7 @@ Result<ProgressResult> LocalNvmeDataPath::progress_impl_(ProgressBudget budget) 
 
     // Check if any ops remain in flight.
     for (const auto& [tok, op] : ops_) {
-        if (op.state == OpState::IN_FLIGHT) {
+        if (op.state == IoState::IN_FLIGHT) {
             result.more_work_likely = true;
             break;
         }
@@ -2157,7 +2179,7 @@ Status LocalNvmeDataPath::release_impl_(DataPathOp op) {
         return Status(StatusCode::NOT_FOUND, "release: op not found");
     }
 
-    if (entry->state == OpState::IN_FLIGHT) {
+    if (entry->state == IoState::IN_FLIGHT) {
         return Status(StatusCode::BUSY,
                       "release: op is still in flight");
     }
@@ -2245,7 +2267,7 @@ std::uint64_t LocalNvmeDataPath::test_prp_list_page_capacity() const {
 std::uint32_t LocalNvmeDataPath::test_in_flight_count() const {
     std::uint32_t n = 0;
     for (const auto& [tok, op] : ops_) {
-        if (op.state == OpState::IN_FLIGHT) ++n;
+        if (op.state == IoState::IN_FLIGHT) ++n;
     }
     return n;
 }
@@ -2438,7 +2460,7 @@ void LocalNvmeDataPath::aggregate_completion_status_(OpEntry& op) {
     op.completion_detail = IoCompletionDetail{};
     if (!op.d_status || op.entry_count == 0) {
         // No status array (shouldn't happen for real ops).
-        op.state = OpState::COMPLETED;
+        op.state = IoState::COMPLETED;
         op.status = Status::Ok();
         op.bytes_transferred = op.total_bytes;
         op.completion_detail.confirmed_bytes = op.total_bytes;
@@ -2457,7 +2479,7 @@ void LocalNvmeDataPath::aggregate_completion_status_(OpEntry& op) {
                                  cudaMemcpyDeviceToHost);
     if (ce != cudaSuccess) {
         cudaGetLastError();
-        op.state = OpState::FAILED;
+        op.state = IoState::FAILED;
         op.status = Status(StatusCode::DEVICE_ERROR,
                            "D2H completion status failed: " +
                            std::string(cudaGetErrorString(ce)));
@@ -2530,7 +2552,7 @@ void LocalNvmeDataPath::aggregate_completion_status_(OpEntry& op) {
             }
         }
         if (any_failed) {
-            op.state = OpState::FAILED;
+            op.state = IoState::FAILED;
             op.status = Status(StatusCode::DEVICE_ERROR, first_error);
             op.bytes_transferred = fallback_confirmed_bytes;
             set_completion_failure(
@@ -2540,7 +2562,7 @@ void LocalNvmeDataPath::aggregate_completion_status_(OpEntry& op) {
                 op.has_timeout, first_failed_entry, first_raw_cq_status);
             attribute_failed_requests();
         } else {
-            op.state = OpState::COMPLETED;
+            op.state = IoState::COMPLETED;
             op.status = Status::Ok();
             op.bytes_transferred = op.total_bytes;
             op.completion_detail.confirmed_bytes = op.total_bytes;
@@ -2601,7 +2623,7 @@ void LocalNvmeDataPath::aggregate_completion_status_(OpEntry& op) {
     }
 
     if (any_failed) {
-        op.state = OpState::FAILED;
+        op.state = IoState::FAILED;
         op.status = Status(StatusCode::DEVICE_ERROR, first_error);
         op.bytes_transferred = confirmed_bytes;  // only confirmed bytes
         set_completion_failure(
@@ -2610,7 +2632,7 @@ void LocalNvmeDataPath::aggregate_completion_status_(OpEntry& op) {
             op.has_timeout, first_failed_entry, first_raw_cq_status);
         attribute_failed_requests();
     } else {
-        op.state = OpState::COMPLETED;
+        op.state = IoState::COMPLETED;
         op.status = Status::Ok();
         op.bytes_transferred = confirmed_bytes;
         op.completion_detail.confirmed_bytes = confirmed_bytes;
@@ -2683,7 +2705,7 @@ LocalNvmeDataPath::OpEntry* LocalNvmeDataPath::find_op_(DataPathOp op) {
 
 bool LocalNvmeDataPath::target_has_inflight_ops_(std::uint64_t token) const {
     for (const auto& [tok, op] : ops_) {
-        if (op.state != OpState::IN_FLIGHT) continue;
+        if (op.state != IoState::IN_FLIGHT) continue;
         for (auto t : op.target_tokens)
             if (t == token) return true;
     }
@@ -2692,7 +2714,7 @@ bool LocalNvmeDataPath::target_has_inflight_ops_(std::uint64_t token) const {
 
 bool LocalNvmeDataPath::memory_has_inflight_ops_(std::uint64_t token) const {
     for (const auto& [tok, op] : ops_) {
-        if (op.state != OpState::IN_FLIGHT) continue;
+        if (op.state != IoState::IN_FLIGHT) continue;
         for (auto t : op.memory_tokens)
             if (t == token) return true;
     }

@@ -2,7 +2,7 @@
 
 #include "csrc/data_paths/local_nvme/io/prp_builder.h"  // AddressDescriptor
 
-// tutti/data_paths/local_nvme/io/submit_one.cuh
+// csrc/data_paths/local_nvme/io/submit_one.cuh
 //
 // Private device helpers for batched, block-aligned NVMe IO.
 // Ported from main: nvme_storage_device.cuh + queue_acquire_helper.cuh.

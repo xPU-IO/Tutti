@@ -1,32 +1,32 @@
-# Extending Tutti: Adding a Resolver + Binding + DataPath
+# Extending Tutti: Adding a Resolver + Payload + DataPath
 
 This guide walks through adding a new storage backend as a community
-contributor. It uses the **memfs** sample (`tutti/bindings/memfs/`) as a
+contributor. It uses the **memfs** sample (`csrc/payloads/memfs/`) as a
 concrete example. The entire sample was added with **zero core changes** —
-no `tutti/include/tutti/**` or Runtime source file was modified.
+no `csrc/include/tutti/**` or Runtime source file was modified.
 
 ## What you need to create
 
 | Component | Location | Purpose |
 |-----------|----------|---------|
-| **Binding** | `tutti/bindings/<name>/binding.h` | Payload type, identity constants, pairing helpers (`make_resolved_target` / `view_payload`) |
-| **DataPath** | `tutti/bindings/<name>/<name>_data_path.h` | Implements `tutti::DataPath` SPI (open/close/register/submit/progress/query/release) |
-| **Resolver** | `tutti/resolvers/<name>/resolver.h` | Implements `tutti::StorageTargetResolver` SPI (parses URI, produces `ResolvedTarget`) |
-| **CMakeLists.txt** | `tutti/bindings/<name>/CMakeLists.txt` | INTERFACE library + optional test registration |
+| **Payload** | `csrc/payloads/<name>/payload.h` | Payload type, identity constants, pairing helpers (`make_resolved_target` / `view_payload`) |
+| **DataPath** | `csrc/payloads/<name>/<name>_data_path.h` | Implements `tutti::DataPath` SPI (open/close/register/submit/progress/query/release) |
+| **Resolver** | `csrc/resolvers/<name>/resolver.h` | Implements `tutti::StorageTargetResolver` SPI (parses URI, produces `ResolvedTarget`) |
+| **CMakeLists.txt** | `csrc/payloads/<name>/CMakeLists.txt` | INTERFACE library + optional test registration |
 | **Contract test** | `tests/<name>_sample_contract/` | URI parsing, E2E, boundary, lifecycle |
 
 ## What you must NOT modify
 
-- `tutti/include/tutti/**` — public/SPI headers (frozen)
-- `tutti/storage_runtime.h` — Runtime implementation (frozen)
-- Any existing resolver/binding/DataPath package
+- `csrc/include/tutti/**` — public/SPI headers (frozen)
+- `csrc/include/tutti/storage_runtime.h` — Runtime implementation (frozen)
+- Any existing resolver/payload/DataPath package
 
 If you find you must change a core file, stop and record it as a gap.
 
 ## A second example: striped (multi-device, fused-kernel submission)
 
-`tutti/data_paths/striped_local_nvme/` (+ `tutti/resolvers/striped_file/` +
-`tutti/bindings/striped_local_nvme/`) is a second, more advanced community
+`csrc/data_paths/striped_local_nvme/` (+ `csrc/resolvers/striped_file/` +
+`csrc/payloads/striped_local_nvme/`) is a second, more advanced community
 extension: it fans a single logical `striped://name?devs=<m1,m2,...>&unit=<bytes>`
 target out across N local NVMe devices with unit-granularity round-robin
 striping, submitted through exactly **one** `cudaLaunchKernel` per
@@ -37,21 +37,22 @@ Like memfs, it was added with **zero core changes** — callers see a plain
 `Striped*` type; see `tests/striped_local_nvme_contract/` (tests 87/90) for
 the "zero striped-awareness at the call site" proof and the fault/partial-
 commit contract. It shares the `nvme_submit_primitives.cuh` device-side
-primitives with `tutti/data_paths/local_nvme/` (extracted once, unchanged)
+primitives with `csrc/data_paths/local_nvme/` (extracted once, unchanged)
 rather than reimplementing `resolve_lba`/doorbell/CQ-poll logic. See the
 package's own header comments (`striped_data_path.h`,
-`resolvers/striped_file/resolver.h`, `bindings/striped_local_nvme/binding.h`)
+`resolvers/striped_file/resolver.h`,
+`payloads/striped_local_nvme/payload.h`)
 for the full design.
 
 ## Step-by-step (memfs example)
 
-### 1. Define the payload (`binding.h`)
+### 1. Define the payload (`payload.h`)
 
-The payload is **pair-private**: it lives only in your binding package. No
+The payload is **pair-private**: it lives only in your payload package. No
 core header references it.
 
 ```cpp
-namespace tutti::binding::memfs {
+namespace tutti::payloads::memfs {
 
 inline constexpr std::string_view kPayloadTypeId = "memfs-payload-v1";
 inline constexpr std::uint32_t kPayloadApiVersion = 1;
@@ -66,7 +67,7 @@ Result<ResolvedTarget> make_resolved_target(uint64_t size,
 // DataPath extracts payload with type-id + version check:
 Result<const MemfsPayload*> view_payload(const ResolvedTarget& target);
 
-} // namespace tutti::binding::memfs
+} // namespace tutti::payloads::memfs
 ```
 
 Key points:
@@ -97,7 +98,7 @@ class MemfsDataPath : public tutti::DataPath {
 ```
 
 Use `detail::SpiIdentityMint::mint<...>(token, generation)` to mint opaque
-identities for targets/memory/ops (see `tutti/testing/mock_data_path.h`
+identities for targets/memory/ops (see `csrc/testing/mock_data_path.h`
 for a complete reference implementation).
 
 ### 3. Implement the resolver (`resolver.h`)
@@ -119,11 +120,11 @@ class MemfsResolver : public StorageTargetResolver {
 ### 4. Create CMakeLists.txt
 
 ```cmake
-add_library(tutti_memfs_binding INTERFACE)
-target_include_directories(tutti_memfs_binding INTERFACE
+add_library(tutti_memfs_payload INTERFACE)
+target_include_directories(tutti_memfs_payload INTERFACE
     $<BUILD_INTERFACE:${TUTTI_REPOSITORY_ROOT}>
 )
-target_link_libraries(tutti_memfs_binding INTERFACE tutti_spi)
+target_link_libraries(tutti_memfs_payload INTERFACE tutti_spi)
 
 if(BUILD_TESTING)
     add_subdirectory(
@@ -134,21 +135,21 @@ endif()
 
 ### 5. Register with one line
 
-Add **one line** to `tutti/CMakeLists.txt`, inside the `if(BUILD_TESTING)`
+Add **one line** to `csrc/CMakeLists.txt`, inside the `if(BUILD_TESTING)`
 block immediately after `include(CTest)`:
 
 ```cmake
 if(BUILD_TESTING)
     include(CTest)
 
-    add_subdirectory(bindings/memfs)   # <-- the one line
+    add_subdirectory(payloads/memfs)   # <-- the one line
 ```
 
 That's it — the library and test are now built.
 
 **Placement matters**: `add_test()` only registers in directories processed
 *after* `include(CTest)` has enabled testing. Putting the line earlier
-(e.g. next to the production `add_subdirectory(bindings/...)` calls) will
+(e.g. next to the production `add_subdirectory(payloads/...)` calls) will
 build the test binary but silently leave it out of `ctest`.
 
 ### 6. Write contract tests
@@ -175,14 +176,14 @@ User: rt.open("memfs://4096", {"memfs"})
 
 ## Checklist
 
-- [ ] Payload type defined only in `binding.h` (grep: no references in
-      `tutti/include/tutti/**`)
+- [ ] Payload type defined only in `payload.h` (grep: no references in
+      `csrc/include/tutti/**`)
 - [ ] Identity constants (type id, API version, DataPath key) in one place
 - [ ] DataPath implements all SPI virtuals
 - [ ] Resolver parses URI and produces `ResolvedTarget` via
       `make_resolved_target`
 - [ ] CMakeLists.txt defines INTERFACE library + test under BUILD_TESTING
-- [ ] Exactly one `add_subdirectory` line added to `tutti/CMakeLists.txt`
+- [ ] Exactly one `add_subdirectory` line added to `csrc/CMakeLists.txt`
 - [ ] No core files modified (`git diff` shows only new files + one line)
 - [ ] Contract tests pass
 - [ ] Existing tests still pass (no regression)
@@ -208,8 +209,8 @@ ls -l /dev/snvm_control
 ### 2. 编译 smoke test
 
 ```bash
-make -C tutti/device_manager/nvme/kernel_modules/test
-make -C tutti/device_manager/nvme/kernel_modules/test gpu
+make -C csrc/device_manager/nvme/kernel_modules/test
+make -C csrc/device_manager/nvme/kernel_modules/test gpu
 ```
 
 测试二进制：
@@ -239,7 +240,7 @@ export TGT=0000:e3:00.0  # 替换为可清空的测试 NVMe PCI BDF
 不 bind 控制器，不会接管内核 `nvme` 驱动：
 
 ```bash
-cd tutti/device_manager/nvme/kernel_modules/test
+cd csrc/device_manager/nvme/kernel_modules/test
 sudo ./snvme_smoke "$TGT"
 sudo ./snvme_smoke_qgroup "$TGT"
 sudo ./snvme_smoke_gpu --gpu 0 "$TGT"

@@ -33,7 +33,7 @@ Status parse_nvme_resource(const YAML::Node& node, const std::string& path,
     config.allocation.selection = parsed_selection.value();
     status = parse_nvme_device_ids(
         allocation["device_ids"], path + ".allocation.device_ids",
-        config.allocation.device_ids);
+        config.allocation.nvme_device_ids);
     if (!status.ok()) return status;
 
     std::uint64_t queues = 0;

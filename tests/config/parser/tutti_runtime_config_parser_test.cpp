@@ -75,7 +75,7 @@ int main() {
                 &spec.storage.resources.front().config);
             CHECK(resource != nullptr);
             if (resource != nullptr) {
-                CHECK(resource->allocation.device_ids ==
+                CHECK(resource->allocation.nvme_device_ids ==
                       std::vector<std::int32_t>{2});
             }
             const auto* datapath =

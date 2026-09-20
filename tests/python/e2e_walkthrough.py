@@ -35,7 +35,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tutti.engine.core import KVEngine
-from tutti.engine.nvtx import range as nvtx_range
+from tutti.common.nvtx import range as nvtx_range
 from tutti.engine.staging import RingWindow
 from tutti.index.chunk_index import derive_io_key  # noqa: F401  (教学展示用)
 from tutti.storage.base import KVStore  # noqa: F401  (SPI 契约参照)

@@ -41,10 +41,10 @@
 #include "csrc/data_paths/striped_local_nvme/striped_data_path.h"
 #include "csrc/resolvers/striped_file/resolver.h"
 #include "csrc/resolvers/local_file/resolver.h"
-#include "csrc/bindings/striped_local_nvme/binding.h"
+#include "csrc/payloads/striped_local_nvme/payload.h"
 
-#include "../hardware_test_directory.h"
-#include "../nvme_test_cli.h"
+#include "tests/hardware_test_directory.h"
+#include "tests/nvme_test_cli.h"
 
 #include <tutti/cuda_like.h>
 

@@ -15,8 +15,8 @@
    contract types** in `tutti/include/tutti/spi/` + `io_types.h` /
    `memory_types.h` / `status.h`.
 3. **Adding a backend requires zero core changes.** New resolver +
-   binding + DataPath packages plug in without touching
-   `tutti/include/tutti/**` or the Runtime (proven twice: the memfs
+   payload + DataPath packages plug in without touching
+   `csrc/include/tutti/**` or the Runtime (proven twice: the memfs
    sample and the striped multi-device DataPath).
 4. **Single-threaded access per instance.** The Runtime serializes all
    SPI entry points (`registry_mutex_`, `datapath_open_mutex_`);
@@ -75,15 +75,15 @@ Key semantics every implementation must honor:
   `detail::SpiIdentityMint::mint<T>(token, generation)`; generations
   make stale-handle use detectable instead of aliasing a recycled slot.
 
-### 2.3 Bindings — the pair-private payload contract
+### 2.3 Payloads — the pair-private payload contract
 
-A binding package (`tutti/bindings/<name>/binding.h`) is the *only* place
+A payload package (`csrc/payloads/<name>/payload.h`) is the *only* place
 where a resolver's output format and a DataPath's input expectation meet:
 
 - `kPayloadTypeId` + `kPayloadApiVersion` + `kRecommendedDataPathKey`
   are each defined exactly once; both packing (`make_resolved_target`)
   and unpacking (`view_payload`, with type-id + version check) go through
-  the binding, so the pair cannot drift apart.
+  the payload package, so the pair cannot drift apart.
 - The Runtime routes purely on these constants: scheme → resolver,
   `recommended_data_path_key` → DataPath.
 

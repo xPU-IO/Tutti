@@ -21,6 +21,11 @@ from dataclasses import dataclass
 
 __all__ = ["ObjectPlacement", "ObjectStore", "ObjectStoreUnavailable"]
 
+# 对象层 scheme 名（与 C++ 侧 csrc/include/tutti/detail/backend_ids.h 对应；
+# 跨语言契约，Python 侧集中在这里，其他模块不要写裸字面量）。
+SCHEME_LOCAL_NVME_FILE = "local_nvme_file"
+SCHEME_STRIPED_NVME_FILE = "striped_local_nvme_file"
+
 
 class ObjectStoreUnavailable(RuntimeError):
     """tutti_runtime 绑定不可用（未构建或不在 PYTHONPATH 上）。"""
@@ -81,7 +86,7 @@ class ObjectStore:
             config.get("namespace_fingerprint")
         )
         store = core.ObjectStore()
-        store.open(config.pop("scheme", "local_nvme_file"), config)
+        store.open(config.pop("scheme", SCHEME_LOCAL_NVME_FILE), config)
         self._core_store = store
 
     def close(self) -> None:
@@ -101,12 +106,6 @@ class ObjectStore:
 
     def contains(self, key: bytes) -> bool:
         return self._required().contains(key)
-
-    def contains_prefix(self, keys) -> int:
-        return int(self._required().contains_prefix(list(keys)))
-
-    def contains_prefix_all_ranks(self, keys) -> int:
-        return int(self._required().contains_prefix_all_ranks(list(keys)))
 
     def placement(self, key: bytes) -> ObjectPlacement | None:
         """内存缓存的 placement；未命中时回落到 C++ 的 lookup。"""

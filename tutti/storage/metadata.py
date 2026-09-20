@@ -16,12 +16,18 @@ from __future__ import annotations
 
 import logging
 
-from .object_store import ObjectStore, _fingerprint_bytes
+from .object_store import (
+    ObjectStore,
+    SCHEME_LOCAL_NVME_FILE,
+    SCHEME_STRIPED_NVME_FILE,
+    _fingerprint_bytes,
+)
 from .registry import (
     create_metadata_store as _create_metadata_store,
     register_metadata_store_type,
 )
 from .tutti_nvme.preset_derive import derive_device_fields
+from .tutti_nvme.runtime_factory import preset_mounts as _preset_mounts
 
 
 _LOG = logging.getLogger(__name__)
@@ -231,8 +237,8 @@ class TuttiMetadataStore:
         for rank, root in enumerate(self._roots):
             options = {
                 "scheme": (
-                    "striped_local_nvme_file"
-                    if self._stripe_unit else "local_nvme_file"
+                    SCHEME_STRIPED_NVME_FILE
+                    if self._stripe_unit else SCHEME_LOCAL_NVME_FILE
                 ),
                 "uri": root,
                 "capacity_slots": self._num_chunks,
@@ -271,17 +277,3 @@ register_metadata_store_type("tutti_nvme", "tutti.storage.metadata:TuttiMetadata
 #: 兼容别名：实现已上移到 stores.registry.create_metadata_store，这里保留
 #: 同名模块属性，使既有导入路径与测试打桩（monkeypatch 本模块属性）不变。
 create_metadata_store = _create_metadata_store
-
-
-def _preset_mounts(preset):
-    if not isinstance(preset, dict):
-        return None
-    devices = preset.get("devices")
-    if not isinstance(devices, (list, tuple)):
-        return None
-    mounts = []
-    for device in devices:
-        if not isinstance(device, dict) or not device.get("mount_path"):
-            return None
-        mounts.append(device["mount_path"])
-    return mounts or None

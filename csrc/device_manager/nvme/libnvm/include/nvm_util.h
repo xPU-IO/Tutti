@@ -178,18 +178,6 @@
 #define NVM_DEFAULT_CID(sq)         ((uint16_t) ((sq)->tail + (!(sq)->phase) * (sq)->qs))
 
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-/*
- * Get controller associated with admin queue-pair reference.
- */
-const nvm_ctrl_t* nvm_ctrl_from_aq_ref(nvm_aq_ref ref);
-#ifdef __cplusplus
-}
-#endif
-
-
 
 #ifdef __cplusplus
 extern "C" {

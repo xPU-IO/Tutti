@@ -15,7 +15,7 @@ target_link_libraries(tutti_striped_local_nvme_contract_test PRIVATE
     tutti_striped_local_nvme_datapath
     tutti_striped_file_resolver
     tutti_local_file_resolver
-    tutti_local_file_binding
+    tutti_local_file_payload
     tutti_spi
     libnvm
     Threads::Threads

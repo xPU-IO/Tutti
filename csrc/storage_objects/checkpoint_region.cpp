@@ -62,19 +62,6 @@ std::uint64_t round_up(std::uint64_t value, std::uint64_t multiple) noexcept {
 
 } // namespace
 
-const char* to_string(CheckpointRejection rejection) noexcept {
-    switch (rejection) {
-        case CheckpointRejection::kNone: return "none";
-        case CheckpointRejection::kEmptyContainer: return "empty_container";
-        case CheckpointRejection::kBadMagic: return "bad_magic";
-        case CheckpointRejection::kUnsupportedVersion: return "unsupported_version";
-        case CheckpointRejection::kTruncatedBuffer: return "truncated_buffer";
-        case CheckpointRejection::kBadBodyCrc: return "bad_body_crc";
-        case CheckpointRejection::kMalformedBody: return "malformed_body";
-    }
-    return "unknown";
-}
-
 std::vector<std::uint8_t> encode_checkpoint(
     const std::vector<CheckpointEntry>& entries, std::uint64_t sequence) {
     std::vector<std::uint8_t> body;

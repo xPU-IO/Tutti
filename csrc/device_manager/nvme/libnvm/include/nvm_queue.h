@@ -16,27 +16,6 @@
 
 
 /*
- * Clear queue descriptor.
- *
- * Initialize an empty queue descriptor. 
- * The user must clear the queue memory manually before using the handle.
- *
- * Note: vaddr must be page-aligned and at least one page.
- *
- * Queue memory must be physically contiguous.
- */
-
-__host__
-int nvm_queue_clear(nvm_queue_t* q,            // NVM queue descriptor
-                    const nvm_ctrl_t* ctrl,    // NVM controller handle
-                    bool cq,                   // Is this a completion queue or submission queue?
-                    uint16_t no,               // Queue number
-                    uint32_t qs,               // Queue size (number of entries)
-                    bool local,                // Is this local or remote memory
-                    volatile void* vaddr,      // Virtual address to queue memory
-                    uint64_t ioaddr);          // Bus address to queue memory (as seen from the controller)
-
-/*
  * Reset queue descriptor and set all members to initial state.
  *
  * Note: this function should not be used if the queue has been created but

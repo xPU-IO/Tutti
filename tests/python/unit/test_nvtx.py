@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from tutti.engine import nvtx as tutti_nvtx
+from tutti.common import nvtx as tutti_nvtx
 
 
 def test_direction_palette():

@@ -1,7 +1,7 @@
 # tests/memfs_sample_contract/CMakeLists.txt
 #
 # SAMPLE-ONLY contract test for the memfs extension.
-# Hardware-free: plain C++17, links only tutti_spi + tutti_memfs_binding.
+# Hardware-free: plain C++17, links only tutti_spi + tutti_memfs_payload.
 
 cmake_minimum_required(VERSION 3.18)
 
@@ -13,7 +13,7 @@ add_executable(tutti_memfs_sample_contract_test
 
 target_link_libraries(tutti_memfs_sample_contract_test PRIVATE
     tutti_spi
-    tutti_memfs_binding
+    tutti_memfs_payload
     Threads::Threads
 )
 

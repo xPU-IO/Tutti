@@ -1,4 +1,4 @@
-# tutti/presets/CMakeLists.txt
+# csrc/presets/CMakeLists.txt
 #
 # Preset assembly layer — public API factory functions that construct
 # StorageRuntime with the appropriate DataPath + resolver injected.

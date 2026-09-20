@@ -1,10 +1,8 @@
-// tutti/data_paths/local_nvme/metadata/metadata_arena.cpp
+// csrc/data_paths/local_nvme/metadata/metadata_arena.cpp
 
 #include "csrc/data_paths/local_nvme/metadata/metadata_arena.h"
 
 #include <tutti/cuda_like.h>
-#include <nvm_types.h>
-#include <nvm_dma.h>
 
 #include "csrc/data_paths/local_nvme/io/submit_one.cuh"
 
@@ -25,14 +23,13 @@ MetadataArena::~MetadataArena() {
 // init: pre-allocate all workspace
 // -----------------------------------------------------------------------
 
-bool MetadataArena::init(const Config& cfg, nvm_ctrl_t* ctrl) {
+bool MetadataArena::init(const Config& cfg) {
     if (initialized_) return false;
-    if (cfg.num_slots == 0 || cfg.max_entries_per_slot == 0 || ctrl == nullptr) {
+    if (cfg.num_slots == 0 || cfg.max_entries_per_slot == 0) {
         return false;
     }
 
     cfg_ = cfg;
-    ctrl_ = ctrl;
 
     int prev_dev = -1;
     cudaError_t ce = cudaGetDevice(&prev_dev);

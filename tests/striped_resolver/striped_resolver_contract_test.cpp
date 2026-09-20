@@ -14,8 +14,8 @@
 
 #include <tutti/status.h>
 #include <tutti/spi/storage_target_resolver.h>
-#include <csrc/bindings/striped_local_nvme/binding.h>
-#include <csrc/resolvers/striped_file/resolver.h>
+#include "csrc/payloads/striped_local_nvme/payload.h"
+#include "csrc/resolvers/striped_file/resolver.h"
 
 #include <cstdio>
 #include <cstdint>
@@ -26,7 +26,7 @@
 #include <string>
 #include <vector>
 
-namespace ns = tutti::binding::striped_local_nvme;
+namespace ns = tutti::payloads::striped_local_nvme;
 using tutti::ResolvedTarget;
 using tutti::ResolveOptions;
 using tutti::Result;
@@ -65,12 +65,12 @@ public:
 
         // Build a minimal ResolvedTarget using the ext4 binding helpers.
         // We create a single-extent payload covering [0, logical_size).
-        auto ns = tutti::binding::ext4_local_nvme::NamespaceIdentity{
+        auto ns = tutti::payloads::ext4_local_nvme::NamespaceIdentity{
             "0000:08:00.0", 1, 4096};
-        std::vector<tutti::binding::ext4_local_nvme::Extent> exts;
+        std::vector<tutti::payloads::ext4_local_nvme::Extent> exts;
         exts.push_back({0, 0, results_[idx].logical_size});
 
-        auto payload_result = tutti::binding::ext4_local_nvme::
+        auto payload_result = tutti::payloads::ext4_local_nvme::
             Ext4LocalNvmePayload::create(ns, std::move(exts),
                                           results_[idx].logical_size);
         if (!payload_result.ok()) {
@@ -80,8 +80,8 @@ public:
         // Simple lease: a shared_ptr<int> acts as a non-null lease marker.
         auto lease = std::make_shared<int>(42);
 
-        return tutti::binding::ext4_local_nvme::make_resolved_target(
-            std::string(tutti::binding::ext4_local_nvme::kResolverTypeId),
+        return tutti::payloads::ext4_local_nvme::make_resolved_target(
+            std::string(tutti::payloads::ext4_local_nvme::kResolverTypeId),
             results_[idx].logical_size,
             std::move(payload_result).value(),
             std::move(lease));
@@ -514,14 +514,14 @@ static void test_backing_file_path() {
             const ResolveOptions&) override {
             received_uris.emplace_back(uri);
             // Return a minimal valid target.
-            auto ns = tutti::binding::ext4_local_nvme::NamespaceIdentity{
+            auto ns = tutti::payloads::ext4_local_nvme::NamespaceIdentity{
                 "0000:08:00.0", 1, 4096};
-            std::vector<tutti::binding::ext4_local_nvme::Extent> exts;
+            std::vector<tutti::payloads::ext4_local_nvme::Extent> exts;
             exts.push_back({0, 0, 4096});
-            auto pr = tutti::binding::ext4_local_nvme::Ext4LocalNvmePayload::
+            auto pr = tutti::payloads::ext4_local_nvme::Ext4LocalNvmePayload::
                 create(ns, std::move(exts), 4096);
             auto lease = std::make_shared<int>(1);
-            return tutti::binding::ext4_local_nvme::make_resolved_target(
+            return tutti::payloads::ext4_local_nvme::make_resolved_target(
                 "test", 4096, std::move(pr).value(), std::move(lease));
         }
         std::vector<std::string> received_uris;

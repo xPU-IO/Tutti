@@ -1,6 +1,6 @@
 #pragma once
 
-// tutti/data_paths/local_nvme/io/nvme_submit_primitives.cuh
+// csrc/data_paths/local_nvme/io/nvme_submit_primitives.cuh
 //
 // Shared NVMe submission primitives.
 //
@@ -57,7 +57,6 @@ struct EntryCompletionStatus {
 #include <queue.h>
 #include <nvm_parallel_queue.h>
 #include <nvm_cmd.h>
-#include <nvm_io.h>
 
 #include <cstdio>
 
