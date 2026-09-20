@@ -49,6 +49,36 @@ If you are changing architecture, interfaces, deployment flow, or naming, you mu
 - Do not bind core abstractions to the current file-based implementation model
 - Do not introduce new top-level abstractions that permanently hardcode the `Tutti` name unless maintainers explicitly choose that path
 
+### Include Paths
+
+Two include roots are registered, and the spelling tells you which side of the
+API boundary a header lives on:
+
+| Header | Root | Form | Example |
+| --- | --- | --- | --- |
+| Public API / SPI (`csrc/include/tutti/`) | `csrc/include` | angle brackets | `#include <tutti/spi/data_path.h>` |
+| Implementation (everything else under `csrc/`) | repository root | double quotes | `#include "csrc/data_paths/..."` |
+
+- These two are the only allowed spellings. Do not write bare implementation
+  paths (`"data_paths/..."`), `csrc/include/...`, or relative `"../foo.h"`
+  paths; the only sanctioned exception is the kernel-shared UAPI shim
+  `libnvm/include/ioctl.h`, which must resolve from its own directory for both
+  the kernel module and userspace builds.
+- First-line path comments: public headers state their **include name**
+  (`// tutti/spi/data_path.h`); implementation files state their **source path**
+  (`// csrc/data_paths/...`). Keep them in sync when a file moves.
+- Implementation-only helpers must not live under `csrc/include/tutti/`:
+  `install(DIRECTORY csrc/include/tutti/)` ships that whole tree, so a helper
+  placed there silently becomes installed API surface. Cross-cutting helpers
+  belong in `csrc/common/`.
+- Public headers must not include implementation headers, and must not name
+  backend-private types or constants.
+- New backend packages follow
+  `csrc/payloads/<name>/payload.h` (payload contract) +
+  `csrc/resolvers/<name>/resolver.h` + `csrc/data_paths/<name>/`, and register
+  their identity constants in `csrc/common/backend_ids.h`. See
+  [doc/extending_tutti.md](doc/extending_tutti.md).
+
 ### Refactoring Strategy
 
 This repository is mid-refactor. All code movement must follow a **zero-risk, additive-first** discipline:

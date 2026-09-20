@@ -23,7 +23,7 @@ mediates an individual IO.
 | GPU-direct NVMe access | `snvme` kernel module + `libnvm` user library; GPU kernels write SQ entries and tap doorbells directly |
 | Batch IO throughput | One GPU kernel launch handles thousands of NVMe IOs; per-IO device/LBA resolution happens on-GPU |
 | Multi-device striping | A striped target spans up to 4 NVMe devices in tensor-sized units; one fused kernel fans out the batch |
-| Stable public API | `StorageRuntime` is the only surface applications touch; resolvers/bindings/DataPaths are replaceable behind the SPI |
+| Stable public API | `StorageRuntime` is the only surface applications touch; resolvers/payloads/DataPaths are replaceable behind the SPI |
 | Vendor portability | `cuda_like` three-layer GPU framework; kernel P2P layer split into symmetric per-vendor backends |
 
 ### 1.2 Current scope (v0.1.1)
@@ -71,7 +71,7 @@ mediates an individual IO.
 ```
 
 Each layer depends only on layers below it. The public API
-(`tutti/include/tutti/`) never names a resolver/binding/DataPath
+(`csrc/include/tutti/`) never names a resolver/payload/DataPath
 implementation type; SPI implementations never touch public request
 types beyond their contracts.
 
@@ -102,7 +102,7 @@ pre-stat validation). `striped_file` composes N per-device file targets
 into one logical striped target (tensor-unit placement: tensor index mod N,
 packed within each per-device shard).
 
-#### Bindings (`tutti/bindings/`)
+#### Payloads (`csrc/payloads/`)
 
 The pair-private contract between one resolver family and one DataPath
 family: payload type, identity constants (`type-id` + `api-version` +
@@ -183,14 +183,14 @@ stream semantics.
 ## 5. Source map
 
 ```text
-tutti/include/tutti/          public API (storage_runtime.h, io_types.h, …)
-tutti/include/tutti/spi/      SPI contracts (data_path.h, resolver, …)
-tutti/include/tutti/gpu_vendor/  cuda_like vendor shims
-tutti/resolvers/              local_file, striped_file
-tutti/bindings/               ext4_local_nvme, striped_local_nvme, memfs (sample)
-tutti/data_paths/             local_nvme, striped_local_nvme
-tutti/device_manager/nvme/    libnvm, nvmeservice, kernel_modules
-tutti/examples/               layerwise_kv_overlap (KV cache reference)
+csrc/include/tutti/          public API (storage_runtime.h, io_types.h, …)
+csrc/include/tutti/spi/      SPI contracts (data_path.h, resolver, …)
+csrc/include/tutti/gpu_vendor/  cuda_like vendor shims
+csrc/resolvers/              local_file, striped_file, memfs (sample)
+csrc/payloads/               ext4_local_nvme, striped_local_nvme, memfs (sample)
+csrc/data_paths/             local_nvme, striped_local_nvme
+csrc/device_manager/nvme/    libnvm, nvmeservice, kernel_modules
+examples/                    layerwise_kv_overlap (KV cache reference)
 tests/                        contract suites + perf microbenchmarks
 doc/                          architecture, design, porting, build docs
 ```
