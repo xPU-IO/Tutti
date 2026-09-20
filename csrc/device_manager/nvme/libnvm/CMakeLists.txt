@@ -1,4 +1,4 @@
-# tutti/device_manager/nvme/libnvm/CMakeLists.txt
+# csrc/device_manager/nvme/libnvm/CMakeLists.txt
 # libnvm: User-space NVMe queue library wrapping snvme kernel module
 #
 # Layer 2 component: wraps snvme ioctls, manages queue memory, GPU DMA

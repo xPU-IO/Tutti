@@ -13,7 +13,6 @@
 #include "nvm_types.h"
 #include "nvm_util.h"
 #include "nvm_error.h"
-#include "nvm_admin.h"
 #include "nvm_queue.h"
 #include "nvm_ctrl.h"
 #include <cstdio>
@@ -237,55 +236,5 @@ struct QueuePair
     ~QueuePair() = default;
 
 };
-
-/*
- * Legacy bring-up tail.  Before the queue-group API, Controller::init_queues
- * pre-mapped all rings + run nvm_queue_set + nvm_device_init (BIND),
- * this function ran NVM_GET_DEV_INFO and called nvm_queue_clear() on
- * every QueuePair to derive doorbell host VAs from the controller's
- * dstrd via the SQ_DBL/CQ_DBL macros.
- *
- * In the queue-group flow the kernel returns BAR0-relative doorbell offsets
- * directly via NVM_ADD_USER_QUEUE.out_pairs[].sq/cq_doorbell_offset,
- * and Controller::init_queues writes those into nvm_queue_t.db
- * itself.  This function is kept only for binary compatibility with
- * any external caller; the Controller class no longer uses it.
- */
-__attribute__((deprecated("Queue-group flow handles per-queue init inside "
-                          "Controller::init_queues; use nvm_add_user_queue() "
-                          "+ out_pairs[].*_doorbell_offset directly")))
-inline int init_userioq_device(nvm_ctrl_t* ctrl, QueuePair** qps, struct disk* d)
-{
-    int err,i;
-
-    err = ioctl_get_dev_info(ctrl, d);
-    if(err)
-    {
-        return -1;
-    }
-    if(ctrl->nr_user_q > ctrl->cq_num)
-    {
-        return -1;
-    }
-    for (i = 0; i < ctrl->nr_user_q; i++){
-        qps[i]->pageSize = ctrl->page_size;
-        qps[i]->block_size = d->block_size;
-        qps[i]->block_size_minus_1 = d->block_size -1;
-        qps[i]->block_size_log = std::log2(d->block_size);
-        qps[i]->nvmNamespace = d->ns_id;
-        // printf("pageSize  is %u, block_size is %lu, block_size_minus_1 is %u, block_size_minus_1 is %u block_size_log is %u, nvmNamespace is %u\n",qps[i]->pageSize,qps[i]->block_size,qps[i]->block_size_minus_1,qps[i]->block_size_log,qps[i]->nvmNamespace);
-
-        // clear cq
-        nvm_queue_clear(&qps[i]->cq,ctrl,true,i+ctrl->start_cq_idx,qps[i]->cq.qs,1,qps[i]->cq_mem.get()->vaddr,qps[i]->cq_mem.get()->ioaddrs[0]);
-    
-
-        // clear sq
-        nvm_queue_clear(&qps[i]->sq,ctrl,false,i+ctrl->start_cq_idx,qps[i]->sq.qs,1,qps[i]->sq_mem.get()->vaddr,qps[i]->sq_mem.get()->ioaddrs[0]);
-
-    }
-    return 0;
-}
-
-
 
 #endif

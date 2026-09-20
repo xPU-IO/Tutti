@@ -243,7 +243,4 @@ void nvm_ctrl_free(nvm_ctrl_t* ctrl)
 
 
 
-int nvm_raw_ctrl_init(nvm_ctrl_t** ctrl)
-{
-    return _nvm_ctrl_init(ctrl, NULL, NULL, DEVICE_TYPE_UNKNOWN,NULL,0);
-}
+
