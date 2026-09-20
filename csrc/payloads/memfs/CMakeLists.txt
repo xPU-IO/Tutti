@@ -1,13 +1,13 @@
-# tutti/bindings/memfs/CMakeLists.txt
+# csrc/payloads/memfs/CMakeLists.txt
 #
-# SAMPLE-ONLY binding package: memfs resolver + binding + DataPath.
+# SAMPLE-ONLY payload package: memfs resolver + payload + DataPath.
 #
 # This is a community-extension sample (see doc/extending_tutti.md).
 # It is NOT a production backend.  The entire sample is header-only and
 # hardware-free: no CUDA, no libnvm, no kernel headers.
 #
-# Registration: a single `add_subdirectory(bindings/memfs)` line in
-# tutti/CMakeLists.txt enables both the library target and (under
+# Registration: the `add_subdirectory(payloads/memfs)` line in
+# csrc/CMakeLists.txt enables both the library target and (under
 # BUILD_TESTING) the contract test.  No other core CMake change is
 # required.
 
@@ -15,15 +15,15 @@
 # Header-only INTERFACE library
 # ---------------------------------------------------------------------------
 
-add_library(tutti_memfs_binding INTERFACE)
+add_library(tutti_memfs_payload INTERFACE)
 
-# Workspace root so that <tutti/bindings/memfs/*.h> and
-# <tutti/resolvers/memfs/*.h> resolve.
-target_include_directories(tutti_memfs_binding INTERFACE
+# Workspace root so that "csrc/payloads/memfs/*.h" and
+# "csrc/resolvers/memfs/*.h" resolve.
+target_include_directories(tutti_memfs_payload INTERFACE
     $<BUILD_INTERFACE:${TUTTI_REPOSITORY_ROOT}>
 )
 
-target_link_libraries(tutti_memfs_binding INTERFACE
+target_link_libraries(tutti_memfs_payload INTERFACE
     tutti_spi
 )
 

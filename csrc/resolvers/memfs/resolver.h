@@ -1,6 +1,6 @@
 #pragma once
 
-// tutti/resolvers/memfs/resolver.h
+// csrc/resolvers/memfs/resolver.h
 //
 // SAMPLE-ONLY resolver for the memfs binding.  Parses `memfs://<size>`
 // URIs and produces a ResolvedTarget backed by an in-memory buffer.
@@ -19,9 +19,10 @@
 // Header-only C++17.  Depends only on public/SPI headers, the memfs
 // binding header, and the standard library.
 
+#include "csrc/common/backend_ids.h"
 #include <tutti/status.h>
 #include <tutti/spi/storage_target_resolver.h>
-#include "csrc/bindings/memfs/binding.h"
+#include "csrc/payloads/memfs/payload.h"
 
 #include <cerrno>
 #include <cstdint>
@@ -37,12 +38,15 @@ namespace tutti::resolver::memfs {
 // MemfsResolver — resolves memfs:// URIs to in-memory targets.
 // -------------------------------------------------------------------------
 
+inline constexpr std::string_view kScheme =
+    tutti::detail::backend_ids::kMemfsScheme;
+
 class MemfsResolver : public StorageTargetResolver {
 public:
     explicit MemfsResolver(
         std::uint64_t capacity_bytes = 0,
         std::string data_path_key =
-            std::string(tutti::binding::memfs::kRecommendedDataPathKey))
+            std::string(tutti::payloads::memfs::kRecommendedDataPathKey))
         : capacity_bytes_(capacity_bytes),
           data_path_key_(std::move(data_path_key)) {}
 
@@ -52,7 +56,7 @@ public:
 
         // Verify scheme (optional: the Runtime already routes by scheme,
         // but a resolver should be defensive).
-        if (options.scheme != "memfs") {
+        if (options.scheme != kScheme) {
             return Result<ResolvedTarget>::Failure(
                 Status(StatusCode::INVALID_ARGUMENT,
                        "memfs resolver requires scheme 'memfs'"));
@@ -97,17 +101,17 @@ public:
         }
 
         // Create the payload (backing buffer).
-        auto payload = tutti::binding::memfs::MemfsPayload::create(
+        auto payload = tutti::payloads::memfs::MemfsPayload::create(
             static_cast<std::uint64_t>(size));
         if (!payload.ok()) {
             return Result<ResolvedTarget>::Failure(payload.status());
         }
 
         // Pack into a ResolvedTarget.
-        return tutti::binding::memfs::make_resolved_target(
+        return tutti::payloads::memfs::make_resolved_target(
             static_cast<std::uint64_t>(size),
             std::move(payload).value(),
-            std::make_shared<tutti::binding::memfs::MemfsOwnerLease>(),
+            std::make_shared<tutti::payloads::memfs::MemfsOwnerLease>(),
             data_path_key_);
     }
 

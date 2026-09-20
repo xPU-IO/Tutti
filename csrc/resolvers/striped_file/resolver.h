@@ -1,6 +1,6 @@
 #pragma once
 
-// tutti/resolvers/striped_file/resolver.h
+// csrc/resolvers/striped_file/resolver.h
 //
 // StripedResolver: resolves "striped://<name>?devs=<m1,m2,...>&unit=<bytes>"
 // URIs into a single ResolvedTarget carrying N per-device sub-targets.
@@ -22,15 +22,17 @@
 //   where <i> is 0-based shard index.
 //
 // Lease semantics:
-//   The bundle's lease (StripeBundleLease) holds all N sub-leases.
+//   The bundle's lease (StripeBundleLease) is a marker; the real fd
+//   cleanup happens when the payload's shard vector is destroyed.
 //   If shard i fails to resolve, shards 0..i-1 (already resolved) are
 //   released via RAII — the local vector<ResolvedTarget> destructor
 //   closes their fds.  This is fail-closed: no partial bundle escapes.
 
+#include "csrc/common/backend_ids.h"
 #include <tutti/status.h>
 #include <tutti/spi/storage_target_resolver.h>
-#include <csrc/bindings/striped_local_nvme/binding.h>
-#include <csrc/resolvers/local_file/resolver.h>
+#include "csrc/payloads/striped_local_nvme/payload.h"
+#include "csrc/resolvers/local_file/resolver.h"
 
 #include <cstdint>
 #include <cstring>
@@ -42,7 +44,8 @@
 
 namespace tutti::resolvers::striped_file {
 
-inline constexpr std::string_view kScheme = "striped";
+inline constexpr std::string_view kScheme =
+    tutti::detail::backend_ids::kStripedScheme;
 inline constexpr std::uint64_t kMinStripeUnit = 4096;
 
 // -------------------------------------------------------------------------
@@ -58,7 +61,7 @@ public:
     StripedResolver(std::vector<std::unique_ptr<StorageTargetResolver>> shard_resolvers,
                     std::uint64_t stripe_unit,
                     std::string data_path_key =
-                        std::string(binding::striped_local_nvme::
+                        std::string(payloads::striped_local_nvme::
                                         kRecommendedDataPathKey))
         : shard_resolvers_(std::move(shard_resolvers)),
           stripe_unit_(stripe_unit),
@@ -239,8 +242,6 @@ public:
         // vector destructor (ResolvedTarget move-only → unique ownership).
         std::vector<ResolvedTarget> shards;
         shards.reserve(N);
-        std::vector<std::shared_ptr<void>> sub_leases;
-        sub_leases.reserve(N);
 
         for (std::uint32_t i = 0; i < N; ++i) {
             // Construct backing file path: <mount>/striped/<name>.shard<i>
@@ -261,29 +262,15 @@ public:
                            sr.status().message()));
             }
 
-            // Extract the sub-lease for the bundle lease.
-            // We access the internal lease via the fact that
-            // ResolvedTarget stores it as shared_ptr<void>.
-            // Since we can't access it directly (it's private),
-            // the StripeBundleLease will hold shared_ptr<void> copies
-            // obtained from the sub-targets.  But ResolvedTarget's
-            // lease is private...
-            //
-            // Design: the StripeBundleLease is a marker.  The real
-            // fd cleanup happens when the StripedLocalNvmePayload's
-            // shard vector is destroyed (each shard's shared_ptr<void>
-            // lease refcount → 0 → fd close).  The StripeBundleLease
-            // just needs to be non-null.
             shards.push_back(std::move(sr).value());
         }
 
         // 8. Create the bundle lease (marker — real cleanup in payload dtor).
         auto bundle_lease = std::make_shared<
-            binding::striped_local_nvme::StripeBundleLease>(
-            std::move(sub_leases));
+            payloads::striped_local_nvme::StripeBundleLease>();
 
         // 9. Create the immutable payload.
-        auto payload_result = binding::striped_local_nvme::
+        auto payload_result = payloads::striped_local_nvme::
             StripedLocalNvmePayload::create(
                 N, stripe_unit_, std::move(shards), parsed_rot);
 
@@ -300,11 +287,11 @@ public:
                        "StripedLocalNvmePayload::create returned null"));
         }
         const auto logical = payload->logical_size();
-        return ResolvedTarget::make<binding::striped_local_nvme::StripedLocalNvmePayload,
-                                    binding::striped_local_nvme::StripeBundleLease>(
-            std::string(binding::striped_local_nvme::kResolverTypeId),
-            std::string(binding::striped_local_nvme::kPayloadTypeId),
-            binding::striped_local_nvme::kPayloadApiVersion,
+        return ResolvedTarget::make<payloads::striped_local_nvme::StripedLocalNvmePayload,
+                                    payloads::striped_local_nvme::StripeBundleLease>(
+            std::string(payloads::striped_local_nvme::kResolverTypeId),
+            std::string(payloads::striped_local_nvme::kPayloadTypeId),
+            payloads::striped_local_nvme::kPayloadApiVersion,
             logical,
             data_path_key_,
             std::move(payload),

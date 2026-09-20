@@ -1,9 +1,9 @@
-// binding_contract_test.cpp
+// payload_contract_test.cpp
 //
-// Contract tests for tutti/bindings/ext4_local_nvme/binding.h.
+// Contract tests for csrc/payloads/ext4_local_nvme/payload.h.
 // Plain C++17 executable, no GTest or third-party deps.
 
-#include <csrc/bindings/ext4_local_nvme/binding.h>
+#include "csrc/payloads/ext4_local_nvme/payload.h"
 
 #include <tutti/spi/storage_target_resolver.h>  // for mismatch test only
 
@@ -15,7 +15,7 @@
 #include <utility>
 #include <vector>
 
-namespace binding = tutti::binding::ext4_local_nvme;
+namespace payloads = tutti::payloads::ext4_local_nvme;
 
 // =====================================================================
 // Fake types
@@ -38,9 +38,9 @@ public:
         std::string_view uri,
         const tutti::ResolveOptions& /*opts*/) override {
 
-        auto payload = binding::Ext4LocalNvmePayload::create(
-            binding::NamespaceIdentity{"0000:08:00.0", 1, 4096},
-            std::vector<binding::Extent>{
+        auto payload = payloads::Ext4LocalNvmePayload::create(
+            payloads::NamespaceIdentity{"0000:08:00.0", 1, 4096},
+            std::vector<payloads::Extent>{
                 {0,     0x10000, 0x1000},
                 {0x1000, 0x20000, 0x1000},
                 {0x2000, 0x30000, 0x1000},
@@ -52,8 +52,8 @@ public:
         auto lease = std::make_shared<FakeLease>();
         lease->description = std::string(uri);
 
-        return binding::make_resolved_target(
-            std::string(binding::kResolverTypeId),
+        return payloads::make_resolved_target(
+            std::string(payloads::kResolverTypeId),
             0x3000,
             std::move(payload).value(),
             std::move(lease));
@@ -65,8 +65,8 @@ public:
     explicit FakeDataPathConsumer(const tutti::ResolvedTarget& target)
         : target_(target) {}
 
-    tutti::Result<const binding::Ext4LocalNvmePayload*> get_payload() const {
-        return binding::view_payload(target_);
+    tutti::Result<const payloads::Ext4LocalNvmePayload*> get_payload() const {
+        return payloads::view_payload(target_);
     }
 
 private:
@@ -120,14 +120,14 @@ static int test_payload_type_mismatch() {
     auto wrong = tutti::ResolvedTarget::make<int, FakeLease>(
         "wrong-resolver",
         "wrong-payload-type-id",
-        binding::kPayloadApiVersion,
+        payloads::kPayloadApiVersion,
         100,
         "some-key",
         std::move(payload),
         std::move(lease));
     if (!wrong.ok()) return 1;
 
-    auto v = binding::view_payload(wrong.value());
+    auto v = payloads::view_payload(wrong.value());
     if (v.ok()) return 1;
     if (v.status().code() != tutti::StatusCode::UNSUPPORTED) return 1;
     return 0;
@@ -135,26 +135,26 @@ static int test_payload_type_mismatch() {
 
 // 3. API version mismatch → UNSUPPORTED.
 static int test_version_mismatch() {
-    auto payload = binding::Ext4LocalNvmePayload::create(
-        binding::NamespaceIdentity{"00:00.0", 1, 512},
-        std::vector<binding::Extent>{{0, 0, 512}},
+    auto payload = payloads::Ext4LocalNvmePayload::create(
+        payloads::NamespaceIdentity{"00:00.0", 1, 512},
+        std::vector<payloads::Extent>{{0, 0, 512}},
         512);
     if (!payload.ok()) return 1;
     auto lease = std::make_shared<FakeLease>();
 
     auto wrong = tutti::ResolvedTarget::make<
-        binding::Ext4LocalNvmePayload, FakeLease>(
+        payloads::Ext4LocalNvmePayload, FakeLease>(
         "wrong-resolver",
-        std::string(binding::kPayloadTypeId),
+        std::string(payloads::kPayloadTypeId),
         999,
         512,
         "some-key",
-        std::const_pointer_cast<binding::Ext4LocalNvmePayload>(
+        std::const_pointer_cast<payloads::Ext4LocalNvmePayload>(
             std::move(payload).value()),
         std::move(lease));
     if (!wrong.ok()) return 1;
 
-    auto v = binding::view_payload(wrong.value());
+    auto v = payloads::view_payload(wrong.value());
     if (v.ok()) return 1;
     if (v.status().code() != tutti::StatusCode::UNSUPPORTED) return 1;
     return 0;
@@ -165,7 +165,7 @@ static int test_empty_target() {
     tutti::ResolvedTarget empty;
     if (empty.valid()) return 1;
 
-    auto v = binding::view_payload(empty);
+    auto v = payloads::view_payload(empty);
     if (v.ok()) return 1;
     if (v.status().code() != tutti::StatusCode::UNSUPPORTED) return 1;
     return 0;
@@ -175,26 +175,26 @@ static int test_empty_target() {
 static int test_owner_lifetime() {
     FakeLease::reset_count();
 
-    std::weak_ptr<const binding::Ext4LocalNvmePayload> weak_payload;
+    std::weak_ptr<const payloads::Ext4LocalNvmePayload> weak_payload;
     std::weak_ptr<FakeLease> weak_lease;
 
     {
-        auto payload = binding::Ext4LocalNvmePayload::create(
-            binding::NamespaceIdentity{"00:00.0", 1, 512},
-            std::vector<binding::Extent>{{0, 0, 512}},
+        auto payload = payloads::Ext4LocalNvmePayload::create(
+            payloads::NamespaceIdentity{"00:00.0", 1, 512},
+            std::vector<payloads::Extent>{{0, 0, 512}},
             512);
         if (!payload.ok()) return 1;
 
         auto lease = std::make_shared<FakeLease>();
 
-        weak_payload = std::weak_ptr<const binding::Ext4LocalNvmePayload>(
+        weak_payload = std::weak_ptr<const payloads::Ext4LocalNvmePayload>(
             payload.value());
         weak_lease = lease;
 
         if (weak_payload.expired()) return 1;
         if (weak_lease.expired()) return 1;
 
-        auto rt_result = binding::make_resolved_target(
+        auto rt_result = payloads::make_resolved_target(
             "test-resolver", 512,
             std::move(payload).value(), std::move(lease));
         if (!rt_result.ok()) return 1;
@@ -205,7 +205,7 @@ static int test_owner_lifetime() {
         if (weak_payload.expired()) return 1;
         if (weak_lease.expired()) return 1;
 
-        auto v = binding::view_payload(rt);
+        auto v = payloads::view_payload(rt);
         if (!v.ok()) return 1;
 
         // rt destroyed here → both released.
@@ -231,12 +231,12 @@ static int test_move_retains_owner() {
     if (!moved_to.valid()) return 1;
     if (original.valid()) return 1;
 
-    auto v = binding::view_payload(moved_to);
+    auto v = payloads::view_payload(moved_to);
     if (!v.ok()) return 1;
     if (v.value() == nullptr) return 1;
     if (v.value()->file_size() != 0x3000) return 1;
 
-    auto v2 = binding::view_payload(original);
+    auto v2 = payloads::view_payload(original);
     if (v2.ok()) return 1;
     return 0;
 }
@@ -247,14 +247,14 @@ static int test_immutable() {
     auto result = resolver.resolve("fake://imm.txt", {"fake"});
     if (!result.ok()) return 1;
 
-    auto v = binding::view_payload(result.value());
+    auto v = payloads::view_payload(result.value());
     if (!v.ok()) return 1;
 
     // Static assertion: the returned pointer type is const.
     static_assert(
         std::is_same_v<
             std::remove_reference_t<decltype(v.value())>,
-            const binding::Ext4LocalNvmePayload*>);
+            const payloads::Ext4LocalNvmePayload*>);
 
     (void)v;
     return 0;
@@ -304,7 +304,7 @@ static int test_mapping_out_of_range() {
     auto result = resolver.resolve("fake://oor.txt", {"fake"});
     if (!result.ok()) return 1;
 
-    auto pr = binding::view_payload(result.value());
+    auto pr = payloads::view_payload(result.value());
     if (!pr.ok()) return 1;
     const auto* p = pr.value();
 
@@ -320,9 +320,9 @@ static int test_mapping_out_of_range() {
 
 // 10. validate() accepts legal extent set.
 static int test_validate_accepts_legal() {
-    auto payload = binding::Ext4LocalNvmePayload::create(
-        binding::NamespaceIdentity{"00:00.0", 1, 512},
-        std::vector<binding::Extent>{
+    auto payload = payloads::Ext4LocalNvmePayload::create(
+        payloads::NamespaceIdentity{"00:00.0", 1, 512},
+        std::vector<payloads::Extent>{
             {0,     0,     512},
             {512,   1024,  512},
             {1024,  2048,  512},
@@ -334,7 +334,7 @@ static int test_validate_accepts_legal() {
 
 // 11. validate() rejects illegal sets.
 static int test_validate_rejects_illegal() {
-    using namespace binding;
+    using namespace payloads;
 
     // (a) Hole.
     {
@@ -392,30 +392,30 @@ static int test_validate_rejects_illegal() {
 
 // 12. Pairing convergence: no bare type id literals in test code.
 static int test_pairing_convergence() {
-    static_assert(binding::kPayloadTypeId.size() > 0);
-    static_assert(binding::kPayloadApiVersion > 0);
-    static_assert(binding::kRecommendedDataPathKey.size() > 0);
+    static_assert(payloads::kPayloadTypeId.size() > 0);
+    static_assert(payloads::kPayloadApiVersion > 0);
+    static_assert(payloads::kRecommendedDataPathKey.size() > 0);
 
     FakeResolver resolver;
     auto result = resolver.resolve("fake://conv.txt", {"fake"});
     if (!result.ok()) return 1;
 
-    auto v = binding::view_payload(result.value());
+    auto v = payloads::view_payload(result.value());
     if (!v.ok()) return 1;
 
     // The recommended_data_path_key on the target matches the binding
     // constant — resolver set it via make_resolved_target which uses
     // kRecommendedDataPathKey internally.
     if (result.value().recommended_data_path_key()
-        != binding::kRecommendedDataPathKey) return 1;
+        != payloads::kRecommendedDataPathKey) return 1;
 
     // The payload_type_id on the target matches the binding constant.
     if (result.value().payload_type_id()
-        != binding::kPayloadTypeId) return 1;
+        != payloads::kPayloadTypeId) return 1;
 
     // The source_api_version on the target matches the binding constant.
     if (result.value().source_api_version()
-        != binding::kPayloadApiVersion) return 1;
+        != payloads::kPayloadApiVersion) return 1;
 
     return 0;
 }

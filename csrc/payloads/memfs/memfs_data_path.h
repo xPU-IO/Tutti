@@ -1,6 +1,6 @@
 #pragma once
 
-// tutti/bindings/memfs/memfs_data_path.h
+// csrc/payloads/memfs/memfs_data_path.h
 //
 // SAMPLE-ONLY DataPath for the memfs binding.  Implements the full
 // DataPath SPI lifecycle against an in-memory backing buffer.
@@ -15,7 +15,7 @@
 #include <tutti/spi/data_path.h>
 #include <tutti/status.h>
 #include <tutti/io_types.h>
-#include "csrc/bindings/memfs/binding.h"
+#include "csrc/payloads/memfs/payload.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -24,7 +24,7 @@
 #include <string>
 #include <unordered_map>
 
-namespace tutti::binding::memfs {
+namespace tutti::payloads::memfs {
 
 // -------------------------------------------------------------------------
 // MemfsDataPath — in-memory DataPath for the memfs sample.
@@ -105,7 +105,7 @@ public:
         // active, so the pointer is never used after the payload is freed.
         MemfsPayload* p = const_cast<MemfsPayload*>(payload.value());
 
-        std::uint64_t tok = next_target_++;
+        std::uint64_t tok = next_target_token_++;
         std::lock_guard<std::mutex> lock(mtx_);
         targets_[tok] = TargetRecord{
             p,
@@ -140,7 +140,7 @@ public:
                 Status(StatusCode::INVALID_ARGUMENT,
                        "memory view must be non-null/non-zero"));
         }
-        std::uint64_t tok = next_memory_++;
+        std::uint64_t tok = next_memory_token_++;
         std::lock_guard<std::mutex> lock(mtx_);
         memory_[tok] = MemoryRecord{view.base, view.size_bytes};
         return detail::SpiIdentityMint::mint<detail::DataPathMemoryTag>(tok, 1);
@@ -177,7 +177,7 @@ public:
             // Look up target.
             auto tit = targets_.find(req.target.token());
             if (tit == targets_.end()) {
-                out.initial_states[i].state = RequestState::REJECTED;
+                out.initial_states[i].state = IoRequestState::REJECTED;
                 out.initial_states[i].status = Status(
                     StatusCode::NOT_FOUND, "unknown target in request");
                 continue;
@@ -186,7 +186,7 @@ public:
             // Look up memory.
             auto mit = memory_.find(req.memory.token());
             if (mit == memory_.end()) {
-                out.initial_states[i].state = RequestState::REJECTED;
+                out.initial_states[i].state = IoRequestState::REJECTED;
                 out.initial_states[i].status = Status(
                     StatusCode::NOT_FOUND, "unknown memory in request");
                 continue;
@@ -198,14 +198,14 @@ public:
             // Bounds checks.
             if (req.intent.target_offset > tr.logical_size ||
                 req.intent.length > tr.logical_size - req.intent.target_offset) {
-                out.initial_states[i].state = RequestState::REJECTED;
+                out.initial_states[i].state = IoRequestState::REJECTED;
                 out.initial_states[i].status = Status(
                     StatusCode::OUT_OF_RANGE, "target bounds exceeded");
                 continue;
             }
             if (req.intent.memory_offset > mr.size ||
                 req.intent.length > mr.size - req.intent.memory_offset) {
-                out.initial_states[i].state = RequestState::REJECTED;
+                out.initial_states[i].state = IoRequestState::REJECTED;
                 out.initial_states[i].status = Status(
                     StatusCode::OUT_OF_RANGE, "memory bounds exceeded");
                 continue;
@@ -225,7 +225,7 @@ public:
                     static_cast<std::size_t>(req.intent.length));
             }
 
-            out.initial_states[i].state = RequestState::ACCEPTED;
+            out.initial_states[i].state = IoRequestState::ACCEPTED;
             out.initial_states[i].status = Status::Ok();
             ++accepted;
         }
@@ -239,13 +239,13 @@ public:
         // Mint an op that is already COMPLETED (synchronous).
         std::uint64_t op_tok = next_op_++;
         ops_[op_tok] = OpRecord{
-            OpState::COMPLETED,
+            IoState::COMPLETED,
             Status::Ok(),
             0,  // bytes_transferred filled below
         };
         // Count total bytes for accepted requests.
         for (std::size_t i = 0; i < count; ++i) {
-            if (out.initial_states[i].state == RequestState::ACCEPTED) {
+            if (out.initial_states[i].state == IoRequestState::ACCEPTED) {
                 ops_[op_tok].bytes_transferred += requests[i].intent.length;
             }
         }
@@ -283,7 +283,7 @@ public:
         if (it == ops_.end()) {
             return Status(StatusCode::NOT_FOUND, "unknown op");
         }
-        if (it->second.state == OpState::IN_FLIGHT) {
+        if (it->second.state == IoState::IN_FLIGHT) {
             return Status(StatusCode::BUSY, "op not terminal");
         }
         ops_.erase(it);
@@ -301,7 +301,7 @@ private:
         std::uint64_t size = 0;
     };
     struct OpRecord {
-        OpState state = OpState::IN_FLIGHT;
+        IoState state = IoState::IN_FLIGHT;
         Status terminal_status;
         std::uint64_t bytes_transferred = 0;
     };
@@ -309,12 +309,12 @@ private:
     DataPathCapabilities caps_;
 
     mutable std::mutex mtx_;
-    std::uint64_t next_target_ = 1;
-    std::uint64_t next_memory_ = 1;
+    std::uint64_t next_target_token_ = 1;
+    std::uint64_t next_memory_token_ = 1;
     std::uint64_t next_op_ = 1;
     std::unordered_map<std::uint64_t, TargetRecord> targets_;
     std::unordered_map<std::uint64_t, MemoryRecord> memory_;
     std::unordered_map<std::uint64_t, OpRecord> ops_;
 };
 
-} // namespace tutti::binding::memfs
+} // namespace tutti::payloads::memfs

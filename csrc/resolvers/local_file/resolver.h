@@ -1,6 +1,6 @@
 #pragma once
 
-// tutti/resolvers/local_file/resolver.h
+// csrc/resolvers/local_file/resolver.h
 //
 // Fail-closed StorageTargetResolver for controlled file targets backed by
 // a local NVMe namespace.
@@ -29,12 +29,20 @@
 //
 // The resolver does NOT submit IO, construct PRP/LBA descriptors, or
 // understand NVMe queue internals.  It produces a ResolvedTarget carrying
-// an Ext4LocalNvmePayload via the ext4_local_nvme binding.
+// an Ext4LocalNvmePayload via the ext4_local_nvme payload package.
+//
+// Note on scope: the checks above are transport- and filesystem-agnostic —
+// a regular file whose extents resolve to a block device is all this
+// resolver needs.  The "local NVMe" constraint belongs to the DataPath
+// layer (its payload carries a controller PCI address); the pairing of
+// this resolver with that DataPath is what the contract name
+// "ext4-local-nvme" identifies.
 
+#include "csrc/common/backend_ids.h"
 #include <tutti/status.h>
 #include <tutti/spi/storage_target_resolver.h>
 
-#include <csrc/bindings/ext4_local_nvme/binding.h>
+#include "csrc/payloads/ext4_local_nvme/payload.h"
 
 #include <linux/fiemap.h>
 #include <linux/fs.h>
@@ -59,7 +67,8 @@ namespace tutti::resolvers::local_file {
 // Constants
 // -------------------------------------------------------------------------
 
-inline constexpr std::string_view kScheme = "file";
+inline constexpr std::string_view kScheme =
+    tutti::detail::backend_ids::kExt4Scheme;
 inline constexpr std::uint32_t kFiemapMaxExtentsPerCall = 256;
 inline constexpr std::uint32_t kMaxTotalExtents = 124;
 
@@ -144,7 +153,7 @@ public:
                       BackingDeviceConfig backing_config,
                       std::uint32_t exts_per_call = kFiemapMaxExtentsPerCall,
                       std::string data_path_key =
-                          std::string(binding::ext4_local_nvme::
+                          std::string(payloads::ext4_local_nvme::
                                           kRecommendedDataPathKey))
         : ns_{
               std::move(controller_pci_addr),
@@ -295,7 +304,7 @@ public:
         }
 
         // 8. Collect extents via FIEMAP (fail-closed).
-        std::vector<binding::ext4_local_nvme::Extent> extents;
+        std::vector<payloads::ext4_local_nvme::Extent> extents;
         std::uint64_t file_size = static_cast<std::uint64_t>(st.st_size);
         Status fiemap_status = collect_fiemap_(
             fd, path, file_size, extents);
@@ -306,7 +315,7 @@ public:
         }
 
         // 9. Create the immutable payload (create() runs validate()).
-        auto payload_result = binding::ext4_local_nvme::Ext4LocalNvmePayload::
+        auto payload_result = payloads::ext4_local_nvme::Ext4LocalNvmePayload::
             create(ns_, std::move(extents), file_size);
 
         if (!payload_result.ok()) {
@@ -318,8 +327,8 @@ public:
         // 10. Create the fd lease and produce ResolvedTarget.
         auto lease = std::make_shared<FileDescriptorLease>(fd);
 
-        return binding::ext4_local_nvme::make_resolved_target(
-            std::string(binding::ext4_local_nvme::kResolverTypeId),
+        return payloads::ext4_local_nvme::make_resolved_target(
+            std::string(payloads::ext4_local_nvme::kResolverTypeId),
             file_size,
             std::move(payload_result).value(),
             std::move(lease),
@@ -342,7 +351,7 @@ private:
         int fd,
         std::string_view path,
         std::uint64_t file_size,
-        std::vector<binding::ext4_local_nvme::Extent>& out_extents) const {
+        std::vector<payloads::ext4_local_nvme::Extent>& out_extents) const {
 
         struct stat st{};
         if (::fstat(fd, &st) != 0) {
@@ -486,7 +495,7 @@ private:
                 }
 
                 // Build the binding Extent (byte units).
-                binding::ext4_local_nvme::Extent out{};
+                payloads::ext4_local_nvme::Extent out{};
                 out.logical_offset = ex.fe_logical;
                 out.device_offset  = device_offset;
                 out.length         = ex.fe_length;
@@ -536,7 +545,7 @@ private:
         return Status::Ok();
     }
 
-    binding::ext4_local_nvme::NamespaceIdentity ns_;
+    payloads::ext4_local_nvme::NamespaceIdentity ns_;
     BackingDeviceConfig backing_config_;
     std::uint32_t exts_per_call_;
     std::string data_path_key_;

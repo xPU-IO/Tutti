@@ -1,10 +1,10 @@
-# tutti/resolvers/local_file/CMakeLists.txt
+# csrc/resolvers/local_file/CMakeLists.txt
 #
 # Private resolver target: header-only LocalFileResolver using FS_IOC_FIEMAP.
 #
 # Consumers link tutti_local_file_resolver to obtain:
 #   - workspace root include (for <tutti/resolvers/local_file/resolver.h>)
-#   - tutti_local_file_binding (transitively, for the payload contract)
+#   - tutti_local_file_payload (transitively, for the payload contract)
 #   - tutti_spi (transitively, for public headers)
 #
 # Hardware-free at the header level (Linux FIEMAP headers are always available).
@@ -18,6 +18,6 @@ target_include_directories(tutti_local_file_resolver INTERFACE
 )
 
 target_link_libraries(tutti_local_file_resolver INTERFACE
-    tutti_local_file_binding
+    tutti_local_file_payload
     tutti_spi
 )
