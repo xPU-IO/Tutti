@@ -449,7 +449,7 @@ staged host gate:
 read stream 连续执行，`start_load_kv` 在一次 host 调用中提交 read 0..N-1，随后
 compute callback 只等待自己的 read-ready event，不再补交 read。direct read 的 structured failure
 由 completion watcher异步收集，不作为逐层host gate。完整证据和状态机见
-`doc/Tutticonnector/README.md`。失败后：
+本文 §7「Eager 逐层执行编排」。失败后：
 
 - direct 已排入的 compute 可以继续，但本 step 输出必须丢弃，受影响 request 的
   block IDs按现有connector合同上报并整请求重算；
@@ -927,7 +927,7 @@ block table 直接生成 byte-range I/O；仅不满足 5.1 准入条件时走现
 
 1. 提交已经完成的 single-group cross-layer direct backend、memory unregister、
    `2*num_layers` capacity 和 staged fallback 基线。
-2. 已按 `doc/Tutticonnector/README.md` 把 direct read 改为R0同步 + host feeder
+2. 已按本文 §7「Eager 逐层执行编排」把 direct read 改为R0同步 + host feeder
    R1..R(N-1)，保留per-layer event与整请求recompute，未修改Runtime/DataPath。
 3. 已用小规模合成测试验证精确enqueue顺序；下一步用真实Hy3 TP4比较block size
    64/128/256 和 Nsight timeline。
