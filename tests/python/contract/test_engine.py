@@ -1031,7 +1031,6 @@ class TestBind:
             "chunk_kv_bytes": SEG * NUM_LAYERS,
             "max_chunks_per_wave": MAX_WAVE,
             "direct_transfer": True,
-            "direct_transfer_strict": True,
         }
         engine = KVEngine(config, MemoryKVStore(SEG, NUM_CHUNKS))
         window = RingWindow(bytearray(NUM_SLOTS * SEG), NUM_SLOTS, SEG)

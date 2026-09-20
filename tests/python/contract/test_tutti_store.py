@@ -1250,3 +1250,31 @@ def test_scan_reports_committed_objects_only(tmp_path):
     store.put_batch([(key, src_id, 0)]).wait()
     (tmp_path / "pool" / "stray.bin").write_text("junk")
     assert store.scan() == [key]
+
+
+# ---------- 写排序开关（store options / env 后门，§11.1-③） ----------
+
+
+def test_defer_writes_after_reads_option_and_env_backdoor(
+    tmp_path, monkeypatch
+):
+    """显式选项优先于 env 后门；缺省为 True；非 bool 拒绝。"""
+    from tutti.storage.tutti_nvme.store import TuttiKVStore
+
+    monkeypatch.setenv("TUTTI_DEFER_WRITES_AFTER_READS", "0")
+    explicit = TuttiKVStore(
+        tmp_path / "explicit", 4, SEG, defer_writes_after_reads=True,
+    )
+    assert explicit.defer_writes_after_reads is True
+
+    from_env = TuttiKVStore(tmp_path / "env", 4, SEG)
+    assert from_env.defer_writes_after_reads is False
+
+    monkeypatch.delenv("TUTTI_DEFER_WRITES_AFTER_READS", raising=False)
+    default = TuttiKVStore(tmp_path / "default", 4, SEG)
+    assert default.defer_writes_after_reads is True
+
+    with pytest.raises(ValueError, match="defer_writes_after_reads"):
+        TuttiKVStore(
+            tmp_path / "bad", 4, SEG, defer_writes_after_reads=1,
+        )

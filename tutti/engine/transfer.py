@@ -5,12 +5,9 @@ from __future__ import annotations
 import logging
 from typing import Sequence
 
+from tutti.common.errors import DirectTransferUnavailable
 
 _LOG = logging.getLogger(__name__)
-
-
-class DirectTransferUnavailable(RuntimeError):
-    """Raised when a store cannot expose a direct paged-memory backend."""
 
 
 class DirectTransfer:

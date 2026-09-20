@@ -5,7 +5,7 @@
 
     槽位分配  → reserve()          对象有效性 → commit()（每对象一次）
     槽位路径  → placement.uri      崩溃恢复   → recover()
-    容量      → usage()            跨 rank    → contains_prefix_all_ranks()
+    容量      → usage()
 
 与旧实现的关键语义差异（评审定案）：
 
@@ -29,7 +29,12 @@ import os
 from pathlib import Path
 
 from tutti.index.chunk_index import decode_io_key as _decode
-from tutti.storage.object_store import ObjectPlacement, ObjectStore
+from tutti.storage.object_store import (
+    ObjectPlacement,
+    ObjectStore,
+    SCHEME_LOCAL_NVME_FILE,
+    SCHEME_STRIPED_NVME_FILE,
+)
 
 __all__ = ["ObjectLayout"]
 
@@ -149,7 +154,10 @@ class ObjectLayout:
             devices = [{"mount_path": mount} for mount in self._mounts]
         prewarm_chunks = min(self._prewarm_chunks, self._capacity_chunks)
         return {
-            "scheme": "striped_local_nvme_file" if self._stripe_unit else "local_nvme_file",
+            "scheme": (
+                SCHEME_STRIPED_NVME_FILE
+                if self._stripe_unit else SCHEME_LOCAL_NVME_FILE
+            ),
             "uri": str(self._root),
             # 容量/预热按槽位声明：每槽位字节数由对象层按几何算（条带布局的
             # 对象头前缀会向上取整到整个条带轮，本层不该重算）。

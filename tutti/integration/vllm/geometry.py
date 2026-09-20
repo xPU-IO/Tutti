@@ -13,7 +13,7 @@ import os
 # num_layers 优先从 vLLM KVCacheConfig 推导，extra_config 仅作兼容覆盖。
 _ENGINE_REQUIRED_KEYS = ("chunk_tokens", "max_chunks_per_wave")
 _ENGINE_KEYS = (*_ENGINE_REQUIRED_KEYS, "chunk_kv_bytes")
-_ENGINE_OPTIONAL_KEYS = ("direct_transfer", "direct_transfer_strict")
+_ENGINE_OPTIONAL_KEYS = ("direct_transfer",)
 
 # vLLM 的 cdiv 惰性解析缓存：该函数在每请求路径上被调用，不能每次
 # 都走 import 查找；同时纯 Python 单测环境没有 vLLM，需保留本地兜底。
