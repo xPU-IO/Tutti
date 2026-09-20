@@ -1,8 +1,0 @@
-DEPRECATED (2026-08-18) — DO NOT LAND NEW CHANGES HERE
-
-This per-version tree is superseded by the unified tree at ../snvme/
-(corresponding baseline: snvme/baseline/5.4-tlinux4/).  See ../PORTING.md.
-
-It is kept ONLY as a frozen fallback / diff reference until the unified
-baseline 5.4-tlinux4 passes compile + insmod + smoke verification on a real
-host, and WILL BE REMOVED afterwards.

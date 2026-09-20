@@ -925,8 +925,6 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
 
 				uq->qid       = qid;
 				uq->alive     = 1;
-				uq->sq_vaddr  = req->pairs[i].sq_vaddr;
-				uq->cq_vaddr  = req->pairs[i].cq_vaddr;
 
 				req->out_pairs[i].sq_doorbell_offset =
 					(uint32_t)(NVME_REG_DBS + qid * 2 * uq_ndev->db_stride * 4);
