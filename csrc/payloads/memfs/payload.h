@@ -1,6 +1,6 @@
 #pragma once
 
-// tutti/bindings/memfs/binding.h
+// csrc/payloads/memfs/payload.h
 //
 // SAMPLE-ONLY binding: the private payload contract shared between the
 // memfs resolver and the memfs DataPath.
@@ -23,7 +23,9 @@
 #include <utility>
 #include <vector>
 
-namespace tutti::binding::memfs {
+#include "csrc/common/backend_ids.h"
+
+namespace tutti::payloads::memfs {
 
 // -------------------------------------------------------------------------
 // Identity constants — the single declaration point for payload type id,
@@ -31,15 +33,15 @@ namespace tutti::binding::memfs {
 // -------------------------------------------------------------------------
 
 inline constexpr std::string_view kPayloadTypeId =
-    "memfs-payload-v1";
+    tutti::detail::backend_ids::kMemfsPayloadTypeId;
 
 inline constexpr std::uint32_t kPayloadApiVersion = 1;
 
 inline constexpr std::string_view kRecommendedDataPathKey =
-    "memfs";
+    tutti::detail::backend_ids::kMemfsDataPathKey;
 
 inline constexpr std::string_view kResolverTypeId =
-    "memfs-resolver-v1";
+    tutti::detail::backend_ids::kMemfsResolverTypeId;
 
 // -------------------------------------------------------------------------
 // MemfsPayload
@@ -139,4 +141,4 @@ view_payload(const ResolvedTarget& target) {
         kPayloadTypeId, kPayloadApiVersion);
 }
 
-} // namespace tutti::binding::memfs
+} // namespace tutti::payloads::memfs

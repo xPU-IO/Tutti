@@ -1,6 +1,6 @@
 #pragma once
 
-// tutti/bindings/ext4_local_nvme/binding.h
+// csrc/payloads/ext4_local_nvme/payload.h
 //
 // First binding: the private payload contract shared between the
 // ext4 resolver and the local NVMe DataPath.
@@ -28,7 +28,9 @@
 #include <utility>
 #include <vector>
 
-namespace tutti::binding::ext4_local_nvme {
+#include "csrc/common/backend_ids.h"
+
+namespace tutti::payloads::ext4_local_nvme {
 
 // -------------------------------------------------------------------------
 // Identity constants
@@ -39,15 +41,15 @@ namespace tutti::binding::ext4_local_nvme {
 // -------------------------------------------------------------------------
 
 inline constexpr std::string_view kPayloadTypeId =
-    "ext4-local-nvme-payload-v1";
+    tutti::detail::backend_ids::kExt4PayloadTypeId;
 
 inline constexpr std::uint32_t kPayloadApiVersion = 1;
 
 inline constexpr std::string_view kRecommendedDataPathKey =
-    "local-nvme-ext4";
+    tutti::detail::backend_ids::kExt4DataPathKey;
 
 inline constexpr std::string_view kResolverTypeId =
-    "ext4-extent-resolver-v1";
+    tutti::detail::backend_ids::kExt4ResolverTypeId;
 
 // -------------------------------------------------------------------------
 // Extent
@@ -296,4 +298,4 @@ view_payload(const ResolvedTarget& target) {
         kPayloadTypeId, kPayloadApiVersion);
 }
 
-} // namespace tutti::binding::ext4_local_nvme
+} // namespace tutti::payloads::ext4_local_nvme

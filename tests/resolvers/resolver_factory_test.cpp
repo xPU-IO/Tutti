@@ -6,8 +6,8 @@
 #include <utility>
 #include <vector>
 
-#include <csrc/resolvers/local_file/resolver.h>
-#include <csrc/resolvers/striped_file/resolver.h>
+#include "csrc/resolvers/local_file/resolver.h"
+#include "csrc/resolvers/striped_file/resolver.h"
 
 #include "csrc/resolvers/memfs/resolver.h"
 #include "csrc/resource/memory/memory_resource.h"

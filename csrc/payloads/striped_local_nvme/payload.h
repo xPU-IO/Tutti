@@ -1,6 +1,6 @@
 #pragma once
 
-// tutti/bindings/striped_local_nvme/binding.h
+// csrc/payloads/striped_local_nvme/payload.h
 //
 // Striped binding: pair-private payload contract for striped://
 // targets backed by N local NVMe devices.
@@ -36,7 +36,7 @@
 
 #include <tutti/status.h>
 #include <tutti/spi/storage_target_resolver.h>
-#include <csrc/bindings/ext4_local_nvme/binding.h>
+#include "csrc/payloads/ext4_local_nvme/payload.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -46,41 +46,33 @@
 #include <utility>
 #include <vector>
 
-namespace tutti::binding::striped_local_nvme {
+#include "csrc/common/backend_ids.h"
+
+namespace tutti::payloads::striped_local_nvme {
 
 // -------------------------------------------------------------------------
 // Identity constants
 // -------------------------------------------------------------------------
 inline constexpr std::string_view kPayloadTypeId =
-    "striped-local-nvme-payload-v1";
+    tutti::detail::backend_ids::kStripedPayloadTypeId;
 
 inline constexpr std::uint32_t kPayloadApiVersion = 1;
 
 inline constexpr std::string_view kRecommendedDataPathKey =
-    "striped-local-nvme";
+    tutti::detail::backend_ids::kStripedDataPathKey;
 
 inline constexpr std::string_view kResolverTypeId =
-    "striped-resolver-v1";
+    tutti::detail::backend_ids::kStripedResolverTypeId;
 
 // -------------------------------------------------------------------------
 // StripeBundleLease
 //
-// Owner lease for the striped bundle.  Holds the N sub-leases extracted
-// from the per-shard ResolvedTargets.  When destroyed, all N sub-leases
-// are released (closing N fds).
-//
-// Note: the sub-leases are ALSO held inside the StripedLocalNvmePayload's
-// shard ResolvedTargets (via shared_ptr<void> lease).  The StripeBundleLease
-// provides an explicit, independent lease reference so that the outer
-// ResolvedTarget's lease is non-null (required by ResolvedTarget::make).
-// Both references must be released before the fds close.
+// Marker lease for the striped bundle: ResolvedTarget::make 只要求 outer
+// lease 非空，真正的 fd 清理在 StripedLocalNvmePayload 的 shard vector
+// 析构时发生（每个 shard 自带 shared_ptr<void> lease，引用计数归零即
+// close(fd)）。因此这里不需要任何状态。
 // -------------------------------------------------------------------------
-struct StripeBundleLease {
-    std::vector<std::shared_ptr<void>> sub_leases;
-
-    explicit StripeBundleLease(std::vector<std::shared_ptr<void>> leases)
-        : sub_leases(std::move(leases)) {}
-};
+struct StripeBundleLease {};
 
 // -------------------------------------------------------------------------
 // StripedLocalNvmePayload
@@ -242,4 +234,4 @@ view_payload(const ResolvedTarget& target) {
         kPayloadTypeId, kPayloadApiVersion);
 }
 
-} // namespace tutti::binding::striped_local_nvme
+} // namespace tutti::payloads::striped_local_nvme
