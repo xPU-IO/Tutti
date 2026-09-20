@@ -39,6 +39,47 @@ def _segment_bytes(chunk_i: int, layer: int) -> bytes:
     return bytes([marker]) + bytes([marker ^ 0xFF]) * (SEG - 1)
 
 
+def test_feeder_binds_thread_cuda_device(monkeypatch):
+    """喂层线程在入口绑定本 rank 的 CUDA 设备。
+
+    回归：新建线程的当前设备是进程默认值 0，不绑定的话运行时 DeviceGuard 每次
+    submit 都要先切到本 rank、restore 再切回 0（两次 cudaSetDevice），而 8 rank
+    并发时其中一次实测约 950ms —— 该调用不进入 nsys 的 CUDA API 表，表现为
+    `runtime_submit|op=read` 上 1s 的气泡（提交本身只有 0.2ms）。
+    """
+    import sys as _sys
+    import types as _types
+
+    from tutti.engine.core import _bind_thread_cuda_device
+
+    calls = []
+    state = {"current": 0}
+    fake_cuda = _types.SimpleNamespace(
+        is_available=lambda: True,
+        current_device=lambda: state["current"],
+        set_device=lambda device: calls.append(device),
+    )
+    fake_torch = _types.ModuleType("torch")
+    fake_torch.cuda = fake_cuda
+    monkeypatch.setitem(_sys.modules, "torch", fake_torch)
+
+    _bind_thread_cuda_device(_types.SimpleNamespace(_accel_id=3))
+    assert calls == [3], "新线程必须绑定到本 rank 的设备"
+
+    # 已经在目标设备上：保持 no-op，不做无谓的驱动调用
+    calls.clear()
+    state["current"] = 3
+    _bind_thread_cuda_device(_types.SimpleNamespace(_accel_id=3))
+    assert calls == []
+
+    # 拿不到 accel id / 设备号非法：静默跳过（回退到旧行为，不影响正确性）
+    state["current"] = 0
+    _bind_thread_cuda_device(None)
+    _bind_thread_cuda_device(_types.SimpleNamespace(_accel_id=-1))
+    _bind_thread_cuda_device(_types.SimpleNamespace(_accel_id=None))
+    assert calls == []
+
+
 def test_step_read_failure_never_scatters():
     class Inner:
         staging_depth = 2

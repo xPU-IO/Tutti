@@ -158,6 +158,30 @@ class _ReadPlan:
                 pass
 
 
+def _bind_thread_cuda_device(store) -> None:
+    """把当前线程的 CUDA 当前设备绑定到本 rank 的 GPU。
+
+    新线程的当前设备是进程默认值 0。不绑定的话，运行时 `DeviceGuard` 每次
+    submit 都要先切到本 rank、restore 再切回 0（两次 ``cudaSetDevice``），而
+    8 rank 并发时其中一次实测约 950ms——该调用不进入 nsys 的 CUDA API 表，只在
+    runtime 内埋点可见——表现为 `tutti.direct.runtime_submit|op=read` 上 1 秒的
+    气泡（提交自身只有 0.2ms）。绑定后 guard 的 enter/restore 都是 no-op。
+
+    失败不致命：guard 仍会切设备，只是回到"每次两次 cudaSetDevice"的老行为。
+    """
+    accel = getattr(store, "_accel_id", -1)
+    if not isinstance(accel, int) or accel < 0:
+        return
+    try:
+        import torch
+
+        if torch.cuda.is_available() and torch.cuda.current_device() != accel:
+            torch.cuda.set_device(accel)
+    except Exception:  # pragma: no cover - 环境异常时保持老行为
+        _LOG.debug("DIRECT_THREAD_DEVICE_BIND_FAILED accel=%d", accel,
+                   exc_info=True)
+
+
 class _DirectAllLayerReadPlan:
     """Direct-only all-layer read plan.
 
@@ -367,7 +391,8 @@ class _DirectAllLayerReadPlan:
         with self._ready_cond:
             self.read_ready_events[callback] = fence_event
             self._ready_cond.notify_all()
-        _LOG.warning(
+        # 正常路径的逐层时间线诊断：debug（每层一条，warning 会淹没真实告警）。
+        _LOG.debug(
             "DIRECT_READ_LAYER_SUBMIT layer=%d physical=%d "
             "elapsed_ms=%.3f completed_ns=%d",
             callback, physical, elapsed_ms, completed_ns,
@@ -379,6 +404,7 @@ class _DirectAllLayerReadPlan:
             add_terminal(self._on_completion)
 
     def _run_feeder(self) -> None:
+        _bind_thread_cuda_device(getattr(self.engine, "_store", None))
         try:
             started_ns = time.perf_counter_ns()
             for callback in range(1, self.layer_count):
