@@ -175,8 +175,8 @@ nvmeservice_daemon --config <path-to-sys_config.yaml>
   neither `SNVM_DEVICE_UNBIND` nor `SNVM_CHRDEV_REMOVE` touches the
   module refcount at all.  If `rmmod snvme` says "Module snvme is in
   use" after a SIGKILL'd daemon, do NOT assume it's this; check for a
-  mounted `/dev/snvme*n*` block device or an open raw `/dev/snvme<N>`
-  admin chardev first (`lsof /dev/snvme*n* /dev/snvme[0-9]*` shows
+  mounted `/dev/snvme*n*` block device or an open raw `/dev/ssnvme<N>`
+  admin chardev first (`lsof /dev/snvme*n* /dev/ssnvme[0-9]*` shows
   both) -- those are the two refs that actually outlive the
   daemon and that no owner-side ioctl ever releases.
   When cleaning up a wedged daemon, send SIGTERM and wait before
