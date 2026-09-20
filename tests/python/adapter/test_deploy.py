@@ -121,7 +121,7 @@ class TestLocalRankPlaceholder:
         assert captured["options"]["layer_span"] == 3
 
     def test_metadata_store_applies_layer_span(self, tmp_path):
-        """层宽注入后落到各 rank 的 layout；缺省保持未声明（fail-closed）。"""
+        """层宽注入后成为对象几何的一半；缺省保持未声明（fail-closed）。"""
         from tutti.storage.metadata import TuttiMetadataStore
 
         store = TuttiMetadataStore(
@@ -130,10 +130,7 @@ class TestLocalRankPlaceholder:
             segment_bytes=4096,
             layer_span=80,
         )
-        assert store._layout.layer_span == 80
-        assert all(
-            layout.layer_span == 80 for layout in store._layouts.values()
-        )
+        assert store.layer_span == 80
 
         bare = TuttiMetadataStore(
             root=str(tmp_path / "bare"),
@@ -141,7 +138,7 @@ class TestLocalRankPlaceholder:
             segment_bytes=4096,
         )
         bare.open()
-        assert bare._layout.layer_span is None
+        assert bare.layer_span is None
         assert bare.scan() == []
 
     def test_rank_local_nvme_and_gpu_are_expanded_together(self, monkeypatch):

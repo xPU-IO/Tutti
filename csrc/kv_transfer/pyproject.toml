@@ -6,7 +6,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tutti-kv-transfer"
-version = "0.1.0"
+# 版本唯一来源：仓库根 VERSION，由 setup.py 读取（setuptools 的 file 指令
+# 被沙箱限制在项目目录内，无法跨目录读根 VERSION）。
+dynamic = ["version"]
 description = "gather/scatter CUDA kernels for the Tutti vLLM connector (single_layer_kv_transfer ported from LMCache, Apache-2.0)"
 requires-python = ">=3.10"
 

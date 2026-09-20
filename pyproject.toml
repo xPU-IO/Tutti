@@ -7,10 +7,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tutti"
-version = "0.1.0"
+# 版本唯一来源：仓库根 VERSION（CMake 与其余 Python distribution 共用）。
+dynamic = ["version"]
 description = "Tutti: GPU-direct NVMe KV cache offloading runtime (core + framework integrations)"
 requires-python = ">=3.10"
 dependencies = []
+
+[tool.setuptools.dynamic]
+version = {file = ["VERSION"]}
 
 [tool.setuptools.packages.find]
 # 单一顶层包 tutti，所有子包均为常规包（带 __init__.py）。收进 tutti 命名空间

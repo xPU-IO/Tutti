@@ -28,6 +28,13 @@ std::uint64_t checkpoint_entry_capacity(std::uint64_t total_slots) {
 // without materially enlarging the region.
 constexpr std::uint32_t kMaxKeyBytes = 256;
 
+// Rejection returned by every mutating entry point of a read-only store. Not a
+// silent no-op: a caller that believes it is writing must see the failure.
+Status read_only_error(const char* operation) {
+    return Status(StatusCode::UNSUPPORTED,
+                  std::string(operation) + ": store is read-only");
+}
+
 } // namespace
 
 ObjectStoreCore::ObjectStoreCore() = default;
@@ -103,7 +110,10 @@ Status ObjectStoreCore::open(const StoreConfig& config) {
     const Status backend = build_backend_locked();
     if (!backend.ok()) return backend;
 
-    slot_bytes_ = ObjectHeaderLayout::kHeaderBytes + config.layout.payload_bytes();
+    // The placement owns where the payload starts: a striped layout rounds that
+    // prefix up to a whole stripe round (see StripedPlacement::payload_offset),
+    // so the space a slot occupies is prefix + payload, not header + payload.
+    slot_bytes_ = placement_->payload_offset() + config.layout.payload_bytes();
     shard_bytes_ = placement_->shard_file_bytes(slot_bytes_);
 
     // Striped geometry must divide into whole stripe rounds. Otherwise the last
@@ -118,30 +128,42 @@ Status ObjectStoreCore::open(const StoreConfig& config) {
     }
 
     SpaceAllocatorConfig alloc_config;
-    // capacity_bytes is a ceiling on PAYLOAD-plus-header space; the slot count
-    // is derived from it, so callers size the cache in the unit they think in.
-    alloc_config.capacity_bytes = config.capacity_bytes;
+    // capacity is a ceiling; the slot count follows from slot_bytes_. Callers
+    // may express either in bytes or directly in slots -- the slot form is
+    // preferred because only this layer knows the real per-slot space.
+    alloc_config.capacity_bytes =
+        config.capacity_slots > 0 ? config.capacity_slots * slot_bytes_
+                                  : config.capacity_bytes;
     alloc_config.slot_bytes = slot_bytes_;
     alloc_config.prewarm_slots =
-        config.prewarm_bytes == 0 ? 0 : config.prewarm_bytes / slot_bytes_;
+        config.prewarm_slots > 0
+            ? config.prewarm_slots
+            : (config.prewarm_bytes == 0 ? 0
+                                         : config.prewarm_bytes / slot_bytes_);
     if (!allocator_.configure(alloc_config)) {
         return Status(StatusCode::INVALID_ARGUMENT,
                       "capacity_bytes too small to hold a single object");
     }
 
-    const Status layout_status = ensure_layout_locked();
-    if (!layout_status.ok()) return layout_status;
+    if (!config_.read_only) {
+        const Status layout_status = ensure_layout_locked();
+        if (!layout_status.ok()) return layout_status;
+    }
 
     container_bytes_ = checkpoint_container_bytes(
         checkpoint_entry_capacity(allocator_.total_slots()), kMaxKeyBytes);
     const std::uint64_t region =
         container_bytes_ * CheckpointLayout::kContainerCount;
-    const Status meta_status =
-        ensure_metadata_file(checkpoint_path_locked(), region);
-    if (!meta_status.ok()) return meta_status;
+    if (!config_.read_only) {
+        const Status meta_status =
+            ensure_metadata_file(checkpoint_path_locked(), region);
+        if (!meta_status.ok()) return meta_status;
+    }
 
     // Recover before prewarming. Recovery may find slots already materialised
     // and in use, and prewarming first would be wasted work on a warm pool.
+    // A missing checkpoint is a cold start either way, so the read-only path
+    // needs no special casing here.
     const Status recovered = load_checkpoint_locked();
     if (!recovered.ok()) return recovered;
 
@@ -149,24 +171,34 @@ Status ObjectStoreCore::open(const StoreConfig& config) {
     // prewarm_bytes costs real time: extents must be genuinely written, at
     // roughly 225 MB/s per rank, so a terabyte is on the order of an hour.
     // capacity_bytes is only a ceiling; prewarm_bytes is what open() pays for.
-    const Status warmed =
-        materialise_through_locked(allocator_.prewarm_slots());
-    if (!warmed.ok()) return warmed;
+    if (!config_.read_only) {
+        const Status warmed =
+            materialise_through_locked(allocator_.prewarm_slots());
+        if (!warmed.ok()) return warmed;
+    }
 
     // Residency bitmaps last: their slot_count depends on the final geometry.
     if (config_.rank_count > 1) {
         const std::uint64_t slots = allocator_.total_slots();
         const std::uint64_t digest = fingerprint_digest_locked();
-        const Status dir = ensure_directory(join(config_.uri, "residency"));
-        if (!dir.ok()) return dir;
+        if (!config_.read_only) {
+            const Status dir = ensure_directory(join(config_.uri, "residency"));
+            if (!dir.ok()) return dir;
+        }
 
         // A bitmap that cannot be opened is not fatal: the cross-rank query
         // degrades to this rank's own view, which under-reports and is
         // therefore safe. Refusing to start would trade a performance loss for
         // an outage.
-        (void)own_residency_.open_writable(residency_path_locked(config_.rank_id),
-                                          config_.rank_id, config_.rank_count,
-                                          slots, digest);
+        if (config_.read_only) {
+            (void)own_residency_.open_readonly(
+                residency_path_locked(config_.rank_id), config_.rank_count,
+                slots, digest);
+        } else {
+            (void)own_residency_.open_writable(
+                residency_path_locked(config_.rank_id), config_.rank_id,
+                config_.rank_count, slots, digest);
+        }
         peer_residency_.clear();
         peer_residency_.resize(config_.rank_count);
         for (std::uint32_t rank = 0; rank < config_.rank_count; ++rank) {
@@ -184,13 +216,23 @@ Status ObjectStoreCore::open(const StoreConfig& config) {
 Status ObjectStoreCore::close() {
     std::lock_guard<std::mutex> guard(mutex_);
     if (!opened_) return {};
+    // Flush a dirty checkpoint first. commit() writes the object header (the
+    // durable statement) and marks the checkpoint dirty, so without this a
+    // clean restart would report every object committed since the last
+    // checkpoint as absent -- its header is on media, but the key set lives in
+    // the checkpoint. close() is explicit and returns a Status, so unlike the
+    // destructor it can report the failure.
+    Status status;
+    if (checkpoint_dirty_) {
+        status = persist_checkpoint_locked();
+    }
     // Flush the bitmap so a clean shutdown does not lose residency information
     // that the next start would otherwise have to rebuild.
     (void)own_residency_.sync();
     own_residency_.close();
     peer_residency_.clear();
     opened_ = false;
-    return {};
+    return status;
 }
 
 Status ObjectStoreCore::build_backend_locked() {
@@ -380,6 +422,31 @@ StoreUsage ObjectStoreCore::usage() const {
     return u;
 }
 
+std::uint64_t ObjectStoreCore::ready_slots() const {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (!opened_) return 0;
+    // materialised_ is the count of slots whose files actually exist on media
+    // (prewarmed here, or recovered from a previous process). Do NOT derive
+    // this from SpaceAllocatorStats::unmaterialised_slots: that is the
+    // allocator's high-water mark of *handed out* slots, which stays at zero
+    // through prewarm, so the bind-time warm-up saw an empty pool and the first
+    // IO paid the whole peer-memory registration on the request path.
+    return materialised_;
+}
+
+std::string ObjectStoreCore::slot_uri(std::uint64_t slot) const {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (!opened_ || placement_ == nullptr) return {};
+    if (slot >= allocator_.total_slots()) return {};
+    return placement_->uri_for_slot(slot);
+}
+
+std::uint64_t ObjectStoreCore::slot_generation(std::uint64_t slot) const {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (!opened_ || slot >= allocator_.total_slots()) return 0;
+    return allocator_.generation_of(slot);
+}
+
 // -------------------------------------------------------------------------
 // write path
 // -------------------------------------------------------------------------
@@ -387,6 +454,9 @@ StoreUsage ObjectStoreCore::usage() const {
 Result<ReserveOutcome> ObjectStoreCore::reserve(const ObjectKey* keys,
                                                 std::size_t count) {
     std::lock_guard<std::mutex> guard(mutex_);
+    if (config_.read_only) {
+        return Result<ReserveOutcome>::Failure(read_only_error("reserve"));
+    }
     ReserveOutcome out;
     if (!opened_) {
         return Result<ReserveOutcome>::Failure(
@@ -480,6 +550,7 @@ Status ObjectStoreCore::write_header_locked(std::uint64_t slot,
 
 Status ObjectStoreCore::commit(const ObjectKey* keys, std::size_t count) {
     std::lock_guard<std::mutex> guard(mutex_);
+    if (config_.read_only) return read_only_error("commit");
     if (!opened_) {
         return Status(StatusCode::NOT_READY, "store is not open");
     }
@@ -523,6 +594,7 @@ Status ObjectStoreCore::commit(const ObjectKey* keys, std::size_t count) {
 
 Status ObjectStoreCore::abort(const ObjectKey* keys, std::size_t count) {
     std::lock_guard<std::mutex> guard(mutex_);
+    if (config_.read_only) return read_only_error("abort");
     if (keys == nullptr || count == 0) return {};
 
     std::vector<std::uint64_t> slots;
@@ -548,6 +620,9 @@ Status ObjectStoreCore::abort(const ObjectKey* keys, std::size_t count) {
 Result<std::uint64_t> ObjectStoreCore::release(const ObjectKey* keys,
                                                std::size_t count) {
     std::lock_guard<std::mutex> guard(mutex_);
+    if (config_.read_only) {
+        return Result<std::uint64_t>::Failure(read_only_error("release"));
+    }
     if (keys == nullptr || count == 0) {
         return Result<std::uint64_t>::Success(0);
     }
@@ -577,6 +652,7 @@ Result<std::uint64_t> ObjectStoreCore::release(const ObjectKey* keys,
 
 Status ObjectStoreCore::pin(const ObjectKey* keys, std::size_t count) {
     std::lock_guard<std::mutex> guard(mutex_);
+    if (config_.read_only) return read_only_error("pin");
     if (keys == nullptr) return {};
     for (std::size_t i = 0; i < count; ++i) ++pins_[index_key(keys[i])];
     return {};
@@ -584,6 +660,7 @@ Status ObjectStoreCore::pin(const ObjectKey* keys, std::size_t count) {
 
 Status ObjectStoreCore::unpin(const ObjectKey* keys, std::size_t count) {
     std::lock_guard<std::mutex> guard(mutex_);
+    if (config_.read_only) return read_only_error("unpin");
     if (keys == nullptr) return {};
     for (std::size_t i = 0; i < count; ++i) {
         auto it = pins_.find(index_key(keys[i]));
@@ -718,6 +795,7 @@ Status ObjectStoreCore::persist_checkpoint_locked() {
 
 Status ObjectStoreCore::checkpoint() {
     std::lock_guard<std::mutex> guard(mutex_);
+    if (config_.read_only) return read_only_error("checkpoint");
     if (!opened_) {
         return Status(StatusCode::NOT_READY, "store is not open");
     }

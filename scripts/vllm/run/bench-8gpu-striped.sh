@@ -207,10 +207,14 @@ if [[ "$USE_NSYS" == 1 ]]; then
     #     8.1 万条砍到 3.0 万条，连 tutti.striped_nvme.io_kernel|op=read 这类关键
     #     范围一起滤掉，正好丢掉最该看的部分。这里的 --nvtx-capture 只作为采集
     #     触发条件，不过滤内容。
+    #  ④ 默认不采 cublas/cudnn，但可用 TUTTI_NSYS_TRACE 打开：请求开头的
+    #     250ms 级 compute 气泡期间既无 kernel 也无 CUDA runtime 调用，时间就
+    #     花在未采集的库调用（cuBLASLt 启发式搜索、cuDNN）里——不看这两类
+    #     就永远只能看到"空白"。代价是事件数量显著增加。
     nsys profile \
         --output "$REPORT" \
         --force-overwrite true \
-        --trace cuda,nvtx \
+        --trace "${TUTTI_NSYS_TRACE:-cuda,nvtx}" \
         --capture-range=nvtx \
         --nvtx-capture='tutti.bench@tutti' \
         --capture-range-end=none \

@@ -117,7 +117,7 @@ struct StoreDevice {
     std::uint32_t namespace_id = 0;
     std::uint32_t block_size = 0;
 
-    // Block device whose extents back mount_path (e.g. /dev/ssnvme0n1), and the
+    // Block device whose extents back mount_path (e.g. /dev/snvme0n1), and the
     // namespace's byte offset within it.
     std::string backing_device_path;
     std::uint64_t namespace_base_bytes = 0;
@@ -140,6 +140,13 @@ struct StoreConfig {
 
     // Total capacity ceiling for this store. 0 means "whatever the backend
     // reports as usable". Implementations clamp to the real backend capacity.
+    //
+    // Slot-count form of the same knob. A caller that thinks in objects (chunks)
+    // should size the cache in slots: only the store knows the object geometry,
+    // and a byte figure derived by the caller would be wrong for a striped
+    // layout, whose payload prefix is rounded up to a whole stripe round -- that
+    // mismatch silently produced fewer slots than asked for. Non-zero wins.
+    std::uint64_t capacity_slots = 0;
     std::uint64_t capacity_bytes = 0;
 
     ObjectLayout layout;
@@ -156,6 +163,8 @@ struct StoreConfig {
     std::uint64_t stripe_unit = 0;
 
     // Bytes of usable space to materialise before open() returns. 0 = none.
+    // Slot-count form of prewarm_bytes (non-zero wins). See capacity_slots.
+    std::uint64_t prewarm_slots = 0;
     std::uint64_t prewarm_bytes = 0;
 
     // Background space reclamation. When false, reclamation runs
@@ -169,6 +178,14 @@ struct StoreConfig {
     // 1 means single-rank: no bitmap is created and
     // contains_prefix_all_ranks() degenerates to contains_prefix().
     std::uint32_t rank_count = 1;
+
+    // Read-only view of a pool owned by another process (e.g. the scheduler's
+    // residency index reading a worker's namespace). open() then loads the
+    // checkpoint and maps the residency bitmaps WITHOUT creating directories,
+    // materialising slots or prewarming, and every mutating call fails with
+    // UNSUPPORTED instead of being silently ignored -- a misconfigured writer
+    // must fail loudly, not lose data.
+    bool read_only = false;
 
     // msync period for the residency bitmap. 0 = never actively sync (rely
     // on kernel writeback alone). Purely a performance knob: the bitmap is an
@@ -420,6 +437,26 @@ public:
     virtual Result<ObjectPlacement> lookup(const ObjectKey& key) const = 0;
 
     virtual StoreUsage usage() const = 0;
+
+    // ---- Bind-time warm-up ----
+    //
+    // Slots whose backing files exist on media right now (materialised by
+    // prewarm, by recovery, or by an earlier reservation). A caller that wants
+    // to warm the runtime's target and peer-memory registration caches before
+    // serving traffic needs real URIs to open: the first IO on a slot otherwise
+    // pays resolve() plus registration -- hundreds of milliseconds per device,
+    // serialised behind the runtime's registry lock -- on the request path
+    // where it stalls the forward thread.
+    virtual std::uint64_t ready_slots() const = 0;
+
+    // URI for a slot in [0, ready_slots()). Its format is the placement's, not
+    // the caller's: it must be exactly what the resolver parses. Empty when the
+    // slot is not ready.
+    virtual std::string slot_uri(std::uint64_t slot) const = 0;
+
+    // Generation of a slot, so a warmed-up cache entry can be validated later
+    // without reopening. Zero when the slot is out of range.
+    virtual std::uint64_t slot_generation(std::uint64_t slot) const = 0;
 
     // ---- Write path ----
 

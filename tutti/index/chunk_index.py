@@ -63,6 +63,23 @@ _IO_LAYER_BYTES = 2
 IO_KEY_BYTES = _KEY_BYTES + _IO_LAYER_BYTES
 
 
+def decode_io_key(io_key: bytes) -> tuple[bytes, int]:
+    """io_key → (chunk 身份, 层号)。
+
+    任意长度 key 均可解读（chunk 取前 16 字节，其余按小端表示层号），与
+    ``derive_io_key`` 互逆：短 key 只有 chunk、层号为 0（通用 KV 存储契约
+    允许这种 key）。层号宽度超出 int 的 key 会 ValueError。
+    """
+    if not isinstance(io_key, (bytes, bytearray, memoryview)):
+        raise ValueError(f"io_key 必须为 bytes，得到 {type(io_key).__name__}")
+    io_key = bytes(io_key)
+    if not io_key:
+        raise ValueError("io_key 不能为空")
+    chunk_id = io_key[:_KEY_BYTES]
+    layer = int.from_bytes(io_key[_KEY_BYTES:], "little")
+    return chunk_id, layer
+
+
 def derive_io_key(chunk_key: bytes, layer_idx: int) -> bytes:
     """把层编号编入 chunk key，得到存储层使用的 io_key（18 字节）。
 

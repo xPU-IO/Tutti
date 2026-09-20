@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import torch
 
 from tutti.index.chunk_index import derive_io_key
-from tutti.storage.tutti_nvme.layout import decode_io_key
+from tutti.index.chunk_index import decode_io_key
 from tutti.storage.memory import MemoryKVStore
 from tests.python.adapter.test_adapter import (
     BLOCK_SIZE,
@@ -102,23 +102,23 @@ def _segment_bytes(chunk: int, layer: int) -> bytes:
 
 
 def test_layer_span_predisposes_full_size(tmp_path):
-    """bind 注入层宽后，数据文件首写即全尺寸（票据稳定不再重开）。
+    """bind 注入层宽后，槽位首写即全尺寸（票据稳定不再重开）。
 
     回归背景：文件随层逐层增长时，传输层票据因尺寸过期被反复弃置
-    重开，层多时票据池耗尽（open: handle cache pool exhausted）。
+    重开，层多时票据池耗尽（open: handle cache pool exhausted）。对象层
+    在预留时就按几何物化整槽位（对象头 + 全部层段），因此尺寸恒定。
     """
-    from tutti.storage.tutti_nvme.layout import Layout
+    from tutti.storage.tutti_nvme.object_layout import ObjectLayout
 
-    layout = Layout(tmp_path, segment_bytes=SEG)
-    layout.ensure_dirs()
+    chunk = b"\x42" * 16
+    layout = ObjectLayout(
+        tmp_path, segment_bytes=SEG, capacity_chunks=8, prewarm_chunks=1,
+        namespace=b"layer-span",
+    )
     layout.set_layer_span(80)
-    io_keys = [derive_io_key(b"\x42" * 16, 0)]  # 首层写入
-    layout.prepare_put(io_keys, capacity_chunks=8)
-    size = layout.chunk_file(b"\x42" * 16).stat().st_size
-    assert size == 80 * SEG  # 首写即全尺寸
-
-    # 未设层宽时保持按需增长（兼容路径）
-    layout2 = Layout(tmp_path / "spanless", segment_bytes=SEG)
-    layout2.ensure_dirs()
-    layout2.prepare_put([derive_io_key(b"\x43" * 16, 2)], 8)
-    assert layout2.chunk_file(b"\x43" * 16).stat().st_size == 3 * SEG
+    layout.prepare_put([derive_io_key(chunk, 0)], capacity_chunks=8)
+    uri = layout.target_uri(chunk)
+    path = Path(uri[len("file://"):])
+    assert path.stat().st_size == 4096 + 80 * SEG  # 首写即全尺寸
+    assert layout.target_size(chunk) == 80 * SEG
+    layout.close_object_pool()

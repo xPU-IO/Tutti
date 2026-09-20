@@ -1,22 +1,27 @@
 """Scheduler-only metadata stores.
 
-These stores expose only capacity, namespace ownership, marker scanning, and
-eviction.  They intentionally have no runtime, buffer registration, stream,
+These stores expose only capacity, namespace ownership, residency scanning, and
+eviction. They intentionally have no runtime, buffer registration, stream,
 target, or data-transfer API.
+
+The persistent one is a **read-only view of the object layer**: the worker is
+the sole writer of a namespace, the scheduler opens the same namespace read-only
+(no directory creation, no prewarming, no materialisation) and reads the
+committed key set from the checkpoint. Everything after that first read is
+in-memory: residency is published by the worker's per-step increments, so the
+scheduler never touches the filesystem on the request path.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 
+from .object_store import ObjectStore, _fingerprint_bytes
 from .registry import (
     create_metadata_store as _create_metadata_store,
     register_metadata_store_type,
 )
-from .tutti_nvme.layout import Layout
 from .tutti_nvme.preset_derive import derive_device_fields
-from .tutti_nvme.striped_layout import StripedLayout
 
 
 _LOG = logging.getLogger(__name__)
@@ -40,6 +45,10 @@ class MemoryMetadataStore:
     @property
     def capacity_chunks(self) -> int:
         return self._num_chunks
+
+    @property
+    def layer_span(self) -> int | None:
+        return None
 
     def open(self) -> None:
         self._opened = True
@@ -66,7 +75,12 @@ class MemoryMetadataStore:
 
 
 class TuttiMetadataStore:
-    """Marker/manifest-only view of a Tutti NVMe pool."""
+    """调度侧的驻留索引：对象层的**只读**视图 + 内存权威集合。
+
+    盘上不再有 marker/manifest：worker 是命名空间唯一写者，调度侧以只读视图
+    读一次已提交集合（冷启动对账），此后驻留集合由 worker 的 committed 增量
+    维护，查询热路径完全不碰文件系统。
+    """
 
     def __init__(
         self,
@@ -106,26 +120,46 @@ class TuttiMetadataStore:
             }]
         if len(rank_options) != self._tp_size:
             raise ValueError("rank_options must contain one entry per TP rank")
-        self._layouts = {
-            rank: _metadata_layout(options, segment_bytes)
-            for rank, options in enumerate(rank_options)
-        }
-        roots = [str(item.root) for item in self._layouts.values()]
-        if self._tp_size > 1 and len(set(roots)) != self._tp_size:
+        self._roots = [
+            str(options.get("root")) for options in rank_options
+        ]
+        if self._tp_size > 1 and len(set(self._roots)) != self._tp_size:
             raise ValueError("every TP rank requires a distinct metadata root")
-        self._layout = self._layouts[0]
-        self._namespace_matches = {rank: True for rank in self._layouts}
-        # 冷启动对账需要层宽：scan() 按 layer_span 判定"全层齐备"，未声明时
-        # 一律返回空（fail-closed）。worker 侧在 bind 后由引擎注入；调度侧没有
-        # bind 阶段，必须在构造时给出——否则复用已有池时永远恢复不到任何驻留
-        # 项，命中率静默归零（索引此后以内存为权威，不会再扫盘）。
-        if layer_span is not None:
-            for layout in self._layouts.values():
-                layout.set_layer_span(int(layer_span))
+        self._views: list[ObjectStore] = []
+        self._live: set[bytes] = set()
+        # 条带几何（挂载点 + 条带粒度）与数据面必须完全一致：对象层的槽位
+        # 路径由它推导，不一致就会指向别的文件。
+        self._mounts: list[str] | None = None
+        self._stripe_unit = 0
+        if rank_options[0].get("layout") == "striped":
+            stripe_unit = rank_options[0].get("stripe_unit")
+            if stripe_unit is None:
+                raise ValueError("striped metadata store requires stripe_unit")
+            mounts = rank_options[0].get("mounts")
+            preset = rank_options[0].get("preset")
+            if mounts is None and isinstance(preset, dict):
+                if "daemon_config" in preset:
+                    import yaml
+                    preset = derive_device_fields(preset, yaml)
+                mounts = _preset_mounts(preset)
+            if not mounts:
+                raise ValueError("striped metadata store requires mounts")
+            self._mounts = [str(mount) for mount in mounts]
+            self._stripe_unit = int(stripe_unit)
+        # 冷启动对账需要层宽（对象几何 = 段数 × 段大小 + 对象头），未声明时
+        # scan() 返回空（fail-closed）。worker 侧在 bind 后由引擎注入；调度侧
+        # 没有 bind 阶段，必须在构造时给出——否则复用已有池时永远恢复不到任何
+        # 驻留项，命中率静默归零（索引此后以内存为权威，不会再扫盘）。
+        self._layer_span = int(layer_span) if layer_span else None
 
     @property
     def capacity_chunks(self) -> int:
         return self._num_chunks
+
+    @property
+    def layer_span(self) -> int | None:
+        """层宽（对象几何的一半）；未声明时 None（scan 一律返回空）。"""
+        return self._layer_span
 
     def set_key_namespace(self, namespace: bytes) -> None:
         if self._opened:
@@ -135,103 +169,98 @@ class TuttiMetadataStore:
     def open(self) -> None:
         if self._opened:
             raise RuntimeError("metadata store is already open")
-        for rank, layout in self._layouts.items():
-            layout.ensure_dirs()
-            if self._key_namespace is not None:
-                self._namespace_matches[rank] = layout.check_namespace(
-                    self._key_namespace
-                )
-                if not self._namespace_matches[rank]:
-                    _LOG.warning(
-                        "rank %d pool %s namespace mismatch; all-rank lookup "
-                        "fails closed",
-                        rank, layout.root,
-                    )
         self._opened = True
+        if self._layer_span:
+            self._refresh()
 
     def close(self) -> None:
+        for view in self._views:
+            try:
+                view.close()
+            except Exception:  # pragma: no cover - 关闭失败不影响调度
+                _LOG.exception("关闭对象层只读视图失败")
+        self._views = []
+        self._live = set()
         self._opened = False
 
     def scan(self):
+        """已驻留的 io_key（升序）。
+
+        首次调用（或 open 时）读一次对象层；之后以内存集合为准——worker 的
+        提交会经 ``TuttiWorkerMetadata`` 增量补进来。
+        """
         self._require_open()
-        if not all(self._namespace_matches.values()):
-            return []
-        marker_sets = {
-            rank: set(layout.scan()) for rank, layout in self._layouts.items()
-        }
-        valid = self._valid_all_rank_chunks(marker_sets)
-        return sorted(
-            chunk_key + layer.to_bytes(2, "little")
-            for chunk_key in valid
-            for layer in range(self._record_num_layers(chunk_key))
-        )
+        if not self._live and self._layer_span:
+            self._refresh()
+        return sorted(self._live)
 
     def drop(self, keys) -> None:
         self._require_open()
-        self._layout.drop(keys)
+        self._live.difference_update(bytes(key) for key in keys)
+
+    # ---- 内部 ----
+
+    def _refresh(self) -> None:
+        """读一次各 rank 的已提交集合，取交集（全 rank 齐备才可读）。"""
+        try:
+            views = self._views or self._open_views()
+        except Exception:
+            _LOG.warning(
+                "对象层只读视图打开失败；本轮冷启动对账按空池处理（后续由 "
+                "worker 增量恢复）", exc_info=True,
+            )
+            return
+        committed = [view.recover() for view in views]
+        if not committed:
+            return
+        common = set.intersection(*committed)
+        span = self._layer_span or 0
+        self._live = {
+            chunk + layer.to_bytes(2, "little")
+            for chunk in common
+            for layer in range(span)
+        }
+        if common:
+            _LOG.info(
+                "METADATA_RECOVERED chunks=%d io_keys=%d ranks=%d",
+                len(common), len(self._live), len(committed),
+            )
+
+    def _open_views(self) -> list[ObjectStore]:
+        stores = []
+        for rank, root in enumerate(self._roots):
+            options = {
+                "scheme": (
+                    "striped_local_nvme_file"
+                    if self._stripe_unit else "local_nvme_file"
+                ),
+                "uri": root,
+                "capacity_slots": self._num_chunks,
+                "segment_bytes": self._segment_bytes,
+                "segment_count": self._layer_span,
+                "namespace_fingerprint": _fingerprint_bytes(self._key_namespace),
+                "devices": self._devices_for(rank),
+                "stripe_unit": self._stripe_unit,
+                "prewarm_bytes": 0,
+                "background_reclaim": False,
+                "rank_id": 0,
+                "rank_count": 1,
+                "read_only": True,
+            }
+            store = ObjectStore(options)
+            store.open()
+            stores.append(store)
+        self._views = stores
+        return stores
+
+    def _devices_for(self, rank: int) -> list[dict]:
+        del rank
+        mounts = self._mounts or [self._roots[0]]
+        return [{"mount_path": mount} for mount in mounts]
 
     def _require_open(self) -> None:
         if not self._opened:
             raise RuntimeError("metadata store is not open")
-
-    def _valid_all_rank_chunks(self, marker_sets) -> set[bytes]:
-        """全 rank 层标记齐备、且池 manifest 认可归属的 chunk。
-
-        运行时驻留由内存权威索引门禁（worker→scheduler 的
-        TuttiWorkerMetadata），盘上只保留两样东西：层标记（数据完整性）
-        与池 manifest（槽位归属 + 几何 + 命名空间）。此前的 rank 提交
-        凭证（commits/*.commit.json）与 manifest 信息高度重叠且每文件
-        fsync，已整体删除。
-        """
-        candidates: set[bytes] = set()
-        for rank in range(self._tp_size):
-            for io_key in marker_sets[rank]:
-                if len(io_key) == 18:
-                    candidates.add(bytes(io_key[:16]))
-        num_layers = self._layout.layer_span
-        if not num_layers:
-            return set()
-        expected_layers = set(range(num_layers))
-        slot_bytes = num_layers * self._segment_bytes
-        valid = set()
-        for chunk_key in candidates:
-            accepted = True
-            for rank in range(self._tp_size):
-                if not self._pool_manifest_matches(rank, chunk_key, slot_bytes):
-                    accepted = False
-                    break
-                layers = {
-                    int.from_bytes(io_key[16:], "little")
-                    for io_key in marker_sets[rank]
-                    if io_key[:16] == chunk_key and len(io_key) == 18
-                }
-                if not layers >= expected_layers:
-                    accepted = False
-                    break
-            if accepted:
-                valid.add(chunk_key)
-        return valid
-
-    def _record_num_layers(self, chunk_key: bytes) -> int:
-        del chunk_key
-        return self._layout.layer_span
-
-    def _pool_manifest_matches(self, rank, chunk_key, slot_bytes) -> bool:
-        """池 manifest 是否认可该 chunk 的归属与几何。"""
-        path = self._layouts[rank].pool_manifest_path()
-        try:
-            manifest = json.loads(path.read_text("utf-8"))
-            allocation = manifest["allocated"][chunk_key.hex()]
-            geometry = manifest["rank_geometry"]
-            return (
-                manifest.get("namespace") == self._key_namespace.hex()
-                and int(manifest.get("slot_bytes", -1)) == slot_bytes
-                and int(geometry.get("num_layers", -1)) * self._segment_bytes
-                == slot_bytes
-                and int(allocation.get("generation", -1)) > 0
-            )
-        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
-            return False
 
 
 # 调度侧 store 的注册：与数据面共用 stores.registry 的注册面，目标以
@@ -256,26 +285,3 @@ def _preset_mounts(preset):
             return None
         mounts.append(device["mount_path"])
     return mounts or None
-
-
-def _metadata_layout(options, segment_bytes):
-    root = options.get("root")
-    layout = options.get("layout", "file_per_chunk")
-    if layout in (None, "file_per_chunk", "file"):
-        return Layout(root, segment_bytes)
-    if layout == "striped":
-        mounts = options.get("mounts")
-        preset = options.get("preset")
-        if mounts is None and isinstance(preset, dict):
-            if "daemon_config" in preset:
-                import yaml
-                preset = derive_device_fields(preset, yaml)
-            mounts = _preset_mounts(preset)
-        stripe_unit = options.get("stripe_unit")
-        if stripe_unit is None:
-            raise ValueError("striped metadata store requires stripe_unit")
-        return StripedLayout(
-            root, segment_bytes, mounts, stripe_unit,
-            rank_id=int(options.get("rank_id", 0)),
-        )
-    raise ValueError(f"unknown tutti_nvme layout: {layout!r}")

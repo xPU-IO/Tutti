@@ -9,9 +9,17 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 if "TORCH_CUDA_ARCH_LIST" not in os.environ:
     os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0"
 
+
+def read_version():
+    """版本唯一来源：仓库根 VERSION（与 CMake / 其余 Python 包共用）。"""
+    here = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(here, "..", "..", "VERSION")) as f:
+        return f.read().strip()
+
+
 setup(
     name="tutti-kv-transfer",
-    version="0.1.0",
+    version=read_version(),
     description=(
         "gather/scatter CUDA kernels for the Tutti vLLM connector "
         "(single_layer_kv_transfer ported from LMCache, Apache-2.0)"

@@ -15,7 +15,7 @@ from tutti.integration.vllm.connector import (
 )
 from tutti.engine.core import KVEngine
 from tutti.index.chunk_index import derive_io_key
-from tutti.storage.tutti_nvme.layout import decode_io_key
+from tutti.index.chunk_index import decode_io_key
 from tutti.storage.memory import MemoryKVStore
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,

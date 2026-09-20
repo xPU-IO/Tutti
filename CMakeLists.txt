@@ -40,12 +40,22 @@ if(NOT TUTTI_ACCELERATOR STREQUAL "HOST" AND NOT CMAKE_CUDA_COMPILER)
     endif()
 endif()
 
+# Version has one source of truth: the repository-root VERSION file, shared by
+# this project() call and the three Python distributions.  project() needs the
+# literal at configure time, so it must be read before the call below.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" TUTTI_VERSION)
+string(STRIP "${TUTTI_VERSION}" TUTTI_VERSION)
+if(NOT TUTTI_VERSION MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+$")
+    message(FATAL_ERROR
+        "VERSION must be a major.minor.patch triplet, got '${TUTTI_VERSION}'")
+endif()
+
 if(TUTTI_ACCELERATOR STREQUAL "HOST")
-    project(Tutti VERSION 0.1.1 LANGUAGES C CXX)
+    project(Tutti VERSION ${TUTTI_VERSION} LANGUAGES C CXX)
 else()
     # CUDA is currently also the compiler integration used by the MUSA/MACA
     # framework stubs.  Their profile modules provide vendor-specific SDKs.
-    project(Tutti VERSION 0.1.1 LANGUAGES C CXX CUDA)
+    project(Tutti VERSION ${TUTTI_VERSION} LANGUAGES C CXX CUDA)
 endif()
 
 # CTest must be enabled at the repository root so `ctest --test-dir <build>`

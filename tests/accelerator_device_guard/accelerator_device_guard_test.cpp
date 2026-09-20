@@ -235,6 +235,28 @@ void test_injected_guard_failures() {
     }
     CHECK(restore_failure.current == 1,
           "destructor retries restoration after explicit restore failure");
+
+    // A no-op enter (the caller is already on the target device) must not call
+    // set_device on restore.  Not just an optimisation: on real hardware the
+    // redundant cudaSetDevice serialised against device-wide work and cost
+    // ~950ms per read submit while 8 ranks submitted concurrently.
+    InjectedGuardBackendState noop_state;
+    noop_state.current = 0;
+    tutti::testing::DeviceGuardBackend noop_backend{
+        &noop_state, &injected_get_device, &injected_set_device};
+    {
+        auto guard = tutti::testing::DeviceGuardTestAccess::create(0, noop_backend);
+        CHECK(guard.ok() && guard.previous_accel_id() == 0,
+              "no-op enter keeps the caller device");
+        noop_state.set_failures = 1;  // would fail if set_device were called
+        CHECK(guard.restore().ok(),
+              "no-op enter restores without touching the driver");
+        CHECK(guard.state() == tutti::DeviceGuardState::RESTORED,
+              "no-op restore reaches RESTORED");
+        CHECK(noop_state.set_failures == 1,
+              "no-op restore did not consume the injected set-device failure");
+    }
+    CHECK(noop_state.current == 0, "no-op restore leaves the device untouched");
 }
 
 void test_runtime_boundaries_and_ownership() {

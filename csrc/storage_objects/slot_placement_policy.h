@@ -137,6 +137,18 @@ public:
         return static_cast<std::uint32_t>(mounts_.size());
     }
     std::string resolver_scheme() const override { return "striped"; }
+
+    // Payload start in the object's logical address space, rounded up to a whole
+    // stripe round.
+    //
+    // Reserving only the header (4096B) leaves every segment -- and therefore
+    // every IO request -- misaligned to the stripe unit: a 128 KiB request then
+    // touches three shards instead of two, and the extra command per request
+    // showed up as +64% write IO kernel time on real hardware (2.64ms -> 4.34ms
+    // per submit, 4.6s -> 7.4s of device time for a 10k-token cold request).
+    // Aligning to a whole round costs at most one round of space per slot and
+    // keeps each request inside the shards it was sized for.
+    std::uint64_t payload_offset() const override;
     Status paths_for_slot(std::uint64_t slot,
                           std::vector<std::string>* out) const override;
     std::uint64_t shard_file_bytes(std::uint64_t slot_bytes) const override;

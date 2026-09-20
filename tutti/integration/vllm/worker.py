@@ -789,7 +789,8 @@ class WorkerImpl:
                 (callback_ns - started_ns) / 1_000_000
                 if started_ns is not None else None
             )
-            _LOG.warning(
+            # 正常路径的时间线诊断：debug（每请求一条，原先 warning）。
+            _LOG.debug(
                 "DIRECT_FIRST_COMPUTE_CALLBACK callback=0 physical=%d "
                 "t_ns=%d since_start_ms=%s",
                 idx, callback_ns,

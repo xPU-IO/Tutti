@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pytest
 
-from tutti.storage.tutti_nvme.layout import Layout, decode_io_key
+from tutti.index.chunk_index import decode_io_key
 from tutti.storage.tutti_nvme.store import (
     TuttiKVStore,
     _TuttiCompletion,
@@ -172,6 +172,9 @@ def register_factory(register) -> None:
         store = TuttiKVStore(
             root=root, num_chunks=8, segment_bytes=4096, runtime=FakeRuntime()
         )
+        # 对象几何（段数 × 段大小 + 对象头）必须定案才能落盘。通用契约的
+        # key 是不带层号的短 key（每 key 自成一个对象），故层宽取 1。
+        store.set_layer_span(1)
         weakref.finalize(store, shutil.rmtree, root, True)
         return store
 
@@ -184,36 +187,54 @@ def register_factory(register) -> None:
     )
 
 
-def make_store(tmp_path, num_chunks=8, runtime=None) -> TuttiKVStore:
-    return TuttiKVStore(
+def make_store(tmp_path, num_chunks=8, runtime=None, layers=4) -> TuttiKVStore:
+    store = TuttiKVStore(
         root=tmp_path / "pool",
         num_chunks=num_chunks,
         segment_bytes=SEG,
         runtime=runtime or FakeRuntime(),
     )
+    # 对象几何必须定案（对象头 + 每层一个段）才能分配槽位。
+    store.set_layer_span(layers)
+    return store
 
 
-def test_scan_refreshes_markers_from_sibling_store(tmp_path):
-    """A scheduler-side store observes a worker's newly committed marker."""
+def test_sibling_store_recovers_after_checkpoint(tmp_path):
+    """同命名空间的另一个实例在对象层落检查点后恢复出已提交对象。
+
+    生产语义：worker 是命名空间唯一写者（close 落检查点，也可显式落），
+    调度侧只读视图据此重建驻留集合；热路径由 worker 的增量发布维护，不再
+    扫盘，因此这里验证的是冷启动恢复这一条通道。
+    """
     root = tmp_path / "pool"
     worker = TuttiKVStore(
         root=root, num_chunks=8, segment_bytes=SEG, runtime=FakeRuntime()
     )
-    scheduler = TuttiKVStore(
-        root=root, num_chunks=8, segment_bytes=SEG, runtime=FakeRuntime()
-    )
+    worker.set_layer_span(1)
     worker.open()
-    scheduler.open()
-    assert scheduler.scan() == []
-
     src = bytearray(b"x" * SEG)
     buffer_id = worker.register_buffer(src, SEG)
     key = io_key(b"sibling".ljust(16, b"_"), 0)
     worker.put_batch([(key, buffer_id, 0)]).wait()
 
-    assert scheduler.scan() == [key]
+    # 未落检查点前，另一个实例看不到（内存视图是本进程权威）
+    reader = TuttiKVStore(
+        root=root, num_chunks=8, segment_bytes=SEG, runtime=FakeRuntime()
+    )
+    reader.set_layer_span(1)
+    reader.open()
+    assert reader.scan() == []
+
+    worker._layout.checkpoint()
+    recovered = TuttiKVStore(
+        root=root, num_chunks=8, segment_bytes=SEG, runtime=FakeRuntime()
+    )
+    recovered.set_layer_span(1)
+    recovered.open()
+    assert recovered.scan() == [key]
     worker.close()
-    scheduler.close()
+    reader.close()
+    recovered.close()
 
 
 # ---------- partial-commit 窗口重发 ----------
@@ -224,11 +245,13 @@ def test_partial_commit_retried(tmp_path):
     runtime = FakeRuntime(
         reject_plan=lambda rnd, n: set(range(0, n, 2)) if rnd == 0 else set()
     )
-    store = make_store(tmp_path, runtime=runtime)
+    # 每个 key 自成一个对象（层宽 1）：这里验证的是运行时部分拒绝后的窗口
+    # 重发，与层数无关；层宽 >1 时对象要等各层写齐才提交。
+    store = make_store(tmp_path, runtime=runtime, layers=1)
     store.open()
     src = bytearray(4 * SEG)
     src_id = store.register_buffer(src, SEG)
-    keys = [io_key(bytes([i]) * 16, i % 3) for i in range(4)]
+    keys = [io_key(bytes([i]) * 16, 0) for i in range(4)]
     for i, key in enumerate(keys):
         src[i * SEG:(i + 1) * SEG] = bytes([0x30 + i]) * SEG
     store.put_batch([(k, src_id, i * SEG) for i, k in enumerate(keys)]).wait()
@@ -246,7 +269,7 @@ def test_partial_commit_non_ok_status_still_drains_handle(tmp_path):
         reject_plan=lambda rnd, n: {0} if rnd == 0 else set(),
         partial_status_non_ok=True,
     )
-    store = make_store(tmp_path, runtime=runtime)
+    store = make_store(tmp_path, runtime=runtime, layers=1)
     store.open()
     src = bytearray(2 * SEG)
     src[:SEG] = b"a" * SEG
@@ -320,6 +343,7 @@ def test_auto_routes_read_and_write_to_distinct_streams(tmp_path, monkeypatch):
         runtime=runtime, io_stream="auto", preset={"gpu_id": 0},
     )
     store.open()
+    store.set_layer_span(1)   # 对象几何必须定案（单层 key 各成一个对象）
     assert store._stream_mode == "dual"
     assert store._read_stream != store._write_stream
     assert store._read_stream_obj is not store._write_stream_obj
@@ -515,9 +539,14 @@ def test_double_stall_raises(tmp_path):
 # ---------- 层段布局（18B 标准 io_key） ----------
 
 
-def test_layer_segments_share_chunk_file(tmp_path):
-    """同 chunk 各层共用一个数据文件；层段 offset = layer × segment。"""
-    store = make_store(tmp_path)
+def _slot_path(store, chunk_id) -> Path:
+    uri = store._layout.target_uri(chunk_id)
+    return Path(uri[len("file://"):] if uri.startswith("file://") else uri)
+
+
+def test_layer_segments_share_one_object(tmp_path):
+    """同 chunk 各层共用一个对象文件；段 offset = 对象头 + layer × segment。"""
+    store = make_store(tmp_path, layers=6)
     store.open()
     src = bytearray(SEG)
     src_id = store.register_buffer(src, SEG)
@@ -527,82 +556,102 @@ def test_layer_segments_share_chunk_file(tmp_path):
         src[:] = bytes([0x40 + layer]) * SEG
         store.put_batch([(io_key(chunk, layer), src_id, 0)]).wait()
 
-    data_files = list((Path(store._layout.root) / "chunks").glob("*.bin"))
-    assert len(data_files) == 1  # 一个 chunk 一个文件
-    data = data_files[0].read_bytes()
-    assert len(data) == 6 * SEG  # 最大层 5 → 实写扩展到 6 段
+    path = _slot_path(store, chunk)
+    data = path.read_bytes()
+    payload = store._layout.target_offset(chunk)
+    assert payload == 4096                      # 自描述对象头
+    assert len(data) == payload + 6 * SEG       # 几何按层宽定型，不是"用多少长多少"
     for layer in layers:
-        segment = data[layer * SEG:(layer + 1) * SEG]
+        segment = data[payload + layer * SEG:payload + (layer + 1) * SEG]
         assert segment == bytes([0x40 + layer]) * SEG
-        assert data_files[0].name == chunk.hex() + ".bin"
 
 
-def test_real_write_extension(tmp_path):
-    """按需扩展是实写（物理块就位），非稀疏跳写。"""
-    store = make_store(tmp_path)
+def test_slot_materialisation_is_physical(tmp_path):
+    """预留即物化：整槽位实写零（物理块就位），非稀疏跳写。"""
+    store = make_store(tmp_path, layers=4)
     store.open()
-    src = bytearray(SEG)
-    src_id = store.register_buffer(src, SEG)
-    store.put_batch([(io_key(b"\x22" * 16, 3), src_id, 0)]).wait()
-    path = Path(store._layout.root) / "chunks" / ((b"\x22" * 16).hex() + ".bin")
-    assert path.stat().st_size == 4 * SEG
-    assert path.stat().st_blocks * 512 >= 4 * SEG  # 物理块已分配（非稀疏）
+    src_id = store.register_buffer(bytearray(SEG), SEG)
+    chunk = b"\x22" * 16
+    store.put_batch([(io_key(chunk, 3), src_id, 0)]).wait()
+    path = _slot_path(store, chunk)
+    assert path.stat().st_size == 4096 + 4 * SEG
+    assert path.stat().st_blocks * 512 >= 4096 + 4 * SEG
 
 
-def test_get_missing_layer_of_live_chunk_raises(tmp_path):
-    """同 chunk 已写层 0/2，get 层 1（无 marker）→ ValueError。"""
-    store = make_store(tmp_path)
+def test_incomplete_object_is_unreadable(tmp_path):
+    """半截对象（层没写齐）读不得：一层没写完就当整个 chunk 没写。"""
+    store = make_store(tmp_path, layers=3)
     store.open()
     src = bytearray(SEG)
     src_id = store.register_buffer(src, SEG)
     chunk = b"\x33" * 16
     for layer in (0, 2):
         store.put_batch([(io_key(chunk, layer), src_id, 0)]).wait()
+    assert store.scan() == []  # 未提交 ⇒ 不在驻留集合
     with pytest.raises(ValueError):
         store.get_batch([(io_key(chunk, 1), src_id, 0)])
+
+    store.put_batch([(io_key(chunk, 1), src_id, 0)]).wait()   # 补齐最后一层
+    assert store.scan() == sorted(
+        io_key(chunk, layer) for layer in range(3)
+    )
 
 
 # ---------- 容量 ----------
 
 
-def test_capacity_rejected_without_side_effects(tmp_path):
-    """超容量的批整体拒绝，且不触碰文件系统。"""
-    store = make_store(tmp_path, num_chunks=2)
+def test_capacity_exhaustion_trims_batch(tmp_path, caplog):
+    """容量耗尽不失败：只写被受理的 chunk（对象层部分受理契约）。"""
+    store = make_store(tmp_path, num_chunks=2, layers=1)
     store.open()
     src = bytearray(3 * SEG)
     src_id = store.register_buffer(src, SEG)
     keys = [io_key(bytes([i]) * 16, 0) for i in range(3)]
-    with pytest.raises(ValueError, match="容量"):
-        store.put_batch([(k, src_id, i * SEG) for i, k in enumerate(keys)])
-    chunks_dir = Path(store._layout.root) / "chunks"
-    assert list(chunks_dir.iterdir()) == []  # 未建任何文件
+    with caplog.at_level("WARNING", logger="tutti.storage.tutti_nvme.store"):
+        completion = store.put_batch(
+            [(k, src_id, i * SEG) for i, k in enumerate(keys)]
+        )
+        completion.wait()
+    resident = store.scan()
+    assert len(resident) == 2                  # 容量只允许两个对象
+    assert set(resident) <= set(keys)
+    assert any("ADMISSION_SHORTFALL" in r.message for r in caplog.records)
+    # 未受理的 chunk 不进驻留集合、也不产出对象文件
+    slots = _slot_path(store, bytes(resident[0][:16])).parent
+    assert len(list(slots.glob("*.obj"))) <= 2
+    rejected = [key for key in keys if key not in set(resident)]
+    for key in rejected:
+        assert not store._layout.is_committed(bytes(key[:16]))
 
 
 # ---------- drop 与槽位回收 ----------
 
 
-def test_drop_all_layers_recycles_chunk_file(tmp_path):
-    """一个 chunk 的全部层被 drop → 数据文件删除（槽位回收）。"""
-    store = make_store(tmp_path, num_chunks=2)
+def test_drop_releases_whole_object(tmp_path):
+    """drop 命中对象任一 key 即回收整个对象：按对象提交 ⇒ 不存在半删的 chunk。"""
+    store = make_store(tmp_path, num_chunks=2, layers=2)
     store.open()
-    src = bytearray(SEG)
-    src_id = store.register_buffer(src, SEG)
+    src_id = store.register_buffer(bytearray(2 * SEG), SEG)
     chunk = b"\x44" * 16
     keys = [io_key(chunk, layer) for layer in (0, 1)]
-    for layer in (0, 1):
-        store.put_batch([(io_key(chunk, layer), src_id, 0)]).wait()
-    chunk_files = list((Path(store._layout.root) / "chunks").glob("*.bin"))
-    assert len(chunk_files) == 1
+    store.put_batch(
+        [(key, src_id, index * SEG) for index, key in enumerate(keys)]
+    ).wait()
+    path = _slot_path(store, chunk)
+    assert path.exists() and store.scan() == sorted(keys)
 
-    store.drop([keys[0]])  # 剩一层 → 文件保留
-    assert chunk_files[0].exists()
-    store.drop([keys[1]])  # 全部层删光 → 文件回收
-    assert not chunk_files[0].exists()
+    store.drop([keys[0]])  # 命中一次 → 整个对象回收（各层一起）
     assert store.scan() == []
+    assert not store._layout.is_committed(chunk)
+    assert not store.has(keys[1])       # 各层一起失效，不存在半删 chunk
+    assert not store.has(keys[0])
+    # 槽位文件由对象层决定何时回收/复用（可能保留给下一次分配），但对象
+    # 已经不可读：是否还存在文件不属于本层的契约。
 
     # 回收后的容量可复用
-    store.put_batch([(io_key(b"\x55" * 16, 0), src_id, 0)]).wait()
-    assert len(list((Path(store._layout.root) / "chunks").glob("*.bin"))) == 1
+    other = b"\x55" * 16
+    store.put_batch([(io_key(other, 0), src_id, 0)]).wait()
+    assert _slot_path(store, other).exists()
 
 
 # ---------- 持久化与重开恢复 ----------
@@ -610,45 +659,59 @@ def test_drop_all_layers_recycles_chunk_file(tmp_path):
 
 def test_reopen_recovers_scan(tmp_path):
     """close 后新实例 open 同一 root → scan 恢复在场 io_key 且数据可读。"""
-    store = make_store(tmp_path)
+    store = make_store(tmp_path, layers=2)
+    store.open()
+    src = bytearray(4 * SEG)
+    src_id = store.register_buffer(src, SEG)
+    first, second = b"\x66" * 16, b"\x77" * 16
+    src[:2 * SEG] = b"\x0A" * (2 * SEG)
+    src[2 * SEG:] = b"\x0B" * (2 * SEG)
+    keys = [
+        io_key(first, 0), io_key(first, 1),
+        io_key(second, 0), io_key(second, 1),
+    ]
+    store.put_batch([
+        (io_key(first, 0), src_id, 0), (io_key(first, 1), src_id, SEG),
+        (io_key(second, 0), src_id, 2 * SEG),
+        (io_key(second, 1), src_id, 3 * SEG),
+    ]).wait()
+    store.close()
+
+    reopened = make_store(tmp_path, layers=2)
+    reopened.open()
+    assert reopened.scan() == sorted(keys)
+    dst = bytearray(4 * SEG)
+    dst_id = reopened.register_buffer(dst, SEG)
+    reopened.get_batch([
+        (io_key(first, 0), dst_id, 0), (io_key(first, 1), dst_id, SEG),
+        (io_key(second, 0), dst_id, 2 * SEG),
+        (io_key(second, 1), dst_id, 3 * SEG),
+    ]).wait()
+    assert dst[:SEG] == b"\x0A" * SEG
+    assert dst[3 * SEG:] == b"\x0B" * SEG
+
+
+def test_object_committed_only_after_completion(tmp_path):
+    """先数据后提交：put_batch 返回时对象尚未提交（崩溃安全时序）。"""
+    store = make_store(tmp_path, layers=2)
     store.open()
     src = bytearray(2 * SEG)
     src_id = store.register_buffer(src, SEG)
-    keys = [io_key(b"\x66" * 16, 0), io_key(b"\x77" * 16, 4)]
-    src[:SEG] = b"\x0A" * SEG
-    src[SEG:] = b"\x0B" * SEG
-    store.put_batch([(keys[0], src_id, 0), (keys[1], src_id, SEG)]).wait()
-    store.close()
-
-    reopened = make_store(tmp_path)
-    reopened.open()
-    assert reopened.scan() == sorted(keys)
-    dst = bytearray(2 * SEG)
-    dst_id = reopened.register_buffer(dst, SEG)
-    reopened.get_batch([(keys[0], dst_id, 0), (keys[1], dst_id, SEG)]).wait()
-    assert dst[:SEG] == b"\x0A" * SEG
-    assert dst[SEG:] == b"\x0B" * SEG
-
-
-def test_marker_only_after_completion(tmp_path):
-    """put_batch 返回时 marker 尚未创建（先数据后 marker 的崩溃安全时序）。"""
-    store = make_store(tmp_path)
-    store.open()
-    src = bytearray(SEG)
-    src_id = store.register_buffer(src, SEG)
-    key = io_key(b"\x88" * 16, 1)
-    completion = store.put_batch([(key, src_id, 0)])
-    assert store.scan() == []  # 数据已落盘但 marker 未建
+    chunk = b"\x88" * 16
+    keys = [io_key(chunk, layer) for layer in range(2)]
+    completion = store.put_batch([
+        (keys[0], src_id, 0), (keys[1], src_id, SEG),
+    ])
+    assert store.scan() == []  # 数据已下发但对象未提交
     completion.wait()
-    assert store.scan() == [key]
+    assert store.scan() == sorted(keys)
 
 
-def test_write_publishes_markers_and_pool_manifest_only(tmp_path):
-    """写入只留下两样盘上痕迹：层标记 + 池 manifest 归属。
+def test_write_leaves_object_files_only(tmp_path):
+    """写入的盘上痕迹只有对象文件（对象头 + 段）；无 marker / manifest。
 
-    rank 提交凭证（commits/*.commit.json）已整体删除：运行时驻留由
-    内存权威索引（worker→scheduler 的 TuttiWorkerMetadata）门禁，其
-    字段与池 manifest 高度重叠，且每文件 fsync 压在计算下发路径上。
+    Python 侧不再产生任何元数据文件：层标记、manifest、提交凭证都已下沉到
+    对象层（对象头 + 检查点），冷启动恢复由对象层给出。
     """
     root = tmp_path / "pool"
     namespace = b"all-rank-commit-test"
@@ -659,9 +722,6 @@ def test_write_publishes_markers_and_pool_manifest_only(tmp_path):
         runtime=FakeRuntime(),
         rank_id=2,
         tp_size=4,
-        initial_slots=1,
-        low_watermark=0,
-        high_watermark=1,
         max_slots=2,
         allocator_enabled=False,
     )
@@ -676,18 +736,17 @@ def test_write_publishes_markers_and_pool_manifest_only(tmp_path):
         (io_key(chunk, 1), src_id, SEG),
     ]).wait()
 
-    layout = store._layout
-    # 层标记：每层一个 .ok（数据完整性）
-    assert layout.pool_chunk_complete(chunk, 2)
-    # 池 manifest：chunk → slot 归属 + 几何（冷启动恢复的唯一归属依据）
-    manifest = json.loads(layout.pool_manifest_path().read_text("utf-8"))
-    assert manifest["namespace"] == namespace.hex()
-    assert manifest["slot_bytes"] == 2 * SEG
-    assert manifest["rank_geometry"]["num_layers"] == 2
-    allocation = manifest["allocated"][chunk.hex()]
-    assert int(allocation["generation"]) > 0
-    # 提交凭证目录不再产生
+    # 对象有效 ⇔ 全部段都写过；归属与几何都在对象头里
+    assert store._layout.is_committed(chunk)
+    assert store._layout.target_offset(chunk) == 4096
+    assert store._layout.target_size(chunk) == 2 * SEG
+
+    names = {path.name for path in root.rglob("*")}
+    assert not [name for name in names if name.endswith(".ok")]
+    assert not [name for name in names if "manifest" in name]
     assert not (root / "commits").exists()
+    # 元数据只剩对象层自己的（检查点 / 跨 rank 位图）
+    assert (root / "meta").is_dir()
     store.close()
 
 
@@ -761,7 +820,7 @@ def test_completion_wait_detail_is_retained_after_release():
 def test_get_batch_auto_releases_terminal_handle(tmp_path):
     """Pre-enqueued reads cannot retain all handles until layer callbacks."""
     runtime = FakeRuntime()
-    store = make_store(tmp_path, runtime=runtime)
+    store = make_store(tmp_path, runtime=runtime, layers=1)
     store.open()
     key = io_key(b"read-auto-free".ljust(16, b"_"), 0)
     src = bytearray(b"r" * SEG)
@@ -824,7 +883,7 @@ def test_unregistered_buffer_and_bad_offset(tmp_path):
 
 
 def test_ctypes_buffer_supported(tmp_path):
-    store = make_store(tmp_path)
+    store = make_store(tmp_path, layers=1)
     store.open()
     src = (ctypes.c_char * SEG)()
     dst = bytearray(SEG)
@@ -973,6 +1032,28 @@ def test_preset_rejects_out_of_range_unsigned_field(tmp_path):
     message = str(excinfo.value)
     assert "num_queues" in message, message
     assert "out of range" in message, message
+
+
+@pytest.mark.parametrize("value", [65536, 2**40])
+def test_preset_accepts_wide_unsigned_field(tmp_path, value):
+    """uint64 字段（stripe_unit）必须接受正常正数，包括超出 uint32 的值。
+
+    回归：范围检查曾在有符号域里比较，而 ``uint64_t`` 的 max() 转回 int64 是
+    -1 —— 于是 ``value > kMax`` 对任何正数都成立，stripe_unit=65536 被解析层
+    拒绝，8 卡条带真机运行直接起不来。只有真机跑才会暴露（单测当时没有覆盖
+    uint64 字段），所以这条测试按"解析层不得报 out of range"断言。
+    """
+    tutti_runtime = _load_bindings_runtime()
+    # stripe_unit 只存在于条带 preset（单盘 preset 没有这个键）。
+    preset = {
+        "devices": [{"pci_bdf": "0000:00:00.0", "mount_path": str(tmp_path)}],
+        "stripe_unit": value,
+    }
+    with pytest.raises(Exception) as excinfo:
+        tutti_runtime.make_striped_nvme_runtime(preset)
+    message = str(excinfo.value)
+    assert "stripe_unit" not in message, message
+    assert "out of range" not in message, message
 
 
 def test_preset_accepts_negative_gpu_id(tmp_path):
@@ -1160,9 +1241,12 @@ def test_decode_io_key_rules():
         decode_io_key("not-bytes")
 
 
-def test_scan_ignores_stray_files(tmp_path):
-    layout = Layout(tmp_path, SEG)
-    layout.ensure_dirs()
-    (tmp_path / "meta" / "stray.txt").write_text("junk")
-    (tmp_path / "meta" / ("ab" + ".ok")).write_text("")
-    assert layout.scan() == {bytes.fromhex("ab")}
+def test_scan_reports_committed_objects_only(tmp_path):
+    """scan 只报已提交对象（对象层职责）；目录里的杂散文件不参与判定。"""
+    store = make_store(tmp_path, layers=1)
+    store.open()
+    src_id = store.register_buffer(bytearray(SEG), SEG)
+    key = io_key(b"\xab" * 16, 0)
+    store.put_batch([(key, src_id, 0)]).wait()
+    (tmp_path / "pool" / "stray.bin").write_text("junk")
+    assert store.scan() == [key]

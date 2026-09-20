@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -67,16 +68,32 @@ class FakePool:
 
 
 class FakeLayout:
+    """对象层布局的最小替身：容量按对象、段 0 跳过对象头。
+
+    ``payload_offset`` 与 C++ 对象层一致（4096B 自描述头），因此这里验证的
+    地址公式等同于真机：``payload_offset + layer * segment_bytes + 块内偏移``。
+    """
+
+    payload_offset = 4096
+    layer_span = 3
+
     def __init__(self, events=None):
         self.prepared = []
         self.events = events if events is not None else []
         self.generations = {}
 
     def prepare_put(self, io_keys, capacity):
+        """预留对象：返回 ``(admitted, rejected)``（对象层契约）。"""
         self.prepared.append((tuple(io_keys), capacity))
         self.events.append("prepare_put")
+        admitted = {}
         for io_key in io_keys:
-            self.generations.setdefault(bytes(io_key[:16]), 1)
+            chunk_id = bytes(io_key[:16])
+            self.generations.setdefault(chunk_id, 1)
+            admitted[bytes(io_key)] = (
+                chunk_id, int.from_bytes(bytes(io_key[16:]), "little")
+            )
+        return admitted, 0
 
     @staticmethod
     def target_uri(chunk_id):
@@ -85,6 +102,10 @@ class FakeLayout:
     @staticmethod
     def target_size(chunk_id):
         return 3 * 8192
+
+    @staticmethod
+    def target_offset(chunk_id):
+        return FakeLayout.payload_offset
 
     def target_generation(self, chunk_id):
         return self.generations.get(bytes(chunk_id), 1)
@@ -242,31 +263,19 @@ class FakeEngineStore(FakeStoreOwner):
         return None
 
 
-class _FakeGpuFile:
-    def __init__(self, slot, ticket):
-        self.slot = slot
-        self.ticket = ticket
-
-
-class _FakeObjectPool:
-    """最小对象池替身：只暴露 warm_up_registration 需要的就绪句柄视图。"""
-
-    configured = True
-
-    def __init__(self, tickets):
-        self._files = [
-            _FakeGpuFile(slot, ticket) for slot, ticket in enumerate(tickets)
-        ]
-
-    def gpu_files(self):
-        return list(self._files)
-
-
 def _warm_up_backend(tickets):
+    """绑定期预热的替身：对象层已物化槽位的 URI 与票据。
+
+    ``tickets=None`` 模拟非池部署（对象层没有可预开的槽位）。
+    """
     runtime = FakeRuntime()
     store = FakeStoreOwner(runtime)
     if tickets is not None:
-        store._object_pool = _FakeObjectPool(tickets)
+        store._warm_uris = [f"file:///slot{slot}.obj" for slot in range(len(tickets))]
+        store._targets = {
+            uri: SimpleNamespace(ticket=ticket, size=3 * 8192, generation=1)
+            for uri, ticket in zip(store._warm_uris, tickets)
+        }
     backend = TuttiDirectBackend(store)
     backend.register_paged_caches(
         FakePool(128), num_layers=3, blocks_per_chunk=2,
@@ -355,7 +364,9 @@ def test_direct_address_formula_and_one_submit_per_layer(block_size):
         for block_id in (3, 1, 7, 0)
     ]
     assert [request[1] for request in requests] == [
-        2 * geometry.segment_bytes + ordinal * geometry.page_bytes
+        FakeLayout.payload_offset
+        + 2 * geometry.segment_bytes
+        + ordinal * geometry.page_bytes
         for ordinal in (0, 1, 0, 1)
     ]
     assert {request[4] for request in requests} == {geometry.page_bytes}
@@ -532,9 +543,10 @@ def test_direct_clean_root_first_write_materializes_target(tmp_path):
     key = b"clean-root-key!".ljust(16, b"_")
     completion = backend.put_paged_batch([key], 0, [[3, 1]])
     uri = store._layout.target_uri(key)
-    target_path = store._layout.chunk_file(key)
+    target_path = Path(uri[len("file://"):])
+    # 预留即物化：对象文件是 对象头 + 全部层的段（层数 × 段大小）。
     assert target_path.exists()
-    assert target_path.stat().st_size == 3 * 8192
+    assert target_path.stat().st_size == 4096 + 3 * 8192
     assert len(runtime.open_batch_calls) == 1
     assert completion._watcher is None
     completion.wait()
@@ -554,8 +566,10 @@ def test_direct_real_store_failure_rolls_back_live_and_layout(tmp_path):
     store.set_layer_span(3)
     # 槽位目标在启动期（set_layer_span）预开，失败写入不得再新增票据：
     # 槽位是稳定身份，失败的是该 chunk 的绑定而非槽位文件本身。
-    ready = store._object_pool.gpu_files()
-    assert ready and all(f.ticket for f in ready), "槽位应在 set_layer_span 时就绪化"
+    ready = dict(store._targets)
+    assert ready and all(entry.ticket for entry in ready.values()), (
+        "槽位应在 set_layer_span 时就绪化"
+    )
     backend = TuttiDirectBackend(store)
     backend.register_paged_caches(
         FakePool(128), num_layers=3, blocks_per_chunk=2,
@@ -566,9 +580,10 @@ def test_direct_real_store_failure_rolls_back_live_and_layout(tmp_path):
     with pytest.raises(RuntimeError, match="失败"):
         completion.wait()
     assert store._live == set()
-    # 就绪 GpuFile 不得因一次失败的写入而变化（槽位句柄随槽位常驻）
-    assert store._object_pool.gpu_files() == ready
-    assert not store._layout.chunk_file(key).exists()
+    # 已就绪的槽位票据不得因一次失败的写入而变化（票据随槽位常驻）
+    assert store._targets == ready
+    # 失败的写入不得提交对象：按对象提交 ⇒ 半截对象读不得
+    assert not store._layout.is_committed(key)
     assert "write" not in backend._target_plans
     backend.close()
     store.close()
@@ -1117,7 +1132,8 @@ def test_direct_all_layer_plan_logs_submit_timing(caplog, monkeypatch):
     engine = _direct_engine(log)
     monkeypatch.setattr("torch.cuda.is_available", lambda: True)
     monkeypatch.setattr("torch.cuda.Event", lambda enable_timing=False: object())
-    with caplog.at_level("WARNING", logger="tutti.engine.core"):
+    # 逐层提交时间线是 debug 级诊断，需显式放开该 logger 的级别。
+    with caplog.at_level("DEBUG", logger="tutti.engine.core"):
         plan = _DirectAllLayerReadPlan(
             engine, [b"m" * 16], [[2, 7]], (0, 1, 2)
         )
@@ -1757,7 +1773,7 @@ def test_worker_logs_first_direct_compute_callback(caplog):
     worker._load_keys = [b"j" * 16]
     worker._read_plan = Plan()
     worker._direct_start_load_started_ns = 1
-    with caplog.at_level("WARNING", logger="tutti.integration.vllm.worker"):
+    with caplog.at_level("DEBUG", logger="tutti.integration.vllm.worker"):
         worker.wait_for_layer_load("model.layers.0.self_attn")
         worker.wait_for_layer_load("model.layers.0.self_attn")
     messages = [

@@ -142,7 +142,15 @@ public:
         status_ = Status::Ok();
         return status_;
 #else
-        if (previous_accel_id_ < 0) {
+        if (previous_accel_id_ < 0 ||
+            previous_accel_id_ == target_accel_id_) {
+            // enter_() did not switch devices, so there is nothing to restore.
+            //
+            // This is not merely an optimisation: cudaSetDevice is a
+            // driver-level call that serialises against device-wide work, and
+            // the redundant call measured ~950ms per read submit on real
+            // hardware while 8 ranks submitted concurrently (A cold request's
+            // writes were still draining).  The submit itself took 0.2ms.
             state_ = DeviceGuardState::RESTORED;
             status_ = Status::Ok();
             return status_;

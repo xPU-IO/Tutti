@@ -110,27 +110,41 @@ class TestEngineNamespace:
             self._mk(12345)
 
 
-class TestPoolOwnershipManifest:
-    """TuttiKVStore 池归属：首建 manifest / 一致复用 / 不一致空池。"""
+class TestNamespacePlumbing:
+    """命名空间（对象身份）进对象层配置：时机与取值。
 
-    def _open_store(self, root, namespace=None):
-        from tutti.storage.tutti_nvme.layout import Layout
+    Python 侧不再有 namespace.manifest：身份写进每个对象的对象头，由对象层
+    在 lookup/读取时逐对象校验（C++ 契约测试覆盖）。这里只钉住 Python 到
+    对象层的管道：命名空间必须进配置、且只能在打开对象层之前声明。
+    """
 
-        layout = Layout(root, segment_bytes=SEG)
-        if namespace is not None:
-            layout.check_namespace(namespace)
+    @staticmethod
+    def _layout(root, namespace=None):
+        from tutti.storage.tutti_nvme.object_layout import ObjectLayout
+
+        layout = ObjectLayout(
+            root, segment_bytes=SEG, capacity_chunks=8, prewarm_chunks=1,
+            namespace=namespace,
+        )
         return layout
 
-    def test_first_use_writes_manifest(self, tmp_path):
-        layout = self._open_store(tmp_path / "pool", NS_A)
-        assert (tmp_path / "pool" / "namespace.manifest").read_bytes() == NS_A
+    def test_namespace_reaches_object_layer_config(self, tmp_path):
+        layout = self._layout(tmp_path / "pool", NS_A)
+        layout.set_layer_span(NL)
+        assert layout._config()["namespace_fingerprint"] == NS_A
+        layout.close_object_pool()
 
-    def test_consistent_namespace_reuses(self, tmp_path):
-        layout = self._open_store(tmp_path / "pool", NS_A)
-        assert self._open_store(tmp_path / "pool", NS_A) is not None
-        assert layout.check_namespace(NS_A) is True
+    def test_default_namespace_is_empty(self, tmp_path):
+        layout = self._layout(tmp_path / "pool")
+        layout.set_layer_span(NL)
+        assert layout._config()["namespace_fingerprint"] == b""
+        layout.close_object_pool()
 
-    def test_inconsistent_namespace_rejected(self, tmp_path):
-        self._open_store(tmp_path / "pool", NS_A)
-        layout = self._open_store(tmp_path / "pool")
-        assert layout.check_namespace(NS_B_MODEL) is False  # 禁止静默复用
+    def test_namespace_declared_after_open_is_rejected(self, tmp_path):
+        import pytest
+
+        layout = self._layout(tmp_path / "pool")
+        layout.set_layer_span(NL)          # 打开对象层（几何定案）
+        with pytest.raises(RuntimeError, match="命名空间"):
+            layout.set_namespace(NS_A)
+        layout.close_object_pool()

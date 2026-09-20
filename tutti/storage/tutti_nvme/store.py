@@ -22,8 +22,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .layout import Layout, decode_io_key
-from .object_pool import ObjectPool, PoolConfig
+from .object_layout import ObjectLayout
 from .preset_derive import derive_device_fields
 from .runtime_factory import (
     build_runtime,
@@ -32,10 +31,9 @@ from .runtime_factory import (
     preset_mounts,
 )
 
-from .striped_layout import StripedLayout
 from tutti.engine.nvtx import range as nvtx_range
 from tutti.engine.transfer import DirectTransferUnavailable
-from tutti.index.chunk_index import derive_io_key
+from tutti.index.chunk_index import decode_io_key, derive_io_key
 
 #: 运行日志（池归属校验等部署问题的非静默说明）。
 _LOG = logging.getLogger(__name__)
@@ -103,6 +101,8 @@ class DirectTargetPlanEntry:
     target_uri: str
     target_size: int
     target_generation: int
+    # 段 0 在对象逻辑地址空间中的起点（对象头之后）。层内偏移在此之上叠加。
+    target_offset: int = 0
 
 
 @dataclass(frozen=True)
@@ -185,7 +185,10 @@ class TuttiDirectBackend:
         self._geometry: DirectPoolGeometry | None = None
         self._closed = False
         self._target_plans: dict[str, DirectTargetPlan] = {}
+        self._prepared_write_request: tuple[bytes, ...] | None = None
         self._prepared_write_chunks: tuple[bytes, ...] | None = None
+        # 绑定期预开的槽位 URI（registration 预热的票据来源）。
+        self._warm_uris: list[str] = []
         self._invalid_plan_tokens: set[int] = set()
         self._next_plan_token = 0
         # Target-cache invalidation is the generation-change signal used by
@@ -268,13 +271,13 @@ class TuttiDirectBackend:
         geometry = self._geometry
         if self._closed or geometry is None or self._memory_ticket is None:
             return False
-        # 非池部署（无对象池的 store 实现）没有就绪槽位句柄，跳过。
-        pool = getattr(store, "_object_pool", None)
-        if pool is None or not getattr(pool, "configured", False):
-            return False
+        # 用绑定期预开的第一个槽位票据：open_batch 已完成 resolve +
+        # peer-memory 注册，正是要挪出请求路径的那部分。冷池同样有票据
+        # （预热槽位在 open 时已物化），所以这一路径不依赖已有驻留。
         target_ticket = 0
-        for entry in pool.gpu_files():
-            if entry.ticket:
+        for uri in getattr(store, "_warm_uris", ()) or ():
+            entry = store._targets.get(uri)
+            if entry is not None and entry.ticket:
                 target_ticket = int(entry.ticket)
                 break
         if not target_ticket:
@@ -483,20 +486,33 @@ class TuttiDirectBackend:
                     "direct write target preparation changed within one step"
                 )
             return
-        if self._prepared_write_chunks is not None:
-            if self._prepared_write_chunks != chunk_ids:
+        if self._prepared_write_request is not None:
+            if self._prepared_write_request != chunk_ids:
                 raise RuntimeError(
                     "direct write target preparation changed within one step"
                 )
             return
         # The highest layer is sufficient to request the complete configured
-        # object. Object-pool allocation materializes the full file/extent and
-        # fixes its generation before begin_target_plan calls open_batch.
+        # object: reservation materialises the slot and fixes its generation
+        # before begin_target_plan calls open_batch.
         last_layer = self.geometry.num_layers - 1
         io_keys = [derive_io_key(chunk_id, last_layer)
                    for chunk_id in chunk_ids]
-        self._store._layout.prepare_put(io_keys, self._store._num_chunks)
-        self._prepared_write_chunks = chunk_ids
+        admitted, rejected = self._store._layout.prepare_put(
+            io_keys, self._store._num_chunks
+        )
+        if rejected:
+            _LOG.warning(
+                "DIRECT_WRITE_ADMISSION_SHORTFALL requested=%d admitted=%d "
+                "rejected=%d capacity=%d",
+                len(chunk_ids), len(admitted), rejected,
+                self._store._num_chunks,
+            )
+        self._prepared_write_request = chunk_ids
+        self._prepared_write_chunks = tuple(
+            chunk_id for chunk_id in chunk_ids
+            if derive_io_key(chunk_id, last_layer) in admitted
+        )
 
     def begin_target_plan(self, keys, direction: str) -> DirectTargetPlan:
         if direction not in ("read", "write"):
@@ -506,11 +522,14 @@ class TuttiDirectBackend:
         if self._memory_ticket is None:
             raise RuntimeError("direct target plan requires registered memory")
         chunk_ids = self._chunk_ids(keys)
-        if (direction == "write"
-                and self._prepared_write_chunks != chunk_ids):
-            raise RuntimeError(
-                "direct write target plan requires prepare_write_targets"
-            )
+        if direction == "write":
+            if self._prepared_write_request != chunk_ids:
+                raise RuntimeError(
+                    "direct write target plan requires prepare_write_targets"
+                )
+            # Unadmitted chunks (capacity exhausted) are not written this step:
+            # the write plan simply does not contain them.
+            chunk_ids = self._prepared_write_chunks
         entries = [(chunk_id + (0).to_bytes(2, "little"), 0, 0)
                    for chunk_id in chunk_ids]
         with nvtx_range(
@@ -539,6 +558,7 @@ class TuttiDirectBackend:
                 target_uri=uri,
                 target_size=int(target_size),
                 target_generation=int(target_generation),
+                target_offset=int(self._store._layout.target_offset(chunk_id)),
             ))
         self._next_plan_token += 1
         plan = DirectTargetPlan(
@@ -548,7 +568,8 @@ class TuttiDirectBackend:
             entries=tuple(plan_entries),
         )
         self._target_plans[direction] = plan
-        _LOG.warning(
+        # 正常路径的时间线诊断：debug（每个方向每次构建一条）。
+        _LOG.debug(
             "DIRECT_TARGET_PLAN_BUILD direction=%s chunks=%d token=%d",
             direction, len(plan.entries), plan.plan_token,
         )
@@ -560,6 +581,7 @@ class TuttiDirectBackend:
             self._invalid_plan_tokens.discard(plan.plan_token)
         if direction == "write":
             self._prepared_write_chunks = None
+            self._prepared_write_request = None
 
     def has_write_plan(self) -> bool:
         """是否已存在写方向的 target 计划（供执行引擎查询，避免窥探私有表）。"""
@@ -568,7 +590,7 @@ class TuttiDirectBackend:
     def planned_directions(self) -> tuple[str, ...]:
         """当前活跃的 target 计划方向（含尚未提交的预备写计划）。"""
         directions = list(self._target_plans)
-        if (getattr(self, "_prepared_write_chunks", None) is not None
+        if (getattr(self, "_prepared_write_request", None) is not None
                 and "write" not in directions):
             directions.append("write")
         return tuple(directions)
@@ -596,14 +618,10 @@ class TuttiDirectBackend:
     def _validate_plan_entry(self, entry: DirectTargetPlanEntry) -> None:
         """Check the current cache record for one submitted chunk.
 
-        对象池模式下句柄随槽位常驻（GpuFile），不在 `_targets` 里；
-        校验改看池中的就绪句柄是否仍与计划一致。
+        槽位路径稳定 ⇒ 票据按 URI 长驻；槽位被回收再分配时对象层会换
+        generation，`_ensure_targets` 据此关闭旧票据并重开，所以这里的
+        「票据 + 大小 + generation 三者一致」就是完整判据。
         """
-        pool = getattr(self._store, "_object_pool", None)
-        if pool is not None and pool.configured:
-            slot = pool.slot_of(entry.chunk_id)
-            if slot is not None and pool.ticket_of_slot(slot) == entry.target_ticket:
-                return
         cached = getattr(self._store, "_targets", {}).get(entry.target_uri)
         if cached is None:
             raise RuntimeError(
@@ -704,7 +722,8 @@ class TuttiDirectBackend:
                         + int(layer_idx) * geometry.layer_stride_bytes
                     )
                     target_offset = (
-                        int(layer_idx) * geometry.segment_bytes
+                        plan_entry.target_offset
+                        + int(layer_idx) * geometry.segment_bytes
                         + block_ordinal * geometry.page_bytes
                     )
                     requests.append((
@@ -1064,6 +1083,13 @@ class _TuttiCompletion:
         self._mark_terminal(ok, None)
         self._finish()
 
+    @classmethod
+    def settled(cls, runtime, on_settled, ok: bool = True) -> "_TuttiCompletion":
+        """已成终态的空批：没有提交任何请求（如容量耗尽时不写任何东西）。"""
+        completion = cls(runtime, [], on_settled, auto_watch=False)
+        completion._settle(ok)
+        return completion
+
 
 class TuttiKVStore:
     """tutti runtime 之上的 KVStore SPI 实现（层盲，io_key 纯映射）。"""
@@ -1099,19 +1125,18 @@ class TuttiKVStore:
         self._root = Path(root)
         self._rank_id = rank_id
         self._tp_size = tp_size
-        max_slots = num_chunks if max_slots is None else max_slots
-        initial_slots = min(32, max_slots) if initial_slots is None else initial_slots
-        high_watermark = initial_slots if high_watermark is None else high_watermark
-        low_watermark = high_watermark // 2 if low_watermark is None else low_watermark
-        pool_config = PoolConfig(
-            initial_slots=initial_slots,
-            low_watermark=low_watermark,
-            high_watermark=high_watermark,
-            max_slots=max_slots,
-            wait_timeout_s=float(pool_wait_timeout_s),
+        # 容量与预热都以 chunk（对象）为单位，对象层在打开时按对象几何折算成
+        # 字节。旧的池水位（initial/low/high/max）没有对应物：物化按需发生、
+        # 回收在后台进行，不再需要水位驱动的扩容，也不会阻塞前向线程。
+        self._num_chunks = (
+            min(num_chunks, max_slots) if max_slots is not None else num_chunks
         )
-        pool_config.validate()
-        self._num_chunks = min(num_chunks, max_slots)
+        warm_chunks = (
+            min(32, self._num_chunks) if initial_slots is None
+            else min(int(initial_slots), self._num_chunks)
+        )
+        if high_watermark is not None:
+            warm_chunks = min(int(high_watermark), self._num_chunks)
         self._segment_bytes = segment_bytes
         self._runtime = runtime
         self._own_runtime = runtime is None
@@ -1124,7 +1149,8 @@ class TuttiKVStore:
             self._preset = derive_device_fields(self._preset, yaml)
         self._key_namespace: bytes | None = None
         if layout in (None, "file_per_chunk", "file"):
-            self._layout = Layout(self._root, segment_bytes)
+            layout_mounts = [str(self._root)]
+            layout_stripe_unit = 0
         elif layout == "striped":
             if mounts is None:
                 mounts = _preset_mounts(self._preset)
@@ -1138,16 +1164,22 @@ class TuttiKVStore:
                     f"stripe_unit 不一致：options={stripe_unit} "
                     f"preset={preset_unit}"
                 )
-            self._layout = StripedLayout(
-                self._root, segment_bytes, mounts, stripe_unit,
-                rank_id=rank_id,
-            )
+            layout_mounts = [str(mount) for mount in mounts]
+            layout_stripe_unit = int(stripe_unit)
         else:
             raise ValueError(f"未知 tutti_nvme layout：{layout!r}")
-        self._object_pool = ObjectPool(
-            self._layout, pool_config, allocator_enabled=allocator_enabled
+        # 文件系统的全部职责（槽位分配、对象头、检查点、恢复、容量）都在
+        # 这一层之下：本类只保留内存簿记与 runtime 票据缓存。
+        self._layout = ObjectLayout(
+            self._root,
+            segment_bytes,
+            mounts=layout_mounts,
+            stripe_unit=layout_stripe_unit,
+            capacity_chunks=self._num_chunks,
+            prewarm_chunks=warm_chunks,
+            rank_id=rank_id,
+            background_reclaim=bool(allocator_enabled),
         )
-        self._layout.attach_object_pool(self._object_pool)
         self._opened = False
         self._live: set[bytes] = set()
         self._buffers: dict[int, tuple[int, int]] = {}
@@ -1208,18 +1240,8 @@ class TuttiKVStore:
                 self._runtime = _build_runtime(self._preset)
             else:
                 self._runtime = _build_runtime_from_env()
-        self._layout.ensure_dirs()
-        self._live = self._layout.scan()
-        # 池归属校验：manifest 与命名空间不一致 → 空池语义（miss），
-        # 禁止静默复用异构数据（不同模型/几何的旧池）。
-        if self._key_namespace is not None:
-            if not self._layout.check_namespace(self._key_namespace):
-                _LOG.warning(
-                    "池 %s 的命名空间 manifest 与当前配置不一致——按空池"
-                    "处理（不读旧数据）；如需腾挪请人工清理",
-                    self._root,
-                )
-                self._live = set()
+        # 对象层在 set_layer_span（层宽定案）时才打开：槽位几何必须先确定。
+        # 命名空间不一致由对象层在打开时 fail-closed。
         if self._io_stream_raw == "auto":
             self._resolve_auto_stream()
         else:
@@ -1605,7 +1627,24 @@ class TuttiKVStore:
         chunk_ids = tuple(dict.fromkeys(
             decode_io_key(io_key)[0] for io_key in io_keys
         ))
-        self._layout.prepare_put(io_keys, self._num_chunks)
+        admitted, rejected = self._layout.prepare_put(io_keys, self._num_chunks)
+        if rejected:
+            # 容量耗尽：只写被受理的 chunk。缓存装不下不是请求的错误，本层
+            # 按对象层契约裁剪本批（绝不阻塞、绝不抛错）。
+            _LOG.warning(
+                "DIRECT_WRITE_ADMISSION_SHORTFALL admitted=%d rejected=%d "
+                "capacity=%d",
+                len(admitted), rejected, self._num_chunks,
+            )
+            entries = [item for item in entries if bytes(item[0]) in admitted]
+            io_keys = [io_key for io_key, _, _ in entries]
+            chunk_ids = tuple(dict.fromkeys(
+                decode_io_key(io_key)[0] for io_key in io_keys
+            ))
+            if not entries:
+                return _TuttiCompletion.settled(
+                    self._runtime, lambda _ok: None
+                )
         targets = self._ensure_targets(entries)
         requests = []
         for io_key, buffer_id, offset in entries:
@@ -1614,7 +1653,8 @@ class TuttiKVStore:
             requests.append(
                 (
                     targets[uri],
-                    layer * self._segment_bytes,
+                    self._layout.target_offset(chunk_id)
+                    + layer * self._segment_bytes,
                     self._mem_for(buffer_id),
                     offset,
                     self._segment_bytes,
@@ -1643,7 +1683,8 @@ class TuttiKVStore:
             requests.append(
                 (
                     targets[uri],
-                    layer * self._segment_bytes,
+                    self._layout.target_offset(chunk_id)
+                    + layer * self._segment_bytes,
                     self._mem_for(buffer_id),
                     offset,
                     self._segment_bytes,
@@ -1674,13 +1715,25 @@ class TuttiKVStore:
         self._close_cached_targets(self._chunk_target_uris_to_close(released))
         self._layout.drop(io_keys)
         self._live.difference_update(io_keys)
+        # 对象被回收 ⇒ 该 chunk 的全部层一起离开在场集合（按对象提交 ⇒
+        # 不存在"半删的 chunk"）。
+        span = self._layout.layer_span or 0
+        for chunk_id in released:
+            if len(chunk_id) == 16:
+                self._live.difference_update(
+                    chunk_id + layer.to_bytes(2, "little")
+                    for layer in range(span)
+                )
 
     def scan(self):
+        """已驻留 io_key 快照（升序）。
+
+        内存视图是权威（提交成功即入内存，不再扫盘）；并上对象层的恢复集合
+        只为纳入本进程之外（上一代进程）已提交的对象——那部分只在冷启动时
+        非空。
+        """
         self._require_open()
-        # Refresh the local view from the marker directory. Layout.scan uses
-        # a directory-generation cache, so this observes commits from a
-        # sibling scheduler/worker process without rescanning unchanged pools.
-        self._live = self._layout.scan()
+        self._live |= self._layout.scan()
         return sorted(self._live)
 
     def has(self, io_key) -> bool:
@@ -1689,39 +1742,26 @@ class TuttiKVStore:
         return io_key in self._live
 
     def set_key_namespace(self, namespace: bytes) -> None:
-        """声明 key 命名空间（engine 构造期注入，open 前生效）。
+        """声明 key 命名空间（engine 构造期注入，打开对象层前生效）。
 
-        用于池归属 manifest 校验：不透明字节串，本层不解读字段。
+        对象层用它做归属校验（对象头 + 检查点记录），不一致时 fail-closed，
+        禁止静默复用异构数据；字节串对本层不透明。
         """
         if self._opened:
             raise RuntimeError("命名空间须在 open 之前注入")
         self._key_namespace = bytes(namespace)
+        self._layout.set_namespace(self._key_namespace)
 
     def set_layer_span(self, num_layers: int) -> None:
-        """Bind rank-local geometry and synchronously create initial slots.
+        """定层宽并打开对象层：对象几何（段数 × 段大小 + 对象头）由此确定。
 
-        池在此刻才完成 configure（初始槽位同步建出，并完成 GpuFile 就绪
-        化），因此"就绪化回调"也必须在这里注册——store 的 open() 早于
-        本调用，那时还没有槽位。本调用发生在 worker 初始化期，不在请求
-        路径上。
+        对象层在此打开——它承担槽位物化（含预热）、检查点加载与崩溃恢复，
+        恢复出的已提交 chunk 立即进入内存视图（`_live`）。本调用发生在
+        worker 初始化期，不在请求路径上。
         """
         self._layout.set_layer_span(num_layers)
-        pool = self._object_pool
-        if pool is not None and pool.configured:
-            pool.set_gpu_file_opener(self._open_gpu_files)
-            pool.set_gpu_file_closer(self._close_cached_targets)
-            pool.mark_gpu_files_ready()
-            # 预热到 high_watermark：扩容 + open_batch 的 peer-memory 映射
-            # 必须整体留在启动期，否则请求期扩容会把前向线程阻塞秒级
-            # （registry 锁被 open_batch 全程持有）。
-            pool.warm_up()
-
-    def _open_gpu_files(self, uris) -> list[int]:
-        """GpuFile 就绪化：把槽位文件打开成运行时句柄。
-
-        仅由池在初始化/后台分配器线程调用；请求路径不再 open。
-        """
-        return [int(t) for t in self._runtime.open_batch(list(uris))]
+        self._live = self._layout.scan()
+        self._preopen_ready_targets()
 
     def object_pool_snapshot(self) -> dict | None:
         return self._layout.object_pool_snapshot()
@@ -1759,28 +1799,64 @@ class TuttiKVStore:
             entries.append((bytes(io_key), buffer_id, offset))
         return entries
 
-    def _preopen_pool_targets(self) -> None:
-        """启动期把对象池已有槽位的目标票据一次性开好。
+    def _preopen_ready_targets(self) -> None:
+        """启动期把对象层已物化槽位的目标票据一次性开好。
 
         推理路径的 `_ensure_targets` 是"首次接触某 chunk 才 open"，而
         open 的成本是 resolve（open+fstat+fsync+FIEMAP）加句柄构建
-        （cudaMalloc 192B + H2D + D2H），且 `open_batch` 会为每个 URI
-        现建一个线程——实测首个写入波次 39 个 chunk 因此付出约 30ms
-        的前向线程停顿，正压在层 0→1 的计算下发路径上。
+        （cudaMalloc 192B + H2D + D2H），`open_batch` 还会为每个 URI
+        现建一个线程；首次 resolve 同时触发 peer-memory 注册（实测单次
+        200~275ms，且全程持 runtime registry 锁）。
 
-        槽位路径稳定（分配不改名），所以这些票据可以在启动时一次开
-        好；运行时 `_ensure_targets` 只做内存查找。池后续由后台分配
-        器扩展出的新槽位走按需 open 兜底（水位机制保证它们不在请求
-        关键路径上出现）。
+        槽位路径稳定（分配/回收都不改名），所以这些票据可以在启动时
+        一次开好，运行时只做内存查找。
 
         失败不致命：记录告警后回退到按需 open 的老路径。
         """
-        pool = self._object_pool
-        if pool is None or not pool.configured:
-            return
         if not callable(getattr(self._runtime, "open_batch", None)):
             return
-        pool.mark_gpu_files_ready()
+        ready = self._layout.ready_slots()
+        if not ready:
+            return
+        size = self._layout.slot_payload_bytes
+        try:
+            with nvtx_range(
+                f"tutti.direct.preopen_ready|slots={len(ready)}"
+            ):
+                self._preopen_uris(ready, size)
+        except Exception as exc:
+            _LOG.warning("DIRECT_PREOPEN_READY_FAILED err=%r", exc)
+            return
+        self._warm_uris = [uri for uri, _ in ready]
+        _LOG.info(
+            "DIRECT_PREOPEN_READY slots=%d targets=%d",
+            len(self._warm_uris), len(self._targets),
+        )
+
+    def _preopen_uris(self, entries, size: int) -> None:
+        """把一批 ``(uri, generation)`` 打开成运行时票据并缓存。
+
+        槽位路径稳定（分配/回收都不改名），因此票据可长驻；这里写入的
+        size/generation 来自对象层，与后续 `_ensure_targets` 的校验口径一致，
+        不会被误判为失效而重开。
+        """
+        with self._targets_lock:
+            missing = [
+                (uri, generation)
+                for uri, generation in entries
+                if uri not in self._targets
+            ]
+        if not missing:
+            return
+        tickets = self._runtime.open_batch([uri for uri, _ in missing])
+        if len(tickets) != len(missing):
+            raise RuntimeError("Runtime.open_batch returned wrong handle count")
+        with self._targets_lock:
+            for (uri, generation), ticket in zip(missing, tickets):
+                self._targets.setdefault(
+                    uri,
+                    _TargetCacheEntry(int(ticket), int(size), int(generation)),
+                )
 
     def _ensure_targets(self, entries) -> dict[str, int]:
         """解析一批 io_key 的运行时目标句柄。
@@ -1790,9 +1866,6 @@ class TuttiKVStore:
         常驻）。只有池未覆盖的路径（无池、槽位未就绪）才回落到按需
         open。
         """
-        pool = self._object_pool
-        pool_mode = pool is not None and pool.configured
-        ready: dict[str, int] = {}
         descriptors = []
         seen = set()
         stale = []
@@ -1802,13 +1875,6 @@ class TuttiKVStore:
             if uri in seen:
                 continue
             seen.add(uri)
-            if pool_mode:
-                slot = pool.slot_of(chunk_id)
-                if slot is not None:
-                    ticket = pool.ticket_of_slot(slot)
-                    if ticket:
-                        ready[uri] = ticket
-                        continue
             size = self._layout.target_size(chunk_id)
             generation = self._layout.target_generation(chunk_id)
             cached = self._targets.get(uri)
@@ -1834,9 +1900,7 @@ class TuttiKVStore:
                         _TargetCacheEntry(int(ticket), int(size), int(generation)),
                     )
         with self._targets_lock:
-            resolved = {uri: self._targets[uri].ticket for uri, _, _ in descriptors}
-        resolved.update(ready)
-        return resolved
+            return {uri: self._targets[uri].ticket for uri, _, _ in descriptors}
 
     def _chunk_target_uris_to_close(self, chunk_ids) -> list[str]:
         """解绑/中止/失败时应当关闭票据的 chunk 目标 URI。
@@ -1847,9 +1911,7 @@ class TuttiKVStore:
         个线程），正是推理路径上要消除的开销。槽位文件真被重建时，
         `target_generation` 会在 `_ensure_targets` 里判定失效并关闭。
         """
-        if self._object_pool is not None and self._object_pool.configured:
-            return []
-        return [self._layout.target_uri(chunk_id) for chunk_id in chunk_ids]
+        return []
 
     def _close_cached_targets(self, uris) -> None:
         records = [(uri, self._targets[uri]) for uri in dict.fromkeys(uris)
@@ -1907,10 +1969,32 @@ class TuttiKVStore:
         return self._mem_cache[(addr, size)]
 
     def _on_put_settled(self, ok: bool, io_keys) -> None:
-        """put 批 settle：数据确认落盘后才建层标记并更新在场集（崩溃安全）。"""
+        """put 批 settle：数据确认落盘后才提交对象并更新在场集（崩溃安全）。
+
+        只有**对象已提交**（chunk 的全部段都写过）的那批层才进入在场集：
+        半截对象按"没写过"处理（一层没写完就当整个 chunk 没写），否则读到
+        的是从未校验过的字节。
+        """
         if ok:
-            self._layout.commit_layers(io_keys)
-            self._live.update(io_keys)
+            committed = self._layout.commit_layers(io_keys)
+            if not committed:
+                return
+            span = self._layout.layer_span or 0
+            for chunk_id in committed:
+                if len(chunk_id) == 16:
+                    # 标准 io_key：对象有效 ⇔ 全部层段都写过，因此每一层
+                    # 都可读——本批只带了触发提交的那一层，其余层必须一起
+                    # 进入在场集合（否则复用只能命中最后一层）。
+                    self._live.update(
+                        chunk_id + layer.to_bytes(2, "little")
+                        for layer in range(span)
+                    )
+                else:
+                    # 通用短 key（通用 KV 契约）：形态不规范化，只记本批原样
+                    self._live.update(
+                        io_key for io_key in io_keys
+                        if decode_io_key(io_key)[0] == chunk_id
+                    )
             return
         chunk_ids = tuple(dict.fromkeys(
             decode_io_key(io_key)[0] for io_key in io_keys

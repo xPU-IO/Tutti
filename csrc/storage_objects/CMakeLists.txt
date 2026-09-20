@@ -43,6 +43,10 @@ target_link_libraries(tutti_storage_objects PUBLIC
 set_target_properties(tutti_storage_objects PROPERTIES
     CXX_STANDARD 17
     CXX_STANDARD_REQUIRED ON
+    # Consumed by the pybind11 extension (tutti_runtime._core), which is a
+    # shared object: without PIC the linker rejects the archive's absolute
+    # relocations.
+    POSITION_INDEPENDENT_CODE ON
 )
 
 target_compile_options(tutti_storage_objects PRIVATE

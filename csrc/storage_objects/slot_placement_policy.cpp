@@ -95,21 +95,30 @@ Status StripedPlacement::paths_for_slot(std::uint64_t slot,
     return {};
 }
 
+std::uint64_t StripedPlacement::payload_offset() const {
+    const std::uint64_t round = stripe_unit_ * mounts_.size();
+    if (round == 0) return ObjectHeaderLayout::kHeaderBytes;
+    return round_up(ObjectHeaderLayout::kHeaderBytes, round);
+}
+
 std::uint64_t StripedPlacement::shard_file_bytes(
     std::uint64_t slot_bytes) const {
     if (mounts_.empty()) return 0;
-    const std::uint64_t header = ObjectHeaderLayout::kHeaderBytes;
-    if (slot_bytes <= header) return header;
-    const std::uint64_t payload = slot_bytes - header;
+    const std::uint64_t prefix = payload_offset();
+    const std::uint64_t payload = slot_bytes > prefix ? slot_bytes - prefix : 0;
     const std::uint64_t shards = mounts_.size();
-    // Round the per-shard share up to a whole stripe unit so the last stripe
-    // round is not partial: a partial round would make a segment's tail land on
-    // a shard that has no space reserved for it.
-    const std::uint64_t share = round_up((payload + shards - 1) / shards,
-                                         stripe_unit_ == 0 ? 1 : stripe_unit_);
-    // Every shard reserves the header prefix, used only on shard 0, so all
-    // shards are the same size and the payload offset is uniform.
-    return header + share;
+    const std::uint64_t unit = stripe_unit_ == 0 ? 1 : stripe_unit_;
+    // The resolver derives the object's logical size from the shard FILES as
+    //     N * floor(min_shard_bytes / unit) * unit
+    // so the file size must survive that floor: sizing from the payload alone
+    // leaves the prefix outside the logical space and the payload's last
+    // segment lands past the end (OUT_OF_RANGE on real hardware -- how the
+    // striped object layer failed its first 8-GPU run). Rounding the total up
+    // to whole stripe rounds keeps file offsets, logical offsets and shard
+    // sizes in one coordinate system.
+    const std::uint64_t round = unit * shards;
+    const std::uint64_t rounds = (prefix + payload + round - 1) / round;
+    return rounds * unit;
 }
 
 std::string StripedPlacement::uri_for_slot(std::uint64_t slot) const {
@@ -131,10 +140,10 @@ bool StripedPlacement::geometry_valid(std::uint64_t slot_bytes) const {
     // first IO.
     if (stripe_unit_ == 0 || stripe_unit_ % kMinStripeUnit != 0) return false;
 
-    const std::uint64_t header = ObjectHeaderLayout::kHeaderBytes;
-    if (slot_bytes <= header) return false;
+    const std::uint64_t prefix = payload_offset();
+    if (slot_bytes <= prefix) return false;
 
-    const std::uint64_t payload = slot_bytes - header;
+    const std::uint64_t payload = slot_bytes - prefix;
     const std::uint64_t shards = mounts_.size();
 
     // The payload must divide evenly across shards in whole stripe units.

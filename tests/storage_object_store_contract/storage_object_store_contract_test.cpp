@@ -159,6 +159,11 @@ public:
         return {};
     }
 
+    // Bind-time warm-up accessors: this fake has no media, so it reports none.
+    std::uint64_t ready_slots() const override { return 0; }
+    std::string slot_uri(std::uint64_t) const override { return {}; }
+    std::uint64_t slot_generation(std::uint64_t) const override { return 0; }
+
     tutti::Status close() override {
         opened_ = false;
         return {};

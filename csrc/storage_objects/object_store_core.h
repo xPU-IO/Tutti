@@ -83,6 +83,10 @@ public:
     Result<ObjectPlacement> lookup(const ObjectKey& key) const override;
     StoreUsage usage() const override;
 
+    std::uint64_t ready_slots() const override;
+    std::string slot_uri(std::uint64_t slot) const override;
+    std::uint64_t slot_generation(std::uint64_t slot) const override;
+
     Result<ReserveOutcome> reserve(const ObjectKey* keys,
                                    std::size_t count) override;
     Status commit(const ObjectKey* keys, std::size_t count) override;

@@ -4,7 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tutti-runtime"
-version = "0.1.0"
+# 版本唯一来源：仓库根 VERSION，由 setup.py 读取（setuptools 的 file 指令
+# 被沙箱限制在项目目录内，无法跨目录读根 VERSION）。
+dynamic = ["version"]
 description = "Python bindings for the Tutti StorageRuntime (pybind11, torch-free)"
 requires-python = ">=3.8"
 dependencies = []

@@ -23,6 +23,12 @@ from setuptools import setup
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
+def read_version():
+    """版本唯一来源：仓库根 VERSION（与 CMake / 其余 Python 包共用）。"""
+    with open(os.path.join(HERE, "..", "..", "VERSION")) as f:
+        return f.read().strip()
+
+
 def die(msg):
     sys.stderr.write("ERROR: %s\n" % msg)
     sys.exit(1)
@@ -121,6 +127,10 @@ STATIC_LIBS = [
     os.path.join(
         TUTTI_BUILD_DIR, "csrc", "resolvers", "libtutti_resolver_factory.a",
     ),
+    os.path.join(
+        TUTTI_BUILD_DIR, "csrc", "storage_objects",
+        "libtutti_storage_objects.a",
+    ),
 ]
 for lib in STATIC_LIBS:
     if not os.path.exists(lib):
@@ -149,4 +159,4 @@ ext = Pybind11Extension(
     language="c++",
 )
 
-setup(ext_modules=[ext])
+setup(version=read_version(), ext_modules=[ext])

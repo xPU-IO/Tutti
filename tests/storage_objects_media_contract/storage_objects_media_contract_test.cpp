@@ -84,6 +84,7 @@ bool o_direct_supported(const std::string& dir) {
 constexpr std::uint64_t kSegmentBytes = 131072;   // 128 KiB, as deployed
 constexpr std::uint32_t kSegmentCount = 80;       // 80 layers
 constexpr std::uint64_t kPayload = kSegmentBytes * kSegmentCount;  // 10 MiB
+// A slot's space is the placement's payload prefix plus the payload.
 constexpr std::uint64_t kSlotBytes = ObjectHeaderLayout::kHeaderBytes + kPayload;
 
 ObjectKey key_of(std::uint8_t tag, std::size_t len = 18) {
@@ -172,40 +173,58 @@ void test_striped_placement() {
     CHECK(paths[0].rfind("/mnt/nvme0/", 0) == 0);
     CHECK(paths[1].rfind("/mnt/nvme1/", 0) == 0);
 
-    // Every shard reserves the header prefix so all shards are the same size and
-    // the payload offset is uniform.
-    const std::uint64_t shard_bytes = policy.shard_file_bytes(kSlotBytes);
-    CHECK(shard_bytes == ObjectHeaderLayout::kHeaderBytes + kPayload / 2);
+    // Each shard is a whole number of stripe rounds. The formula must survive
+    // the resolver's floor, which derives the object's logical size from the
+    // shard FILES as  N * floor(shard_bytes / unit) * unit  (see
+    // striped_local_nvme/binding.h): sizing from the payload alone leaves the
+    // prefix outside that space and the last segment's write lands past the end
+    // -- exactly how the first real 8-GPU run failed with
+    // "target_offset + length exceeds target size".
+    // Slot space = the placement's payload prefix + the payload.
+    const std::uint64_t slot_bytes = policy.payload_offset() + kPayload;
+    const std::uint64_t shard_bytes = policy.shard_file_bytes(slot_bytes);
     CHECK(shard_bytes % 4096 == 0);
-    // Total reserved space is the payload plus one header per shard.
-    CHECK(shard_bytes * 2 == kPayload + 2 * ObjectHeaderLayout::kHeaderBytes);
+    CHECK(shard_bytes % kUnit == 0);
+    const std::uint64_t kPrefix = policy.payload_offset();
+    CHECK(kPrefix % (kUnit * 2) == 0);         // payload starts on a whole round
+    const std::uint64_t kPayloadAfterPrefix = slot_bytes - kPrefix;
+    CHECK(kPayloadAfterPrefix == kPayload);    // payload size is unchanged
+    const std::uint64_t kRoundsPerShard =
+        (kPrefix + kPayloadAfterPrefix + kUnit * 2 - 1) / (kUnit * 2);
+    CHECK(shard_bytes == kRoundsPerShard * kUnit);
+    // The invariants that matter: the resolver's logical space covers the
+    // payload, and the payload starts on a whole stripe round so a request is
+    // confined to the shards it was sized for.
+    const std::uint64_t logical_bytes = 2 * (shard_bytes / kUnit) * kUnit;
+    CHECK(logical_bytes >= slot_bytes);
+    CHECK(policy.payload_offset() % (kUnit * 2) == 0);
 
     // --- geometry validation ---
     // 10 MiB over 2 shards at 64 KiB units divides evenly: 80 whole rounds.
-    CHECK(policy.geometry_valid(kSlotBytes));
+    CHECK(policy.geometry_valid(slot_bytes));
 
     // A payload that does not divide evenly into whole stripe rounds must be
     // rejected. Otherwise the final round is short and a segment's tail maps
     // past the end of some shard -- silent corruption, not a clean error.
-    CHECK(!policy.geometry_valid(ObjectHeaderLayout::kHeaderBytes + kUnit * 3));
-    CHECK(!policy.geometry_valid(ObjectHeaderLayout::kHeaderBytes + 100));
+    CHECK(!policy.geometry_valid(kPrefix + kUnit * 3));
+    CHECK(!policy.geometry_valid(kPrefix + 100));
     // A slot with no room for a payload is not a valid geometry.
-    CHECK(!policy.geometry_valid(ObjectHeaderLayout::kHeaderBytes));
+    CHECK(!policy.geometry_valid(kPrefix));
     CHECK(!policy.geometry_valid(0));
 
     // A zero stripe unit is nonsense and must not be silently defaulted.
     StripedPlacement no_unit(mounts, 0);
-    CHECK(!no_unit.geometry_valid(kSlotBytes));
+    CHECK(!no_unit.geometry_valid(slot_bytes));
 
     // The resolver requires a 4096-aligned stripe unit, so an unaligned one must
     // be rejected at open() rather than on the first IO.
     StripedPlacement unaligned(mounts, 1000);
-    CHECK(!unaligned.geometry_valid(kSlotBytes));
+    CHECK(!unaligned.geometry_valid(slot_bytes));
 
     // No mounts at all is a configuration error, reported rather than crashed.
     StripedPlacement empty({}, kUnit);
     CHECK(empty.shard_count() == 0);
-    CHECK(!empty.geometry_valid(kSlotBytes));
+    CHECK(!empty.geometry_valid(slot_bytes));
     std::vector<std::string> none;
     CHECK(!empty.paths_for_slot(0, &none).ok());
 
@@ -229,17 +248,26 @@ void test_striped_placement() {
     CHECK(four.paths_for_slot(9, &fp).ok());
     REQUIRE(fp.size() == 4);
     CHECK(fp[3] == "/d/striped/9.shard3");
-    CHECK(four.geometry_valid(kSlotBytes));   // 10 MiB / 4 / 64 KiB = 40 rounds
-    CHECK(four.shard_file_bytes(kSlotBytes) ==
-          ObjectHeaderLayout::kHeaderBytes + kPayload / 4);
+    // Same rule as the two-shard case: payload starts on a whole stripe round
+    // and every shard is a whole number of rounds.
+    CHECK(four.payload_offset() % (kUnit * 4) == 0);
+    const std::uint64_t four_slot_bytes = four.payload_offset() + kPayload;
+    CHECK(four.geometry_valid(four_slot_bytes));
+    const std::uint64_t four_bytes = four.shard_file_bytes(four_slot_bytes);
+    CHECK(four_bytes % kUnit == 0);
+    CHECK(4 * (four_bytes / kUnit) * kUnit >= four_slot_bytes);
 
     // --- the two policies agree on what they must agree on ---
-    // Both put the header at shard 0 offset 0 and start the payload at the same
-    // logical offset, so the core needs no special casing.
+    // Both put the header at shard 0 offset 0, and each keeps its payload
+    // start on a whole stripe round (a single file has a one-round geometry,
+    // so a stripe-aligned offset there is the same 4096B reservation).
     SingleFilePlacement single("/mnt/nvme0/ns");
     CHECK(single.header_shard() == policy.header_shard());
     CHECK(single.header_offset_in_shard() == policy.header_offset_in_shard());
-    CHECK(single.payload_offset() == policy.payload_offset());
+    CHECK(single.payload_offset() == ObjectHeaderLayout::kHeaderBytes);
+    // A single file has no stripe geometry to align to: the payload just has to
+    // start on a device IO granularity boundary.
+    CHECK(single.payload_offset() % 4096 == 0);
 }
 
 // ======================================================================

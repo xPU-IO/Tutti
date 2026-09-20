@@ -602,6 +602,58 @@ void test_configuration_errors(const std::string& base) {
 // ======================================================================
 // 11. Factory
 // ======================================================================
+// ======================================================================
+// 12. A read-only view observes the pool and mutates nothing
+// ======================================================================
+void test_read_only_view(const std::string& base) {
+    const std::string root = base + "/readonly";
+    const ObjectKey keys[2] = {key_of(0x41), key_of(0x42)};
+    {
+        auto writer = make_store(root);
+        REQUIRE(writer->open(make_config(root, 8)).ok());
+        REQUIRE(writer->reserve(keys, 2).ok());
+        REQUIRE(writer->commit(keys, 2).ok());
+        REQUIRE(writer->close().ok());
+    }
+
+    StoreConfig ro = make_config(root, 8);
+    ro.read_only = true;
+    auto reader = make_store(root);
+    REQUIRE(reader->open(ro).ok());
+
+    // Sees exactly what the writer committed.
+    CHECK(reader->contains_prefix(keys, 2) == 2);
+    CHECK(reader->recover().ok());
+    CHECK(reader->recover().value().size() == 2);
+
+    // Every mutating entry point refuses instead of pretending to work: a
+    // read-only store that silently accepted writes would lose data.
+    CHECK(reader->reserve(keys, 1).status().code() == StatusCode::UNSUPPORTED);
+    CHECK(reader->commit(keys, 1).code() == StatusCode::UNSUPPORTED);
+    CHECK(reader->abort(keys, 1).code() == StatusCode::UNSUPPORTED);
+    CHECK(reader->release(keys, 1).status().code() == StatusCode::UNSUPPORTED);
+    CHECK(reader->pin(keys, 1).code() == StatusCode::UNSUPPORTED);
+    CHECK(reader->unpin(keys, 1).code() == StatusCode::UNSUPPORTED);
+    CHECK(reader->checkpoint().code() == StatusCode::UNSUPPORTED);
+    CHECK(reader->close().ok());
+
+    // The reader left no trace: a fresh view still sees exactly the two
+    // committed objects, so observing a pool never disturbs it.
+    auto again = make_store(root);
+    CHECK(again->open(ro).ok());
+    CHECK(again->recover().value().size() == 2);
+    CHECK(again->close().ok());
+
+    // Opening a namespace that does not exist yet is a cold start, not a
+    // failure: the scheduler's index must survive the very first run.
+    const std::string empty = base + "/readonly_empty";
+    auto cold = make_store(empty);
+    CHECK(cold->open(ro).ok());
+    CHECK(cold->contains_prefix(keys, 2) == 0);
+    CHECK(cold->recover().value().empty());
+    CHECK(cold->close().ok());
+}
+
 void test_factory() {
     auto single = create_storage_object_store("local_nvme_file");
     CHECK(single.ok());
@@ -658,6 +710,7 @@ int main() {
         test_fingerprint(dir);
         test_pin_and_abort(dir);
         test_prefix_queries(dir);
+        test_read_only_view(dir);
         test_configuration_errors(dir);
     } else {
         std::printf("SKIP: %s does not support O_DIRECT; store tests not run.\n",

@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import json
 from types import SimpleNamespace
 
 from tutti.integration.vllm.connector import TuttiConnectorV1
 from tutti.engine.metadata import SchedulerMetadataIndex
-from tutti.storage.tutti_nvme.layout import Layout
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 
 
@@ -53,44 +51,6 @@ def _root_template(tmp_path):
 
 def _rank_root(tmp_path, rank):
     return tmp_path / f"pool-{rank}"
-
-
-def _publish_rank(tmp_path, namespace, keys, rank, generation,
-                  *, num_layers=NUM_LAYERS, pool_generation=None):
-    root = _rank_root(tmp_path, rank)
-    layout = Layout(root, SEGMENT_BYTES)
-    layout.ensure_dirs()
-    if pool_generation is None:
-        pool_generation = rank + 1
-    layout.commit_layers(
-        key + layer.to_bytes(2, "little")
-        for key in keys
-        for layer in range(num_layers)
-    )
-    allocated = {}
-    for slot, key in enumerate(keys):
-        allocated[key.hex()] = {
-            "slot": slot,
-            "generation": pool_generation,
-        }
-    layout.pool_manifest_path().write_text(json.dumps({
-        "layout_version": 1,
-        "namespace": namespace.hex(),
-        "rank_geometry": {
-            "layout": "file_per_chunk",
-            "num_layers": NUM_LAYERS,
-            "segment_bytes": SEGMENT_BYTES,
-            "slot_bytes": NUM_LAYERS * SEGMENT_BYTES,
-            "physical_slot_bytes": NUM_LAYERS * SEGMENT_BYTES,
-        },
-        "slot_bytes": NUM_LAYERS * SEGMENT_BYTES,
-        "max_slots": 64,
-        "allocated": allocated,
-    }), encoding="utf-8")
-    # 提交凭证已删除：冷启动可见性只由池 manifest（上面的 allocated 段）
-    # 与层标记决定，运行时驻留由内存权威索引门禁。
-    del keys, generation, pool_generation
-    return layout
 
 
 def test_scheduler_never_calls_worker_or_runtime_factory(tmp_path, monkeypatch):
