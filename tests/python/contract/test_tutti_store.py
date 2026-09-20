@@ -654,6 +654,34 @@ def test_drop_releases_whole_object(tmp_path):
     assert _slot_path(store, other).exists()
 
 
+def test_abort_chunks_tolerates_recycled_chunks(tmp_path):
+    """清理路径容忍已被驱逐回收的 chunk。
+
+    回归（2026-09-20 在线驱逐压测）：调度侧驱逐决策与本步写受理交叉时，
+    本步 _save_keys 可能含一个已被 store.drop() 移出预留表的 chunk；回滚
+    路径对它调 target_uri 的 fail-fast 会把"本轮写失败"升级成 worker 崩溃
+    （KeyError → EngineDeadError，整个 server 一起死）。
+    """
+    store = make_store(tmp_path, num_chunks=4, layers=2)
+    store.open()
+    kept = b"\x11" * 16
+    recycled = b"\x22" * 16
+
+    # 两个 chunk 同批受理：预留但未提交（= 写受理后、提交前的窗口）
+    admitted, _ = store._layout.prepare_put(
+        [io_key(kept, 0), io_key(recycled, 0)], store.capacity_chunks
+    )
+    assert len(admitted) == 2
+    # 调度侧驱逐 recycled：drop 命中对象任一 key 即回收整个对象、移出预留表
+    store.drop([io_key(recycled, 0)])
+
+    # 本步写失败后的回滚：必须容忍 recycled 已不在预留表（原先抛 KeyError）
+    store.abort_chunks([io_key(kept, 0), io_key(recycled, 0)])
+    # kept 的预留被回滚、recycled 保持已回收状态，两者都不可读
+    assert not store.has(io_key(kept, 0))
+    assert not store.has(io_key(recycled, 0))
+
+
 # ---------- 持久化与重开恢复 ----------
 
 

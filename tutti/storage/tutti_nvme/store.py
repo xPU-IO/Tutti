@@ -475,8 +475,16 @@ class TuttiDirectBackend:
             decode_io_key(derive_io_key(bytes(key), 0))[0] for key in keys
         ))
 
-    def prepare_write_targets(self, keys) -> None:
-        """Allocate every write target before Runtime tickets are opened."""
+    def prepare_write_targets(self, keys) -> tuple[bytes, ...]:
+        """Allocate every write target before Runtime tickets are opened.
+
+        返回本批**容量受理**的 chunk（顺序同入参、已去重）。对象层契约是
+        "部分受理、绝不阻塞"：容量耗尽时未受理的 chunk 不进写计划（见
+        begin_target_plan 的注释），**本步不写**，调用方必须据此裁剪本批；
+        否则 _submit 会以 "plan lacks chunk" fail-closed 并打死 worker
+        （2026-09-20 在线驱逐压测实证：12 请求 × 79 chunk 远超容量时必然
+        触发，EngineDeadError 整个 server 一起死）。
+        """
         chunk_ids = self._chunk_ids(keys)
         active = self._target_plans.get("write")
         if active is not None:
@@ -485,13 +493,13 @@ class TuttiDirectBackend:
                 raise RuntimeError(
                     "direct write target preparation changed within one step"
                 )
-            return
+            return self._prepared_write_chunks
         if self._prepared_write_request is not None:
             if self._prepared_write_request != chunk_ids:
                 raise RuntimeError(
                     "direct write target preparation changed within one step"
                 )
-            return
+            return self._prepared_write_chunks
         # The highest layer is sufficient to request the complete configured
         # object: reservation materialises the slot and fixes its generation
         # before begin_target_plan calls open_batch.
@@ -513,6 +521,7 @@ class TuttiDirectBackend:
             chunk_id for chunk_id in chunk_ids
             if derive_io_key(chunk_id, last_layer) in admitted
         )
+        return self._prepared_write_chunks
 
     def begin_target_plan(self, keys, direction: str) -> DirectTargetPlan:
         if direction not in ("read", "write"):
@@ -1814,12 +1823,17 @@ class TuttiKVStore:
         return self._layout.object_pool_snapshot()
 
     def abort_chunks(self, chunk_ids) -> None:
-        """Rollback incomplete chunks after the step has drained all IO."""
+        """Rollback incomplete chunks after the step has drained all IO.
+
+        容忍"已被驱逐/回收"的 chunk：驱逐（apply_evictions → drop）会把
+        chunk 移出预留表，而本步的 _save_keys 仍可能含它——调度侧的驱逐决策
+        与本步的写受理会交叉。对这类 chunk 没有可回滚的预留，跳过即可；
+        否则 target_uri 的 fail-fast 会把一次写失败升级为 worker 崩溃
+        （2026-09-20 在线驱逐压测复现：KeyError → EngineDeadError）。
+        """
         chunks = tuple(dict.fromkeys(bytes(chunk_id) for chunk_id in chunk_ids))
         self._wait_chunk_io(chunks)
-        self._close_cached_targets(
-            [self._layout.target_uri(chunk_id) for chunk_id in chunks]
-        )
+        self._close_cached_targets(self._layout.reserved_uris(chunks))
         self._layout.abort_uncommitted(chunks)
 
     # ---------- 内部 ----------

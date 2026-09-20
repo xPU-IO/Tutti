@@ -945,7 +945,23 @@ class WorkerImpl:
         if keys:
             # 对象池分配 + 目标票据就绪；与 store_layer 内的首层惰性
             # 调用等价（幂等），提前到这里以避开计算下发关键路径。
-            self._engine.prepare_write_targets(keys)
+            admitted = self._engine.prepare_write_targets(keys)
+            if admitted is not None:
+                # 池容量受理可能少于本批：驱逐压力下"调度侧索引容量"与
+                # "对象池槽位"两层受理状态会短暂不一致。未受理的 chunk
+                # 不进写计划、本步不写（对象层契约），必须在此裁剪——
+                # 否则后续 _submit 以 "plan lacks chunk" fail-closed，
+                # 打死 worker 连带整个 server（2026-09-20 在线驱逐压测）。
+                before = len(keys)
+                keys, generations, block_tables = self._select_new_chunks(
+                    keys, generations, block_tables, admitted
+                )
+                if len(keys) != before:
+                    _LOG.warning(
+                        "DIRECT_WRITE_CAPACITY_TRIM 池容量受理 %d/%d chunk"
+                        "（未受理的本步不写；容量耗尽在驱逐压力下是稳态）",
+                        len(keys), before,
+                    )
         self._save_keys = keys
         self._save_generations = generations
         self._save_block_tables = block_tables

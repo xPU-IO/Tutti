@@ -1440,23 +1440,37 @@ class KVEngine:
             self, keys, block_tables, physical_layers, depth, on_failure
         )
 
-    def prepare_write_targets(self, keys) -> None:
+    def prepare_write_targets(self, keys):
         """预置写入目标（对象池分配 + 票据就绪）。
 
         与 store_layer 内部的首层惰性调用等价且幂等（重复调用直接
         返回）。提前调用的意义是把对象池分配/manifest 落盘从"首个
         写入层"挪到 start_load_kv——那里读计划已预提交、计算尚未
         开始，开销不与层 0→1 的计算下发争用前向线程。
+
+        返回**池容量受理**的 chunk 集合（无 direct 后端时返回 None）；
+        调用方据此裁剪本批写入——容量耗尽时未受理的 chunk 不进写计划，
+        不裁剪会让后续提交以 "plan lacks chunk" fail-closed。
         """
         if not isinstance(self._transfer, DirectTransfer):
-            return
+            return None
         backend = getattr(self._transfer, "_backend", None)
         prepare = getattr(backend, "prepare_write_targets", None)
         if not callable(prepare):
-            return
+            return None
         direct_lock = getattr(self, "_direct_submit_lock", None)
         with (direct_lock if direct_lock is not None else nullcontext()):
-            prepare(keys)
+            admitted = prepare(keys)
+            # 与读方向对称（start_read_plan 里对 "read" 调 begin_target_plan）：
+            # 这里必须把写方向的计划也建出来，否则 store_layer 每层都会走
+            # "计划不存在" 的兜底分支重新 prepare(keys)，而调用方裁剪后的
+            # keys 是子集，会撞 prepare_write_targets 的 fail-closed 守卫
+            # （2026-09-20 在线驱逐压测：RuntimeError: direct write target
+            # preparation changed within one step → EngineDeadError）。
+            begin_plan = getattr(backend, "begin_target_plan", None)
+            if callable(begin_plan) and admitted:
+                begin_plan(keys, "write")
+            return admitted
 
     def store_layer(self, keys, layer_idx: int, src_first_blocks):
         """发起一批写入：一层 × N chunk，源侧 → staging 槽 → 持久化。

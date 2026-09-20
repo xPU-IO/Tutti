@@ -363,6 +363,20 @@ class ObjectLayout:
             raise KeyError(f"chunk 未预留：{bytes(chunk_id)!r}")
         return placement.uri
 
+    def reserved_uris(self, chunk_ids) -> list[str]:
+        """已预留 chunk 的 URI 列表；未预留的静默跳过（保序去重）。
+
+        给清理路径（Store::abort_chunks）用：一个 chunk 可能已被驱逐/回收，
+        此时它不在预留表里、也没有可清理的缓存目标——这不是异常。target_uri
+        与 target_offset 保持 fail-fast，供真正要求"必须已预留"的调用方用。
+        """
+        uris = []
+        for chunk_id in dict.fromkeys(bytes(c) for c in chunk_ids):
+            placement = self._placement(chunk_id)
+            if placement is not None:
+                uris.append(placement.uri)
+        return uris
+
     def target_offset(self, chunk_id: bytes) -> int:
         """段 0 在对象逻辑地址空间中的起点（对象头之后）。"""
         placement = self._placement(chunk_id)
