@@ -1,13 +1,14 @@
-// tutti/presets/local_nvme_preset.cpp
+// csrc/presets/local_nvme_preset.cpp
 //
 // Preset assembly layer implementation.
 // Includes private headers to construct DataPaths + resolvers, returns
 // public types (StorageRuntime + RuntimeTelemetry).
 
-#include "tutti/presets/local_nvme.h"
+#include <tutti/presets/local_nvme.h>
 
 #include <tutti/storage_runtime.h>
 #include <tutti/cuda_like.h>
+#include "csrc/common/backend_ids.h"
 
 #include <cctype>
 #include <cstdlib>
@@ -18,9 +19,9 @@
 // Private headers — included here ONLY, never by consumer code.
 #include "csrc/data_paths/local_nvme/local_nvme_data_path.h"
 #include "csrc/data_paths/striped_local_nvme/striped_data_path.h"
-#include "csrc/bindings/striped_local_nvme/binding.h"
-#include <csrc/resolvers/local_file/resolver.h>
-#include <csrc/resolvers/striped_file/resolver.h>
+#include "csrc/payloads/striped_local_nvme/payload.h"
+#include "csrc/resolvers/local_file/resolver.h"
+#include "csrc/resolvers/striped_file/resolver.h"
 
 namespace tutti::presets {
 
@@ -95,7 +96,7 @@ RuntimeWithTelemetry make_local_nvme_runtime(const LocalNvmePreset& p) {
     // into RuntimeComponents, lifetime tied to the runtime.
     auto* dp = new lnvme::LocalNvmeDataPath(
         chrdev_for_bdf(p.device.pci_bdf),
-        p.gpu_id,
+        p.accel_id,
         p.num_queues,
         p.device.namespace_id,
         p.device.block_size,
@@ -124,11 +125,11 @@ RuntimeWithTelemetry make_local_nvme_runtime(const LocalNvmePreset& p) {
     owned.resolvers.push_back(OwnedResolver{
         "file", std::unique_ptr<StorageTargetResolver>(resolver)});
     owned.data_paths.push_back(OwnedDataPath{
-        "local-nvme-ext4", std::unique_ptr<DataPath>(dp),
-        DataPathConfig{"local_nvme"}});
+        std::string(tutti::detail::backend_ids::kExt4DataPathKey),
+        std::unique_ptr<DataPath>(dp), DataPathConfig{"local_nvme"}});
 
     RuntimeConfig runtime_config;
-    runtime_config.accel_id = p.gpu_id;
+    runtime_config.accel_id = p.accel_id;
     auto created = StorageRuntime::create_owning(runtime_config, std::move(owned));
     if (!created.ok()) {
         RuntimeWithTelemetry result;
@@ -155,16 +156,15 @@ RuntimeWithTelemetry make_striped_nvme_runtime(const StripedNvmePreset& p) {
     std::vector<snvme::DeviceDescriptor> sdevs;
     for (const auto& d : p.devices) {
         sdevs.push_back({chrdev_for_bdf(d.pci_bdf), d.namespace_id,
-                         (std::uint32_t)p.gpu_id, p.num_queues, d.block_size,
+                         (std::uint32_t)p.accel_id, p.num_queues, d.block_size,
                          d.pci_bdf});
     }
 
     auto* dp = new snvme::StripedDataPath(
-        std::move(sdevs), (std::uint32_t)p.gpu_id,
+        std::move(sdevs), (std::uint32_t)p.accel_id,
         /*mdts_override=*/0, /*cq_poll_budget=*/0,
         p.max_batch_entries, p.max_in_flight_operations,
-        /*handle_cache_capacity=*/0, p.prp_cache_capacity,
-        p.threads_per_block);
+        p.prp_cache_capacity, p.threads_per_block);
 
     std::vector<std::unique_ptr<StorageTargetResolver>> sub_resolvers;
     for (const auto& d : p.devices) {
@@ -182,11 +182,11 @@ RuntimeWithTelemetry make_striped_nvme_runtime(const StripedNvmePreset& p) {
     owned.resolvers.push_back(OwnedResolver{
         "striped", std::unique_ptr<StorageTargetResolver>(resolver)});
     owned.data_paths.push_back(OwnedDataPath{
-        std::string(tutti::binding::striped_local_nvme::kRecommendedDataPathKey),
+        std::string(tutti::payloads::striped_local_nvme::kRecommendedDataPathKey),
         std::unique_ptr<DataPath>(dp), DataPathConfig{"striped-nvme"}});
 
     RuntimeConfig runtime_config;
-    runtime_config.accel_id = p.gpu_id;
+    runtime_config.accel_id = p.accel_id;
     auto created = StorageRuntime::create_owning(runtime_config, std::move(owned));
     if (!created.ok()) {
         RuntimeWithTelemetry result;

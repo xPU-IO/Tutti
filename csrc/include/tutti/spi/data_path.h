@@ -248,13 +248,15 @@ struct DataPathRequest {
 };
 
 // Per-request initial state, one per input request, in input order.
-enum class RequestState {
-    ACCEPTED,  // issued or will be issued; observable via the op
+// 这套状态枚举（以及下面的 IoState）由 DataPath 与 StorageRuntime 共用，
+// 两侧不再各持一份逐值同构的双名定义。
+enum class IoRequestState {
+    ACCEPTED,  // issued or will be issued; observable via the op/handle
     REJECTED,  // validation failed before any irreversible issue
 };
 
-struct RequestInitialState {
-    RequestState state = RequestState::REJECTED;
+struct IoRequestInitialState {
+    IoRequestState state = IoRequestState::REJECTED;
     Status status;  // OK for ACCEPTED; error code+message for REJECTED
 };
 
@@ -271,11 +273,11 @@ struct RequestInitialState {
 struct SubmitOutcome {
     Status status;
     std::optional<DataPathOp> op;
-    std::vector<RequestInitialState> initial_states;
+    std::vector<IoRequestInitialState> initial_states;
 };
 
-// Operational state of a DataPathOp.
-enum class OpState {
+// Operational state of a DataPathOp（Runtime 的 IoHandle 快照共用同一枚举）。
+enum class IoState {
     IN_FLIGHT,  // not terminal; query() keeps the op alive
     COMPLETED,  // terminal success
     FAILED,     // terminal failure
@@ -315,7 +317,7 @@ struct IoCompletionDetail {
 
 // Snapshot returned by query(). query() never destroys the op.
 struct DataPathSnapshot {
-    OpState state = OpState::IN_FLIGHT;
+    IoState state = IoState::IN_FLIGHT;
     Status status;  // OK while IN_FLIGHT; terminal status otherwise
     std::uint64_t bytes_transferred = 0;
     IoCompletionDetail detail;

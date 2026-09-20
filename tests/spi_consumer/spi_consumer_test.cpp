@@ -88,10 +88,10 @@ int main() {
     tutti::DataPathConfig cfg{"consumer"};
     CHECK(cfg.name == "consumer");
 
-    // ---- RequestInitialState / SubmitOutcome ----
-    tutti::RequestInitialState ris;
-    ris.state = tutti::RequestState::ACCEPTED;
-    CHECK(ris.state == tutti::RequestState::ACCEPTED);
+    // ---- IoRequestInitialState / SubmitOutcome ----
+    tutti::IoRequestInitialState ris;
+    ris.state = tutti::IoRequestState::ACCEPTED;
+    CHECK(ris.state == tutti::IoRequestState::ACCEPTED);
     tutti::SubmitOutcome out;
     out.status = tutti::Status::Ok();
     CHECK(out.status.ok());
@@ -99,10 +99,10 @@ int main() {
     out.initial_states.resize(2);
     CHECK(out.initial_states.size() == 2);
 
-    // ---- OpState / DataPathSnapshot ----
+    // ---- IoState / DataPathSnapshot ----
     tutti::DataPathSnapshot snap;
-    snap.state = tutti::OpState::IN_FLIGHT;
-    CHECK(snap.state == tutti::OpState::IN_FLIGHT);
+    snap.state = tutti::IoState::IN_FLIGHT;
+    CHECK(snap.state == tutti::IoState::IN_FLIGHT);
     CHECK(snap.bytes_transferred == 0);
 
     // ---- ProgressBudget / ProgressResult ----

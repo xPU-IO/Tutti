@@ -9,8 +9,9 @@
 
 #include <tutti/config/tutti_runtime_config_parser.h>
 #include <tutti/cuda_like.h>
-#include <csrc/data_paths/data_path_factory.h>
-#include <csrc/resolvers/resolver_factory.h>
+#include "csrc/common/ascii.h"
+#include "csrc/data_paths/data_path_factory.h"
+#include "csrc/resolvers/resolver_factory.h"
 #include <tutti/storage_runtime.h>
 
 #include <tutti/resource.h>
@@ -26,14 +27,6 @@ Status create_error(StatusCode code, std::string message) {
 template <typename T>
 Result<T> failure(Status status) {
     return Result<T>::Failure(std::move(status));
-}
-
-std::string upper(std::string value) {
-    for (char& ch : value) {
-        ch = static_cast<char>(
-            std::toupper(static_cast<unsigned char>(ch)));
-    }
-    return value;
 }
 
 Result<int> default_accelerator_device_count() {
@@ -58,8 +51,8 @@ Result<int> default_accelerator_device_count() {
 Status validate_runtime_environment(
     const config::TuttiRuntimeSpec& spec,
     const tutti_runtime::TuttiRuntimeCreateInternalOptions& options) {
-    if (upper(spec.accelerator.profile) !=
-        upper(TUTTI_COMPILED_ACCELERATOR_PROFILE)) {
+    if (tutti::detail::upper_ascii(spec.accelerator.profile) !=
+        tutti::detail::upper_ascii(TUTTI_COMPILED_ACCELERATOR_PROFILE)) {
         return create_error(
             StatusCode::INVALID_ARGUMENT,
             "accelerator.profile does not match compiled profile");

@@ -1,6 +1,6 @@
 #pragma once
 
-// tutti/data_paths/local_nvme/io/nvme_queue_group.h
+// csrc/data_paths/local_nvme/io/nvme_queue_group.h
 //
 // On-GPU NVMe user-queue pool — ported from main's device_manager.
 //

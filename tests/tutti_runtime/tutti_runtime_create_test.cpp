@@ -8,8 +8,8 @@
 #include <utility>
 #include <vector>
 
-#include <csrc/data_paths/data_path_factory.h>
-#include <csrc/resolvers/resolver_factory.h>
+#include "csrc/data_paths/data_path_factory.h"
+#include "csrc/resolvers/resolver_factory.h"
 #include <tutti/storage_runtime.h>
 
 #include "csrc/testing/mock_data_path.h"

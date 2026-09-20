@@ -1,6 +1,6 @@
 #pragma once
 
-// tutti/testing/mock_data_path.h
+// csrc/testing/mock_data_path.h
 //
 // Reusable MockDataPath contract kit — a test-only DataPath implementation
 // that covers the full SPI lifecycle (open/close, registration_domain,
@@ -12,7 +12,7 @@
 // C++17 standard library — no CUDA, no libnvm, no hardware.
 //
 // Usage example:
-//   #include <csrc/testing/mock_data_path.h>
+//   #include "csrc/testing/mock_data_path.h"
 //   tutti::testing::MockDataPath dp;
 //   dp.set_reject_at_index(3);        // reject 4th request onward
 //   dp.set_manual_mode(true);         // progress() does not auto-complete
@@ -77,7 +77,7 @@ public:
     std::atomic<bool> manual_mode{false};        // progress() does not auto-complete
     std::atomic<bool> block_progress_flag{false}; // progress() blocks until cleared
     std::uint64_t bytes_per_request = 4096;     // bytes counted per accepted request
-    OpState terminal_state = OpState::COMPLETED;
+    IoState terminal_state = IoState::COMPLETED;
     Status terminal_status = Status::Ok();
     IoCompletionDetail terminal_detail;         // copied into terminal snapshots
 
@@ -156,7 +156,7 @@ public:
         std::lock_guard<std::mutex> lock(ops_mtx_);
         auto it = ops_.find(op.token());
         if (it != ops_.end()) {
-            it->second.state = OpState::COMPLETED;
+            it->second.state = IoState::COMPLETED;
             it->second.terminal_status = Status::Ok();
             it->second.bytes_transferred =
                 it->second.accepted_count * bytes_per_request;
@@ -167,7 +167,7 @@ public:
         std::lock_guard<std::mutex> lock(ops_mtx_);
         auto it = ops_.find(op.token());
         if (it != ops_.end()) {
-            it->second.state = OpState::FAILED;
+            it->second.state = IoState::FAILED;
             it->second.terminal_status = status;
         }
     }
@@ -190,7 +190,7 @@ public:
         std::lock_guard<std::mutex> lock(ops_mtx_);
         std::size_t n = 0;
         for (const auto& kv : ops_) {
-            if (kv.second.state == OpState::IN_FLIGHT) ++n;
+            if (kv.second.state == IoState::IN_FLIGHT) ++n;
         }
         return n;
     }
@@ -215,7 +215,7 @@ public:
 
     Result<DataPathTarget> open(const ResolvedTarget&) override {
         ++open_calls;
-        std::uint64_t tok = next_target_++;
+        std::uint64_t tok = next_target_token_++;
         // Domain key: constant by default (all targets share one domain,
         // so memory is registered once per device, not per target).
         // Tests can override by setting domain_key_prefix.
@@ -247,7 +247,7 @@ public:
         const RegistrationDomainKey&) override {
         ++register_calls;
         last_registered_memory_view = view;
-        return detail::SpiIdentityMint::mint<detail::DataPathMemoryTag>(next_memory_++, 1);
+        return detail::SpiIdentityMint::mint<detail::DataPathMemoryTag>(next_memory_token_++, 1);
     }
 
     Status unregister_memory(DataPathMemory) override {
@@ -272,7 +272,7 @@ public:
         if (fail_submit.load()) {
             out.status = Status(StatusCode::DEVICE_ERROR, "injected submit failure");
             for (std::size_t i = 0; i < count; ++i) {
-                out.initial_states[i].state = RequestState::REJECTED;
+                out.initial_states[i].state = IoRequestState::REJECTED;
                 out.initial_states[i].status = out.status;
             }
             return out;
@@ -283,12 +283,12 @@ public:
         for (std::size_t i = 0; i < count; ++i) {
             if (failed || i == reject_at_index) {
                 failed = true;
-                out.initial_states[i].state = RequestState::REJECTED;
+                out.initial_states[i].state = IoRequestState::REJECTED;
                 out.initial_states[i].status = Status(
                     StatusCode::RESOURCE_EXHAUSTED, "injected rejection");
                 continue;
             }
-            out.initial_states[i].state = RequestState::ACCEPTED;
+            out.initial_states[i].state = IoRequestState::ACCEPTED;
             out.initial_states[i].status = Status::Ok();
             ++accepted;
         }
@@ -305,7 +305,7 @@ public:
         {
             std::lock_guard<std::mutex> lock(ops_mtx_);
             OpRecord rec;
-            rec.state = OpState::IN_FLIGHT;
+            rec.state = IoState::IN_FLIGHT;
             rec.accepted_count = accepted;
             rec.bytes_transferred = 0;
             rec.scratch.assign(accepted * 16, 0);
@@ -347,7 +347,7 @@ public:
             for (auto& kv : ops_) {
                 if (remaining == 0) break;
                 OpRecord& rec = kv.second;
-                if (rec.state == OpState::IN_FLIGHT && !manual_mode.load()) {
+                if (rec.state == IoState::IN_FLIGHT && !manual_mode.load()) {
                     rec.state = terminal_state;
                     rec.terminal_status = terminal_status;
                     rec.bytes_transferred = rec.accepted_count * bytes_per_request;
@@ -369,7 +369,7 @@ public:
         {
             std::lock_guard<std::mutex> lock(ops_mtx_);
             for (const auto& kv : ops_) {
-                if (kv.second.state == OpState::IN_FLIGHT) { more = true; break; }
+                if (kv.second.state == IoState::IN_FLIGHT) { more = true; break; }
             }
         }
         result.more_work_likely = more;
@@ -410,7 +410,7 @@ public:
         if (it == ops_.end()) {
             return Status(StatusCode::NOT_FOUND, "unknown op");
         }
-        if (it->second.state == OpState::IN_FLIGHT) {
+        if (it->second.state == IoState::IN_FLIGHT) {
             return Status(StatusCode::BUSY, "op not terminal");
         }
         ++release_calls;
@@ -427,7 +427,7 @@ public:
 
 private:
     struct OpRecord {
-        OpState state = OpState::IN_FLIGHT;
+        IoState state = IoState::IN_FLIGHT;
         Status terminal_status;  // OK while IN_FLIGHT
         std::uint64_t bytes_transferred = 0;
         IoCompletionDetail completion_detail;
@@ -435,8 +435,8 @@ private:
         std::vector<char> scratch;  // per-op private; never shared
     };
 
-    std::uint64_t next_target_ = 1;
-    std::uint64_t next_memory_ = 1;
+    std::uint64_t next_target_token_ = 1;
+    std::uint64_t next_memory_token_ = 1;
     std::uint64_t next_op_ = 1;
 
     mutable std::mutex ops_mtx_;

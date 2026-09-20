@@ -9,14 +9,14 @@
 #include <tutti/storage_runtime.h>
 #include <tutti/spi/data_path.h>
 #include <tutti/spi/storage_target_resolver.h>
-#include <csrc/bindings/ext4_local_nvme/binding.h>
+#include "csrc/payloads/ext4_local_nvme/payload.h"
 #include "csrc/data_paths/local_nvme/local_nvme_data_path.h"
 #include "csrc/data_paths/local_nvme/io/device_target.h"
 #include "csrc/data_paths/local_nvme/io/submit_one.cuh"
 #include "csrc/resolvers/local_file/resolver.h"
 
-#include "../hardware_test_directory.h"
-#include "../nvme_test_cli.h"
+#include "tests/hardware_test_directory.h"
+#include "tests/nvme_test_cli.h"
 
 #include <tutti/cuda_like.h>
 #include <nvm_types.h>
@@ -40,7 +40,7 @@
 
 using namespace tutti;
 using namespace tutti::data_paths::local_nvme;
-using namespace tutti::binding::ext4_local_nvme;
+using namespace tutti::payloads::ext4_local_nvme;
 using namespace tutti::test_support;
 
 static int g_pass = 0;
@@ -412,27 +412,27 @@ public:
         const ResolvedTarget& inner_rt = inner_results_.back();
 
         // Extract payload via view.
-        auto payload = binding::ext4_local_nvme::view_payload(inner_rt);
+        auto payload = payloads::ext4_local_nvme::view_payload(inner_rt);
         if (!payload.ok()) {
             return Result<ResolvedTarget>::Failure(payload.status());
         }
 
         // Create null-deleter shared_ptr that borrows the payload
         // (the inner RT owns it; it stays alive in inner_results_).
-        auto shared_payload = std::shared_ptr<binding::ext4_local_nvme::Ext4LocalNvmePayload>(
-            const_cast<binding::ext4_local_nvme::Ext4LocalNvmePayload*>(payload.value()),
-            [](binding::ext4_local_nvme::Ext4LocalNvmePayload*){});
+        auto shared_payload = std::shared_ptr<payloads::ext4_local_nvme::Ext4LocalNvmePayload>(
+            const_cast<payloads::ext4_local_nvme::Ext4LocalNvmePayload*>(payload.value()),
+            [](payloads::ext4_local_nvme::Ext4LocalNvmePayload*){});
 
         // Dummy lease (real fd is owned by inner RT's lease).
         auto dummy_lease = std::make_shared<
             tutti::resolvers::local_file::FileDescriptorLease>(-1);
 
         return ResolvedTarget::make<
-            binding::ext4_local_nvme::Ext4LocalNvmePayload,
+            payloads::ext4_local_nvme::Ext4LocalNvmePayload,
             tutti::resolvers::local_file::FileDescriptorLease>(
             std::string(inner_rt.resolver_type_id()),
-            std::string(binding::ext4_local_nvme::kPayloadTypeId),
-            binding::ext4_local_nvme::kPayloadApiVersion,
+            std::string(payloads::ext4_local_nvme::kPayloadTypeId),
+            payloads::ext4_local_nvme::kPayloadApiVersion,
             inner_rt.logical_size(),
             override_key_,
             std::move(shared_payload),
@@ -514,7 +514,7 @@ static bool drain_to_terminal(LocalNvmeDataPath& dp, DataPathOp op,
         ProgressBudget pb{16, 1000000000};
         dp.progress(pb);
         auto s = dp.query(op);
-        if (s.ok() && s.value().state != OpState::IN_FLIGHT) return true;
+        if (s.ok() && s.value().state != IoState::IN_FLIGHT) return true;
         usleep(1000);
     }
     return false;
@@ -752,9 +752,9 @@ int main(int argc, char** argv) {
         CHECK(!outcome.op.has_value(), "submit op == nullopt (zero issued)");
         CHECK(outcome.initial_states.size() == 2,
               "submit initial_states.size() == count");
-        CHECK(outcome.initial_states[0].state == RequestState::REJECTED,
+        CHECK(outcome.initial_states[0].state == IoRequestState::REJECTED,
               "submit[0] REJECTED");
-        CHECK(outcome.initial_states[1].state == RequestState::REJECTED,
+        CHECK(outcome.initial_states[1].state == IoRequestState::REJECTED,
               "submit[1] REJECTED");
         CHECK(!outcome.initial_states[0].status.ok(),
               "submit[0] status not OK");
@@ -1264,7 +1264,7 @@ int main(int argc, char** argv) {
         }
         auto lease = std::make_shared<int>(42);
         return make_resolved_target(
-            std::string(binding::ext4_local_nvme::kResolverTypeId),
+            std::string(payloads::ext4_local_nvme::kResolverTypeId),
             file_size, payload_result.value(), std::move(lease));
     };
 
@@ -1693,7 +1693,7 @@ int main(int argc, char** argv) {
             auto wsubmit = dp.submit(&wreq, 1, wctx);
             CHECK(wsubmit.status.ok(), "submit WRITE");
             CHECK(wsubmit.op.has_value(), "WRITE op minted");
-            CHECK(wsubmit.initial_states[0].state == RequestState::ACCEPTED,
+            CHECK(wsubmit.initial_states[0].state == IoRequestState::ACCEPTED,
                   "WRITE ACCEPTED");
             if (!wsubmit.op.has_value()) {
                 cudaStreamDestroy(stream);
@@ -1723,7 +1723,7 @@ int main(int argc, char** argv) {
                 dp.progress(pb);
                 auto snap = dp.query(wsubmit.op.value());
                 bool terminal = false;
-                if (snap.ok() && snap.value().state != OpState::IN_FLIGHT) {
+                if (snap.ok() && snap.value().state != IoState::IN_FLIGHT) {
                     terminal = true;
                     printf("  WRITE terminal: state=%d bytes=%llu\n",
                            (int)snap.value().state,
@@ -1731,7 +1731,7 @@ int main(int argc, char** argv) {
                 }
                 CHECK(terminal, "WRITE reached terminal");
                 if (snap.ok()) {
-                    CHECK(snap.value().state == OpState::COMPLETED,
+                    CHECK(snap.value().state == IoState::COMPLETED,
                           "WRITE COMPLETED");
                     CHECK(snap.value().bytes_transferred == 4096,
                           "WRITE bytes=4096");
@@ -1798,7 +1798,7 @@ int main(int argc, char** argv) {
                 dp.progress(pb2);
                 auto rsnap = dp.query(rsubmit.op.value());
                 bool terminal = false;
-                if (rsnap.ok() && rsnap.value().state != OpState::IN_FLIGHT) {
+                if (rsnap.ok() && rsnap.value().state != IoState::IN_FLIGHT) {
                     terminal = true;
                     printf("  READ terminal: state=%d bytes=%llu\n",
                            (int)rsnap.value().state,
@@ -1870,7 +1870,7 @@ int main(int argc, char** argv) {
         auto out = dp.submit(&req, 1, ctx);
         CHECK(!out.status.ok(), "unaligned target_offset rejected");
         CHECK(!out.op.has_value(), "no op minted");
-        CHECK(out.initial_states[0].state == RequestState::REJECTED,
+        CHECK(out.initial_states[0].state == IoRequestState::REJECTED,
               "REJECTED state");
 
         cudaStreamDestroy(s);
@@ -1947,7 +1947,7 @@ int main(int argc, char** argv) {
 
         auto out = dp.submit(&req, 1, ctx);
         CHECK(!out.status.ok(), "HOST memory submit rejected");
-        CHECK(out.initial_states[0].state == RequestState::REJECTED,
+        CHECK(out.initial_states[0].state == IoRequestState::REJECTED,
               "REJECTED");
 
         cudaStreamDestroy(s);
@@ -2037,7 +2037,7 @@ int main(int argc, char** argv) {
                 ProgressBudget pb{16, 1000000000};
                 dp.progress(pb);
                 auto snap = dp.query(out.op.value());
-                if (snap.ok() && snap.value().state != OpState::IN_FLIGHT)
+                if (snap.ok() && snap.value().state != IoState::IN_FLIGHT)
                     break;
             }
             // Now release should work.
@@ -2128,7 +2128,7 @@ int main(int argc, char** argv) {
                 usleep(1000);
             }
             auto snap = dp.query(wr_outcome.op.value());
-            CHECK(snap.ok() && snap.value().state == OpState::COMPLETED,
+            CHECK(snap.ok() && snap.value().state == IoState::COMPLETED,
                   "write completed");
             printf("  write bytes: %llu\n",
                    (unsigned long long)snap.value().bytes_transferred);
@@ -2158,7 +2158,7 @@ int main(int argc, char** argv) {
                 usleep(1000);
             }
             auto snap = dp.query(rd_outcome.op.value());
-            CHECK(snap.ok() && snap.value().state == OpState::COMPLETED,
+            CHECK(snap.ok() && snap.value().state == IoState::COMPLETED,
                   "read completed");
             dp.release(rd_outcome.op.value());
         }
@@ -2242,7 +2242,7 @@ int main(int argc, char** argv) {
                 usleep(1000);
             }
             auto snap = dp.query(wr_outcome.op.value());
-            CHECK(snap.ok() && snap.value().state == OpState::COMPLETED,
+            CHECK(snap.ok() && snap.value().state == IoState::COMPLETED,
                   "LIST write completed");
             printf("  write bytes: %llu\n",
                    (unsigned long long)snap.value().bytes_transferred);
@@ -2272,7 +2272,7 @@ int main(int argc, char** argv) {
                 usleep(1000);
             }
             auto snap = dp.query(rd_outcome.op.value());
-            CHECK(snap.ok() && snap.value().state == OpState::COMPLETED,
+            CHECK(snap.ok() && snap.value().state == IoState::COMPLETED,
                   "LIST read completed");
             dp.release(rd_outcome.op.value());
         }
@@ -2353,7 +2353,7 @@ int main(int argc, char** argv) {
                 usleep(1000);
             }
             auto snap = dp.query(outcome.op.value());
-            CHECK(snap.ok() && snap.value().state == OpState::COMPLETED,
+            CHECK(snap.ok() && snap.value().state == IoState::COMPLETED,
                   "batch write completed");
             dp.release(outcome.op.value());
         }
@@ -2474,11 +2474,11 @@ int main(int argc, char** argv) {
         // Partial commit: op should exist, status non-OK (partial).
         CHECK(outcome.op.has_value(), "partial commit: op exists");
         CHECK(!outcome.status.ok(), "partial commit: overall status non-OK");
-        CHECK(outcome.initial_states[0].state == RequestState::ACCEPTED,
+        CHECK(outcome.initial_states[0].state == IoRequestState::ACCEPTED,
               "request 0 ACCEPTED");
         CHECK(outcome.initial_states[0].status.ok(),
               "request 0 ACCEPTED status OK");
-        CHECK(outcome.initial_states[1].state == RequestState::REJECTED,
+        CHECK(outcome.initial_states[1].state == IoRequestState::REJECTED,
               "request 1 REJECTED");
         CHECK(!outcome.initial_states[1].status.ok(),
               "request 1 REJECTED status non-OK");
@@ -2491,7 +2491,7 @@ int main(int argc, char** argv) {
                 usleep(1000);
             }
             auto snap = dp.query(outcome.op.value());
-            CHECK(snap.ok() && snap.value().state == OpState::COMPLETED,
+            CHECK(snap.ok() && snap.value().state == IoState::COMPLETED,
                   "partial commit: valid request completed");
             dp.release(outcome.op.value());
         }
@@ -2619,11 +2619,11 @@ int main(int argc, char** argv) {
             bool all_done = true;
             if (wo1.op.has_value()) {
                 auto s = dp.query(wo1.op.value());
-                if (!s.ok() || s.value().state == OpState::IN_FLIGHT) all_done = false;
+                if (!s.ok() || s.value().state == IoState::IN_FLIGHT) all_done = false;
             }
             if (wo2.op.has_value()) {
                 auto s = dp.query(wo2.op.value());
-                if (!s.ok() || s.value().state == OpState::IN_FLIGHT) all_done = false;
+                if (!s.ok() || s.value().state == IoState::IN_FLIGHT) all_done = false;
             }
             if (all_done) break;
             usleep(1000);
@@ -2632,12 +2632,12 @@ int main(int argc, char** argv) {
         // Verify both completed.
         if (wo1.op.has_value()) {
             auto s = dp.query(wo1.op.value());
-            CHECK(s.ok() && s.value().state == OpState::COMPLETED, "stream 1 completed");
+            CHECK(s.ok() && s.value().state == IoState::COMPLETED, "stream 1 completed");
             dp.release(wo1.op.value());
         }
         if (wo2.op.has_value()) {
             auto s = dp.query(wo2.op.value());
-            CHECK(s.ok() && s.value().state == OpState::COMPLETED, "stream 2 completed");
+            CHECK(s.ok() && s.value().state == IoState::COMPLETED, "stream 2 completed");
             dp.release(wo2.op.value());
         }
 
@@ -2658,7 +2658,7 @@ int main(int argc, char** argv) {
                 ProgressBudget pb{16, 1000000000};
                 dp.progress(pb);
                 auto s = dp.query(rd1_out.op.value());
-                if (s.ok() && s.value().state != OpState::IN_FLIGHT) break;
+                if (s.ok() && s.value().state != IoState::IN_FLIGHT) break;
                 usleep(1000);
             }
             dp.release(rd1_out.op.value());
@@ -2684,7 +2684,7 @@ int main(int argc, char** argv) {
                 ProgressBudget pb{16, 1000000000};
                 dp.progress(pb);
                 auto s = dp.query(rd2_out.op.value());
-                if (s.ok() && s.value().state != OpState::IN_FLIGHT) break;
+                if (s.ok() && s.value().state != IoState::IN_FLIGHT) break;
                 usleep(1000);
             }
             dp.release(rd2_out.op.value());
@@ -2866,7 +2866,7 @@ int main(int argc, char** argv) {
             CHECK(pr0.ok(), "progress zero-timeout OK");
             CHECK(pr0.value().work_units_consumed == 0, "zero-timeout: 0 work consumed");
             auto snap0 = dp.query(out.op.value());
-            CHECK(snap0.ok() && snap0.value().state == OpState::IN_FLIGHT,
+            CHECK(snap0.ok() && snap0.value().state == IoState::IN_FLIGHT,
                   "zero-timeout: op still IN_FLIGHT");
 
             // Positive timeout: should advance the op to terminal.
@@ -2875,7 +2875,7 @@ int main(int argc, char** argv) {
             CHECK(pr1.ok(), "progress positive-timeout OK");
             CHECK(pr1.value().work_units_consumed > 0, "positive-timeout: work consumed");
             auto snap1 = dp.query(out.op.value());
-            CHECK(snap1.ok() && snap1.value().state == OpState::COMPLETED,
+            CHECK(snap1.ok() && snap1.value().state == IoState::COMPLETED,
                   "positive-timeout: op COMPLETED");
 
             dp.release(out.op.value());
@@ -2940,7 +2940,7 @@ int main(int argc, char** argv) {
         if (out.op.has_value()) {
             // Op should be IN_FLIGHT.
             auto snap0 = dp.query(out.op.value());
-            CHECK(snap0.ok() && snap0.value().state == OpState::IN_FLIGHT,
+            CHECK(snap0.ok() && snap0.value().state == IoState::IN_FLIGHT,
                   "op is IN_FLIGHT during delay");
 
             // A progress work unit is exactly one event query. It must not
@@ -2965,7 +2965,7 @@ int main(int argc, char** argv) {
             // Resources must still be queryable.
             auto snap1 = dp.query(out.op.value());
             CHECK(snap1.ok(), "op still queryable after shutdown TIMEOUT");
-            CHECK(snap1.value().state == OpState::IN_FLIGHT, "op still IN_FLIGHT");
+            CHECK(snap1.value().state == IoState::IN_FLIGHT, "op still IN_FLIGHT");
 
             // Target and memory still valid.
             auto ts = dp.test_target_state(open_r.value());
@@ -2985,7 +2985,7 @@ int main(int argc, char** argv) {
                 ProgressBudget pb{16, 1000000000};
                 dp.progress(pb);
                 auto snap = dp.query(out.op.value());
-                if (snap.ok() && snap.value().state != OpState::IN_FLIGHT) break;
+                if (snap.ok() && snap.value().state != IoState::IN_FLIGHT) break;
                 usleep(1000);
             }
             dp.release(out.op.value());
@@ -3076,7 +3076,7 @@ int main(int argc, char** argv) {
         CHECK(!overflow.op.has_value(), "no op minted (zero issued)");
         CHECK(overflow.status.code() == StatusCode::RESOURCE_EXHAUSTED,
               "RESOURCE_EXHAUSTED");
-        CHECK(overflow.initial_states[0].state == RequestState::REJECTED,
+        CHECK(overflow.initial_states[0].state == IoRequestState::REJECTED,
               "REJECTED state");
 
         // Drain: wait for all delays + kernels to complete.
@@ -3088,7 +3088,7 @@ int main(int argc, char** argv) {
             bool all_done = true;
             for (auto& op : ops) {
                 auto snap = dp.query(op);
-                if (!snap.ok() || snap.value().state == OpState::IN_FLIGHT) {
+                if (!snap.ok() || snap.value().state == IoState::IN_FLIGHT) {
                     all_done = false;
                     break;
                 }
@@ -3212,11 +3212,11 @@ int main(int argc, char** argv) {
                 ProgressBudget pb{16, 1000000000};
                 dp.progress(pb);
                 auto snap = dp.query(out.op.value());
-                if (snap.ok() && snap.value().state != OpState::IN_FLIGHT) break;
+                if (snap.ok() && snap.value().state != IoState::IN_FLIGHT) break;
                 usleep(1000);
             }
             auto snap = dp.query(out.op.value());
-            CHECK(snap.ok() && snap.value().state == OpState::COMPLETED,
+            CHECK(snap.ok() && snap.value().state == IoState::COMPLETED,
                   "1MiB write completed");
             CHECK(snap.value().bytes_transferred == io_size, "1MiB bytes");
             dp.release(out.op.value());
@@ -3267,7 +3267,7 @@ int main(int argc, char** argv) {
         auto out = dp.submit(&wr, 1, ctx);
         CHECK(!out.status.ok(), "wrong accel_id rejected");
         CHECK(!out.op.has_value(), "no op (zero issued)");
-        CHECK(out.initial_states[0].state == RequestState::REJECTED,
+        CHECK(out.initial_states[0].state == IoRequestState::REJECTED,
               "REJECTED");
         printf("  error: %s\n", out.status.message().c_str());
 
@@ -3380,7 +3380,7 @@ int main(int argc, char** argv) {
         // Launch failed → op must be nullopt, zero issued.
         CHECK(!out.status.ok(), "launch failure → non-OK status");
         CHECK(!out.op.has_value(), "launch failure → op nullopt (zero issued)");
-        CHECK(out.initial_states[0].state == RequestState::REJECTED,
+        CHECK(out.initial_states[0].state == IoRequestState::REJECTED,
               "REJECTED");
         printf("  launch failure error: %s\n", out.status.message().c_str());
 
@@ -3476,7 +3476,7 @@ int main(int argc, char** argv) {
 
         CHECK(drain_to_terminal(dp, wo.op.value()), "DUAL write terminal");
         auto wsnap = dp.query(wo.op.value());
-        CHECK(wsnap.ok() && wsnap.value().state == OpState::COMPLETED, "DUAL write COMPLETED");
+        CHECK(wsnap.ok() && wsnap.value().state == IoState::COMPLETED, "DUAL write COMPLETED");
         CHECK(wsnap.value().bytes_transferred == io_size, "DUAL write bytes");
         dp.release(wo.op.value());
 
@@ -3611,7 +3611,7 @@ int main(int argc, char** argv) {
 
         CHECK(drain_to_terminal(dp, wo.op.value()), "LIST write terminal");
         auto wsnap = dp.query(wo.op.value());
-        CHECK(wsnap.ok() && wsnap.value().state == OpState::COMPLETED, "LIST write COMPLETED");
+        CHECK(wsnap.ok() && wsnap.value().state == IoState::COMPLETED, "LIST write COMPLETED");
         CHECK(wsnap.value().bytes_transferred == io_size, "LIST write bytes");
         dp.release(wo.op.value());
 
@@ -4180,11 +4180,11 @@ int main(int argc, char** argv) {
 
         CHECK(outcome.status.ok(), "event-record fallback keeps accepted status");
         CHECK(outcome.op.has_value(), "issued IO returns an observable op");
-        CHECK(outcome.initial_states[0].state == RequestState::ACCEPTED,
+        CHECK(outcome.initial_states[0].state == IoRequestState::ACCEPTED,
               "issued request remains ACCEPTED");
         if (outcome.op.has_value()) {
             auto snapshot = dp.query(outcome.op.value());
-            CHECK(snapshot.ok() && snapshot.value().state == OpState::COMPLETED,
+            CHECK(snapshot.ok() && snapshot.value().state == IoState::COMPLETED,
                   "event-record fallback stores terminal completion");
             CHECK(dp.release(outcome.op.value()).ok(), "terminal fallback op releases");
         }
@@ -4250,7 +4250,7 @@ int main(int argc, char** argv) {
         CHECK(outcome.status.ok() && outcome.op.has_value(), "submit delayed LIST write");
         if (outcome.op.has_value()) {
             auto snapshot = dp.query(outcome.op.value());
-            CHECK(snapshot.ok() && snapshot.value().state == OpState::IN_FLIGHT,
+            CHECK(snapshot.ok() && snapshot.value().state == IoState::IN_FLIGHT,
                   "LIST op is in flight during delay");
             CHECK(dp.test_op_has_prp_list_dma(outcome.op.value()),
                   "LIST op owns PRP-list DMA mapping");
@@ -4451,7 +4451,7 @@ int main(int argc, char** argv) {
             auto snap = dp.query(wout.op.value());
             CHECK(snap.ok(), "SQE write query OK");
             if (snap.ok()) {
-                CHECK(snap.value().state == OpState::COMPLETED,
+                CHECK(snap.value().state == IoState::COMPLETED,
                       "SQE zero-init: WRITE COMPLETED (controller accepted SQE)");
                 CHECK(snap.value().bytes_transferred == kBlockSize,
                       "SQE write bytes correct");
@@ -4529,7 +4529,7 @@ int main(int argc, char** argv) {
             auto snap = dp.query(wout.op.value());
             CHECK(snap.ok(), "query OK");
             if (snap.ok()) {
-                CHECK(snap.value().state == OpState::FAILED,
+                CHECK(snap.value().state == IoState::FAILED,
                       "resolve_lba failure → FAILED (not COMPLETED)");
                 CHECK(!snap.value().status.ok(), "status non-OK");
                 CHECK(snap.value().bytes_transferred == 0,
@@ -4572,7 +4572,7 @@ int main(int argc, char** argv) {
             ProgressBudget pb{16, 1000000000};
             dp.progress(pb);
             auto snap = dp.query(wout2.op.value());
-            CHECK(snap.ok() && snap.value().state == OpState::COMPLETED,
+            CHECK(snap.ok() && snap.value().state == IoState::COMPLETED,
                   "normal IO COMPLETED after injection disabled");
             dp.release(wout2.op.value());
         }
@@ -4650,7 +4650,7 @@ int main(int argc, char** argv) {
             ProgressBudget pb{16, 1000000000};
             dp.progress(pb);
             auto snap = dp.query(wout.op.value());
-            CHECK(snap.ok() && snap.value().state == OpState::COMPLETED,
+            CHECK(snap.ok() && snap.value().state == IoState::COMPLETED,
                   "WRITE COMPLETED with default CQ budget");
             dp.release(wout.op.value());
         }
@@ -4703,7 +4703,7 @@ int main(int argc, char** argv) {
                 ProgressBudget pb{16, 1000000000};
                 dp.progress(pb);
                 auto snap = dp.query(out.op.value());
-                CHECK(snap.ok() && snap.value().state == OpState::COMPLETED,
+                CHECK(snap.ok() && snap.value().state == IoState::COMPLETED,
                       "SINGLE WRITE COMPLETED");
                 CHECK(snap.value().bytes_transferred == kBlockSize,
                       "SINGLE bytes == 4096");
@@ -4757,11 +4757,11 @@ int main(int argc, char** argv) {
                     ProgressBudget pb{16, 1000000000};
                     dp.progress(pb);
                     auto snap = dp.query(out.op.value());
-                    if (snap.ok() && snap.value().state != OpState::IN_FLIGHT) break;
+                    if (snap.ok() && snap.value().state != IoState::IN_FLIGHT) break;
                     usleep(1000);
                 }
                 auto snap = dp.query(out.op.value());
-                CHECK(snap.ok() && snap.value().state == OpState::COMPLETED,
+                CHECK(snap.ok() && snap.value().state == IoState::COMPLETED,
                       "LIST WRITE COMPLETED");
                 CHECK(snap.value().bytes_transferred == io_size,
                       "LIST bytes == 1MiB");
@@ -4850,7 +4850,7 @@ int main(int argc, char** argv) {
             ProgressBudget pb{16, 1000000000};
             dp.progress(pb);
             auto snap = dp.query(out.op.value());
-            if (!snap.ok() || snap.value().state != OpState::COMPLETED) return false;
+            if (!snap.ok() || snap.value().state != IoState::COMPLETED) return false;
             if (snap.value().bytes_transferred != kBlockSize) return false;
 
             Status rel = dp.release(out.op.value());
@@ -4978,7 +4978,7 @@ int main(int argc, char** argv) {
             ProgressBudget pb{16, 1000000000};
             dp.progress(pb);
             auto snap = dp.query(wout.op.value());
-            CHECK(snap.ok() && snap.value().state == OpState::COMPLETED,
+            CHECK(snap.ok() && snap.value().state == IoState::COMPLETED,
                   "production IO COMPLETED via scalar inject path");
             dp.release(wout.op.value());
         }
@@ -4995,7 +4995,7 @@ int main(int argc, char** argv) {
             ProgressBudget pb{16, 1000000000};
             dp.progress(pb);
             auto snap = dp.query(wout2.op.value());
-            CHECK(snap.ok() && snap.value().state == OpState::FAILED,
+            CHECK(snap.ok() && snap.value().state == IoState::FAILED,
                   "scalar bit0 injection → FAILED");
             std::vector<std::uint32_t> results;
             bool ok = dp.test_copy_completion_status(wout2.op.value(), results);
@@ -5067,7 +5067,7 @@ int main(int argc, char** argv) {
             auto snap = dp.query(wout.op.value());
             CHECK(snap.ok(), "query OK");
             if (snap.ok()) {
-                CHECK(snap.value().state == OpState::FAILED,
+                CHECK(snap.value().state == IoState::FAILED,
                       "nvme-error injection → FAILED");
                 CHECK(!snap.value().status.ok(), "status non-OK");
                 const std::string& msg = snap.value().status.message();
@@ -5116,7 +5116,7 @@ int main(int argc, char** argv) {
             ProgressBudget pb{16, 1000000000};
             dp.progress(pb);
             auto snap = dp.query(wout2.op.value());
-            CHECK(snap.ok() && snap.value().state == OpState::COMPLETED,
+            CHECK(snap.ok() && snap.value().state == IoState::COMPLETED,
                   "normal IO COMPLETED after nvme-error inject disabled");
             dp.release(wout2.op.value());
         }
@@ -5176,7 +5176,7 @@ int main(int argc, char** argv) {
 
             // Before injection: op should be IN_FLIGHT (event not queried yet).
             auto snap0 = dp.query(wout.op.value());
-            CHECK(snap0.ok() && snap0.value().state == OpState::IN_FLIGHT,
+            CHECK(snap0.ok() && snap0.value().state == IoState::IN_FLIGHT,
                   "op is IN_FLIGHT before progress");
 
             // Inject a persistent query error: progress() must transition
@@ -5191,7 +5191,7 @@ int main(int argc, char** argv) {
             auto snap = dp.query(wout.op.value());
             CHECK(snap.ok(), "query OK after progress");
             if (snap.ok()) {
-                CHECK(snap.value().state == OpState::FAILED,
+                CHECK(snap.value().state == IoState::FAILED,
                       "query error → FAILED (not IN_FLIGHT)");
                 CHECK(snap.value().status.code() == StatusCode::DEVICE_ERROR,
                       "FAILED status is DEVICE_ERROR");
@@ -5286,7 +5286,7 @@ int main(int argc, char** argv) {
                 auto snap = dp.query(outcome.op.value());
                 CHECK(snap.ok(), "query OK");
                 if (snap.ok()) {
-                    CHECK(snap.value().state == OpState::FAILED,
+                    CHECK(snap.value().state == IoState::FAILED,
                           "timeout → FAILED");
                     CHECK(snap.value().detail.failure_kind == IoFailureKind::CQ_TIMEOUT,
                           "structured failure kind == CQ_TIMEOUT");
@@ -5377,7 +5377,7 @@ int main(int argc, char** argv) {
                 cudaStreamSynchronize(s2);
                 CHECK(drain_to_terminal(dp2, out2.op.value()), "regression LIST drains");
                 auto snap2 = dp2.query(out2.op.value());
-                CHECK(snap2.ok() && snap2.value().state == OpState::COMPLETED,
+                CHECK(snap2.ok() && snap2.value().state == IoState::COMPLETED,
                       "regression normal LIST COMPLETED");
                 CHECK(!dp2.test_op_has_timeout(out2.op.value()),
                       "regression normal op has_timeout == false");
@@ -5481,7 +5481,7 @@ int main(int argc, char** argv) {
             bool all_done = true;
             for (auto& op : ops) {
                 auto snap = dp.query(op);
-                if (!snap.ok() || snap.value().state == OpState::IN_FLIGHT) {
+                if (!snap.ok() || snap.value().state == IoState::IN_FLIGHT) {
                     all_done = false; break;
                 }
             }
@@ -5648,7 +5648,7 @@ int main(int argc, char** argv) {
             cudaStreamSynchronize(s);
             CHECK(drain_to_terminal(dp, out.op.value()), "LIST drains to terminal");
             auto snap = dp.query(out.op.value());
-            CHECK(snap.ok() && snap.value().state == OpState::COMPLETED,
+            CHECK(snap.ok() && snap.value().state == IoState::COMPLETED,
                   "LIST COMPLETED via host pool");
             CHECK(dp.test_op_has_prp_list_dma(out.op.value()),
                   "LIST op has host-pinned PRP-list lease");
@@ -6460,9 +6460,9 @@ int main(int argc, char** argv) {
             dp.progress(pb);
             auto snap = dp.query(ro.op.value());
             if (snap.ok()) {
-                CHECK(snap.value().state != OpState::IN_FLIGHT,
+                CHECK(snap.value().state != IoState::IN_FLIGHT,
                       "op terminal after single progress (post-sync harvest)");
-                if (snap.value().state == OpState::COMPLETED) {
+                if (snap.value().state == IoState::COMPLETED) {
                     CHECK(snap.value().bytes_transferred == kBlockSize,
                           "READ transferred correct bytes");
                 }
@@ -6561,7 +6561,7 @@ int main(int argc, char** argv) {
             if (out.op.has_value()) {
                 CHECK(drain_to_terminal(dp, out.op.value()), "WRITE completed");
                 auto snap = dp.query(out.op.value());
-                CHECK(snap.ok() && snap.value().state == OpState::COMPLETED,
+                CHECK(snap.ok() && snap.value().state == IoState::COMPLETED,
                       "WRITE state COMPLETED");
                 CHECK(snap.value().bytes_transferred == io_size, "WRITE bytes");
                 std::uint32_t n_entries = dp.test_entry_count(out.op.value());
@@ -6590,7 +6590,7 @@ int main(int argc, char** argv) {
             if (out.op.has_value()) {
                 CHECK(drain_to_terminal(dp, out.op.value()), "READ completed");
                 auto snap = dp.query(out.op.value());
-                CHECK(snap.ok() && snap.value().state == OpState::COMPLETED,
+                CHECK(snap.ok() && snap.value().state == IoState::COMPLETED,
                       "READ state COMPLETED");
                 CHECK(snap.value().bytes_transferred == io_size, "READ bytes");
                 dp.release(out.op.value());
@@ -6817,7 +6817,7 @@ int main(int argc, char** argv) {
 
             bool all_rejected = (out.initial_states.size() == big.size());
             for (const auto& st : out.initial_states) {
-                if (st.state != RequestState::REJECTED) all_rejected = false;
+                if (st.state != IoRequestState::REJECTED) all_rejected = false;
             }
             CHECK(all_rejected, "every one of the 257 requests is REJECTED");
 

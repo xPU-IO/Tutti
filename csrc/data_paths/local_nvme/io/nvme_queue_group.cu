@@ -1,4 +1,4 @@
-// tutti/data_paths/local_nvme/io/nvme_queue_group.cu
+// csrc/data_paths/local_nvme/io/nvme_queue_group.cu
 //
 // NvmeQueueGroup implementation — ported from main's device_manager.
 // Creation/destruction order matches libnvm's queue-group init_queues path.

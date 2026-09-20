@@ -1,4 +1,4 @@
-// tutti/data_paths/local_nvme/io/device_target.cu
+// csrc/data_paths/local_nvme/io/device_target.cu
 //
 // Device target handle build/free — ported from main's
 // HostFsBackedNvmeStorage::build_handle_template_ / release path.

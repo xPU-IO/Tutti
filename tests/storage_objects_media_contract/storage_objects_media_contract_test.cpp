@@ -176,7 +176,7 @@ void test_striped_placement() {
     // Each shard is a whole number of stripe rounds. The formula must survive
     // the resolver's floor, which derives the object's logical size from the
     // shard FILES as  N * floor(shard_bytes / unit) * unit  (see
-    // striped_local_nvme/binding.h): sizing from the payload alone leaves the
+    // striped_local_nvme/payload.h): sizing from the payload alone leaves the
     // prefix outside that space and the last segment's write lands past the end
     // -- exactly how the first real 8-GPU run failed with
     // "target_offset + length exceeds target size".

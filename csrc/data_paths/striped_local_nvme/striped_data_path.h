@@ -1,6 +1,6 @@
 #pragma once
 
-// tutti/data_paths/striped_local_nvme/striped_data_path.h
+// csrc/data_paths/striped_local_nvme/striped_data_path.h
 //
 // StripedDataPath — single-kernel fused submission across N NVMe devices.
 //
@@ -35,7 +35,7 @@
 #include <tutti/spi/data_path.h>
 #include <tutti/status.h>
 #include <tutti/io_types.h>
-#include "csrc/bindings/striped_local_nvme/binding.h"
+#include "csrc/payloads/striped_local_nvme/payload.h"
 #include "csrc/data_paths/striped_local_nvme/striped_arena.h"
 #include "csrc/data_paths/local_nvme/metadata/prp_page_cache.h"  // Round 16 S5
 #include "csrc/data_paths/local_nvme/metadata/prp_buf_pool.h"
@@ -74,8 +74,8 @@ using tutti::ProgressResult;
 using tutti::RegistrationDomainKey;
 using tutti::ResourceProvider;
 using tutti::SubmitOutcome;
-using tutti::OpState;
-using tutti::RequestState;
+using tutti::IoState;
+using tutti::IoRequestState;
 using tutti::StatusCode;
 using tutti::Status;
 using tutti::Result;
@@ -112,18 +112,19 @@ public:
     // mdts_override: 0 = use hardware min(); else min(override, hardware min()).
     // max_batch_entries: max fan-out entries per op (bounds StripedArena sizing).
     // max_in_flight_operations: cap on concurrent IN_FLIGHT ops.
-    // handle_cache_capacity: 0 = OFF (default); >0 = GPU LRU handle cache slots.
     // prp_cache_capacity: 0 = OFF (default); >0 = PRP LIST page cache slots.
     //   (Round 16 S5: aligned to LocalNvmeDataPath's prp_cache_capacity.)
     // threads_per_block: fused submit kernel block size (1..1024, default 16).
     //   Must not exceed any device's actual queue count.
+    //
+    // 注：本 DataPath 没有 HandleWorkspaceCache 实例，故不接受
+    // handle_cache_capacity（S1）——同一配置键只对 LocalNvmeDataPath 生效。
     StripedDataPath(std::vector<DeviceDescriptor> devices,
                     std::uint32_t cuda_device = 0,
                     std::uint64_t mdts_override = 0,
                     std::uint32_t cq_poll_budget = 2000000,
                     std::uint32_t max_batch_entries = 256,
                     std::uint32_t max_in_flight_operations = 16,
-                    std::uint32_t handle_cache_capacity = 0,
                     std::uint32_t prp_cache_capacity = 0,
                     std::uint32_t threads_per_block = 16);
     ~StripedDataPath() override;
@@ -284,7 +285,7 @@ private:
     };
 
     struct OpEntry {
-        OpState state = OpState::IN_FLIGHT;
+        IoState state = IoState::IN_FLIGHT;
         Status status;
         std::uint64_t bytes_transferred = 0;
         std::uint64_t total_bytes = 0;
@@ -353,8 +354,7 @@ private:
     std::uint32_t max_batch_entries_ = 0;
     std::uint64_t max_in_flight_operations_ = 0;
     std::uint32_t threads_per_block_ = 16;
-    // Round 16 S5: cache capacities (default OFF, aligned to LocalNvme).
-    std::uint32_t handle_cache_capacity_ = 0;
+    // Round 16 S5: cache capacity (default OFF, aligned to LocalNvme).
     std::uint32_t prp_cache_capacity_ = 0;
     std::uint32_t block_size_ = 0;         // uniform across all shards
     std::uint64_t max_request_bytes_ = 0;  // max_batch_entries_ * effective_mdts_bytes_
@@ -370,8 +370,8 @@ private:
     std::vector<std::unique_ptr<tutti::data_paths::local_nvme::PrpBufPool>> prp_buf_pools_;
     bool timeout_prp_retained_ = false;
 
-    std::uint64_t next_target_ = 1;
-    std::uint64_t next_memory_ = 1;
+    std::uint64_t next_target_token_ = 1;
+    std::uint64_t next_memory_token_ = 1;
     std::uint64_t next_op_token_ = 1;
     // Registration domain shared by every target of this DataPath: the
     // memory registration maps the buffer for ALL devices_ regardless of

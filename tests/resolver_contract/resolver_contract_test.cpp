@@ -27,13 +27,13 @@
 //  20. FIEMAP flag rejection via test-only fixture (UNWRITTEN, SHARED, etc.).
 //  21. payload type/version/key compatibility with LocalNvmeDataPath.
 
-#include <csrc/resolvers/local_file/resolver.h>
+#include "csrc/resolvers/local_file/resolver.h"
 
 #include <tutti/status.h>
 #include <tutti/spi/storage_target_resolver.h>
-#include <csrc/bindings/ext4_local_nvme/binding.h>
+#include "csrc/payloads/ext4_local_nvme/payload.h"
 
-#include "../hardware_test_directory.h"
+#include "tests/hardware_test_directory.h"
 
 #include <cerrno>
 #include <cctype>
@@ -50,7 +50,7 @@
 #include <utility>
 #include <vector>
 
-namespace binding = tutti::binding::ext4_local_nvme;
+namespace payloads = tutti::payloads::ext4_local_nvme;
 namespace resolver_ns = tutti::resolvers::local_file;
 
 // =====================================================================
@@ -199,7 +199,7 @@ static void test_normal_path(const std::string& dir) {
         ok = ok && rt.valid();
         ok = ok && rt.logical_size() == sz;
 
-        auto vp = binding::view_payload(rt);
+        auto vp = payloads::view_payload(rt);
         ok = ok && vp.ok() && vp.value() != nullptr;
         if (ok) {
             const auto* p = vp.value();
@@ -271,7 +271,7 @@ static void test_view_payload_roundtrip(const std::string& dir) {
 
     bool ok = false;
     if (result.ok()) {
-        auto vp = binding::view_payload(result.value());
+        auto vp = payloads::view_payload(result.value());
         if (vp.ok() && vp.value()) {
             const auto* p = vp.value();
             ok = p->file_size() == sz;
@@ -299,7 +299,7 @@ static void test_map_to_device(const std::string& dir) {
 
     bool ok = false;
     if (result.ok()) {
-        auto vp = binding::view_payload(result.value());
+        auto vp = payloads::view_payload(result.value());
         if (vp.ok() && vp.value()) {
             const auto* p = vp.value();
 
@@ -347,7 +347,7 @@ static void test_filefrag_cross(const std::string& dir) {
 
     bool ok = false;
     if (result.ok()) {
-        auto vp = binding::view_payload(result.value());
+        auto vp = payloads::view_payload(result.value());
         if (vp.ok() && vp.value()) {
             const auto* p = vp.value();
 
@@ -527,7 +527,7 @@ static void test_fd_lease_lifetime(const std::string& dir) {
         auto result = resolver.resolve("file://" + path, {"file"});
         if (!result.ok()) { cleanup_file(path); test_result("fd lease lifetime", false); return; }
 
-        auto vp = binding::view_payload(result.value());
+        auto vp = payloads::view_payload(result.value());
         ok = vp.ok() && vp.value() != nullptr;
         std::printf("  payload accessible during RT lifetime: %s\n",
             ok ? "OK" : "FAIL");
@@ -559,12 +559,12 @@ static void test_lease_move(const std::string& dir) {
 
     tutti::ResolvedTarget moved_to = std::move(result.value());
 
-    auto vp = binding::view_payload(moved_to);
+    auto vp = payloads::view_payload(moved_to);
     bool ok = vp.ok() && vp.value() != nullptr && vp.value()->file_size() == sz;
 
     {
         tutti::ResolvedTarget scoped = std::move(moved_to);
-        auto vp2 = binding::view_payload(scoped);
+        auto vp2 = payloads::view_payload(scoped);
         ok = ok && vp2.ok();
     }
 
@@ -637,7 +637,7 @@ static void test_multi_round(const std::string& dir) {
         return;
     }
 
-    auto vp_d = binding::view_payload(result_default.value());
+    auto vp_d = payloads::view_payload(result_default.value());
     if (!vp_d.ok() || !vp_d.value()) {
         cleanup_file(path_a); cleanup_file(path_b);
         test_result("multi-round FIEMAP (exts_per_call=1 vs default)", false);
@@ -672,7 +672,7 @@ static void test_multi_round(const std::string& dir) {
         return;
     }
 
-    auto vp_s = binding::view_payload(result_small.value());
+    auto vp_s = payloads::view_payload(result_small.value());
     if (!vp_s.ok() || !vp_s.value()) {
         cleanup_file(path_a); cleanup_file(path_b);
         test_result("multi-round FIEMAP (exts_per_call=1 vs default)", false);
@@ -723,7 +723,7 @@ static void test_namespace_base(const std::string& dir) {
         cleanup_file(path);
         test_result("namespace_base", false); return;
     }
-    auto vp0 = binding::view_payload(r0.value());
+    auto vp0 = payloads::view_payload(r0.value());
     if (!vp0.ok() || !vp0.value()) {
         cleanup_file(path);
         test_result("namespace_base", false); return;
@@ -738,7 +738,7 @@ static void test_namespace_base(const std::string& dir) {
     auto r1 = resolver_base1m.resolve("file://" + path, {"file"});
     bool ok = r1.ok();
     if (ok) {
-        auto vp1 = binding::view_payload(r1.value());
+        auto vp1 = payloads::view_payload(r1.value());
         ok = vp1.ok() && vp1.value();
         if (ok) {
             std::uint64_t shifted = vp1.value()->extents()[0].device_offset;
@@ -934,13 +934,13 @@ static void test_payload_compatibility(const std::string& dir) {
     if (result.ok()) {
         auto& rt = result.value();
         // Verify type/version/key match binding constants.
-        ok = rt.payload_type_id() == binding::kPayloadTypeId;
-        ok = ok && rt.source_api_version() == binding::kPayloadApiVersion;
-        ok = ok && rt.recommended_data_path_key() == binding::kRecommendedDataPathKey;
-        ok = ok && rt.resolver_type_id() == binding::kResolverTypeId;
+        ok = rt.payload_type_id() == payloads::kPayloadTypeId;
+        ok = ok && rt.source_api_version() == payloads::kPayloadApiVersion;
+        ok = ok && rt.recommended_data_path_key() == payloads::kRecommendedDataPathKey;
+        ok = ok && rt.resolver_type_id() == payloads::kResolverTypeId;
 
         // Verify view_payload succeeds (same as LocalNvmeDataPath::open does).
-        auto vp = binding::view_payload(rt);
+        auto vp = payloads::view_payload(rt);
         ok = ok && vp.ok() && vp.value() != nullptr;
 
         // Verify fd lease is held.

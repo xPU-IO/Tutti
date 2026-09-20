@@ -1,5 +1,7 @@
 #include "csrc/data_paths/data_path_factory.h"
 
+#include "csrc/common/backend_ids.h"
+
 #include <algorithm>
 #include <limits>
 #include <memory>
@@ -7,7 +9,7 @@
 #include <utility>
 #include <vector>
 
-#include "csrc/bindings/memfs/memfs_data_path.h"
+#include "csrc/payloads/memfs/memfs_data_path.h"
 #if defined(TUTTI_DATA_PATH_FACTORY_HAS_LOCAL_NVME)
 #include "csrc/data_paths/local_nvme/local_nvme_data_path.h"
 #include "csrc/data_paths/striped_local_nvme/striped_data_path.h"
@@ -18,6 +20,7 @@
 namespace tutti::data_paths {
 namespace {
 
+namespace backend_ids = tutti::detail::backend_ids;
 namespace memory_resource = tutti::resources::memory;
 namespace nvme_resource = tutti::resources::nvme;
 
@@ -59,9 +62,9 @@ Result<std::unique_ptr<const ResourceView>> datapath_view(
 Result<CreatedDataPath> create_memfs(
     const config::DataPathSpec& spec,
     const DataPathCreateContext& context) {
-    if (spec.type != "memfs" ||
+    if (spec.type != backend_ids::kMemfsDataPathType ||
         !std::holds_alternative<config::MemfsDataPathConfig>(spec.config) ||
-        context.relation.contract != "memfs" ||
+        context.relation.contract != backend_ids::kMemfsContract ||
         !std::holds_alternative<config::MemfsBackendConfig>(
             context.relation.config)) {
         return failure<CreatedDataPath>(
@@ -77,7 +80,7 @@ Result<CreatedDataPath> create_memfs(
     }
 
     CreatedDataPath result;
-    result.instance = std::make_unique<binding::memfs::MemfsDataPath>();
+    result.instance = std::make_unique<payloads::memfs::MemfsDataPath>();
     result.initialize_config = DataPathConfig{"memfs"};
     return Result<CreatedDataPath>::Success(std::move(result));
 }
@@ -105,9 +108,9 @@ const config::NvmeDataPathTuning& tuning(
 Result<CreatedDataPath> create_local_nvme(
     const config::DataPathSpec& spec,
     const DataPathCreateContext& context) {
-    if (spec.type != "local-nvme" ||
+    if (spec.type != tutti::detail::backend_ids::kExt4DataPathType ||
         !std::holds_alternative<config::LocalNvmeDataPathConfig>(spec.config) ||
-        context.relation.contract != "ext4-local-nvme" ||
+        context.relation.contract != backend_ids::kExt4Contract ||
         !std::holds_alternative<config::Ext4LocalNvmeBackendConfig>(
             context.relation.config)) {
         return failure<CreatedDataPath>(
@@ -134,7 +137,7 @@ Result<CreatedDataPath> create_local_nvme(
     // multiple concurrent submitters per queue.  The data path itself
     // emits a warning in that case.
     auto max_batch_entries = checked_u32(
-        tuning(spec).max_batch_entries, "max_batch_entries");
+        config.max_batch_entries, "max_batch_entries");
     if (!max_batch_entries.ok()) {
         return failure<CreatedDataPath>(max_batch_entries.status());
     }
@@ -164,10 +167,10 @@ Result<CreatedDataPath> create_local_nvme(
 Result<CreatedDataPath> create_striped_local_nvme(
     const config::DataPathSpec& spec,
     const DataPathCreateContext& context) {
-    if (spec.type != "striped-local-nvme" ||
+    if (spec.type != backend_ids::kStripedDataPathType ||
         !std::holds_alternative<config::StripedLocalNvmeDataPathConfig>(
             spec.config) ||
-        context.relation.contract != "striped-local-nvme") {
+        context.relation.contract != backend_ids::kStripedContract) {
         return failure<CreatedDataPath>(
             invalid("striped-local-nvme DataPathSpec does not match backend relation"));
     }
@@ -224,7 +227,6 @@ Result<CreatedDataPath> create_striped_local_nvme(
         0,
         max_batch_entries.value(),
         max_in_flight.value(),
-        config.handle_cache_capacity,
         config.prp_cache_capacity,
         config.threads_per_block);
     result.initialize_config = DataPathConfig{"striped-local-nvme"};

@@ -46,7 +46,9 @@ struct NvmeDeviceConfig {
 // Configuration for single-disk LocalNvmeDataPath.
 struct LocalNvmePreset {
     NvmeDeviceConfig device;
-    std::int32_t gpu_id = 0;
+    // Accelerator index (CUDA device ordinal); 命名与 io_types.h 的
+    // HostSubmitContext::accel_id 对齐（N2）。
+    std::int32_t accel_id = 0;
     std::uint32_t num_queues = 16;
     // Capacity knobs (0 = use defaults)
     std::uint32_t max_batch_entries = 4096;
@@ -59,7 +61,7 @@ struct LocalNvmePreset {
 // Configuration for 4-disk striped mode.
 struct StripedNvmePreset {
     std::vector<NvmeDeviceConfig> devices;  // typically 4
-    std::int32_t gpu_id = 0;
+    std::int32_t accel_id = 0;  // 见 LocalNvmePreset::accel_id
     std::uint32_t num_queues = 32;           // per-device
     std::uint64_t stripe_unit = 524288;     // 512 KiB (tensor-aligned)
     std::uint32_t max_batch_entries = 8192;

@@ -1,7 +1,7 @@
 #pragma once
 #include "csrc/data_paths/local_nvme/io/prp_builder.h"  // AddressDescriptor
 
-// tutti/data_paths/striped_local_nvme/fused_submit_kernel.cuh
+// csrc/data_paths/striped_local_nvme/fused_submit_kernel.cuh
 //
 // Fused submit kernel: a SINGLE cudaLaunchKernel that dispatches IO entries
 // to N NVMe devices.  Each entry carries a dev_idx that indexes into a

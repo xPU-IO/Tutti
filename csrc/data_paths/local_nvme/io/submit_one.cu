@@ -1,4 +1,4 @@
-// tutti/data_paths/local_nvme/io/submit_one.cu
+// csrc/data_paths/local_nvme/io/submit_one.cu
 //
 // Host launcher for the one-thread-per-entry NVMe IO kernel.
 // Ported from main's nvme_batch_xfer_kernel.cu launch shape. The launcher
