@@ -1,6 +1,6 @@
 #pragma once
 
-// tutti/data_paths/local_nvme/metadata/prp_page_cache.h
+// csrc/data_paths/local_nvme/metadata/prp_page_cache.h
 //
 // Single-tier content-addressed LRU cache for PRP-list pages.
 //
@@ -88,7 +88,6 @@ public:
         std::uint64_t ioaddr = 0;     // DMA IOVA of the page (host-side)
         std::uint32_t pin_count = 0;
         std::uint32_t checkout_refcount = 0;  // P0-1: >0 while checked out by submit
-        bool in_use = false;  // deprecated: superseded by checkout_refcount
     };
 
     PrpPageCache() = default;
@@ -136,7 +135,6 @@ public:
         if (!e) return;
         std::lock_guard<std::mutex> lock(mtx_);
         if (e->checkout_refcount > 0) --e->checkout_refcount;
-        e->in_use = (e->checkout_refcount > 0) || (e->pin_count > 0);
         if (e->pin_count == 0 && e->checkout_refcount == 0) {
             std::uint32_t slot = static_cast<std::uint32_t>(e - entries_.data());
             if (index_.count(e->key) && !lru_pos_.count(slot)) {
@@ -152,7 +150,6 @@ public:
         // P0-1: decrement checkout_refcount (the submit path checked it out,
         // now it's being pinned for the op's lifetime).
         if (e->checkout_refcount > 0) --e->checkout_refcount;
-        e->in_use = false;  // no longer just "checked out" — now pinned
         ++e->pin_count;
         ++stats_.pinned;
         auto it = lru_pos_.find(static_cast<std::uint32_t>(e - entries_.data()));
@@ -205,10 +202,6 @@ public:
         std::lock_guard<std::mutex> lock(mtx_);
         return stats_;
     }
-
-    // Test accessor: check if a page's DMA mapping is active.
-    // Returns true if the pool DMA mapping exists (cache initialized).
-    bool test_dma_active() const { return pool_dma_ != nullptr; }
 
 private:
     Config cfg_{};

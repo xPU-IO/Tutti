@@ -54,8 +54,6 @@ enum class CheckpointRejection {
     kMalformedBody,       // internally inconsistent entry stream
 };
 
-const char* to_string(CheckpointRejection rejection) noexcept;
-
 // -------------------------------------------------------------------------
 // encode_checkpoint
 //

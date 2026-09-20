@@ -1,4 +1,4 @@
-// tutti/data_paths/local_nvme/metadata/prp_page_cache.cpp
+// csrc/data_paths/local_nvme/metadata/prp_page_cache.cpp
 //
 // PrpPageCache init/shutdown + get_or_build (host-pinned pool; the miss
 // path is a plain host memcpy — no CUDA, no stream, no events).
@@ -132,7 +132,6 @@ PrpPageCache::Entry* PrpPageCache::get_or_build(const Key& key,
         std::uint32_t slot = it->second;
         Entry& hit = entries_[slot];
         ++hit.checkout_refcount;  // P0-1: re-checkout increments refcount
-        hit.in_use = true;        // backward compat
         remove_from_lru_(slot);   // checked-out entries are not evictable
         ++stats_.hits;
         return &hit;
@@ -147,7 +146,6 @@ PrpPageCache::Entry* PrpPageCache::get_or_build(const Key& key,
     e.key = key;
     e.pin_count = 0;
     e.checkout_refcount = 1;  // P0-1: new entry starts with one checkout
-    e.in_use = true;  // backward compat
     e.vaddr = static_cast<char*>(pool_host_) +
               static_cast<std::size_t>(slot) * cfg_.page_size;
     e.ioaddr = pool_dma_->ioaddrs[slot];
@@ -157,7 +155,7 @@ PrpPageCache::Entry* PrpPageCache::get_or_build(const Key& key,
                        key.start_page, key.pages_in_io, cfg_.page_size);
 
     index_[key] = slot;
-    // Do NOT add to LRU — entry is in_use (checked out by submit).
+    // Do NOT add to LRU — entry is checked out by submit.
     // unpin() adds it to LRU when the op releases it.
     ++stats_.entries;
     return &e;
@@ -178,7 +176,6 @@ std::uint32_t PrpPageCache::get_or_build_batch(BatchItem* items,
             std::uint32_t slot = it->second;
             Entry& hit = entries_[slot];
             ++hit.checkout_refcount;
-            hit.in_use = true;
             remove_from_lru_(slot);
             ++stats_.hits;
             item.result = &hit;
@@ -194,7 +191,6 @@ std::uint32_t PrpPageCache::get_or_build_batch(BatchItem* items,
         e.key = item.key;
         e.pin_count = 0;
         e.checkout_refcount = 1;
-        e.in_use = true;
         e.vaddr = static_cast<char*>(pool_host_) +
                   static_cast<std::size_t>(slot) * cfg_.page_size;
         e.ioaddr = pool_dma_->ioaddrs[slot];

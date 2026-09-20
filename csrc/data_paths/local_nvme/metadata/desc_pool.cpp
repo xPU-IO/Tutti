@@ -1,4 +1,4 @@
-// tutti/data_paths/local_nvme/metadata/desc_pool.cpp
+// csrc/data_paths/local_nvme/metadata/desc_pool.cpp
 //
 // R19 S3 REQUIRED 3: GPU descriptor pool implementation.
 
