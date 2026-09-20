@@ -1213,12 +1213,38 @@ class TuttiKVStore:
         self._stream_mode = "host"
         self._stream_accel_id = None
         self._execution = "device"
+        # 写排在读之后（默认开）。NVMe 读写混跑会互相拖慢：同一 rank 实测并发
+        # 时读 kernel +52%（2.08→3.16ms）、写 +31%（0.71→0.93ms），带宽利用率
+        # 明显下降。开启后 worker 在写流上插一次 wait_event(最新读层 fence)，
+        # 由设备侧保证"先读后写"（Python 不缓冲、不轮询）。实测：读写重叠
+        # 40/80 → 7/80，写 kernel 0.81→0.61ms、读 2.62→2.38ms，墙钟中性。
+        # 设为 0 可关（读写持续并发的负载若出现写饥饿，用它回退）。
+        self._defer_writes_after_reads = (
+            os.environ.get("TUTTI_DEFER_WRITES_AFTER_READS", "1") != "0"
+        )
 
     # ---------- 生命周期 ----------
 
     @property
     def capacity_chunks(self) -> int:
         return self._num_chunks
+
+    @property
+    def defer_writes_after_reads(self) -> bool:
+        """写批是否应排在读批之后（见 TUTTI_DEFER_WRITES_AFTER_READS）。"""
+        return self._defer_writes_after_reads
+
+    def wait_write_stream_event(self, event) -> None:
+        """让后续写 IO 在设备侧排在 ``event`` 之后（主机不阻塞）。
+
+        只加设备侧依赖：写批照原节奏下发，fuse kernel 在 GPU 上等到该事件触发
+        才执行。用于把 NVMe 读与写错开（混跑实测读 +52%、写 +31%）。
+        """
+        stream = self._write_stream_obj
+        wait = getattr(stream, "wait_event", None)
+        if stream is None or not callable(wait):
+            return
+        wait(event)
 
     @property
     def max_in_flight_operations(self) -> int:

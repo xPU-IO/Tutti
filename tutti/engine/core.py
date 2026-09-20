@@ -323,6 +323,18 @@ class _DirectAllLayerReadPlan:
             raise error
         self.advanced_callbacks.add(callback)
 
+    def latest_read_event(self):
+        """最新**已提交**读层的 fence 事件（没有则 None）。
+
+        供写侧在写流上插一次 ``wait_event``，把写排在读之后（设备侧排序，
+        主机不阻塞）。feeder 会把全部读层在请求开头提交完，因此它推进到最后一
+        层后，这个事件就代表"全部读完成"（同一读流按层序提交，FIFO）。
+        """
+        with self._state_lock:
+            if not self.read_ready_events:
+                return None
+            return self.read_ready_events[max(self.read_ready_events)]
+
     def require_complete(self) -> None:
         self.join_feeder()
         expected = set(range(self.layer_count))
