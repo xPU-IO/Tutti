@@ -1664,6 +1664,11 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
     PrpBufRef prp_buf_ref;
     nvm_dma_t* prp_dma = nullptr;
     std::uint32_t prp_ioaddrs_base = 0;
+    // Holds the host-pool pages until an op takes ownership. On every early
+    // exit between here and the op construction the pages go back to the pool;
+    // otherwise each rejected submit would strand a segment's worth of pinned
+    // host memory.
+    PrpBufLease host_prp_lease;
 
     // Fill PRP-list pages if needed.
     // Two paths:
@@ -1737,6 +1742,7 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
                            "host PrpBufPool allocation failed");
                 return outcome;
             }
+            host_prp_lease = PrpBufLease(&prp_buf_pool_, prp_buf_ref);
             prp_dma = prp_buf_ref.segment;
             prp_ioaddrs_base = static_cast<std::uint32_t>(prp_buf_ref.base_page);
             std::uint32_t list_idx = 0;
@@ -1955,6 +1961,7 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
         op.prp_list_dma = prp_dma;
         op.prp_ioaddrs_base = prp_ioaddrs_base;
         op.prp_buf_ref = prp_buf_ref;
+        if (host_prp_lease.owns()) host_prp_lease.disown();  // op 接管这些页
         op.prp_list_page_count = total_list_ios;
         op.op_token = op_token;
         op.op_generation = 1;
@@ -2018,6 +2025,7 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
     op.prp_list_dma = prp_dma;
     op.prp_ioaddrs_base = prp_ioaddrs_base;
     op.prp_buf_ref = prp_buf_ref;
+    if (host_prp_lease.owns()) host_prp_lease.disown();  // op 接管这些页
     op.prp_list_page_count = total_list_ios;
     op.op_token = op_token;
     op.op_generation = 1;
@@ -2205,6 +2213,17 @@ Status LocalNvmeDataPath::release_impl_(DataPathOp op) {
         for (const auto& ref : entry->prp_cache_refs) {
             prp_cache_.unpin(ref.entry);
         }
+        // Return the host-pool pages this op owned. The cache-miss path
+        // allocates a fresh range per submit (PrpPageCache is off by default),
+        // so without this the pool grows by a segment per such submit instead
+        // of tracking the in-flight working set -- measured as 48 MB/request of
+        // pinned host memory on the 8-GPU online service (an OOM in hours).
+        if (entry->prp_buf_ref.valid) {
+            prp_buf_pool_.release_pages(entry->prp_buf_ref.segment,
+                                        entry->prp_buf_ref.base_page,
+                                        entry->prp_buf_ref.num_pages);
+            entry->prp_buf_ref = PrpBufRef{};
+        }
     }
     for (auto* hc_entry : entry->handle_cache_refs) {
         handle_cache_.unpin(hc_entry);
@@ -2278,6 +2297,14 @@ bool LocalNvmeDataPath::test_op_has_resources(DataPathOp op) const {
         return false;
     }
     return true;
+}
+
+std::uint64_t LocalNvmeDataPath::test_prp_pool_leased_pages() const {
+    return prp_buf_pool_.leased_pages();
+}
+
+std::uint64_t LocalNvmeDataPath::test_prp_pool_total_pages() const {
+    return prp_buf_pool_.total_pages();
 }
 
 void LocalNvmeDataPath::test_set_inject_launch_failure(bool v) {

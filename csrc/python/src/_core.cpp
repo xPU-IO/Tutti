@@ -901,6 +901,9 @@ tutti::StoreConfig store_config_from_py(const py::dict& config) {
     if (config.contains("prewarm_slots")) {
         out.prewarm_slots = py::cast<std::uint64_t>(config["prewarm_slots"]);
     }
+    if (config.contains("warmup_probe_only")) {
+        out.warmup_probe_only = py::cast<bool>(config["warmup_probe_only"]);
+    }
     out.layout.segment_bytes = py::cast<std::uint64_t>(config["segment_bytes"]);
     out.layout.segment_count = py::cast<std::uint32_t>(config["segment_count"]);
     if (config.contains("namespace_fingerprint")) {
@@ -1134,6 +1137,35 @@ public:
         if (!status.ok()) throw_status("object_store.checkpoint", status);
     }
 
+    // ---- asynchronous growth ----
+
+    std::uint64_t precreated_slots() const {
+        return store().precreated_slots();
+    }
+
+    std::uint64_t precreate_target() const {
+        return store().precreate_target();
+    }
+
+    void set_precreate_on_write(bool enabled) {
+        store().set_precreate_on_write(enabled);
+    }
+
+    // Called by the grower thread, never by a request thread. The IO runs with
+    // the GIL released and with the store lock dropped between slots, so a
+    // request thread waits for at most one slot's create+fsync.
+    std::uint64_t precreate_step(std::uint64_t max_slots,
+                                  std::uint64_t headroom) {
+        auto outcome = [&]() {
+            py::gil_scoped_release release;
+            return store().precreate_step(max_slots, headroom);
+        }();
+        if (!outcome.ok()) {
+            throw_status("object_store.precreate_step", outcome.status());
+        }
+        return outcome.value();
+    }
+
 private:
     tutti::StorageObjectStore& store() const {
         if (!store_) {
@@ -1221,7 +1253,13 @@ PYBIND11_MODULE(_core, m) {
         .def("pin", &PyObjectStore::pin, py::arg("keys"))
         .def("unpin", &PyObjectStore::unpin, py::arg("keys"))
         .def("recover", &PyObjectStore::recover)
-        .def("checkpoint", &PyObjectStore::checkpoint);
+        .def("checkpoint", &PyObjectStore::checkpoint)
+        .def("precreate_step", &PyObjectStore::precreate_step,
+             py::arg("max_slots"), py::arg("headroom"))
+        .def("precreated_slots", &PyObjectStore::precreated_slots)
+        .def("precreate_target", &PyObjectStore::precreate_target)
+        .def("set_precreate_on_write", &PyObjectStore::set_precreate_on_write,
+             py::arg("enabled"));
 
     m.def("make_local_nvme_runtime", &make_local_nvme_runtime,
           py::arg("preset"));

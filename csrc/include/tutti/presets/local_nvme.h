@@ -64,7 +64,16 @@ struct StripedNvmePreset {
     std::int32_t accel_id = 0;  // 见 LocalNvmePreset::accel_id
     std::uint32_t num_queues = 32;           // per-device
     std::uint64_t stripe_unit = 524288;     // 512 KiB (tensor-aligned)
-    std::uint32_t max_batch_entries = 8192;
+    // 单次 submit() 的 sub-IO 条目上限。KV 直连路径一层的条目数 = 本步要搬的
+    // block 数，由负载决定（长 prompt + 高并发时实测 9248 > 旧上限 8192），
+    // 调用方无法先验保证；上限按 1M token/rank 的 HBM 池极限（16384 blocks
+    // × 32 KiB）取整，覆盖单层理论最大宽度。
+    // 显存账（per rank，num_slots = 2×max_in_flight = 8，N=2 盘）：
+    //   entry 24B + status 8B + descriptor 24B = 56B/条目
+    //   dev_table = max(2048, entries×N) × 8B
+    //   → 16384×56 + 32768×8 = 1.125 MiB/slot × 8 = 9 MiB（8192 时为 4.5 MiB）
+    // 仍超上限的批由上层按上限切成多次 submit（见 store._submit_retry）。
+    std::uint32_t max_batch_entries = 16384;
     std::uint32_t max_in_flight_operations = 4;
     std::uint32_t threads_per_block = 16;
     std::uint32_t prp_cache_capacity = 4096;

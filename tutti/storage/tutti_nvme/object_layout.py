@@ -25,8 +25,26 @@
 
 from __future__ import annotations
 
+import logging
 import os
+import threading
 from pathlib import Path
+
+# 挂在 tutti 树下的专属通道（connector 会为该树挂 handler 放行 INFO）。
+_PRECREATE_LOG = logging.getLogger("tutti.precreate")
+
+# 后台预建的节奏。batch 决定一次调用最多认领多少槽位（存储锁只在认领与发布
+# 时短暂持有，所以真正决定"写路径最多等多久"的是单槽 IO，而非 batch）；
+# idle 是没有可做的工作时的轮询间隔。
+_PRECREATE_BATCH_SLOTS = 64
+_PRECREATE_IDLE_SLEEP_S = 0.5
+# 认领在飞时的重试间隔：这个状态最长持续一次单槽 IO（~44ms），只需让出一
+# 点时间，避免四个线程一起空转白烧四个核。
+_PRECREATE_FLIGHT_SLEEP_S = 0.002
+# 需求驱动增长的默认就绪余量（槽位）。写路径永不等预建，余量的作用只是把
+# "增长跟不上需求"的概率压低：按 44ms/槽的单线程速度，1024 槽约 45s 的追赶
+# 余量，足够吸收突发。
+_MIN_PRECREATE_HEADROOM_SLOTS = 1024
 
 from tutti.index.chunk_index import decode_io_key as _decode
 from tutti.storage.object_store import (
@@ -59,6 +77,7 @@ class ObjectLayout:
         rank_id: int = 0,
         rank_count: int = 1,
         background_reclaim: bool = True,
+        warmup_probe_only: bool = False,
         namespace: bytes | str | None = None,
     ):
         self._root = Path(root)
@@ -85,6 +104,11 @@ class ObjectLayout:
         self._rank_id = int(rank_id)
         self._rank_count = int(rank_count)
         self._background_reclaim = bool(background_reclaim)
+        # open 期预热口径：True = 只走查已存在的槽位、不建缺失的（配后台预建）；
+        # False = 旧同步语义（把缺失的预热槽位建出来）。
+        self._warmup_probe_only = bool(warmup_probe_only)
+        # 后台预建线程的停止信号（None = 未启动），见 start_background_precreate。
+        self._precreate_stop: threading.Event | None = None
         self._namespace = (
             namespace.encode("utf-8") if isinstance(namespace, str) else namespace
         )
@@ -163,6 +187,7 @@ class ObjectLayout:
             # 对象头前缀会向上取整到整个条带轮，本层不该重算）。
             "capacity_slots": self._capacity_chunks,
             "prewarm_slots": prewarm_chunks,
+            "warmup_probe_only": self._warmup_probe_only,
             "segment_bytes": self._segment_bytes,
             "segment_count": self._layer_span,
             "namespace_fingerprint": self._namespace or b"",
@@ -222,6 +247,143 @@ class ObjectLayout:
     def slot_payload_bytes(self) -> int:
         """每个对象的 payload 字节数（各槽位一致，用于预热票据的尺寸校验）。"""
         return self._segment_bytes * int(self._layer_span or 0)
+
+    # ---------- 后台预建（大容量冷启动与按需增长都不在关键路径上）----------
+
+    def start_background_precreate(self, threads: int = 4,
+                                   headroom: int = 0,
+                                   full_capacity: bool = True) -> bool:
+        """后台预建槽位（一路补到容量或只补就绪余量），写路径不等它。
+
+        术语（与 SPI 头部一致）：**预热**是 open 期同步做掉的那一份；
+        **预建**是把槽位文件建成"尺寸正确、内容为零"的可用状态（~44ms/槽）；
+        **就绪**表示已预建、可被分配。
+
+        与"复用"的关系（决定这批文件的来历，也决定这里要不要干活）：
+          * 容量 ≤ 盘上已有的槽位 → open 的走查已把它们记成就绪，本方法
+            不动任何文件（复用立即生效，零 IO、零异步）；
+          * 容量 > 盘上已有的槽位 → 差量在这里异步补（full_capacity=True
+            时一路补到容量上限）；已经存在的那部分由 C++ 的幂等探测跳过，
+            所以"复用"与"增长"合在同一条前沿上，不重复劳动。
+        就绪余量 headroom 只在 full_capacity=False 时有意义：增长总是从低到
+        高、跟随分配前沿，所以先满足的正是即将被分配到的槽位。
+
+        为什么必须异步：预建一个槽位是 create + 写实零 + fsync（~44ms/槽，见
+        space_allocator 的注释），放在哪一端都是灾难——
+          * 放在 open 期：10 TB 级容量要几十分钟才起得来；
+          * 放在写路径（C++ reserve 的按需预建）：每个新槽位把前向线程卡
+            44ms，正好打在 GPU 计算/IO 流水线上。
+
+        因此契约拆成两半（见 storage_object_store.h 的异步增长一节）：
+          * open 只**走查**（probe，不写）调用方声明的初始槽位，把已经存在
+            的那些记成就绪——复用不花 IO，也不进异步；
+          * 本方法打开 ``set_precreate_on_write(False)``——写路径拿不到
+            就绪槽位时**拒绝并要求调用方裁剪**，与容量耗尽同一契约，且
+            自愈：后台追上后同一笔写就会成功；
+          * 增长由这里的后台线程驱动，容量上限仍然生效。
+
+        失败自愈：后台出错时立刻把按需预建交还写路径——宁慢，不静默停摆
+        （池子停止增长是看不见的容量故障）。
+        幂等：可安全重复启动。
+        返回 True 表示已启动（或无需启动）。
+        """
+        if self._precreate_stop is not None:
+            return True
+        store = self._store
+        step = getattr(store, "precreate_step", None)
+        if not callable(step):
+            # 原生扩展还没有异步预建接口：维持写路径按需预建（旧行为）。
+            return False
+        capacity = int(self._capacity_chunks)
+        # full_capacity：一路补到容量上限（"容量比已有的多多少就异步补多少"）；
+        # 关掉则只保持需求余量，多出来的容量留着不建文件（省盘、省后台带宽）。
+        keep = capacity if full_capacity else max(
+            1, int(headroom or _MIN_PRECREATE_HEADROOM_SLOTS)
+        )
+        try:
+            store.set_precreate_on_write(False)
+        except Exception as exc:
+            _PRECREATE_LOG.warning(
+                "BACKGROUND_PRECREATE_DISABLED err=%r", exc
+            )
+            return False
+        stop = threading.Event()
+        self._precreate_stop = stop
+
+        def run(index: int) -> None:
+            worked = False
+            while not stop.is_set():
+                try:
+                    made = step(_PRECREATE_BATCH_SLOTS, keep)
+                except Exception as exc:
+                    _PRECREATE_LOG.warning(
+                        "BACKGROUND_PRECREATE_FAILED thread=%d err=%r；"
+                        "把按需预建交还写路径",
+                        index, exc,
+                    )
+                    stop.set()
+                    try:
+                        store.set_precreate_on_write(True)
+                    except Exception:
+                        pass
+                    return
+                if made > 0:
+                    # 有活就接着干，不在批次之间空等——追赶分配前沿时
+                    # 这条循环是热路径，睡眠会把它拖慢到 1/500。
+                    worked = True
+                    continue
+                # 返回 0 有两种可能：真无事可做（已到 target），或这一次的
+                # 认领都还在飞（别人刚认领走了）。只有前者该让出 CPU，
+                # 后者必须立刻重试，否则多线程会退化成 2 次/秒。
+                if store.precreated_slots() < store.precreate_target():
+                    # 让出极短时间再重试：这个状态最长持续一次单槽 IO
+                    # （~44ms），但四个线程一起空转会白烧四个核。
+                    stop.wait(_PRECREATE_FLIGHT_SLEEP_S)
+                    continue
+                if worked:
+                    # 从"有活"回到"无事可做"：这是外部唯一能观测到预建
+                    # 已补齐的信号（线程名不进 /proc，CPU 也测不出来）。
+                    worked = False
+                    _PRECREATE_LOG.info(
+                        "BACKGROUND_PRECREATE_CAUGHT_UP precreated=%d "
+                        "target=%d capacity=%d scope=%s",
+                        store.precreated_slots(), store.precreate_target(),
+                        capacity, "capacity" if full_capacity else "demand",
+                    )
+                # 没有可做的工作（分配前沿还没推过来，或已到容量上限）：
+                # 让出 CPU，等下一次需求把它叫醒。
+                stop.wait(_PRECREATE_IDLE_SLEEP_S)
+
+        workers = max(1, min(int(threads), 32))
+        for index in range(workers):
+            threading.Thread(
+                target=run, args=(index,),
+                name=f"tutti-precreate-{index}", daemon=True,
+            ).start()
+        _PRECREATE_LOG.info(
+            "BACKGROUND_PRECREATE_START reused=%d capacity=%d scope=%s "
+            "headroom=%d threads=%d batch=%d",
+            store.precreated_slots(), capacity,
+            "capacity" if full_capacity else "demand",
+            keep, workers, _PRECREATE_BATCH_SLOTS,
+        )
+        return True
+
+    def stop_background_precreate(self) -> None:
+        """请求后台预建停止（close 时调用；线程是 daemon，不阻塞退出）。
+
+        同时把按需预建交还写路径：增长线程没了，池子若还在被写入，就必须
+        退回"自己建槽"的慢路径，而不是永远拒绝。
+        """
+        if self._precreate_stop is not None:
+            self._precreate_stop.set()
+            self._precreate_stop = None
+        restore = getattr(self._store, "set_precreate_on_write", None)
+        if callable(restore):
+            try:
+                restore(True)
+            except Exception:
+                pass
 
     def committed_chunks(self) -> set[bytes]:
         """已提交（= 层齐全）的 chunk 集合；层宽未定案时为空集。"""

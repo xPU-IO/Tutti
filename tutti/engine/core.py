@@ -1146,8 +1146,18 @@ class KVEngine:
         """
         if not isinstance(self._transfer, DirectTransfer):
             return
-        self._transfer.close()
-        self._transfer = None
+        try:
+            self._transfer.close()
+        except Exception as exc:
+            # 高并发下别的请求仍持有票据，close 会以 BUSY 失败（实测
+            # close_batch failed: BUSY: target has inflight operations）。它
+            # 是清理失败、不是准入失败的原因，让它顶替真实原因会把排查方向
+            # 整体带偏（真机上最显眼的那行 Tutti 报错就是它）。
+            _LOG.error(
+                "DIRECT_FALLBACK_CLOSE_FAILED reason=%s cleanup=%s", reason, exc
+            )
+        else:
+            self._transfer = None
         raise DirectTransferUnavailable(str(reason)) from reason
 
     def bind(

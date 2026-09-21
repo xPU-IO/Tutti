@@ -15,7 +15,7 @@
 // which is why every structure in this layer is sized in whole 4096-byte units
 // and why buffers come from posix_memalign rather than std::vector.
 //
-// This layer performs HOST-side metadata IO only: object headers, materialising
+// This layer performs HOST-side metadata IO only: object headers, precreating
 // space, re-zeroing on reclaim. Payload IO is the caller's job via the
 // GPU-direct DataPath, using an ObjectPlacement. Keeping payload out of here is
 // what preserves the premise that KV data never passes through host memory.
@@ -76,6 +76,15 @@ private:
 Status materialise_slot(const std::vector<std::string>& paths,
                         std::uint64_t bytes_per_shard);
 
+// Probe only: whether every shard already occupies `bytes_per_shard` on media.
+// Creates nothing -- unlike materialise_slot this does not even O_CREAT, so it
+// can be used to prove that a slot is reusable without touching the media.
+// A missing shard is (*out = false), not an error: the caller leaves the slot
+// to the grower. Real IO errors are reported, so an unreadable pool fails
+// loudly instead of looking like an empty one.
+Status slot_is_precreated(const std::vector<std::string>& paths,
+                            std::uint64_t bytes_per_shard, bool* out);
+
 // Rewrite zeros over a slot's payload region, for reclamation. Does NOT resize.
 // The header region is zeroed too, which is what actually invalidates the
 // object: a zero magic decodes as "never written" rather than as corruption.
@@ -115,7 +124,7 @@ Status write_checkpoint_container(const std::string& path, std::uint64_t offset,
 Status read_checkpoint_container(const std::string& path, std::uint64_t offset,
                                  std::uint8_t* out, std::size_t out_bytes);
 
-// Create the file if absent and ensure it is at least `bytes`, materialising
+// Create the file if absent and ensure it is at least `bytes`, precreating
 // with real zeros. Used for the checkpoint region.
 Status ensure_metadata_file(const std::string& path, std::uint64_t bytes);
 

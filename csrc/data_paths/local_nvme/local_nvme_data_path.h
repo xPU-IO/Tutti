@@ -221,6 +221,16 @@ public:
     // Returns true if the op's arena lease is still held (not yet released).
     bool test_op_has_resources(DataPathOp op) const;
 
+    // ---- test-only: host PRP pool accounting ----
+    // Pages currently handed out to ops. Must return to 0 once every op has
+    // been released, and must not grow across repeated identical submits --
+    // the submit path allocates per cache miss, so a missing release shows up
+    // here as unbounded growth (pinned host memory, one segment at a time).
+    std::uint64_t test_prp_pool_leased_pages() const;
+    // Pages mapped in total (capacity). Grows only when the free list cannot
+    // satisfy a request; stable across identical submit rounds once warm.
+    std::uint64_t test_prp_pool_total_pages() const;
+
     // ---- test-only: submit failure injection seams ----
     // Simulates a pre-launch failure after resource reservation, proving
     // op=nullopt + zero-issued when no kernel was issued.

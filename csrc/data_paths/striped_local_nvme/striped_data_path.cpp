@@ -1522,6 +1522,8 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
     // locked batch per device (was: one mutex round-trip per entry).
     // Otherwise: growing host-pinned pool (no GPU backing or PRP H2D).
     std::vector<tutti::data_paths::local_nvme::PrpBufRef> prp_buf_refs;
+    // 错误路径归还：op 接管前任何 return 都不得把页面漏在池外。
+    std::vector<tutti::data_paths::local_nvme::PrpBufLease> host_prp_leases;
     if (!list_infos.empty()) {
         std::vector<bool> li_cached(list_infos.size(), false);
         std::vector<std::uint64_t> li_ioaddr(list_infos.size(), 0);
@@ -1571,6 +1573,8 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
                 return outcome;
             }
             prp_buf_refs.push_back(refs_by_dev[d]);
+            host_prp_leases.emplace_back(prp_buf_pools_[d].get(),
+                                        refs_by_dev[d]);
         }
         std::vector<std::uint64_t> next_page(devices_.size(), 0);
         for (std::size_t i = 0; i < list_infos.size(); ++i) {
@@ -1692,7 +1696,13 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
     op.event = event;
     op.stream = ctx.stream;
     op.arena_slot = lease.slot_index;
-    op.prp_buf_refs = std::move(prp_buf_refs);
+    // op 接管页面所有权：把池指针一并记下，完成路径才知道还给谁。
+    for (auto& lease : host_prp_leases) {
+        op.prp_buf_refs.push_back(
+            {lease.pool(), lease.segment(), lease.base_page(),
+             lease.num_pages()});
+        lease.disown();
+    }
     op.op_token = op_token;
     op.op_generation = 1;
     op.target_token = targets_in_batch[0].token;  // Round 16 S4: first target for tracking
@@ -1895,6 +1905,22 @@ Result<DataPathSnapshot> StripedDataPath::query_impl_(DataPathOp op) const {
     return Result<DataPathSnapshot>::Success(std::move(snap));
 }
 
+std::uint64_t StripedDataPath::test_prp_pool_leased_pages() const {
+    std::uint64_t total = 0;
+    for (const auto& pool : prp_buf_pools_) {
+        if (pool) total += pool->leased_pages();
+    }
+    return total;
+}
+
+std::uint64_t StripedDataPath::test_prp_pool_total_pages() const {
+    std::uint64_t total = 0;
+    for (const auto& pool : prp_buf_pools_) {
+        if (pool) total += pool->total_pages();
+    }
+    return total;
+}
+
 Status StripedDataPath::release_impl_(DataPathOp op) {
     auto* entry = find_op_(op);
     if (!entry) {
@@ -1917,8 +1943,20 @@ Status StripedDataPath::release_impl_(DataPathOp op) {
         for (const auto& ref : entry->prp_cache_refs) {
             ref.cache->unpin(ref.entry);
         }
+        // Return the host-pinned PRP-list pages to the pool that served them.
+        // A cache-missing submit allocates a fresh range per device (PrpPageCache
+        // is off by default), so without this the pools grow by a segment per
+        // such submit instead of tracking the in-flight working set -- measured
+        // as 48 MB/request of pinned host memory online (an OOM in hours).
+        for (const auto& ref : entry->prp_buf_refs) {
+            if (ref.pool != nullptr && ref.num_pages != 0) {
+                ref.pool->release_pages(ref.segment, ref.base_page,
+                                        ref.num_pages);
+            }
+        }
     }
     entry->prp_cache_refs.clear();
+    entry->prp_buf_refs.clear();
     ops_.erase(op.token());
     return Status::Ok();
 }

@@ -50,9 +50,14 @@ NUM_GPU_BLOCKS_OVERRIDE="${NUM_GPU_BLOCKS_OVERRIDE:-768}"
 # 几何换算成槽位数（geometry.apply_capacity_bytes）。默认 4 TiB → 四盘各
 # 约 1 TiB。用了它就不要同时给 num_chunks（两者互斥）。
 CAPACITY_BYTES="${CAPACITY_BYTES:-$(( 4 * 1024 * 1024 * 1024 * 1024 ))}"
-# 物化预热槽位数：默认全量（4 TiB 对应的槽数），启动一次付清；否则长跑
-# 期间每个新槽位会在写路径上按需物化（~44ms 实零写，见 space_allocator）。
-HIGH_WATERMARK="${HIGH_WATERMARK:-209715}"
+# 同步预热槽位数：open() 期只付这一份（首个请求 + 头几秒的工作集）。
+# 其余容量由后台线程异步铺开（TUTTI_MATERIALIZE_*），写路径永不 create+fsync
+# 槽位——10 TB 级的容量因此不再等于几十分钟启动或 44ms/槽的前向停顿。
+HIGH_WATERMARK="${HIGH_WATERMARK:-4096}"
+# 后台预建：线程数（0 = 关闭，退回写路径按需建槽）。口径见 TUTTI_PRECREATE_SCOPE。
+# 余量 = 保持"分配前沿之前"多少个槽位已就绪；跟不上需求时写入被裁剪（不阻塞）。
+export TUTTI_PRECREATE_THREADS="${TUTTI_PRECREATE_THREADS:-4}"
+export TUTTI_PRECREATE_HEADROOM="${TUTTI_PRECREATE_HEADROOM:-4096}"
 # 工作集（仅用于日志展示）
 CHUNKS_PER_REQ=$(( (MAX_PROMPT_TOKENS + CHUNK_TOKENS - 1) / CHUNK_TOKENS ))
 WORKING_SET=$(( SAMPLES * CHUNKS_PER_REQ ))
@@ -131,6 +136,7 @@ exec "$PYTHON" -m vllm.entrypoints.openai.api_server \
     --load-format "$LOAD_FORMAT" \
     --num-gpu-blocks-override "$NUM_GPU_BLOCKS_OVERRIDE" \
     --enable-prefix-caching \
+    --enable-log-requests \
     --enable-auto-tool-choice \
     --tool-call-parser "$TOOL_CALL_PARSER" \
     --port "$PORT" \

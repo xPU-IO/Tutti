@@ -7793,6 +7793,110 @@ int main(int argc, char** argv) {
             for (const auto& p : paths) ::unlink(p.c_str());
         }
 
+        // =====================================================================
+        // 91. host PRP pool accounting: release returns the pages, and repeated
+        //     identical submit rounds must not grow the pool.
+        // =====================================================================
+        // PrpPageCache is off in this deployment, so EVERY submit takes its
+        // PRP-list pages from the growable host-pinned pool. That pool had no
+        // release at all: it grew by a segment per cache-missing submit, i.e.
+        // 48 MB/request of pinned host memory in the online 8-GPU service (an
+        // OOM within hours, with resident chunk count frozen). These assertions
+        // pin the contract: pages come back on release, and the pool stops
+        // growing once warm.
+        TEST_CASE("91. host PRP pool: release returns pages, no growth per round");
+        {
+            LocalNvmeDataPath dp = make_qg_dp();
+            auto init_r = init_dp(dp);
+            CHECK(init_r.ok(), "initialize");
+            if (!init_r.ok()) goto next_prp_pool;
+
+            {
+                const uint64_t io_size = 1 * 1024 * 1024;  // > MDTS => PRP list
+                auto rf = make_resolved_file("round19_t91.bin", io_size, 0x91);
+                CHECK(rf.target.ok(), "resolve 1MiB file");
+                if (!rf.target.ok()) { dp.shutdown(0); goto next_prp_pool; }
+                auto open_r = dp.open(rf.target.value());
+                CHECK(open_r.ok(), "open");
+                if (!open_r.ok()) {
+                    dp.shutdown(0);
+                    ::unlink(rf.path.c_str());
+                    goto next_prp_pool;
+                }
+
+                void* raw = nullptr;
+                void* buf = cuda_malloc_aligned_64k(io_size, &raw);
+                auto mem = dp.register_memory(
+                    DataPathMemoryView{buf, io_size, 0,
+                                       DataPathMemoryKind::DEVICE},
+                    primary_registration_domain());
+                CHECK(mem.ok(), "register");
+                if (!mem.ok()) {
+                    cudaFree(raw);
+                    dp.shutdown(0);
+                    ::unlink(rf.path.c_str());
+                    goto next_prp_pool;
+                }
+
+                cudaStream_t s;
+                cudaStreamCreate(&s);
+                HostSubmitContext ctx{ExecutionDomain::DEVICE_EXECUTION, 0, s};
+
+                auto run_round = [&]() -> bool {
+                    std::vector<DataPathOp> ops;
+                    for (int i = 0; i < 4; ++i) {
+                        DataPathRequest wr;
+                        wr.intent.direction = IoDirection::WRITE;
+                        wr.memory = mem.value();
+                        wr.intent.memory_offset = 0;
+                        wr.target = open_r.value();
+                        wr.intent.target_offset = 0;
+                        wr.intent.length = io_size;
+                        auto out = dp.submit(&wr, 1, ctx);
+                        if (!out.status.ok() || !out.op.has_value()) {
+                            return false;
+                        }
+                        ops.push_back(out.op.value());
+                    }
+                    for (auto& op : ops) {
+                        if (!drain_to_terminal(dp, op)) return false;
+                        dp.release(op);
+                    }
+                    return true;
+                };
+
+                CHECK(run_round(), "first round submits and completes");
+                const std::uint64_t leased_first =
+                    dp.test_prp_pool_leased_pages();
+                const std::uint64_t total_first =
+                    dp.test_prp_pool_total_pages();
+                printf("  pool after round 1: leased=%llu total=%llu pages\n",
+                       (unsigned long long)leased_first,
+                       (unsigned long long)total_first);
+                CHECK(total_first > 0, "pool served PRP-list pages");
+                CHECK(leased_first == 0,
+                      "every leased page returned on release");
+
+                bool later_ok = true;
+                for (int r = 0; r < 2 && later_ok; ++r) {
+                    later_ok = run_round();
+                }
+                CHECK(later_ok, "two more identical rounds complete");
+                CHECK(dp.test_prp_pool_leased_pages() == 0,
+                      "no pages out after later rounds");
+                CHECK(dp.test_prp_pool_total_pages() == total_first,
+                      "pool does not grow across identical rounds (no leak)");
+
+                cudaStreamDestroy(s);
+                cudaFree(raw);
+                dp.unregister_memory(mem.value());
+                dp.close(open_r.value());
+                dp.shutdown(0);
+                ::unlink(rf.path.c_str());
+            }
+        next_prp_pool:;
+        }
+
         next_l2_tests:;
 
         runtime_hc->shutdown(1);

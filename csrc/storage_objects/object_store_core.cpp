@@ -35,6 +35,11 @@ Status read_only_error(const char* operation) {
                   std::string(operation) + ": store is read-only");
 }
 
+// How many slots a grower may claim beyond the precreated prefix. Bounds the
+// out-of-order completion set, and stops a stalled grower from parking the
+// prefix far behind its cursor.
+constexpr std::uint64_t kPrecreateClaimWindow = 64;
+
 } // namespace
 
 ObjectStoreCore::ObjectStoreCore() = default;
@@ -160,7 +165,7 @@ Status ObjectStoreCore::open(const StoreConfig& config) {
         if (!meta_status.ok()) return meta_status;
     }
 
-    // Recover before prewarming. Recovery may find slots already materialised
+    // Recover before prewarming. Recovery may find slots already precreated
     // and in use, and prewarming first would be wasted work on a warm pool.
     // A missing checkpoint is a cold start either way, so the read-only path
     // needs no special casing here.
@@ -172,9 +177,22 @@ Status ObjectStoreCore::open(const StoreConfig& config) {
     // roughly 225 MB/s per rank, so a terabyte is on the order of an hour.
     // capacity_bytes is only a ceiling; prewarm_bytes is what open() pays for.
     if (!config_.read_only) {
-        const Status warmed =
-            materialise_through_locked(allocator_.prewarm_slots());
-        if (!warmed.ok()) return warmed;
+        if (config_.warmup_probe_only) {
+            // 增长由后台预建驱动（set_precreate_on_write(false)）：open 只
+            // 走查调用方声明的前缀，把已经在盘上的记成就绪。复用不花 IO，
+            // 容量差量留给后台，大容量冷启动因此不在 open 期付建文件的代价。
+            const Status reused =
+                adopt_existing_through_locked(allocator_.prewarm_slots());
+            if (!reused.ok()) return reused;
+        } else {
+            // 默认（同步）语义：把缺失的预热槽位建出来。这是历史行为，
+            // 未启用后台预建的部署与测试都走这条。
+            const Status warmed =
+                precreate_through_locked(allocator_.prewarm_slots());
+            if (!warmed.ok()) return warmed;
+        }
+        precreate_cursor_ = precreated_;
+        precreate_done_.clear();
     }
 
     // Residency bitmaps last: their slot_count depends on the final geometry.
@@ -297,20 +315,38 @@ Status ObjectStoreCore::ensure_layout_locked() {
 }
 
 // -------------------------------------------------------------------------
-// materialisation
+// precreate
 // -------------------------------------------------------------------------
 
-Status ObjectStoreCore::materialise_through_locked(
+Status ObjectStoreCore::adopt_existing_through_locked(
     std::uint64_t slot_exclusive_end) {
     const std::uint64_t limit =
         std::min(slot_exclusive_end, allocator_.total_slots());
-    while (materialised_ < limit) {
+    while (precreated_ < limit) {
         std::vector<std::string> paths;
-        const Status resolved = placement_->paths_for_slot(materialised_, &paths);
+        const Status resolved = placement_->paths_for_slot(precreated_, &paths);
+        if (!resolved.ok()) return resolved;
+        bool present = false;
+        const Status probed =
+            slot_is_precreated(paths, shard_bytes_, &present);
+        if (!probed.ok()) return probed;
+        if (!present) break;   // the prefix stays contiguous; the grower takes it
+        ++precreated_;
+    }
+    return {};
+}
+
+Status ObjectStoreCore::precreate_through_locked(
+    std::uint64_t slot_exclusive_end) {
+    const std::uint64_t limit =
+        std::min(slot_exclusive_end, allocator_.total_slots());
+    while (precreated_ < limit) {
+        std::vector<std::string> paths;
+        const Status resolved = placement_->paths_for_slot(precreated_, &paths);
         if (!resolved.ok()) return resolved;
         const Status made = materialise_slot(paths, shard_bytes_);
         if (!made.ok()) return made;
-        ++materialised_;
+        ++precreated_;
     }
     return {};
 }
@@ -425,13 +461,13 @@ StoreUsage ObjectStoreCore::usage() const {
 std::uint64_t ObjectStoreCore::ready_slots() const {
     std::lock_guard<std::mutex> guard(mutex_);
     if (!opened_) return 0;
-    // materialised_ is the count of slots whose files actually exist on media
+    // precreated_ is the count of slots whose files actually exist on media
     // (prewarmed here, or recovered from a previous process). Do NOT derive
     // this from SpaceAllocatorStats::unmaterialised_slots: that is the
     // allocator's high-water mark of *handed out* slots, which stays at zero
     // through prewarm, so the bind-time warm-up saw an empty pool and the first
     // IO paid the whole peer-memory registration on the request path.
-    return materialised_;
+    return precreated_;
 }
 
 std::string ObjectStoreCore::slot_uri(std::uint64_t slot) const {
@@ -499,11 +535,21 @@ Result<ReserveOutcome> ObjectStoreCore::reserve(const ObjectKey* keys,
         const std::uint64_t slot = got.slots[0];
         const std::uint64_t generation = got.generations[0];
 
-        // Materialise on demand when prewarm did not cover this slot. This is
+        if (slot >= precreated_ && !precreate_on_write_) {
+            // Growth belongs to the background caller (precreate_step): a
+            // forward thread must never create+fsync a slot, which costs tens
+            // of milliseconds each. Refusing is the same non-blocking contract
+            // as capacity exhaustion -- the caller trims -- and the slot
+            // becomes available as soon as the grower reaches it.
+            allocator_.abort(&slot, 1);
+            ++out.rejected_count;
+            continue;
+        }
+        // Precreate on demand when prewarm did not cover this slot. This is
         // the one place reserve can be slow (~44 ms per slot), which is why
         // prewarm_bytes should cover the working set.
-        if (slot >= materialised_) {
-            const Status made = materialise_through_locked(slot + 1);
+        if (slot >= precreated_) {
+            const Status made = precreate_through_locked(slot + 1);
             if (!made.ok()) {
                 allocator_.abort(&slot, 1);
                 ++out.rejected_count;
@@ -711,9 +757,88 @@ std::uint64_t ObjectStoreCore::drain_reclaim(std::uint64_t max) {
     return done.size();
 }
 
-std::uint64_t ObjectStoreCore::materialised_slots() const {
+std::uint64_t ObjectStoreCore::precreated_slots() const {
     std::lock_guard<std::mutex> guard(mutex_);
-    return materialised_;
+    return precreated_;
+}
+
+std::uint64_t ObjectStoreCore::precreate_target() const {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return precreate_target_;
+}
+
+void ObjectStoreCore::set_precreate_on_write(bool enabled) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    precreate_on_write_ = enabled;
+}
+
+Result<std::uint64_t> ObjectStoreCore::precreate_step(
+    std::uint64_t max_slots, std::uint64_t headroom) {
+    std::uint64_t done = 0;
+    while (done < max_slots) {
+        std::uint64_t slot = 0;
+        std::uint64_t shard_bytes = 0;
+        std::vector<std::string> paths;
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            if (!opened_) {
+                return Result<std::uint64_t>::Failure(
+                    Status(StatusCode::NOT_READY, "store is not open"));
+            }
+            if (config_.read_only) {
+                return Result<std::uint64_t>::Success(done);
+            }
+            const std::uint64_t total = allocator_.total_slots();
+            const SpaceAllocatorStats stats = allocator_.stats();
+            // Slots never handed out: the allocation frontier is everything
+            // below that. Growth follows demand by `headroom` slots.
+            const std::uint64_t frontier = total - stats.unmaterialised_slots;
+            const std::uint64_t target = std::min(total, frontier + headroom);
+            // Published so callers can tell "no work left" from "every claim is
+            // in flight right now": both return 0 created slots, but only the
+            // first one means the grower may go idle.
+            precreate_target_ = target;
+            if (precreate_cursor_ >= target) {
+                return Result<std::uint64_t>::Success(done);
+            }
+            if (precreate_cursor_ - precreated_ >=
+                kPrecreateClaimWindow) {
+                return Result<std::uint64_t>::Success(done);
+            }
+            slot = precreate_cursor_++;
+            // Resolve under the lock -- placement_ is not documented thread
+            // safe -- but do the IO outside it. Holding mutex_ across a
+            // create+fsync is exactly what makes a synchronous precreate
+            // expensive for every other caller.
+            const Status resolved = placement_->paths_for_slot(slot, &paths);
+            if (!resolved.ok()) {
+                --precreate_cursor_;
+                return Result<std::uint64_t>::Failure(resolved);
+            }
+            shard_bytes = shard_bytes_;
+        }
+
+        const Status made = materialise_slot(paths, shard_bytes);
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            if (made.ok()) {
+                precreate_done_.insert(slot);
+                // Publish in order: [0, precreated_) stays "on media" even
+                // when several growers finish out of order.
+                while (precreate_done_.erase(precreated_) > 0) {
+                    ++precreated_;
+                }
+            }
+            // A failure deliberately leaves the cursor where it is: another
+            // grower may already have claimed past this slot, and handing the
+            // number out again would write the same file twice. The hole keeps
+            // the prefix from advancing, which is safe -- reserve() refuses
+            // everything at or beyond it -- and the caller is told.
+        }
+        if (!made.ok()) return Result<std::uint64_t>::Failure(made);
+        ++done;
+    }
+    return Result<std::uint64_t>::Success(done);
 }
 
 // -------------------------------------------------------------------------
@@ -901,7 +1026,7 @@ Status ObjectStoreCore::load_checkpoint_locked() {
 
     // Recovered slots are already materialised on media; record that so
     // reserve() does not try to materialise them again.
-    materialised_ = std::max(materialised_, highest_slot);
+    precreated_ = std::max(precreated_, highest_slot);
     commit_seq_ = std::max(commit_seq_, highest_seq);
 
     // Move the recovered slots through reserve->commit in the allocator so its

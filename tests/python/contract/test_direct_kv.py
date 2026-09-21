@@ -195,6 +195,7 @@ class FakeStoreOwner:
         self._num_chunks = 16
         self._live = set()
         self._targets = {}
+        self._submit_width_limit = None
         self.put_results = []
         self.ensure_targets_calls = 0
 
@@ -224,6 +225,9 @@ class FakeStoreOwner:
 
     def _submit_retry(self, requests, direction):
         return TuttiKVStore._submit_retry(self, requests, direction)
+
+    def _batch_width_limit(self):
+        return TuttiKVStore._batch_width_limit(self)
 
     def _on_put_settled(self, ok, io_keys):
         self.put_results.append((ok, tuple(io_keys)))
@@ -777,6 +781,34 @@ def test_direct_capacity_is_distinct_from_batch_width():
             chunk_tokens=256, segment_bytes=8192,
             max_chunks_per_wave=2,
         )
+
+
+def test_direct_batch_wider_than_limit_is_not_rejected():
+    """批宽超过 runtime 单次提交上限不是准入错误——由提交层切成多次 submit。
+
+    在线实测（TP8 + 2 盘条带 / 每 chunk 4 block / max_batch_entries=8192）：
+    某一保存步攒出 2158 个 chunk（8632 entries）、某一读层展开 9248 entries。
+    批宽由本步要搬多少 chunk 决定，调用方无法先验保证；曾经在这里抛
+    DirectAdmissionError，经 fallback_from_direct 关闭直连绑定后把整个 engine
+    拖死。切分见 test_tutti_store.py 的预切/拆半用例。
+    """
+    backend = TuttiDirectBackend(FakeStoreOwner(FakeRuntime(max_batch=4)))
+    assert backend.register_paged_caches(
+        FakePool(128), num_layers=3, blocks_per_chunk=2,
+        chunk_tokens=256, segment_bytes=8192,
+        max_chunks_per_wave=2,
+    )
+    # 5 张表 = 10 entries > max_batch=4：照常受理。
+    tables = [[0, 1], [2, 3], [4, 5], [6, 7], [0, 1]]
+    assert len(backend.validate_block_tables(tables)) == len(tables)
+
+    # 登记时未声明波宽也一样（宽度不再参与准入判定）。
+    no_wave = TuttiDirectBackend(FakeStoreOwner(FakeRuntime(max_batch=4)))
+    assert no_wave.register_paged_caches(
+        FakePool(128), num_layers=3, blocks_per_chunk=2,
+        chunk_tokens=256, segment_bytes=8192,
+    )
+    assert len(no_wave.validate_block_tables([[0, 1], [2, 3], [4, 5]])) == 3
 
 
 def test_direct_admission_failure_reason_is_deterministic():

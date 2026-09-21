@@ -208,6 +208,25 @@ class ObjectStore:
     def checkpoint(self) -> None:
         self._required().checkpoint()
 
+    # ---- 异步增长（见 SPI 的对应小节）----
+
+    def precreate_step(self, max_slots: int, headroom: int) -> int:
+        """把预建前沿推进至多 max_slots 个槽位（后台线程调用，非请求路径）。"""
+        return int(self._required().precreate_step(int(max_slots),
+                                                     int(headroom)))
+
+    def precreated_slots(self) -> int:
+        """[0, n) 的槽位已确定存在于介质上。"""
+        return int(self._required().precreated_slots())
+
+    def precreate_target(self) -> int:
+        """最近一次 precreate_step() 算出的前沿：就绪到它就说明追上了需求。"""
+        return int(self._required().precreate_target())
+
+    def set_precreate_on_write(self, enabled: bool) -> None:
+        """写路径是否允许自己 create+fsync 槽位（False = 交给后台增长）。"""
+        self._required().set_precreate_on_write(bool(enabled))
+
     # ---- 内部 ----
 
     def _required(self):

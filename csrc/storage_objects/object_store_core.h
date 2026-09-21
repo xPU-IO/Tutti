@@ -35,6 +35,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <tutti/spi/storage_object_store.h>
@@ -100,6 +101,18 @@ public:
     Result<std::vector<ObjectKey>> recover() override;
     Status checkpoint() override;
 
+    // ---- asynchronous growth: precreate (see the SPI contract for 术语) ----
+
+    // Advance the precreated prefix by at most `max_slots` slots, stopping
+    // early once `headroom` slots exist beyond the allocation frontier. The
+    // lock is held only to claim a slot and to publish its completion, so a
+    // concurrent reserve/commit never waits for more than one slot's IO.
+    Result<std::uint64_t> precreate_step(std::uint64_t max_slots,
+                                        std::uint64_t headroom) override;
+    std::uint64_t precreated_slots() const override;
+    std::uint64_t precreate_target() const override;
+    void set_precreate_on_write(bool enabled) override;
+
     // ---- test seams ----
 
     const RecoveryReport& recovery_report() const { return recovery_; }
@@ -107,7 +120,6 @@ public:
     // driven by a background thread; exposed so a single-threaded test can step
     // it deterministically. Returns the number reclaimed.
     std::uint64_t drain_reclaim(std::uint64_t max);
-    std::uint64_t materialised_slots() const;
 
 private:
     struct Entry {
@@ -127,7 +139,14 @@ private:
     // Build the placement policy from config_.devices when it was not injected.
     // No-op for the injected form.
     Status build_backend_locked();
-    Status materialise_through_locked(std::uint64_t slot_exclusive_end);
+    // Adopt the prefix of slots already on media (probe only, writes nothing),
+    // stopping at the first one that is missing. Used at open(): a pool being
+    // reused is proven reusable without any IO, and a pool being grown keeps
+    // the precreate cost off the open() path.
+    Status adopt_existing_through_locked(std::uint64_t slot_exclusive_end);
+    // Precreate every slot below `slot_exclusive_end`. Only the write path uses
+    // this, and only when precreate_on_write_ is enabled.
+    Status precreate_through_locked(std::uint64_t slot_exclusive_end);
     ObjectPlacement placement_locked(std::uint64_t slot,
                                      std::uint64_t generation) const;
     Status write_header_locked(std::uint64_t slot, const ObjectKey& key,
@@ -151,7 +170,19 @@ private:
 
     std::uint64_t slot_bytes_ = 0;        // header + payload, per slot
     std::uint64_t shard_bytes_ = 0;       // per shard file
-    std::uint64_t materialised_ = 0;      // slots [0, materialised_) are real
+    std::uint64_t precreated_ = 0;        // slots [0, precreated_) are ready
+    // Asynchronous growth. Claims come from `precreate_cursor_` and the prefix
+    // only advances in order, so [0, precreated_) stays "on media" even with
+    // several precreate threads; `precreate_done_` holds slots that finished
+    // out of order.
+    std::uint64_t precreate_cursor_ = 0;
+    std::unordered_set<std::uint64_t> precreate_done_;
+    // 最近一次 precreate_step() 算出的前沿（就绪到这个数就算追上需求）。
+    std::uint64_t precreate_target_ = 0;
+    // True = the write path may create+fsync a slot itself (the historical
+    // behaviour). False = growth belongs to precreate_step() and reserve()
+    // rejects a slot that is not ready yet instead of blocking on it.
+    bool precreate_on_write_ = true;
     std::uint64_t commit_seq_ = 0;        // monotonic, shared with checkpoints
     std::uint64_t checkpoint_seq_ = 0;
     std::uint64_t container_bytes_ = 0;

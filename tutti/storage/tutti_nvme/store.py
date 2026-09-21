@@ -38,6 +38,21 @@ from tutti.index.chunk_index import decode_io_key, derive_io_key
 #: 运行日志（池归属校验等部署问题的非静默说明）。
 _LOG = logging.getLogger(__name__)
 
+# runtime 在"这一批太宽"时给出的 RESOURCE_EXHAUSTED 文案（见 datapath 的
+# max_batch_entries / max_batch_bytes 检查）。这类拒绝可以用拆批解决，不该
+# 升级成 worker 崩溃：一批多宽由本步要搬多少 chunk 决定（长 prompt + 高并发
+# 时实测 9248 条，当时上限 8192；上限已提到 16384 = 1M token/rank 的单层
+# 理论最大宽度），不是调用方能先验保证的。
+_BATCH_WIDTH_REJECTION_MARKERS = (
+    "too many sub-IOs",
+    "batch bytes exceed limit",
+)
+
+
+def _is_batch_width_rejection(status_msg: str | None) -> bool:
+    text = status_msg or ""
+    return any(marker in text for marker in _BATCH_WIDTH_REJECTION_MARKERS)
+
 #: KV IO 页基：register_buffer 粒度必须为其正倍数（对齐 NVMe/DMA 路径）。
 _IO_PAGE_BYTES = 4096
 
@@ -681,11 +696,18 @@ class TuttiDirectBackend:
         max_batch = int(
             caps.get("max_batch_entries", caps.get("max_batch_requests", 0)) or 0
         )
+        # 单次 submit 的宽度**不是准入条件**：超宽批由 store._submit_retry 按
+        # runtime 上限切成多次提交（预切 + 被拒拆半）。这里只观测。
+        # 曾经在这抛 DirectAdmissionError：在线实测（TP8 + 2 盘条带，
+        # num_layers=80）一层展开 8632 > 8192 就被判越界，经
+        # fallback_from_direct 关掉整个直连绑定（close_batch BUSY），最终以
+        # EngineDeadError 终止服务。批宽由本步要搬多少 chunk 决定，调用方无法
+        # 先验保证，切分才是正确处理。
         request_count = len(validated_tables) * geometry.blocks_per_chunk
         if max_batch and request_count > max_batch:
-            raise DirectAdmissionError(
-                f"direct layer expands to {request_count} requests, "
-                f"max_batch_entries={max_batch}"
+            _LOG.debug(
+                "DIRECT_LAYER_WIDE requests=%d limit=%d（按上限切成多次提交）",
+                request_count, max_batch,
             )
         return validated_tables
 
@@ -749,7 +771,11 @@ class TuttiDirectBackend:
             f"|chunks={len(keys)}|requests={len(requests)}"
         ):
             handles = store._submit_retry(requests, direction)
-        _LOG.info(
+        # 逐层计时：debug 级。原先用 info 会在每层每方向打一行——实测高负载下
+        # 占日志总行数 97%（4.26M/4.37M 行、867 MB），既淹没真问题（排查 OOM
+        # 时被冲掉），又让格式化本身成为可观开销。要看时开
+        # VLLM_LOGGING_LEVEL=DEBUG。
+        _LOG.debug(
             "DIRECT_SUBMIT_TIMING direction=%s layer=%d chunks=%d requests=%d "
             "python_request_build_ms=%.3f runtime_submit_ms=%.3f",
             direction, layer_idx, len(keys), len(requests),
@@ -1111,7 +1137,8 @@ class TuttiKVStore:
                  pool_wait_timeout_s: float = 5.0,
                  allocator_enabled: bool = True,
                  rank_id: int = 0, tp_size: int = 1,
-                 defer_writes_after_reads: bool | None = None):
+                 defer_writes_after_reads: bool | None = None,
+                 precreate_threads: int | None = None):
         """preset 为 dict 时优先于 TUTTI_NVME_PRESET 环境变量构造 runtime。
 
         preset 的字符串值恰为纯十进制整数时转为 int（配置占位符替换后
@@ -1178,6 +1205,10 @@ class TuttiKVStore:
             layout_stripe_unit = int(stripe_unit)
         else:
             raise ValueError(f"未知 tutti_nvme layout：{layout!r}")
+        # 预建/预热口径必须在对象层打开（set_layer_span）之前定下来：它决定
+        # open 是"建出缺失的预热槽位"（旧同步语义）还是"只走查已存在的槽位、
+        # 把差量交给后台"（异步增长）。
+        self._parse_precreate_options(precreate_threads)
         # 文件系统的全部职责（槽位分配、对象头、检查点、恢复、容量）都在
         # 这一层之下：本类只保留内存簿记与 runtime 票据缓存。
         self._layout = ObjectLayout(
@@ -1189,6 +1220,7 @@ class TuttiKVStore:
             prewarm_chunks=warm_chunks,
             rank_id=rank_id,
             background_reclaim=bool(allocator_enabled),
+            warmup_probe_only=self._precreate_threads > 0,
         )
         self._opened = False
         self._live: set[bytes] = set()
@@ -1208,6 +1240,9 @@ class TuttiKVStore:
         self._keepers: list = []  # 持有 ctypes 视图防 GC
         self._next_buffer_id = 0
         self._accel_id = -1
+        # runtime 广告的单次提交条目上限（caps.max_batch_requests）；
+        # None = 尚未查询，0 = 未知/无限。见 _batch_width_limit。
+        self._submit_width_limit: int | None = None
         # 'auto' 在 open() 惰性解析为专用 IO 流（见 _resolve_auto_stream）；
         # 其余取值（int 句柄 / None）原样使用。
         self._io_stream_raw = io_stream
@@ -1250,6 +1285,35 @@ class TuttiKVStore:
         except ValueError:
             self._checkpoint_interval_s = 60.0
         self._checkpoint_last_ns = time.monotonic_ns()
+
+    def _parse_precreate_options(self, precreate_threads: int | None) -> None:
+        # 后台预建线程数。**默认 0（关闭）**：一旦启用，open 就只走查已存在的
+        # 槽位，写路径也不再自己 create+fsync（拿不到就绪槽位时裁剪，与容量
+        # 耗尽同一契约）——这是行为变更，必须由部署显式选择。大容量冷启动/
+        # 扩容的部署在 serve 脚本里设 TUTTI_PRECREATE_THREADS（如 4）；测试与
+        # 小池保持旧的同步建槽语义。
+        if precreate_threads is None:
+            raw = os.environ.get("TUTTI_PRECREATE_THREADS")
+            precreate_threads = int(raw) if raw and raw.isdigit() else 0
+        if not isinstance(precreate_threads, int) or precreate_threads < 0:
+            raise ValueError(
+                "precreate_threads 须为非负整数，"
+                f"got {precreate_threads!r}"
+            )
+        self._precreate_threads = precreate_threads
+        # 预建口径：
+        #   capacity（默认）—— 容量比盘上已有的多多少就补多少；
+        #   demand         —— 只保持分配前沿之前的就绪余量，不为容量预建。
+        raw_scope = os.environ.get("TUTTI_PRECREATE_SCOPE")
+        self._precreate_full_capacity = (
+            raw_scope.strip().lower() not in {"demand", "0", "false", "no", "off"}
+            if raw_scope is not None else True
+        )
+        # 就绪余量（槽位）：只在 demand 口径下有意义。
+        raw_headroom = os.environ.get("TUTTI_PRECREATE_HEADROOM")
+        self._precreate_headroom = (
+            int(raw_headroom) if raw_headroom and raw_headroom.isdigit() else 0
+        )
 
     # ---------- 生命周期 ----------
 
@@ -1295,6 +1359,25 @@ class TuttiKVStore:
         except (AttributeError, TypeError, ValueError):
             return 0
         return max(value, 0)
+
+    def _batch_width_limit(self) -> int:
+        """单次 submit 的条目上限（0 = 未知/不限）。
+
+        只在首次提交时查一次并缓存：caps() 会跨 pybind 取一遍全部能力字段，
+        放在每层每方向的提交热路径上会给前向线程加无谓的 CPU 开销。
+        """
+        if self._submit_width_limit is None:
+            try:
+                caps = self._runtime.caps()
+                value = int(
+                    caps.get(
+                        "max_batch_requests", caps.get("max_batch_entries", 0)
+                    ) or 0
+                )
+            except Exception:
+                value = 0
+            self._submit_width_limit = max(value, 0)
+        return self._submit_width_limit
 
     def open(self) -> None:
         if self._opened:
@@ -1453,6 +1536,8 @@ class TuttiKVStore:
             self._wait_chunk_io(set(self._inflight_by_chunk))
         except Exception:
             _LOG.exception("等待对象池 target IO 完成失败；继续关闭句柄")
+        # 先让后台预建停手，再关对象层：避免线程在池已关闭后继续建文件。
+        self._layout.stop_background_precreate()
         try:
             self._layout.close_object_pool()
         except Exception:
@@ -1870,6 +1955,15 @@ class TuttiKVStore:
         self._layout.set_layer_span(num_layers)
         self._live = self._layout.scan()
         self._preopen_ready_targets()
+        # 对象层已打开、几何已定：把"容量增长"整体交给后台线程——既避免大容量
+        # 冷启动在 open 期写实零，也避免写路径按需 create+fsync（详见
+        # object_layout.start_background_precreate 的契约说明）。
+        if self._precreate_threads > 0:
+            self._layout.start_background_precreate(
+                self._precreate_threads,
+                headroom=self._precreate_headroom,
+                full_capacity=self._precreate_full_capacity,
+            )
 
     def object_pool_snapshot(self) -> dict | None:
         return self._layout.object_pool_snapshot()
@@ -2170,16 +2264,39 @@ class TuttiKVStore:
             raise
 
     def _submit_retry(self, requests, direction: str):
-        """提交整批；partial-commit 的被拒请求窗口重发。
+        """提交整批；超宽先按上限切段，partial-commit 的被拒请求窗口重发。
 
-        连续两轮零接受（runtime 窗口彻底耗尽）→ RuntimeError。
+        宽度处理分两层：
+          * **提交前预切**：批宽超过 runtime 广告的 max_batch_requests 时，
+            直接按上限切成多次 submit（多次 kernel）。宽度由本步要搬多少
+            chunk 决定（长 prompt + 高并发时可达上万条），不是调用方能先验
+            保证的；预切把它变成常规分批，不再浪费一次必然失败的提交。
+          * **被拒后拆半**：预切用的是"请求条数"，而 runtime 的上限算的是
+            展开后的 sub-IO 条目数（一个请求跨分片/超 MDTS 时会展开成多条）。
+            若仍撞上限就拆半重投；拆到单笔仍被拒才说明是那一笔自身的问题。
+        窗口耗尽（在飞配额/容量）另算：重投，连续两轮零接受才 RuntimeError。
         """
         handles = []
-        pending = list(enumerate(requests))
+        indexed = list(enumerate(requests))
+        width_limit = self._batch_width_limit()
+        if width_limit and len(indexed) > width_limit:
+            # 逆序入栈：循环取 segments[-1]，倒着压保证按原顺序提交。
+            segments = [
+                indexed[start:start + width_limit]
+                for start in range(0, len(indexed), width_limit)
+            ][::-1]
+            _LOG.debug(
+                "TUTTI_SUBMIT_PRESPLIT direction=%s requests=%d limit=%d "
+                "segments=%d",
+                direction, len(indexed), width_limit, len(segments),
+            )
+        else:
+            segments = [indexed]
         all_rejected_rounds = 0
         rejection_diagnostics = []
         try:
-            while pending:
+            while segments:
+                pending = segments[-1]
                 result = self._runtime.submit(
                     [request for _, request in pending],
                     accel_id=self._accel_id,
@@ -2207,13 +2324,29 @@ class TuttiKVStore:
                 if not rejected:
                     if result.io_handle is None or not result.status_ok:
                         raise RuntimeError(f"tutti submit 失败：{result.status_msg}")
-                    break
+                    segments.pop()
+                    all_rejected_rounds = 0
+                    continue
                 if len(rejected) == len(pending):
-                    all_rejected_rounds += 1
                     rejection_diagnostics.append(
-                        f"round={all_rejected_rounds} pending={len(pending)} "
+                        f"round={all_rejected_rounds + 1} pending={len(pending)} "
                         f"status={result.status_msg}"
                     )
+                    # 整批被拒且原因是"这一批太宽"：拆半重投（见 docstring）。
+                    if len(pending) > 1 and _is_batch_width_rejection(
+                        result.status_msg
+                    ):
+                        mid = len(pending) // 2
+                        segments[-1] = pending[:mid]
+                        segments.append(pending[mid:])
+                        _LOG.warning(
+                            "TUTTI_SUBMIT_SPLIT direction=%s wide=%d -> %d+%d "
+                            "status=%s",
+                            direction, len(pending), mid, len(pending) - mid,
+                            result.status_msg,
+                        )
+                        continue
+                    all_rejected_rounds += 1
                     if all_rejected_rounds >= 2:
                         raise RuntimeError(
                             "partial-commit 连续两轮零接受："
@@ -2227,7 +2360,7 @@ class TuttiKVStore:
                     direction, rejected, all_rejected_rounds,
                     result.status_msg,
                 )
-                pending = [pending[i] for i in rejected]
+                segments[-1] = [pending[i] for i in rejected]
         except Exception:
             if handles:
                 self._deferred_completions.append(

@@ -287,6 +287,105 @@ def test_partial_commit_non_ok_status_still_drains_handle(tmp_path):
     assert store.scan() == keys
 
 
+class WidthLimitedRuntime(FakeRuntime):
+    """一批请求数超过 width 就整批拒绝，模拟 runtime 的单次提交条目上限。
+
+    真机形态（2026-09-21 在线）：一个读计划覆盖整步所有 chunk，长 prompt +
+    高并发时单层提交 9248 条 > max_batch_entries=8192，被整批拒绝 →
+    旧逻辑"连续两轮零接受"直接 RuntimeError，打死 worker 并终止服务。
+    """
+
+    def __init__(self, width, advertise=False, **kwargs):
+        super().__init__(**kwargs)
+        self._width = width
+        self._advertise = advertise
+        self.wide_rejections = 0
+        self.accepted_counts: list[int] = []
+
+    def caps(self):
+        caps = super().caps()
+        if self._advertise:
+            caps["max_batch_requests"] = self._width
+        return caps
+
+    def submit(self, requests, accel_id=-1, stream=None, execution="device"):
+        if len(requests) > self._width:
+            self.wide_rejections += 1
+            self.submit_rounds += 1
+            self._next_ticket += 1
+            return FakeSubmitResult(
+                status_ok=False,
+                status_msg="RESOURCE_EXHAUSTED: too many sub-IOs (entries)",
+                io_handle=None,
+                initial_states=[False] * len(requests),
+                rejected=list(range(len(requests))),
+            )
+        self.accepted_counts.append(len(requests))
+        return super().submit(requests, accel_id=accel_id, stream=stream,
+                              execution=execution)
+
+
+def test_wide_batch_is_split_instead_of_killing_the_worker(tmp_path):
+    """整批因"太宽"被拒 → 拆半重投并全部完成，而不是致命升级。"""
+    runtime = WidthLimitedRuntime(width=3)
+    store = make_store(tmp_path, runtime=runtime, layers=1)
+    store.open()
+    src = bytearray(8 * SEG)
+    keys = []
+    for i in range(8):
+        src[i * SEG:(i + 1) * SEG] = bytes([0x40 + i]) * SEG
+        keys.append(io_key(bytes([i]) * 16, 0))
+    src_id = store.register_buffer(src, SEG)
+
+    store.put_batch([(k, src_id, i * SEG) for i, k in enumerate(keys)]).wait()
+
+    assert runtime.wide_rejections > 0, "必须真的撞上过上限（否则用例没覆盖）"
+    # 8 → 4+4（仍超限）→ 2+2+2+2，每段都在上限内。
+    assert runtime.accepted_counts == [2, 2, 2, 2]
+    dst = bytearray(8 * SEG)
+    dst_id = store.register_buffer(dst, SEG)
+    store.get_batch([(k, dst_id, i * SEG) for i, k in enumerate(keys)]).wait()
+    for i in range(8):
+        assert dst[i * SEG:(i + 1) * SEG] == bytes([0x40 + i]) * SEG
+
+
+def test_single_request_over_the_limit_still_fails(tmp_path):
+    """拆到单笔仍被拒 → 说明是那一笔自身的问题，保持 fail-closed。"""
+    runtime = WidthLimitedRuntime(width=0)
+    store = make_store(tmp_path, runtime=runtime, layers=1)
+    store.open()
+    src = bytearray(SEG)
+    src_id = store.register_buffer(src, SEG)
+    keys = [io_key(b"z" * 16, 0)]
+
+    with pytest.raises(RuntimeError, match="连续两轮零接受"):
+        store.put_batch([(keys[0], src_id, 0)]).wait()
+
+
+def test_advertised_width_limit_splits_before_submitting(tmp_path):
+    """runtime 广告了上限 → 提交前按上限切段，不浪费必然失败的那次提交。"""
+    runtime = WidthLimitedRuntime(width=3, advertise=True)
+    store = make_store(tmp_path, runtime=runtime, layers=1)
+    store.open()
+    src = bytearray(8 * SEG)
+    keys = []
+    for i in range(8):
+        src[i * SEG:(i + 1) * SEG] = bytes([0x50 + i]) * SEG
+        keys.append(io_key(bytes([i]) * 16, 0))
+    src_id = store.register_buffer(src, SEG)
+
+    store.put_batch([(k, src_id, i * SEG) for i, k in enumerate(keys)]).wait()
+
+    assert runtime.wide_rejections == 0, "预切后不应再撞上限"
+    # 8 → 3+3+2，按原顺序提交。
+    assert runtime.accepted_counts == [3, 3, 2]
+    dst = bytearray(8 * SEG)
+    dst_id = store.register_buffer(dst, SEG)
+    store.get_batch([(k, dst_id, i * SEG) for i, k in enumerate(keys)]).wait()
+    for i in range(8):
+        assert dst[i * SEG:(i + 1) * SEG] == bytes([0x50 + i]) * SEG
+
+
 def test_auto_routes_read_and_write_to_distinct_streams(tmp_path, monkeypatch):
     """auto creates distinct read/write submit and worker stream routes."""
     import types

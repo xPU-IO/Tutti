@@ -167,6 +167,14 @@ struct StoreConfig {
     std::uint64_t prewarm_slots = 0;
     std::uint64_t prewarm_bytes = 0;
 
+    // 预热只走查（probe）已存在的槽位，不创建缺失的。默认 false = 旧的
+    // 同步语义：open() 把缺失的预热槽位建出来。
+    //
+    // 置 true 用于"增长由后台预建驱动"的部署（配 set_precreate_on_write(false)）：
+    // 那样 open() 只证明已有槽位可用，容量差量在后台补——大容量的冷启动因此
+    // 不在 open 期付建文件的代价。
+    bool warmup_probe_only = false;
+
     // Background space reclamation. When false, reclamation runs
     // synchronously on the calling thread (single-threaded tests).
     bool background_reclaim = true;
@@ -182,7 +190,7 @@ struct StoreConfig {
     // Read-only view of a pool owned by another process (e.g. the scheduler's
     // residency index reading a worker's namespace). open() then loads the
     // checkpoint and maps the residency bitmaps WITHOUT creating directories,
-    // materialising slots or prewarming, and every mutating call fails with
+    // precreating slots or warming up, and every mutating call fails with
     // UNSUPPORTED instead of being silently ignored -- a misconfigured writer
     // must fail loudly, not lose data.
     bool read_only = false;
@@ -500,6 +508,56 @@ public:
     // Force a metadata checkpoint. Implementations checkpoint on their own
     // schedule; this exists for shutdown and for tests.
     virtual Status checkpoint() = 0;
+
+    // ---- Asynchronous growth: precreate ----
+    //
+    // 术语（这一节只用这三个词，避免与对象层/mmap 的“物化”撞车）：
+    //   预热 warmup     open() 期同步做掉调用方声明的那一份（首个请求的工作集）；
+    //   预建 precreate  把一个槽位建成“尺寸正确、内容为零”的可用状态。这是本层
+    //                   唯一的批量 IO（写实零 + fsync，~44ms/槽），所以**只允许
+    //                   在后台做**：放在 open 期＝大容量起不来，放在写路径＝每个
+    //                   新槽位卡住前向线程。
+    //   就绪 ready      已预建、可被分配。写路径只认可就绪槽位。
+    //
+    // 复用与增长共用同一条前沿：容量以内的槽位若已存在，open 只做走查（probe，
+    // 一个字节都不写）就登记为就绪；只在“容量 > 盘上已有”时，差量才由后台预建。
+    //
+    // 旧叫法对照：本文件其他段落与 slot_media 里的 materialise/materialisation
+    // （如 prewarm_bytes 的说明、materialise_slot()）指的是同一件事——单槽的
+    // precreate 实现。新代码一律用上面三个词，旧名待统一。
+    //
+    // 契约分两半：
+    //   * open() 只走查/预热声明的前缀，不越界创建；
+    //   * 后台调用者用 precreate_step() 推进前沿；一旦调用过
+    //     set_precreate_on_write(false)，写路径遇到未就绪槽位就**拒绝**而不是自己
+    //     建（与容量耗尽同一契约——调用方本来就会裁剪），且自愈：后台追上后
+    //     同一笔写即成功。
+
+    // 至多预建 `max_slots` 个槽位，并在“分配前沿之后已有 `headroom` 个就绪槽位”
+    // 时提前收工。返回本次预建了多少个；0 表示无事可做。
+    //
+    // 实现不得跨槽位持锁做 IO：并发的 reserve/commit/read 因此最多等一个槽位的
+    // 时间。可被多线程调用——认领不得重叠，前沿只能按序推进。
+    virtual Result<std::uint64_t> precreate_step(std::uint64_t max_slots,
+                                                 std::uint64_t headroom) {
+        (void)max_slots;
+        (void)headroom;
+        return Result<std::uint64_t>::Failure(
+            Status(StatusCode::UNSUPPORTED, "precreate_step unsupported"));
+    }
+
+    // 已被证明存在于介质上的槽位：[0, precreated_slots()) 是就绪的。返回 0
+    // 表示“未知”，调用方必须当作“尚未就绪”。
+    virtual std::uint64_t precreated_slots() const { return 0; }
+
+    // 上一次 precreate_step() 计算出的前沿：预建到它就算追上需求，再往前
+    // 没有工作。调用方用它区分“暂时被在飞认领挡住”和“真的无事可做”——
+    // 两者都返回 0 个新建槽位，但前者该立刻重试，后者该让出 CPU。
+    virtual std::uint64_t precreate_target() const { return 0; }
+
+    // 写路径是否允许自己 create+fsync 一个即将使用的槽位。False 用于“增长由
+    // precreate_step() 驱动”的部署。
+    virtual void set_precreate_on_write(bool enabled) { (void)enabled; }
 };
 
 // -------------------------------------------------------------------------

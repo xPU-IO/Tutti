@@ -302,7 +302,10 @@ private:
         void* stream = nullptr;  // borrowed cudaStream_t
 
         // Host-pinned PRP-list leases, one or more per controller.
-        std::vector<tutti::data_paths::local_nvme::PrpBufRef> prp_buf_refs;
+        // 每设备一段 host 池页面 + 其归属池：完成路径按池归还，
+        // 否则 cache-miss 提交会把池无限撑大（P0，见 prp_buf_pool.h）。
+        std::vector<tutti::data_paths::local_nvme::PrpBufLeaseRef>
+            prp_buf_refs;
 
         bool has_timeout = false;
         // Per-layer read-copy/reuse fences; see LocalNvmeDataPath::OpEntry.
@@ -368,6 +371,16 @@ private:
     std::vector<std::unique_ptr<tutti::data_paths::local_nvme::PrpPageCache>> prp_caches_;
     // Growing host-pinned miss/exhaustion pool, one per controller/IOMMU domain.
     std::vector<std::unique_ptr<tutti::data_paths::local_nvme::PrpBufPool>> prp_buf_pools_;
+
+    // ---- test-only: host PRP pool accounting (summed over devices) ----
+    // Pages handed out to ops. Must return to 0 after every op is released and
+    // must not grow across repeated identical submits; see
+    // LocalNvmeDataPath's accessors for the leak this guards.
+public:
+    std::uint64_t test_prp_pool_leased_pages() const;
+    std::uint64_t test_prp_pool_total_pages() const;
+
+private:
     bool timeout_prp_retained_ = false;
 
     std::uint64_t next_target_token_ = 1;

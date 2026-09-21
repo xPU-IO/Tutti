@@ -223,6 +223,30 @@ Status materialise_slot(const std::vector<std::string>& paths,
     return {};
 }
 
+Status slot_is_precreated(const std::vector<std::string>& paths,
+                            std::uint64_t bytes_per_shard, bool* out) {
+    if (out == nullptr) {
+        return Status(StatusCode::INVALID_ARGUMENT, "no output flag");
+    }
+    *out = false;
+    if (paths.empty()) {
+        return Status(StatusCode::INVALID_ARGUMENT, "no shard paths");
+    }
+    for (const std::string& path : paths) {
+        struct stat st{};
+        if (::stat(path.c_str(), &st) != 0) {
+            if (errno == ENOENT || errno == ENOTDIR) return {};
+            return errno_status("stat slot", path);
+        }
+        if (!S_ISREG(st.st_mode) ||
+            static_cast<std::uint64_t>(st.st_size) != bytes_per_shard) {
+            return {};
+        }
+    }
+    *out = true;
+    return {};
+}
+
 Status zero_slot(const std::vector<std::string>& paths,
                  std::uint64_t bytes_per_shard) {
     if (paths.empty()) {
