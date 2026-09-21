@@ -1242,6 +1242,14 @@ class TuttiKVStore:
                 f"got {defer_writes_after_reads!r}"
             )
         self._defer_warned = False
+        # 周期落盘提交索引（见 checkpoint_if_due）；0 = 关闭。
+        try:
+            self._checkpoint_interval_s = max(
+                0.0, float(os.environ.get("TUTTI_CHECKPOINT_INTERVAL_S", "60"))
+            )
+        except ValueError:
+            self._checkpoint_interval_s = 60.0
+        self._checkpoint_last_ns = time.monotonic_ns()
 
     # ---------- 生命周期 ----------
 
@@ -1780,6 +1788,50 @@ class TuttiKVStore:
                     chunk_id + layer.to_bytes(2, "little")
                     for layer in range(span)
                 )
+
+    def checkpoint_if_due(self) -> bool:
+        """按时间节流落盘提交索引（TUTTI_CHECKPOINT_INTERVAL_S，默认 60s）。
+
+        为什么必须周期落盘：commit() 只写对象头并把检查点标脏，而脏检查点
+        原先只在 close() 落盘（见对象层 load_checkpoint_locked 的契约注释）。
+        长跑进程被强杀/崩溃/关闭链中断时检查点从未写过——重启后索引为空，
+        盘上数据虽完好却全部失去复用性（实测 4 TiB 池重启后 hit_tokens=0，
+        等效冷池）。
+
+        为什么安全：检查点是多容器轮转写，落盘中途崩溃不会写坏上一个容器；
+        且**对象头才是权威**——未进检查点的对象重启后其槽位保持 free，会被
+        后续分配复用，不泄漏空间（代价仅是那部分 KV 不可复用）。
+
+        单次开销 = 检查点状态表（209715 槽约 122 MB），默认 60s 一次。
+
+        返回 True 表示本次真的落盘了。
+        """
+        interval = self._checkpoint_interval_s
+        if interval <= 0:
+            return False
+        now = time.monotonic_ns()
+        elapsed = (now - self._checkpoint_last_ns) / 1e9
+        if elapsed < interval:
+            _LOG.debug(
+                "DIRECT_CHECKPOINT_SKIP elapsed=%.1fs interval=%.1fs",
+                elapsed, interval,
+            )
+            return False
+        # 先推时间戳：落盘失败也不该每步重试（避免放大故障）。
+        self._checkpoint_last_ns = now
+        try:
+            self._layout.checkpoint()
+        except Exception:
+            _LOG.warning(
+                "DIRECT_CHECKPOINT_FAILED 索引落盘失败；复用收益可能退化到"
+                "上一次成功的检查点", exc_info=True,
+            )
+            return False
+        _LOG.info(
+            "DIRECT_CHECKPOINT_WRITTEN elapsed=%.1fs（提交索引已落盘，重启可复用）",
+            elapsed,
+        )
+        return True
 
     def scan(self):
         """已驻留 io_key 快照（升序）。

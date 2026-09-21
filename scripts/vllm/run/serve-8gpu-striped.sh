@@ -21,6 +21,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 PORT="${PORT:-8192}"
+# 工具调用（tool choice=auto 必需）：hy_v3 是 vLLM 为 HYV3ForCausalLM 内置的
+# 解析器；换模型时按 vllm 的 --tool-call-parser 列表改（hermes/qwen3_coder…）。
+# 这两个参数不影响 Tutti 的 key 命名空间，旧池数据继续可复用。
+TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-hy_v3}"
 MODEL="${MODEL:-/mnt/nvme4/models/Hy3-FP8}"
 SERVED_NAME="${SERVED_NAME:-tutti}"
 TP_SIZE="${TP_SIZE:-8}"
@@ -127,6 +131,8 @@ exec "$PYTHON" -m vllm.entrypoints.openai.api_server \
     --load-format "$LOAD_FORMAT" \
     --num-gpu-blocks-override "$NUM_GPU_BLOCKS_OVERRIDE" \
     --enable-prefix-caching \
+    --enable-auto-tool-choice \
+    --tool-call-parser "$TOOL_CALL_PARSER" \
     --port "$PORT" \
     --no-enable-flashinfer-autotune \
     --kv-transfer-config "$KV_CONFIG"

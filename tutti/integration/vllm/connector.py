@@ -37,6 +37,32 @@ from tutti.integration.vllm.worker_meta import TuttiWorkerMetadata
 # 才能继承 vllm 根 logger 的 handler（否则输出被静默吞掉）。
 logger = init_logger("vllm.tutti.connector")
 
+
+def _ensure_impl_logging_visible() -> None:
+    """让 ``tutti.*`` 实现层日志与 vllm 日志一同可见。
+
+    store / worker / engine 用 ``logging.getLogger(__name__)``（即 ``tutti.*``），
+    而 vLLM 只配置 ``vllm.*`` 的 handler——实现层的 INFO/WARNING 会被整树过滤。
+    实测（2026-09-21 长跑排查）：检查点落盘、容量裁剪、注册预热这些观测在
+    生产日志里全部静默，导致"功能是否生效"只能靠盘上文件反推。
+
+    这里给 ``tutti`` 树挂一个 handler 并放行 INFO（DEBUG 仍按开关走），已配置
+    过就不重复挂；``propagate=False`` 避免与 root 重复输出。
+    """
+    impl = logging.getLogger("tutti")
+    if impl.handlers:
+        return
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s [%(name)s] %(message)s"
+    ))
+    impl.addHandler(handler)
+    impl.setLevel(logging.INFO)
+    impl.propagate = False
+
+
+_ensure_impl_logging_visible()
+
 if TYPE_CHECKING:
     from tutti.integration.vllm.worker import WorkerImpl
 

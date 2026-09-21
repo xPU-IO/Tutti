@@ -1184,6 +1184,11 @@ class WorkerImpl:
             self._record_store_outcome(
                 self._save_keys, ok=first_error is None
             )
+            # 周期落盘提交索引（节流在 store 侧，默认 60s）：崩溃/强杀时最坏
+            # 只丢一个间隔的复用收益，而不是整份索引（见 store.checkpoint_if_due）。
+            checkpoint = getattr(self._engine, "checkpoint_if_due", None)
+            if callable(checkpoint):
+                checkpoint()
         self._save_inflight = []
         self._defer_write_event = None
         self._save_seen_callbacks = set()

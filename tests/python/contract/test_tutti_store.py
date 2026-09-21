@@ -1306,3 +1306,39 @@ def test_defer_writes_after_reads_option_and_env_backdoor(
         TuttiKVStore(
             tmp_path / "bad", 4, SEG, defer_writes_after_reads=1,
         )
+
+
+# ---------- 周期落盘（checkpoint_if_due）----------
+
+
+def test_checkpoint_if_due_throttles_and_can_be_disabled(tmp_path, monkeypatch):
+    """提交索引周期落盘：按时间节流，间隔 0 时关闭。
+
+    回归（2026-09-21 长跑复盘）：commit() 只写对象头并把检查点标脏，脏检查点
+    原先只在 close() 落盘；长跑进程被强杀/崩溃时索引从未持久化——重启后
+    盘上 4 TiB KV 完好却查不到（hit_tokens=0，等效冷池）。
+    """
+    from tutti.storage.tutti_nvme.store import TuttiKVStore
+
+    monkeypatch.setenv("TUTTI_CHECKPOINT_INTERVAL_S", "0")
+    disabled = TuttiKVStore(tmp_path / "off", 4, SEG)
+    assert disabled.checkpoint_if_due() is False
+
+    monkeypatch.setenv("TUTTI_CHECKPOINT_INTERVAL_S", "3600")
+    store = TuttiKVStore(tmp_path / "on", 4, SEG)
+    # 刚构造：距上次落盘不足一个间隔 → 跳过
+    assert store.checkpoint_if_due() is False
+    # 模拟间隔已过（把上次落盘时刻推回原点）→ 触发
+    store._checkpoint_last_ns = 0
+    assert store.checkpoint_if_due() is True
+    # 落盘后重新计时 → 紧接着的下一步不再落盘
+    assert store.checkpoint_if_due() is False
+
+
+def test_checkpoint_if_due_rejects_bad_env(tmp_path, monkeypatch):
+    """非法间隔值回退默认（不因环境变量写错而崩或静默关闭）。"""
+    from tutti.storage.tutti_nvme.store import TuttiKVStore
+
+    monkeypatch.setenv("TUTTI_CHECKPOINT_INTERVAL_S", "not-a-number")
+    store = TuttiKVStore(tmp_path / "bad", 4, SEG)
+    assert store._checkpoint_interval_s == 60.0

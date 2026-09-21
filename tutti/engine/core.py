@@ -1440,6 +1440,20 @@ class KVEngine:
             self, keys, block_tables, physical_layers, depth, on_failure
         )
 
+    def checkpoint_if_due(self) -> bool:
+        """周期落盘提交索引（转发 store，节流在 store 侧）。
+
+        为什么由 worker 每步驱动而不是定时器线程：落盘要与"提交结算"在同一
+        线程的因果链上（结算刚更新内存索引），避免并发写检查点；每步一次
+        monotonic 比较的成本可忽略。
+
+        返回 True 表示本次真的落盘了。
+        """
+        due = getattr(self._store, "checkpoint_if_due", None)
+        if not callable(due):
+            return False
+        return bool(due())
+
     def prepare_write_targets(self, keys):
         """预置写入目标（对象池分配 + 票据就绪）。
 
