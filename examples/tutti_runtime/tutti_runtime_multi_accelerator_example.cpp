@@ -204,7 +204,9 @@ bool validate_config_pair(Options& options) {
                              index);
                 return false;
             }
-            options.stripe_units[index] = backend->stripe_unit;
+            // 2026-09-22: the multi-device backend has no knobs left
+            // (stripe_unit was removed with the striping itself); the
+            // backend-config check above is all the validation there is.
         }
         endpoints[index] = nvme->provider.endpoint;
     }

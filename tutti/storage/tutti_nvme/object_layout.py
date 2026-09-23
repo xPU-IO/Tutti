@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from pathlib import Path
 
 # 挂在 tutti 树下的专属通道（connector 会为该树挂 handler 放行 INFO）。
@@ -46,6 +47,19 @@ _PRECREATE_FLIGHT_SLEEP_S = 0.002
 # 余量，足够吸收突发。
 _MIN_PRECREATE_HEADROOM_SLOTS = 1024
 
+# 磁盘空间护栏：预建线程在把盘写满之前必须停手。故障形态（2026-09-22 事故）：
+# 容量配置超过物理盘（8TiB/rank × 8 rank = 64TiB 需求 > 4×5.8TB 盘），预建
+# 线程一路补到 ENOSPC——既写坏池子（半截文件），又让写路径退回"自己建槽"
+# 慢路径，前向线程被拖垮。护栏把增长压回"可用空间之内"：空间不足时暂停
+# 增长（写路径继续按非阻塞裁剪契约拒绝缺槽写），空间恢复后自动继续。
+# 门限可用 TUTTI_PRECREATE_MIN_FREE_BYTES 覆盖（测试用）。
+_PRECREATE_MIN_FREE_BYTES_ENV = "TUTTI_PRECREATE_MIN_FREE_BYTES"
+_PRECREATE_DEFAULT_MIN_FREE_BYTES = 32 * 1024 ** 3  # 32 GiB
+_PRECREATE_SPACE_RECHECK_S = 5.0
+# CAUGHT_UP 是多线程共享的信号（每个线程各打一行会形成风暴），节流到这条
+# 间隔内只由最先追平的线程播报一次。
+_PRECREATE_CAUGHT_UP_LOG_INTERVAL_S = 10.0
+
 from tutti.index.chunk_index import decode_io_key as _decode
 from tutti.storage.object_store import (
     ObjectPlacement,
@@ -59,9 +73,9 @@ __all__ = ["ObjectLayout"]
 class ObjectLayout:
     """由对象层驱动的布局。
 
-    ``mounts`` 是数据盘目录（条带顺序）；``stripe_unit`` 为 0 时走单文件布局。
-    ``devices`` 是给 runtime resolver 用的设备事实（controller/namespace），
-    对象层只用其中的 ``mount_path``。
+    ``mounts`` 是数据盘目录；一个 slot 是一个文件，slot 号在 mounts 间
+    轮转（单 mount 即单文件布局）。``devices`` 是给 runtime resolver 用的
+    设备事实（controller/namespace），对象层只用其中的 ``mount_path``。
     """
 
     def __init__(
@@ -70,7 +84,6 @@ class ObjectLayout:
         segment_bytes: int,
         *,
         mounts=None,
-        stripe_unit: int = 0,
         devices=None,
         capacity_chunks: int = 0,
         prewarm_chunks: int = 0,
@@ -83,20 +96,7 @@ class ObjectLayout:
         self._root = Path(root)
         self._segment_bytes = int(segment_bytes)
         self._mounts = [str(m) for m in (mounts if mounts else [self._root])]
-        self._stripe_unit = int(stripe_unit or 0)
         self._devices = list(devices or [])
-        # 条带几何的本地快速校验：单个挂载点无条带可言；条带粒度必须容纳
-        # 一个 4KiB IO（段本身也要求 4096 对齐），否则 C++ 侧要到首次写才报错。
-        if self._stripe_unit:
-            if len(self._mounts) < 2:
-                raise ValueError(
-                    f"striped layout requires at least two mounts, got "
-                    f"{len(self._mounts)}"
-                )
-            if self._stripe_unit % 4096:
-                raise ValueError(
-                    f"stripe_unit must be 4096-aligned, got {self._stripe_unit}"
-                )
         # 容量/预热按 chunk 计（对象层按 slot_bytes 折算为字节），避免上层
         # 重复推导对象几何——对象头 4096B 由本模块在打开时加进去。
         self._capacity_chunks = int(capacity_chunks or 0)
@@ -109,6 +109,8 @@ class ObjectLayout:
         self._warmup_probe_only = bool(warmup_probe_only)
         # 后台预建线程的停止信号（None = 未启动），见 start_background_precreate。
         self._precreate_stop: threading.Event | None = None
+        # CAUGHT_UP 日志节流（多线程共享一个时间戳，见 _PRECREATE_CAUGHT_UP_LOG_INTERVAL_S）。
+        self._precreate_caught_up_log_at = 0.0
         self._namespace = (
             namespace.encode("utf-8") if isinstance(namespace, str) else namespace
         )
@@ -129,10 +131,6 @@ class ObjectLayout:
     def mounts(self) -> tuple[str, ...]:
         """数据盘挂载点（单文件布局时即 root 本身）。"""
         return tuple(self._mounts)
-
-    @property
-    def stripe_unit(self) -> int:
-        return self._stripe_unit
 
     @property
     def segment_bytes(self) -> int:
@@ -180,11 +178,10 @@ class ObjectLayout:
         return {
             "scheme": (
                 SCHEME_STRIPED_NVME_FILE
-                if self._stripe_unit else SCHEME_LOCAL_NVME_FILE
+                if len(self._mounts) > 1 else SCHEME_LOCAL_NVME_FILE
             ),
             "uri": str(self._root),
-            # 容量/预热按槽位声明：每槽位字节数由对象层按几何算（条带布局的
-            # 对象头前缀会向上取整到整个条带轮，本层不该重算）。
+            # 容量/预热按槽位声明：每槽位字节数由对象层按几何算。
             "capacity_slots": self._capacity_chunks,
             "prewarm_slots": prewarm_chunks,
             "warmup_probe_only": self._warmup_probe_only,
@@ -192,7 +189,6 @@ class ObjectLayout:
             "segment_count": self._layer_span,
             "namespace_fingerprint": self._namespace or b"",
             "devices": devices,
-            "stripe_unit": self._stripe_unit,
             "background_reclaim": self._background_reclaim,
             "rank_id": self._rank_id,
             "rank_count": self._rank_count,
@@ -250,10 +246,50 @@ class ObjectLayout:
 
     # ---------- 后台预建（大容量冷启动与按需增长都不在关键路径上）----------
 
+    def _mounts_free_bytes(self) -> int | None:
+        """所有数据盘挂载点的可用空间合计；任一 statvfs 失败返回 None。
+
+        None 表示护栏失效（调用方按"不拦"处理）：护栏是防呆，不是正确性前提，
+        探测不到空间时不该把预建卡死。
+        """
+        total = 0
+        for mount in self._mounts:
+            try:
+                st = os.statvfs(mount)
+            except OSError:
+                return None
+            total += st.f_bavail * st.f_frsize
+        return total
+
+    def _min_free_bytes(self) -> int:
+        """护栏门限：默认 min(32 GiB, 挂载点总容量的 5%)。
+
+        绝对门限保护大盘（32 GiB ≈ 5.8 TB 盘的 0.55%，足够写路径回旋）；
+        百分比上限保护小盘与测试环境（20 GiB 的盘不该因为凑不够 32 GiB 而
+        永远不能预建）。``TUTTI_PRECREATE_MIN_FREE_BYTES`` 直接覆盖门限
+        （测试用；设 0 表示关闭护栏）。
+        """
+        raw = os.environ.get(_PRECREATE_MIN_FREE_BYTES_ENV)
+        if raw is not None:
+            try:
+                return max(0, int(raw))
+            except (TypeError, ValueError):
+                pass
+        total = 0
+        for mount in self._mounts:
+            try:
+                st = os.statvfs(mount)
+            except OSError:
+                total = 0
+                break
+            total += st.f_blocks * st.f_frsize
+        if total <= 0:
+            return _PRECREATE_DEFAULT_MIN_FREE_BYTES
+        return min(_PRECREATE_DEFAULT_MIN_FREE_BYTES, total * 5 // 100)
+
     def start_background_precreate(self, threads: int = 4,
-                                   headroom: int = 0,
-                                   full_capacity: bool = True) -> bool:
-        """后台预建槽位（一路补到容量或只补就绪余量），写路径不等它。
+                                   headroom: int = 0) -> bool:
+        """后台预建槽位（只补就绪余量，跟随分配前沿），写路径不等它。
 
         术语（与 SPI 头部一致）：**预热**是 open 期同步做掉的那一份；
         **预建**是把槽位文件建成"尺寸正确、内容为零"的可用状态（~44ms/槽）；
@@ -262,11 +298,14 @@ class ObjectLayout:
         与"复用"的关系（决定这批文件的来历，也决定这里要不要干活）：
           * 容量 ≤ 盘上已有的槽位 → open 的走查已把它们记成就绪，本方法
             不动任何文件（复用立即生效，零 IO、零异步）；
-          * 容量 > 盘上已有的槽位 → 差量在这里异步补（full_capacity=True
-            时一路补到容量上限）；已经存在的那部分由 C++ 的幂等探测跳过，
-            所以"复用"与"增长"合在同一条前沿上，不重复劳动。
-        就绪余量 headroom 只在 full_capacity=False 时有意义：增长总是从低到
-        高、跟随分配前沿，所以先满足的正是即将被分配到的槽位。
+          * 容量 > 盘上已有的槽位 → 差量在这里异步补，但**只为分配前沿
+            之前的一段就绪余量**铺文件：容量是用户指定的上限，不是要立刻
+            实体化的目标。已经存在的那部分由 C++ 的幂等探测跳过，所以
+            "复用"与"增长"合在同一条前沿上，不重复劳动。
+        就绪余量 headroom 的语义：增长总是从低到高、跟随分配前沿，所以先
+        满足的正是即将被分配到的槽位。曾有一个"一路补到容量上限"的模式
+        （full_capacity），被删除：盘占用 ∝ 容量而非工作集、几十万次零写
+        与在线 KV 争带宽，且容量配错时会把盘写满（2026-09-22 事故）。
 
         为什么必须异步：预建一个槽位是 create + 写实零 + fsync（~44ms/槽，见
         space_allocator 的注释），放在哪一端都是灾难——
@@ -295,11 +334,9 @@ class ObjectLayout:
             # 原生扩展还没有异步预建接口：维持写路径按需预建（旧行为）。
             return False
         capacity = int(self._capacity_chunks)
-        # full_capacity：一路补到容量上限（"容量比已有的多多少就异步补多少"）；
-        # 关掉则只保持需求余量，多出来的容量留着不建文件（省盘、省后台带宽）。
-        keep = capacity if full_capacity else max(
-            1, int(headroom or _MIN_PRECREATE_HEADROOM_SLOTS)
-        )
+        # keep = 分配前沿之前要保持就绪的槽位数。容量只是上限，不在这里
+        # 铺实体（见方法头注释：full_capacity 已删除）。
+        keep = max(1, int(headroom or _MIN_PRECREATE_HEADROOM_SLOTS))
         try:
             store.set_precreate_on_write(False)
         except Exception as exc:
@@ -312,7 +349,29 @@ class ObjectLayout:
 
         def run(index: int) -> None:
             worked = False
+            space_low = False
             while not stop.is_set():
+                # 磁盘空间护栏（见模块头常量注释）：写路径永不因它阻塞——
+                # 空间不足时这里只是停止增长，缺槽写仍走非阻塞裁剪契约。
+                free = self._mounts_free_bytes()
+                floor = self._min_free_bytes()
+                if free is not None and free < floor:
+                    if not space_low:
+                        space_low = True
+                        _PRECREATE_LOG.warning(
+                            "BACKGROUND_PRECREATE_SPACE_LOW free=%dB floor=%dB "
+                            "precreated=%d target=%d；暂停增长，空间恢复后继续",
+                            free, floor, store.precreated_slots(),
+                            store.precreate_target(),
+                        )
+                    stop.wait(_PRECREATE_SPACE_RECHECK_S)
+                    continue
+                if space_low:
+                    space_low = False
+                    _PRECREATE_LOG.info(
+                        "BACKGROUND_PRECREATE_SPACE_RESUMED free=%dB floor=%dB",
+                        free, floor,
+                    )
                 try:
                     made = step(_PRECREATE_BATCH_SLOTS, keep)
                 except Exception as exc:
@@ -343,13 +402,18 @@ class ObjectLayout:
                 if worked:
                     # 从"有活"回到"无事可做"：这是外部唯一能观测到预建
                     # 已补齐的信号（线程名不进 /proc，CPU 也测不出来）。
+                    # 四个线程会各自经历一次同样的转变，节流成一条。
                     worked = False
-                    _PRECREATE_LOG.info(
-                        "BACKGROUND_PRECREATE_CAUGHT_UP precreated=%d "
-                        "target=%d capacity=%d scope=%s",
-                        store.precreated_slots(), store.precreate_target(),
-                        capacity, "capacity" if full_capacity else "demand",
-                    )
+                    now = time.monotonic()
+                    if (now - self._precreate_caught_up_log_at
+                            >= _PRECREATE_CAUGHT_UP_LOG_INTERVAL_S):
+                        self._precreate_caught_up_log_at = now
+                        _PRECREATE_LOG.info(
+                            "BACKGROUND_PRECREATE_CAUGHT_UP precreated=%d "
+                            "target=%d capacity=%d",
+                            store.precreated_slots(), store.precreate_target(),
+                            capacity,
+                        )
                 # 没有可做的工作（分配前沿还没推过来，或已到容量上限）：
                 # 让出 CPU，等下一次需求把它叫醒。
                 stop.wait(_PRECREATE_IDLE_SLEEP_S)
@@ -361,10 +425,9 @@ class ObjectLayout:
                 name=f"tutti-precreate-{index}", daemon=True,
             ).start()
         _PRECREATE_LOG.info(
-            "BACKGROUND_PRECREATE_START reused=%d capacity=%d scope=%s "
+            "BACKGROUND_PRECREATE_START reused=%d capacity=%d "
             "headroom=%d threads=%d batch=%d",
             store.precreated_slots(), capacity,
-            "capacity" if full_capacity else "demand",
             keep, workers, _PRECREATE_BATCH_SLOTS,
         )
         return True

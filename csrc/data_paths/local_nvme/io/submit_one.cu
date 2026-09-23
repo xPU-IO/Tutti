@@ -18,15 +18,36 @@ cudaError_t launch_submit_one(
     std::uint32_t            cq_poll_budget,
     std::uint32_t            threads_per_block,
     std::uint32_t            inject_flag,
-    void*                    stream)
+    void*                    stream,
+    std::uint32_t            pool_workers,
+    unsigned int*            d_task_counter)
 {
     cudaStream_t s = static_cast<cudaStream_t>(stream);
-    const std::uint32_t blocks = count == 0
-        ? 1 : 1 + (count - 1) / threads_per_block;
-    submit_one_kernel<<<blocks, threads_per_block, 0, s>>>(
-        d_entries, d_status, count, cq_poll_budget, inject_flag);
-    cudaError_t err = cudaGetLastError();
-    return err;
+
+    if (pool_workers == 0 || d_task_counter == nullptr) {
+        // Legacy model: one thread per entry.
+        const std::uint32_t blocks = count == 0
+            ? 1 : 1 + (count - 1) / threads_per_block;
+        submit_one_kernel<<<blocks, threads_per_block, 0, s>>>(
+            d_entries, d_status, count, cq_poll_budget, inject_flag);
+        return cudaGetLastError();
+    }
+
+    // Worker-pool model: exactly pool_workers worker threads; the task
+    // cursor is reset on the same stream so a previous batch's cursor
+    // cannot leak into this one.
+    cudaError_t me = cudaMemsetAsync(d_task_counter, 0,
+                                     sizeof(unsigned int), s);
+    if (me != cudaSuccess) {
+        return me;
+    }
+    const std::uint32_t tpb = pool_workers < threads_per_block
+        ? (pool_workers ? pool_workers : 1u) : threads_per_block;
+    const std::uint32_t blocks = 1 + (pool_workers - 1) / tpb;
+    submit_one_kernel_pool<<<blocks, tpb, 0, s>>>(
+        d_entries, d_status, count, cq_poll_budget, inject_flag,
+        d_task_counter, pool_workers);
+    return cudaGetLastError();
 }
 
 // Fill kernel: writes val to the first n bytes of buf.

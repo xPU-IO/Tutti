@@ -216,6 +216,21 @@ class _DirectAllLayerReadPlan:
         self._feeder_stop = threading.Event()
         self._feeder_done = threading.Event()
         self._feeder_thread = None
+        # 读窗口计时：原点 event 在提交任何读之前记于 compute stream，作为
+        # "该步计算开始"的近似锚点；最后一层读的 fence 兼作收尾计时点。
+        # 两者相减即读窗口的 GPU 时长（见 _capture_read_tail 的判据）。
+        self._read_tail_ms = None
+        self._read_tail_waited = None
+        self._timing_origin = self._new_fence_event(enable_timing=True)
+        record = getattr(self._timing_origin, "record", None)
+        if callable(record):
+            try:
+                record()
+            except Exception:
+                self._timing_origin = None
+        else:
+            # 非 torch event（host/fake store 路径）不具备计时能力。
+            self._timing_origin = None
         if not self.physical_layers:
             raise ValueError("direct all-layer read plan requires at least one layer")
         self._submit_layer(0)
@@ -337,6 +352,9 @@ class _DirectAllLayerReadPlan:
 
     def require_complete(self) -> None:
         self.join_feeder()
+        # 兜底：末层完成回调里 fence 尚未完成时（查询失败）这里再试一次，
+        # 步末读早已完成。
+        self._capture_read_tail()
         expected = set(range(self.layer_count))
         missing_waits = tuple(sorted(expected - self.waited_callbacks))
         if self.next_read_to_submit != self.layer_count or missing_waits:
@@ -353,7 +371,10 @@ class _DirectAllLayerReadPlan:
         with self._state_lock:
             if callback in self.handles or self._feeder_stop.is_set():
                 return
-        fence_event = self._new_fence_event()
+        # 最后一层的 fence 兼作读窗口的收尾计时点（见 _capture_read_tail）。
+        fence_event = self._new_fence_event(
+            enable_timing=(callback == self.layer_count - 1)
+        )
         layer_started_ns = time.perf_counter_ns()
         try:
             with self._state_lock:
@@ -413,7 +434,7 @@ class _DirectAllLayerReadPlan:
         if not callable(add_terminal):
             add_terminal = getattr(handle, "add_done_callback", None)
         if callable(add_terminal):
-            add_terminal(self._on_completion)
+            add_terminal(self._completion_callback(callback))
 
     def _run_feeder(self) -> None:
         _bind_thread_cuda_device(getattr(self.engine, "_store", None))
@@ -453,6 +474,58 @@ class _DirectAllLayerReadPlan:
             return
         thread.join()
 
+    def _completion_callback(self, callback: int):
+        """把完成回调绑定到层号：最后一层的完成即"全部读完成"。"""
+        def done(result) -> None:
+            if callback == self.layer_count - 1:
+                self._capture_read_tail()
+            self._on_completion(result)
+        return done
+
+    def _capture_read_tail(self) -> None:
+        """最后一层读完成时结算读窗口，并给出 overlap 判据。
+
+        ``read_tail_ms`` = 计时原点 → 末层 fence 的 GPU 时长（原点在提交任何
+        读之前记于 compute stream，同时是本步计算开始的近似锚点）。
+        ``waited_layers`` = 此刻 compute 已下发等待过的层数。两者一起判定：
+
+        * ``SERIAL``     读在首层计算开始前已全部完成（无重叠）；
+        * ``OVERLAPPED`` 读完成落在计算窗口内（读与算并行）；
+        * ``READ_TAIL``  计算已走完所有层而读仍未完成（读是瓶颈）。
+        """
+        if self._read_tail_ms is not None or self._timing_origin is None:
+            return
+        fence = self.read_ready_events.get(self.layer_count - 1)
+        if fence is None:
+            return
+        elapsed = getattr(self._timing_origin, "elapsed_time", None)
+        if not callable(elapsed):
+            return
+        try:
+            # 完成回调可能在工作线程里跑：先绑定本 rank 设备再查询；纯观测，
+            # 任何失败都静默跳过，绝不影响读路径。
+            _bind_thread_cuda_device(getattr(self.engine, "_store", None))
+            if not fence.query():
+                return
+            read_tail_ms = elapsed(fence)
+        except Exception:
+            return
+        total = self.layer_count
+        waited = len(self.waited_callbacks)
+        if waited <= 0:
+            verdict = "SERIAL"
+        elif waited >= total:
+            verdict = "READ_TAIL"
+        else:
+            verdict = "OVERLAPPED"
+        self._read_tail_ms = read_tail_ms
+        self._read_tail_waited = waited
+        _LOG.warning(
+            "DIRECT_READ_TAIL read_tail_ms=%.3f waited_layers=%d/%d "
+            "verdict=%s chunks=%d",
+            read_tail_ms, waited, total, verdict, len(self.keys),
+        )
+
     def _on_completion(self, result) -> None:
         if getattr(result, "ok", True) or self.terminal_failure is not None:
             return
@@ -489,11 +562,11 @@ class _DirectAllLayerReadPlan:
             self._record_failure(error)
             raise error
 
-    def _new_fence_event(self):
+    def _new_fence_event(self, enable_timing: bool = False):
         try:
             import torch
             if torch.cuda.is_available():
-                return torch.cuda.Event(enable_timing=False)
+                return torch.cuda.Event(enable_timing=enable_timing)
         except Exception:
             pass
         store = getattr(self.engine, "_store", None)

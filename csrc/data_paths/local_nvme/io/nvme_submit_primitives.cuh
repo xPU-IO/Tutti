@@ -96,13 +96,17 @@ public:
 
     // Bounded poll: returns the real CQ slot on completion (whether or not
     // the CQE reports an NVMe error), or NVM_CQ_TIMEOUT on budget exhaustion.
+    // timing (optional): timing[0] = CQE observed, timing[1] = slot reclaimed.
     __device__ __forceinline__
     static uint32_t poll_bounded(QueuePair* qp, uint16_t cid,
                                   uint32_t cq_poll_budget,
-                                  uint32_t* out_status_dword3)
+                                  uint32_t* out_status_dword3,
+                                  unsigned long long* timing = nullptr)
     {
         uint32_t loc = cq_poll_bounded(&qp->cq, cid, cq_poll_budget);
+        if (timing) timing[0] = TUTTI_GLOBALTIMER_NS();
         if (loc == NVM_CQ_TIMEOUT) {
+            if (timing) timing[1] = timing[0];
             return NVM_CQ_TIMEOUT;
         }
         nvm_cpl_t* cpl = (nvm_cpl_t*)qp->cq.vaddr;
@@ -110,6 +114,7 @@ public:
         *out_status_dword3 = cpl_entry;
         cq_dequeue(&qp->cq, loc, &qp->sq);
         put_cid(&qp->sq, cid);
+        if (timing) timing[1] = TUTTI_GLOBALTIMER_NS();
         return loc;
     }
 };
@@ -205,8 +210,14 @@ void submit_read_one(const DeviceTargetHandle* h,
                      std::uint64_t              nbytes,
                      EntryCompletionStatus*     status,
                      std::uint32_t              cq_poll_budget,
-                     std::uint32_t              inject_flag)
+                     std::uint32_t              inject_flag,
+                     unsigned long long*        timing = nullptr)
 {
+    // Optional per-entry IO timing (TUTTI_IO_TIMING): timing[0] entry,
+    // timing[1] command published, then poll_bounded fills [2] CQE observed
+    // and [3] completion slot reclaimed.
+    if (timing) timing[0] = TUTTI_GLOBALTIMER_NS();
+
     std::uint64_t starting_lba = 0;
     std::uint64_t n_blocks     = 0;
     if (!resolve_lba(h, logical_off, nbytes, &starting_lba, &n_blocks, inject_flag)) {
@@ -220,10 +231,12 @@ void submit_read_one(const DeviceTargetHandle* h,
     QueueAcquireHelper::issue_nvme_cmd(
         qp, prp1, prp2, n_blocks, starting_lba,
         (std::uint8_t)NVM_IO_READ, &cid);
+    if (timing) timing[1] = TUTTI_GLOBALTIMER_NS();
 
     std::uint32_t status_dword3 = 0;
     uint32_t loc = QueueAcquireHelper::poll_bounded(
-        qp, cid, cq_poll_budget, &status_dword3);
+        qp, cid, cq_poll_budget, &status_dword3,
+        timing ? timing + 2 : nullptr);
     if (loc == NVM_CQ_TIMEOUT) {
         if (status) { status->result = 2; status->nvme_status_dword3 = 0; }
         return;
@@ -247,8 +260,11 @@ void submit_write_one(const DeviceTargetHandle* h,
                       std::uint64_t              nbytes,
                       EntryCompletionStatus*     status,
                       std::uint32_t              cq_poll_budget,
-                      std::uint32_t              inject_flag)
+                      std::uint32_t              inject_flag,
+                      unsigned long long*        timing = nullptr)
 {
+    if (timing) timing[0] = TUTTI_GLOBALTIMER_NS();
+
     std::uint64_t starting_lba = 0;
     std::uint64_t n_blocks     = 0;
     if (!resolve_lba(h, logical_off, nbytes, &starting_lba, &n_blocks, inject_flag)) {
@@ -262,10 +278,12 @@ void submit_write_one(const DeviceTargetHandle* h,
     QueueAcquireHelper::issue_nvme_cmd(
         qp, prp1, prp2, n_blocks, starting_lba,
         (std::uint8_t)NVM_IO_WRITE, &cid);
+    if (timing) timing[1] = TUTTI_GLOBALTIMER_NS();
 
     std::uint32_t status_dword3 = 0;
     uint32_t loc = QueueAcquireHelper::poll_bounded(
-        qp, cid, cq_poll_budget, &status_dword3);
+        qp, cid, cq_poll_budget, &status_dword3,
+        timing ? timing + 2 : nullptr);
     if (loc == NVM_CQ_TIMEOUT) {
         if (status) { status->result = 2; status->nvme_status_dword3 = 0; }
         return;

@@ -105,8 +105,8 @@ int main() {
         resource.allocation.selection = NvmeSelection::Striped;
         resource.allocation.nvme_device_ids = {0};
         spec.storage.resolvers.front() =
-            {"resolver", "striped-file", "striped",
-             StripedFileResolverConfig{}};
+            {"resolver", "local-file", "file",
+             LocalFileResolverConfig{}};
         spec.storage.datapaths.front() =
             {"datapath", "striped-local-nvme",
              StripedLocalNvmeDataPathConfig{}};

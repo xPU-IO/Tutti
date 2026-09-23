@@ -6,7 +6,6 @@ set(_tutti_config_public_headers
     spec/resource/memory_spec.h
     spec/resolver/resolver_spec.h
     spec/resolver/local_file_spec.h
-    spec/resolver/striped_file_spec.h
     spec/resolver/memfs_spec.h
     spec/datapath/datapath_spec.h
     spec/datapath/nvme_datapath_spec.h
@@ -51,7 +50,6 @@ add_library(tutti_runtime_spec STATIC
     spec/resource/nvme_spec.cpp
     spec/resolver/local_file_spec.cpp
     spec/resolver/memfs_spec.cpp
-    spec/resolver/striped_file_spec.cpp
     spec/datapath/local_nvme_spec.cpp
     spec/datapath/memfs_spec.cpp
     spec/datapath/striped_local_nvme_spec.cpp
@@ -87,7 +85,6 @@ add_library(tutti_config_parser STATIC
     parser/resource/nvme_config_parser.cpp
     parser/resolver/local_file_config_parser.cpp
     parser/resolver/memfs_config_parser.cpp
-    parser/resolver/striped_file_config_parser.cpp
     parser/datapath/local_nvme_config_parser.cpp
     parser/datapath/memfs_config_parser.cpp
     parser/datapath/striped_local_nvme_config_parser.cpp

@@ -76,6 +76,10 @@ struct DeviceSubmitEntry {
 // inject_flag is a scalar bitmask passed by value (FIX 1: no per-op
 // device allocation): bit0 = force resolve_lba failure, bit1 = synthesize
 // NVMe CQ error on normal completion (test seams, 0 = normal production).
+// pool_workers: 0 = legacy one-thread-per-entry kernel; >0 = worker-pool
+// model with exactly this many fixed worker threads pulling entries from
+// d_task_counter (a device atomic cursor; the launcher resets it to 0 on
+// the same stream before the launch).
 cudaError_t launch_submit_one(
     const DeviceSubmitEntry* d_entries,
     EntryCompletionStatus*   d_status,
@@ -83,7 +87,9 @@ cudaError_t launch_submit_one(
     std::uint32_t            cq_poll_budget,
     std::uint32_t            threads_per_block,
     std::uint32_t            inject_flag,
-    void*                    stream);
+    void*                    stream,
+    std::uint32_t            pool_workers = 0,
+    unsigned int*            d_task_counter = nullptr);
 
 // Fill a GPU buffer with a byte value via a GPU kernel (not cudaMemset).
 // GPU kernel writes are visible to NVMe DMA; cudaMemsetAsync may not be
@@ -134,6 +140,48 @@ void submit_one_kernel(const DeviceSubmitEntry* entries,
         submit_write_one(e.target, desc->prp1, desc->prp2,
                          e.target_offset, desc->data_length,
                          s, cq_poll_budget, inject_flag);
+    }
+}
+
+// -------------------------------------------------------------------------
+// submit_one_kernel_pool — worker-pool model (env TUTTI_POOL_WORKERS=N).
+//
+// A fixed set of `total_workers` threads (instead of one thread per entry)
+// pulls entries from a device-side atomic cursor and runs each to
+// completion (resolve + SQE submit + CQ poll) before pulling the next.
+// atomicAdd hands out each index exactly once; completion is still a
+// single kernel exit = single event = single stream fence.  The worker
+// count is the in-flight bound — see fused_submit_kernel.cuh (striped)
+// for the same model and its measured motivation.
+// -------------------------------------------------------------------------
+TUTTI_GLOBAL
+void submit_one_kernel_pool(const DeviceSubmitEntry* entries,
+                            EntryCompletionStatus*   status,
+                            std::uint32_t            count,
+                            std::uint32_t            cq_poll_budget,
+                            std::uint32_t            inject_flag,
+                            unsigned int*            next_task,
+                            std::uint32_t            total_workers)
+{
+    const std::uint32_t tid = TUTTI_THREAD_IDX_X + TUTTI_BLOCK_IDX_X * TUTTI_BLOCK_DIM_X;
+    if (tid >= total_workers) return;
+
+    for (;;) {
+        const std::uint32_t idx = atomicAdd(next_task, 1u);
+        if (idx >= count) return;
+
+        const DeviceSubmitEntry e = entries[idx];
+        EntryCompletionStatus* s = status ? &status[idx] : nullptr;
+        const AddressDescriptor* desc = e.prp_entry;
+        if (e.direction == 0) {
+            submit_read_one(e.target, desc->prp1, desc->prp2,
+                            e.target_offset, desc->data_length,
+                            s, cq_poll_budget, inject_flag);
+        } else {
+            submit_write_one(e.target, desc->prp1, desc->prp2,
+                             e.target_offset, desc->data_length,
+                             s, cq_poll_budget, inject_flag);
+        }
     }
 }
 

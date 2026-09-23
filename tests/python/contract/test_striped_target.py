@@ -1,11 +1,12 @@
-"""条带布局契约：对象层 + 条带 resolver 替身。
+"""多盘轮转布局契约：对象层 + 文件 resolver 替身。
 
-替身按 C++ 条带 resolver 的同一映射（``shard = (offset/unit + rot) % N``、
-``shard_offset = (offset/(unit*N))*unit + offset%unit``）把每个请求落到真实
-分片文件上，因此这些用例覆盖真实文件读写，却不需要 daemon 或 NVMe 硬件。
+替身按 C++ local-file resolver 的同一语义（``file://<绝对路径>``，路径即
+文件、文件即对象）把每个请求落到真实文件上，因此这些用例覆盖真实文件
+读写，却不需要 daemon 或 NVMe 硬件。
 
-条带的对象几何、槽位路径与 rotation 都在对象层（C++）：
-槽位以 ``<mount_i>/striped/<slot>.shard<i>`` 命名，段 0 从对象头之后开始。
+多盘放置的槽位路径在对象层（C++）：一个槽位是一个文件
+``<mount>/<r<rank_id>>/<slot>.obj``，槽位号在 mounts 间轮转，段 0 从对象
+头之后开始。
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ import ctypes
 import os
 from collections import namedtuple
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import unquote, urlsplit
 
 import pytest
 
@@ -23,13 +24,10 @@ from tutti.storage.tutti_nvme.store import TuttiKVStore
 
 
 SEGMENT = 16 * 1024
-UNIT = 16 * 1024
 MOUNTS = 3
 HEADER = 4096
-# 对象层的条带几何要求 payload 能被 unit × 分片数整除（否则末轮条带不满，
-# 段尾会越过分片边界）。因此各用例按分片数取层宽：
-#   3 分片 → span 3（payload 48KiB = unit × 3）
-#   2 分片 → span 2（payload 32KiB = unit × 2）
+# 多盘几何不再有 unit 整除约束（无条带）：payload 只需 4096 对齐。
+SPAN = 2
 
 
 def _key(value, layer=0):
@@ -41,8 +39,8 @@ SubmitResult = namedtuple(
 )
 
 
-class StripedFakeRuntime:
-    """Host fake that maps every request byte into real shard files."""
+class RotatingFakeRuntime:
+    """Host fake that maps every request onto the real slot file."""
 
     def __init__(self):
         self._next = 0
@@ -55,17 +53,10 @@ class StripedFakeRuntime:
     def open_batch(self, uris):
         tickets = []
         for uri in uris:
-            assert uri.startswith("striped://")
-            parsed = urlsplit(uri)
-            query = parse_qs(parsed.query)
-            mounts = query["devs"][0].split(",")
-            unit = int(query["unit"][0])
-            # 对象层不写 rot：缺省 0（rotation 由槽位号在 C++ 侧派生）
-            rotation = int(query["rot"][0]) if "rot" in query else 0
+            assert uri.startswith("file://")
+            path = unquote(urlsplit(uri).netloc + urlsplit(uri).path)
             self._next += 1
-            self._targets[self._next] = (
-                parsed.netloc + parsed.path, mounts, unit, rotation
-            )
+            self._targets[self._next] = path
             tickets.append(self._next)
         return tickets
 
@@ -98,34 +89,21 @@ class StripedFakeRuntime:
 
     def _execute(self, request):
         target, target_offset, memory, memory_offset, length, direction = request
-        name, mounts, unit, rotation = self._targets[target]
+        path = self._targets[target]
         addr, _ = self._memories[memory]
-        remaining = length
-        logical = target_offset
-        copied = memory_offset
-        while remaining:
-            shard = ((logical // unit) + rotation) % len(mounts)
-            shard_offset = (logical // (unit * len(mounts))) * unit + logical % unit
-            count = min(remaining, unit - logical % unit)
-            path = Path(mounts[shard]) / "striped" / (
-                name + ".shard" + str(shard)
-            )
-            fd = os.open(str(path), os.O_RDWR)
-            try:
-                if direction == "write":
-                    data = ctypes.string_at(addr + copied, count)
-                    os.pwrite(fd, data, shard_offset)
-                else:
-                    data = os.pread(fd, count, shard_offset)
-                    ctypes.memmove(addr + copied, data, len(data))
-            finally:
-                os.close(fd)
-            logical += count
-            copied += count
-            remaining -= count
+        fd = os.open(path, os.O_RDWR)
+        try:
+            if direction == "write":
+                data = ctypes.string_at(addr + memory_offset, length)
+                os.pwrite(fd, data, target_offset)
+            else:
+                data = os.pread(fd, length, target_offset)
+                ctypes.memmove(addr + memory_offset, data, len(data))
+        finally:
+            os.close(fd)
 
 
-def _object_layout(tmp_path, *, mounts, layers=2, segment=SEGMENT, unit=UNIT,
+def _object_layout(tmp_path, *, mounts, layers=SPAN, segment=SEGMENT,
                    capacity=8, rank_id=0, rank_count=1):
     root = tmp_path / "meta-root"
     root.mkdir(parents=True, exist_ok=True)
@@ -133,33 +111,37 @@ def _object_layout(tmp_path, *, mounts, layers=2, segment=SEGMENT, unit=UNIT,
         Path(mount).mkdir(parents=True, exist_ok=True)
     layout = ObjectLayout(
         root, segment, mounts=[str(mount) for mount in mounts],
-        stripe_unit=unit, capacity_chunks=capacity,
+        capacity_chunks=capacity,
         prewarm_chunks=min(capacity, 4), rank_id=rank_id, rank_count=rank_count,
-        namespace=b"striped-contract",
+        namespace=b"rotating-contract",
     )
     layout.set_layer_span(layers)
     return layout
 
 
-def test_striped_store_roundtrip_and_drop(tmp_path):
-    """条带 store 端到端：写读回、按对象提交、drop 使整个对象失效。"""
+def _slot_path(mount, rank_id, slot):
+    return Path(mount) / f"r{rank_id}" / f"{slot}.obj"
+
+
+def test_rotating_store_roundtrip_and_drop(tmp_path):
+    """多盘 store 端到端：写读回、按对象提交、drop 使整个对象失效。"""
     mounts = [tmp_path / ("nvme" + str(i)) for i in range(2)]
     store = TuttiKVStore(
-        tmp_path / "meta-root", 2, SEGMENT, runtime=StripedFakeRuntime(),
-        layout="striped", mounts=mounts, stripe_unit=UNIT,
+        tmp_path / "meta-root", 2, SEGMENT, runtime=RotatingFakeRuntime(),
+        layout="striped", mounts=mounts,
     )
     store.open()
-    store.set_layer_span(2)
-    source = bytearray(SEGMENT * 2)
+    store.set_layer_span(SPAN)
+    source = bytearray(SEGMENT * SPAN)
     source[:SEGMENT] = bytes(range(256)) * (SEGMENT // 256)
     source[SEGMENT:] = b"z" * SEGMENT
-    source_id = store.register_buffer(source, UNIT)
+    source_id = store.register_buffer(source, SEGMENT)
     key0, key1 = _key(7, 0), _key(7, 1)
     store.put_batch([(key0, source_id, 0), (key1, source_id, SEGMENT)]).wait()
 
     assert store.scan() == sorted([key0, key1])
-    destination = bytearray(SEGMENT * 2)
-    destination_id = store.register_buffer(destination, UNIT)
+    destination = bytearray(SEGMENT * SPAN)
+    destination_id = store.register_buffer(destination, SEGMENT)
     store.get_batch(
         [(key0, destination_id, 0), (key1, destination_id, SEGMENT)]
     ).wait()
@@ -172,8 +154,8 @@ def test_striped_store_roundtrip_and_drop(tmp_path):
     store.close()
 
 
-def test_striped_uri_and_shard_paths(tmp_path):
-    """URI 携带 devs/unit；分片文件落在 <mount>/striped/<slot>.shard<i>。"""
+def test_rotating_uri_and_slot_files(tmp_path):
+    """URI 是 file://<mount>/r<rank>/<slot>.obj；槽位文件是整个对象。"""
     mounts = [tmp_path / ("nvme" + str(i)) for i in range(MOUNTS)]
     layout = _object_layout(tmp_path, mounts=mounts, layers=MOUNTS)
     chunk = _key(5)[:16]
@@ -182,30 +164,41 @@ def test_striped_uri_and_shard_paths(tmp_path):
 
     uri = layout.target_uri(chunk)
     parsed = urlsplit(uri)
-    query = parse_qs(parsed.query)
-    assert query["devs"][0].split(",") == [str(m) for m in mounts]
-    assert query["unit"] == [str(UNIT)]
-    # 对象头前缀向上取整到整个条带轮：段（因而每个请求）都与条带单元对齐，
-    # 不会因 4096 的偏移让 128KiB 请求多跨一个分片（实测多出的 NVMe 命令把
-    # 写 IO 设备时间抬高 64%）。
-    wheel = UNIT * MOUNTS
+    assert uri.startswith("file://")
+    # 对象头紧贴 payload：无条带轮对齐预留。
     offset = layout.target_offset(chunk)
-    assert offset % wheel == 0
-    assert offset == -(-HEADER // wheel) * wheel
+    assert offset == HEADER
     assert layout.target_size(chunk) == MOUNTS * SEGMENT
 
-    # 分片文件按 URI 的 name 命名；每分片是整数个条带轮，且总逻辑空间
-    # （N × floor(分片尺寸/unit) × unit）覆盖前缀 + payload。
-    slot = int(parsed.netloc + parsed.path)
-    for index, mount in enumerate(mounts):
-        path = Path(mount) / "striped" / f"{slot}.shard{index}"
-        assert path.exists()
-        size = path.stat().st_size
-        assert size % UNIT == 0
-        assert MOUNTS * (size // UNIT) * UNIT >= offset + MOUNTS * SEGMENT
+    # 槽位文件按 URI 的路径命名，恰好一个文件承载整个对象。
+    slot = int(Path(unquote(parsed.netloc + parsed.path)).stem)
+    mount = mounts[slot % MOUNTS]
+    path = _slot_path(mount, 0, slot)
+    assert path.exists()
+    size = path.stat().st_size
+    assert size >= HEADER + MOUNTS * SEGMENT
 
 
-def test_striped_slot_identity_is_stable(tmp_path):
+def test_rotating_slots_spread_over_mounts(tmp_path):
+    """槽位号在 mounts 间轮转：连续槽位把请求摊到每块盘。"""
+    mounts = [tmp_path / ("nvme" + str(i)) for i in range(2)]
+    layout = _object_layout(tmp_path, mounts=mounts, capacity=8)
+    per_mount = {0: 0, 1: 0}
+    for value in range(8):
+        layout.prepare_put([_key(value, 0)], capacity_chunks=8)
+        uri = layout.target_uri(_key(value)[:16])
+        path = Path(unquote(urlsplit(uri).netloc + urlsplit(uri).path))
+        mount_index = next(
+            i for i, mount in enumerate(mounts)
+            if str(path).startswith(str(mount))
+        )
+        per_mount[mount_index] += 1
+    # 8 槽 × 2 盘 = 每盘 4：轮转必须均匀，不能退化成常量映射。
+    assert per_mount == {0: 4, 1: 4}
+    layout.close_object_pool()
+
+
+def test_rotating_slot_identity_is_stable(tmp_path):
     """同一 chunk 的槽位 URI 恒定；回收后槽位可被新 chunk 复用。"""
     mounts = [tmp_path / ("nvme" + str(i)) for i in range(2)]
     layout = _object_layout(tmp_path, mounts=mounts, capacity=2)
@@ -233,7 +226,7 @@ def test_striped_slot_identity_is_stable(tmp_path):
     layout.close_object_pool()
 
 
-def test_striped_capacity_trims_unadmitted_chunks(tmp_path):
+def test_rotating_capacity_trims_unadmitted_chunks(tmp_path):
     """容量耗尽按对象层契约裁剪：被拒 chunk 没有槽位、也不会被提交。"""
     mounts = [tmp_path / ("nvme" + str(i)) for i in range(2)]
     layout = _object_layout(tmp_path, mounts=mounts, capacity=1)
@@ -249,53 +242,38 @@ def test_striped_capacity_trims_unadmitted_chunks(tmp_path):
     layout.close_object_pool()
 
 
-def test_striped_rank_roots_are_isolated(tmp_path):
-    """多 rank 共用同一组盘：槽位路径与 URI 必须按 rank 的 root 隔离。
+def test_rotating_rank_slots_are_isolated(tmp_path):
+    """多 rank 共用同一组盘：槽位文件按 rank 子目录隔离。
 
-    否则不同 rank 会写同名分片（互相追加/覆盖），槽位校验失败且数据互相
-    污染——8 卡每 4 rank 共用一组盘时的实测故障。分片名由对象的 uri 派生，
-    故隔离由「每个 rank 独立 root」保证，这里把它钉住。
+    否则不同 rank 会写同名文件（互相覆盖），槽位校验失败且数据互相污染
+    ——8 卡共享一组盘时的实测故障。分片文件在 ``<mount>/r<rank_id>/`` 下，
+    这里把隔离钉住。
     """
     mounts = [tmp_path / "nvme0", tmp_path / "nvme1"]
     rank0 = _object_layout(tmp_path / "rank0", mounts=mounts, rank_id=0)
     rank4 = _object_layout(tmp_path / "rank4", mounts=mounts, rank_id=4)
     rank0.prepare_put([_key(7, 0)], capacity_chunks=8)
     rank4.prepare_put([_key(7, 0)], capacity_chunks=8)
-    uri0 = urlsplit(rank0.target_uri(_key(7)[:16]))
-    uri4 = urlsplit(rank4.target_uri(_key(7)[:16]))
-    # 命名空间不同 ⇒ 分片文件名不同（同一组盘上互不覆盖）
-    assert rank0.root != rank4.root
-    assert (uri0.netloc, uri0.path) == (uri4.netloc, uri4.path)  # 槽位号可相同
-    assert uri0.query == uri4.query
+    path0 = Path(unquote(urlsplit(
+        rank0.target_uri(_key(7)[:16])).netloc +
+        urlsplit(rank0.target_uri(_key(7)[:16])).path))
+    path4 = Path(unquote(urlsplit(
+        rank4.target_uri(_key(7)[:16])).netloc +
+        urlsplit(rank4.target_uri(_key(7)[:16])).path))
+    # 同一槽位号、同一组盘，但 rank 子目录不同 ⇒ 互不覆盖
+    assert path0.parent != path4.parent
+    assert path0.parent.name == "r0"
+    assert path4.parent.name == "r4"
+    assert path0.exists() and path4.exists()
+    assert path0 != path4
     rank0.close_object_pool()
     rank4.close_object_pool()
 
 
-def test_striped_unit_larger_than_segment(tmp_path):
-    """条带粒度大于段大小仍是合法几何（一个分片承载多段）。"""
-    mounts = [tmp_path / "nvme0", tmp_path / "nvme1"]
-    layout = _object_layout(
-        tmp_path, mounts=mounts, layers=4, segment=8 * 1024,
-        unit=16 * 1024, capacity=4,
-    )
-    admitted, _ = layout.prepare_put([_key(1, 0)], capacity_chunks=4)
-    assert admitted
-    assert layout.target_size(_key(1)[:16]) == 4 * 8 * 1024
-    assert "unit=16384" in layout.target_uri(_key(1)[:16])
-    layout.close_object_pool()
-
-
-@pytest.mark.parametrize("kwargs", [
-    {"mounts": ["/one"], "stripe_unit": UNIT},
-    {"mounts": ["/one", "/two"], "stripe_unit": 2048},
-    {"mounts": ["/one", "/two"], "stripe_unit": UNIT, "layout": "other"},
-])
-def test_invalid_striped_options(tmp_path, kwargs):
-    options = dict(
-        root=tmp_path, num_chunks=1, segment_bytes=SEGMENT,
-        runtime=StripedFakeRuntime(), layout="striped",
-        mounts=["/one", "/two"], stripe_unit=UNIT,
-    )
-    options.update(kwargs)
+def test_invalid_rotating_options(tmp_path):
+    """未知 layout 拒绝；多盘无其它几何约束（unit 已不存在）。"""
     with pytest.raises(ValueError):
-        TuttiKVStore(**options)
+        TuttiKVStore(
+            tmp_path, 1, SEGMENT, runtime=RotatingFakeRuntime(),
+            layout="other",
+        )

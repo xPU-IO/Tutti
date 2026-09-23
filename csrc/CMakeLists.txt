@@ -223,8 +223,6 @@ target_link_libraries(tutti_spi INTERFACE tutti_api)
 
 add_subdirectory(payloads/ext4_local_nvme)
 add_subdirectory(resolvers/local_file)
-add_subdirectory(payloads/striped_local_nvme)
-add_subdirectory(resolvers/striped_file)
 add_subdirectory(resolvers)
 add_subdirectory(data_paths)
 
@@ -496,13 +494,6 @@ if(BUILD_TESTING)
     )
     message(STATUS "Tutti: added tests/uapi_contract (hardware-free UAPI contract test)")
 
-    # Striped resolver contract test (hardware-free; uses mock shard resolvers).
-    add_subdirectory(
-        "${TUTTI_REPOSITORY_ROOT}/tests/striped_resolver"
-        "${CMAKE_CURRENT_BINARY_DIR}/tests_striped_resolver"
-    )
-    message(STATUS "Tutti: added tests/striped_resolver (hardware-free striped resolver contract test)")
-
     # Phase 3 header-hygiene consumer test (hardware-free).
     # Links ONLY tutti_api; uses __has_include to assert that local-NVMe
     # private headers (libnvm, nvmeservice, snvme kernel, CUDA kernel) are
@@ -599,6 +590,13 @@ if(BUILD_TESTING)
             add_subdirectory(
                 "${TUTTI_REPOSITORY_ROOT}/examples/layerwise_kv_overlap"
                 "${CMAKE_CURRENT_BINARY_DIR}/examples_layerwise_kv_overlap"
+            )
+
+            # Single-drive small-IO bandwidth probe (32 KiB goal: match the
+            # fio libaio baseline from one GPU kernel). Manual workload.
+            add_subdirectory(
+                "${TUTTI_REPOSITORY_ROOT}/examples/nvme_bw_probe"
+                "${CMAKE_CURRENT_BINARY_DIR}/examples_nvme_bw_probe"
             )
 
             # Round 19 S3b: registration throughput microbenchmark.

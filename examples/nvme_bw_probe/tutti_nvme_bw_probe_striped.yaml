@@ -1,0 +1,50 @@
+# ============================================================================
+# nvme_bw_probe —— 4 盘 rotating 配置
+#
+# 与单盘版字段一致；striped 合同要求 device_ids >= 2 且顺序与
+# --directory 传入顺序一致。
+# ============================================================================
+
+accelerator:
+  profile: CUDA
+
+runtime:
+  accel_id: 0
+
+storage:
+  resources:
+    - id: bw-probe-striped-nvme
+      type: nvme
+      provider:
+        type: nvme-service
+        endpoint: "127.0.0.1:50051"
+      allocation:
+        selection: striped            # 多盘：一组 rotating 设备
+        device_ids: [0, 1, 2, 3]
+        queues_per_controller: 32     # 每盘用户队列数（QP）
+
+  resolvers:
+    - id: bw-probe-file-resolver
+      type: local-file                # 解析 file:// URI
+      scheme: file
+      config: {}
+
+  datapaths:
+    - id: bw-probe-striped-datapath
+      type: striped-local-nvme        # 多盘数据路径
+      config:
+        handle_cache_capacity: 16     # 4 文件句柄，16 槽绰绰有余
+        prp_cache_capacity: 262144     # PRP 页缓存（host DRAM 池），1 GiB
+        handle_cache_l2_capacity: 0
+        threads_per_block: 32
+        max_in_flight_operations: 4   # 探针串行 submit+wait
+        max_batch_entries: 8192        # depth 扫描最大值
+        io_granularity: 0             # 动态 PRP
+
+  backends:
+    - id: bw-probe-storage
+      contract: striped-local-nvme    # 多盘契约名
+      resolver: bw-probe-file-resolver
+      datapath: bw-probe-striped-datapath
+      resource: bw-probe-striped-nvme
+      config: {}

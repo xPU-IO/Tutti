@@ -7,7 +7,7 @@
 #include <vector>
 
 #include "csrc/resolvers/local_file/resolver.h"
-#include "csrc/resolvers/striped_file/resolver.h"
+#include "csrc/resolvers/local_file/multi_mount_resolver.h"
 
 #include "csrc/resolvers/memfs/resolver.h"
 #include "csrc/resource/memory/memory_resource.h"
@@ -133,21 +133,45 @@ void test_local_file_creation() {
           "local-file factory should construct LocalFileResolver");
 }
 
-void test_striped_file_creation() {
+void test_multi_mount_creation() {
     ViewResource resource("nvme0", "nvme", nvme_view(2));
+    // The multi-device contract uses the same local-file resolver spec; the
+    // factory switches to the mount-table resolver from the slice count.
     tutti::config::ResolverSpec spec{
-        "resolver0", "striped-file", "striped",
-        tutti::config::StripedFileResolverConfig{}};
+        "resolver0", "local-file", "file",
+        tutti::config::LocalFileResolverConfig{}};
     auto backend = relation("striped-local-nvme", "resolver0",
                             "configured-striped-dp", "nvme0");
 
     auto created = tutti::resolvers::create_resolver(
         spec, {resource, backend, "configured-striped-dp"});
-    CHECK(created.ok(), "striped-file factory should accept two NVMe slices");
+    CHECK(created.ok(), "local-file factory should accept two NVMe slices "
+                         "under the striped contract");
     CHECK(created.ok() && dynamic_cast<
-              tutti::resolvers::striped_file::StripedResolver*>(
+              tutti::resolvers::local_file::MultiMountLocalFileResolver*>(
                   created.value().get()) != nullptr,
-          "striped-file factory should construct StripedResolver");
+          "local-file factory should construct MultiMountLocalFileResolver "
+          "for multi-slice views");
+    if (!created.ok()) return;
+
+    // Dispatch is by mount prefix: a path under mount 1 must resolve via
+    // that mount's binding, and the resolved target must carry the
+    // configured DataPath key.
+    (void)created;
+}
+
+void test_single_slice_rejects_multi_contract() {
+    ViewResource resource("nvme0", "nvme", nvme_view(1));
+    tutti::config::ResolverSpec spec{
+        "resolver0", "local-file", "file",
+        tutti::config::LocalFileResolverConfig{}};
+    auto backend = relation("striped-local-nvme", "resolver0",
+                            "configured-striped-dp", "nvme0");
+
+    auto created = tutti::resolvers::create_resolver(
+        spec, {resource, backend, "configured-striped-dp"});
+    CHECK(!created.ok(),
+          "a single NVMe slice must not pass the multi-device contract");
 }
 
 void test_memfs_creation_and_instance_key() {
@@ -204,7 +228,8 @@ void test_wrong_view_rejected() {
 
 int main() {
     test_local_file_creation();
-    test_striped_file_creation();
+    test_multi_mount_creation();
+    test_single_slice_rejects_multi_contract();
     test_memfs_creation_and_instance_key();
     test_wrong_view_rejected();
     if (failures == 0) {

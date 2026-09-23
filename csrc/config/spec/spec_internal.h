@@ -27,8 +27,6 @@ Status validate_memory_resource(const ResourceSpec& spec,
                                 const std::string& path);
 Status validate_local_file_resolver(const ResolverSpec& spec,
                                     const std::string& path);
-Status validate_striped_file_resolver(const ResolverSpec& spec,
-                                      const std::string& path);
 Status validate_memfs_resolver(const ResolverSpec& spec,
                                const std::string& path);
 Status validate_local_nvme_datapath(const DataPathSpec& spec,

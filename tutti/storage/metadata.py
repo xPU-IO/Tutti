@@ -96,7 +96,6 @@ class TuttiMetadataStore:
         *,
         layout="file_per_chunk",
         mounts=None,
-        stripe_unit=None,
         preset=None,
         rank_options=None,
         tp_size: int = 1,
@@ -121,7 +120,6 @@ class TuttiMetadataStore:
                 "root": root,
                 "layout": layout,
                 "mounts": mounts,
-                "stripe_unit": stripe_unit,
                 "preset": preset,
             }]
         if len(rank_options) != self._tp_size:
@@ -133,14 +131,10 @@ class TuttiMetadataStore:
             raise ValueError("every TP rank requires a distinct metadata root")
         self._views: list[ObjectStore] = []
         self._live: set[bytes] = set()
-        # 条带几何（挂载点 + 条带粒度）与数据面必须完全一致：对象层的槽位
-        # 路径由它推导，不一致就会指向别的文件。
+        # 多盘布局（挂载点集合）与数据面必须完全一致：对象层的槽位路径由它
+        # 推导，不一致就会指向别的文件。
         self._mounts: list[str] | None = None
-        self._stripe_unit = 0
         if rank_options[0].get("layout") == "striped":
-            stripe_unit = rank_options[0].get("stripe_unit")
-            if stripe_unit is None:
-                raise ValueError("striped metadata store requires stripe_unit")
             mounts = rank_options[0].get("mounts")
             preset = rank_options[0].get("preset")
             if mounts is None and isinstance(preset, dict):
@@ -151,7 +145,6 @@ class TuttiMetadataStore:
             if not mounts:
                 raise ValueError("striped metadata store requires mounts")
             self._mounts = [str(mount) for mount in mounts]
-            self._stripe_unit = int(stripe_unit)
         # 冷启动对账需要层宽（对象几何 = 段数 × 段大小 + 对象头），未声明时
         # scan() 返回空（fail-closed）。worker 侧在 bind 后由引擎注入；调度侧
         # 没有 bind 阶段，必须在构造时给出——否则复用已有池时永远恢复不到任何
@@ -238,7 +231,7 @@ class TuttiMetadataStore:
             options = {
                 "scheme": (
                     SCHEME_STRIPED_NVME_FILE
-                    if self._stripe_unit else SCHEME_LOCAL_NVME_FILE
+                    if self._mounts else SCHEME_LOCAL_NVME_FILE
                 ),
                 "uri": root,
                 "capacity_slots": self._num_chunks,
@@ -246,10 +239,11 @@ class TuttiMetadataStore:
                 "segment_count": self._layer_span,
                 "namespace_fingerprint": _fingerprint_bytes(self._key_namespace),
                 "devices": self._devices_for(rank),
-                "stripe_unit": self._stripe_unit,
                 "prewarm_bytes": 0,
                 "background_reclaim": False,
-                "rank_id": 0,
+                # 多盘布局的槽位文件按 rank 分目录（chunks/r<rank>/），必须用
+                # 与 worker 相同的 rank 才能对上同一批文件。
+                "rank_id": rank,
                 "rank_count": 1,
                 "read_only": True,
             }

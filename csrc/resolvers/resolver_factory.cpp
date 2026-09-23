@@ -8,7 +8,7 @@
 #include <vector>
 
 #include "csrc/resolvers/local_file/resolver.h"
-#include "csrc/resolvers/striped_file/resolver.h"
+#include "csrc/resolvers/local_file/multi_mount_resolver.h"
 
 #include "csrc/resolvers/memfs/resolver.h"
 #include "csrc/resource/memory/memory_resource.h"
@@ -21,7 +21,6 @@ namespace backend_ids = tutti::detail::backend_ids;
 namespace local_file = tutti::resolvers::local_file;
 namespace memory_resource = tutti::resources::memory;
 namespace nvme_resource = tutti::resources::nvme;
-namespace striped_file = tutti::resolvers::striped_file;
 
 Status invalid(std::string message) {
     return Status(StatusCode::INVALID_ARGUMENT, std::move(message));
@@ -68,10 +67,28 @@ Result<std::unique_ptr<StorageTargetResolver>> create_local_file(
     const config::ResolverSpec& spec,
     const ResolverCreateContext& context) {
     if (spec.type != tutti::detail::backend_ids::kExt4ResolverType ||
-        !std::holds_alternative<config::LocalFileResolverConfig>(spec.config) ||
-        context.relation.contract != backend_ids::kExt4Contract ||
-        !std::holds_alternative<config::Ext4LocalNvmeBackendConfig>(
-            context.relation.config)) {
+        !std::holds_alternative<config::LocalFileResolverConfig>(spec.config)) {
+        return failure<std::unique_ptr<StorageTargetResolver>>(
+            invalid("local-file ResolverSpec does not match backend relation"));
+    }
+    // Which relation this resolver serves decides the slice cardinality:
+    // ext4-local-nvme is exactly one device; striped-local-nvme (the
+    // multi-device contract, whose files rotate across mounts) is two or
+    // more. Everything else is a configuration error.
+    const bool single = context.relation.contract == backend_ids::kExt4Contract;
+    const bool multi = context.relation.contract == backend_ids::kStripedContract;
+    if (!single && !multi) {
+        return failure<std::unique_ptr<StorageTargetResolver>>(
+            invalid("local-file resolver does not serve contract " +
+                    context.relation.contract));
+    }
+    if (single && !std::holds_alternative<config::Ext4LocalNvmeBackendConfig>(
+                     context.relation.config)) {
+        return failure<std::unique_ptr<StorageTargetResolver>>(
+            invalid("local-file ResolverSpec does not match backend relation"));
+    }
+    if (multi && !std::holds_alternative<config::StripedLocalNvmeBackendConfig>(
+                     context.relation.config)) {
         return failure<std::unique_ptr<StorageTargetResolver>>(
             invalid("local-file ResolverSpec does not match backend relation"));
     }
@@ -86,63 +103,49 @@ Result<std::unique_ptr<StorageTargetResolver>> create_local_file(
         return failure<std::unique_ptr<StorageTargetResolver>>(
             invalid("local-file resolver requires NVMe resolver view"));
     }
-    if (view->slices.size() != 1) {
+    if (view->slices.empty()) {
         return failure<std::unique_ptr<StorageTargetResolver>>(
-            invalid("local-file resolver requires exactly one NVMe slice"));
-    }
-    const auto& slice = view->slices.front();
-    auto result = std::make_unique<local_file::LocalFileResolver>(
-        slice.pci_bdf,
-        slice.namespace_id,
-        slice.logical_block_size,
-        local_file::BackingDeviceConfig{slice.block_path, 0},
-        local_file::kFiemapMaxExtentsPerCall,
-        context.data_path_key);
-    std::unique_ptr<StorageTargetResolver> resolver = std::move(result);
-    return Result<std::unique_ptr<StorageTargetResolver>>::Success(
-        std::move(resolver));
-}
-
-Result<std::unique_ptr<StorageTargetResolver>> create_striped_file(
-    const config::ResolverSpec& spec,
-    const ResolverCreateContext& context) {
-    const auto* relation =
-        std::get_if<config::StripedLocalNvmeBackendConfig>(
-            &context.relation.config);
-    if (spec.type != tutti::detail::backend_ids::kStripedResolverType ||
-        !std::holds_alternative<config::StripedFileResolverConfig>(spec.config) ||
-        context.relation.contract != backend_ids::kStripedContract ||
-        relation == nullptr) {
-        return failure<std::unique_ptr<StorageTargetResolver>>(
-            invalid("striped-file ResolverSpec does not match backend relation"));
-    }
-    auto base_view = resolver_view(context);
-    if (!base_view.ok()) {
-        return failure<std::unique_ptr<StorageTargetResolver>>(
-            base_view.status());
-    }
-    const auto* view = dynamic_cast<const nvme_resource::NvmeResolverResourceView*>(
-        base_view.value().get());
-    if (view == nullptr) {
-        return failure<std::unique_ptr<StorageTargetResolver>>(
-            invalid("striped-file resolver requires NVMe resolver view"));
-    }
-    if (view->slices.size() < 2) {
-        return failure<std::unique_ptr<StorageTargetResolver>>(
-            invalid("striped-file resolver requires at least two NVMe slices"));
+            invalid("local-file resolver requires at least one NVMe slice"));
     }
 
-    std::vector<std::unique_ptr<StorageTargetResolver>> shards;
-    shards.reserve(view->slices.size());
-    for (const auto& slice : view->slices) {
-        shards.push_back(std::make_unique<local_file::LocalFileResolver>(
+    // One device: the original single-mount resolver.
+    if (view->slices.size() == 1) {
+        if (!single) {
+            return failure<std::unique_ptr<StorageTargetResolver>>(
+                invalid("single NVMe slice requires the ext4-local-nvme "
+                        "contract"));
+        }
+        const auto& slice = view->slices.front();
+        auto result = std::make_unique<local_file::LocalFileResolver>(
             slice.pci_bdf,
             slice.namespace_id,
             slice.logical_block_size,
-            local_file::BackingDeviceConfig{slice.block_path, 0}));
+            local_file::BackingDeviceConfig{slice.block_path, 0},
+            local_file::kFiemapMaxExtentsPerCall,
+            context.data_path_key);
+        std::unique_ptr<StorageTargetResolver> resolver = std::move(result);
+        return Result<std::unique_ptr<StorageTargetResolver>>::Success(
+            std::move(resolver));
     }
-    auto result = std::make_unique<striped_file::StripedResolver>(
-        std::move(shards), relation->stripe_unit, context.data_path_key);
+
+    // Several devices: one "file" resolver dispatching by mount prefix. A
+    // slot's file path already names the device it lives on (placement
+    // rotated slots across mounts), so resolution is prefix matching plus
+    // the full single-device pipeline per delegate.
+    if (!multi) {
+        return failure<std::unique_ptr<StorageTargetResolver>>(
+            invalid("multiple NVMe slices require the striped-local-nvme "
+                    "contract"));
+    }
+    std::vector<local_file::MultiMountLocalFileResolver::MountBinding> bindings;
+    bindings.reserve(view->slices.size());
+    for (const auto& slice : view->slices) {
+        bindings.push_back({slice.backing_mount_path, slice.pci_bdf,
+                            slice.namespace_id, slice.logical_block_size,
+                            slice.block_path, context.data_path_key});
+    }
+    auto result = std::make_unique<local_file::MultiMountLocalFileResolver>(
+        std::move(bindings));
     std::unique_ptr<StorageTargetResolver> resolver = std::move(result);
     return Result<std::unique_ptr<StorageTargetResolver>>::Success(
         std::move(resolver));
@@ -189,9 +192,6 @@ Result<std::unique_ptr<StorageTargetResolver>> create_resolver(
     }
     if (std::holds_alternative<config::LocalFileResolverConfig>(spec.config)) {
         return create_local_file(spec, context);
-    }
-    if (std::holds_alternative<config::StripedFileResolverConfig>(spec.config)) {
-        return create_striped_file(spec, context);
     }
     if (std::holds_alternative<config::MemfsResolverConfig>(spec.config)) {
         return create_memfs(spec, context);

@@ -72,9 +72,11 @@ bool MetadataArena::init(const Config& cfg) {
     }
     ++alloc_counts_.cuda_malloc;
 
-    // 3. Allocate status pool (contiguous GPU buffer for all slots).
+    // 3. Allocate status pool (contiguous GPU buffer for all slots). Each
+    // slot gets one extra status element past its entry range to host the
+    // worker-pool task cursor (see Lease::d_task_counter).
     std::size_t status_pool_bytes = static_cast<std::size_t>(cfg_.num_slots) *
-                                    cfg_.max_entries_per_slot *
+                                    (cfg_.max_entries_per_slot + 1) *
                                     sizeof(EntryCompletionStatus);
     ce = cudaMalloc(reinterpret_cast<void**>(&d_status_pool_), status_pool_bytes);
     if (ce != cudaSuccess) {
@@ -187,8 +189,10 @@ bool MetadataArena::acquire(Lease& out) {
     out.slot_index = slot;
     out.event = events_[slot];
     out.d_entries = d_entries_pool_ + static_cast<std::size_t>(slot) * cfg_.max_entries_per_slot;
-    out.d_status = d_status_pool_ + static_cast<std::size_t>(slot) * cfg_.max_entries_per_slot;
+    out.d_status = d_status_pool_ + static_cast<std::size_t>(slot) * (cfg_.max_entries_per_slot + 1);
     out.d_desc_pool = d_desc_pool_ + static_cast<std::size_t>(slot) * cfg_.max_entries_per_slot;
+    out.d_task_counter = reinterpret_cast<unsigned int*>(
+        out.d_status + cfg_.max_entries_per_slot);
 
     return true;
 }

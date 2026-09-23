@@ -145,129 +145,98 @@ void test_single_file_placement() {
 }
 
 // ======================================================================
-// 2. StripedPlacement
+// 2. RotatingFilePlacement
 // ======================================================================
-void test_striped_placement() {
-    const std::vector<std::string> mounts = {"/mnt/nvme0/st", "/mnt/nvme1/st"};
-    constexpr std::uint64_t kUnit = 65536;  // 64 KiB, as deployed
-    StripedPlacement policy(mounts, kUnit);
+void test_rotating_file_placement() {
+    const std::vector<std::string> mounts = {"/mnt/nvme0/kv", "/mnt/nvme1/kv"};
+    RotatingFilePlacement policy(mounts);
 
-    CHECK(policy.shard_count() == 2);
-    CHECK(policy.stripe_unit() == kUnit);
-    // The header lives on shard 0 only. Replicating it would turn one atomic
-    // commit into N fsyncs, where a crash could commit shard 0 and not shard 1.
+    // A slot is one file, so there is no shard set and no stripe geometry.
+    CHECK(policy.shard_count() == 1);
     CHECK(policy.header_shard() == 0);
     CHECK(policy.header_offset_in_shard() == 0);
+    CHECK(policy.payload_offset() == ObjectHeaderLayout::kHeaderBytes);
 
     std::vector<std::string> paths;
     CHECK(policy.paths_for_slot(5, &paths).ok());
-    REQUIRE(paths.size() == 2);
-    // These paths are NOT this policy's choice: the striped resolver derives
-    // <mount_i>/striped/<name>.shard<i> from the URI itself, so the policy must
-    // reproduce them exactly. A divergence would have materialisation write one
-    // set of files while resolution maps another, leaving DMA pointed at
-    // unallocated extents.
-    CHECK(paths[0] == "/mnt/nvme0/st/striped/5.shard0");
-    CHECK(paths[1] == "/mnt/nvme1/st/striped/5.shard1");
-    // Shards must live on DIFFERENT mounts, or striping buys nothing.
-    CHECK(paths[0].rfind("/mnt/nvme0/", 0) == 0);
-    CHECK(paths[1].rfind("/mnt/nvme1/", 0) == 0);
+    REQUIRE(paths.size() == 1);
+    // 5 % 2 == 1 -> mount 1, and the file is the slot: one path, verbatim what
+    // the local-file resolver will take from the URI.
+    CHECK(paths[0] == "/mnt/nvme1/kv/chunks/5.obj");
+    CHECK(paths[0].rfind("/mnt/nvme1/", 0) == 0);
 
-    // Each shard is a whole number of stripe rounds. The formula must survive
-    // the resolver's floor, which derives the object's logical size from the
-    // shard FILES as  N * floor(shard_bytes / unit) * unit  (see
-    // striped_local_nvme/payload.h): sizing from the payload alone leaves the
-    // prefix outside that space and the last segment's write lands past the end
-    // -- exactly how the first real 8-GPU run failed with
-    // "target_offset + length exceeds target size".
-    // Slot space = the placement's payload prefix + the payload.
+    // A slot occupies exactly one file of exactly the slot size -- the whole
+    // object, header included.
     const std::uint64_t slot_bytes = policy.payload_offset() + kPayload;
-    const std::uint64_t shard_bytes = policy.shard_file_bytes(slot_bytes);
-    CHECK(shard_bytes % 4096 == 0);
-    CHECK(shard_bytes % kUnit == 0);
-    const std::uint64_t kPrefix = policy.payload_offset();
-    CHECK(kPrefix % (kUnit * 2) == 0);         // payload starts on a whole round
-    const std::uint64_t kPayloadAfterPrefix = slot_bytes - kPrefix;
-    CHECK(kPayloadAfterPrefix == kPayload);    // payload size is unchanged
-    const std::uint64_t kRoundsPerShard =
-        (kPrefix + kPayloadAfterPrefix + kUnit * 2 - 1) / (kUnit * 2);
-    CHECK(shard_bytes == kRoundsPerShard * kUnit);
-    // The invariants that matter: the resolver's logical space covers the
-    // payload, and the payload starts on a whole stripe round so a request is
-    // confined to the shards it was sized for.
-    const std::uint64_t logical_bytes = 2 * (shard_bytes / kUnit) * kUnit;
-    CHECK(logical_bytes >= slot_bytes);
-    CHECK(policy.payload_offset() % (kUnit * 2) == 0);
+    CHECK(policy.shard_file_bytes(slot_bytes) == slot_bytes);
 
-    // --- geometry validation ---
-    // 10 MiB over 2 shards at 64 KiB units divides evenly: 80 whole rounds.
-    CHECK(policy.geometry_valid(slot_bytes));
+    // --- the rotation is what spreads a prompt across devices ---
+    //
+    // Consecutive slot numbers are consecutive chunks of a prompt, so with N
+    // mounts each device owns one slot in every N. If this ever degenerated to
+    // a constant (the bug the striped layout had: every chunk's layer L landed
+    // on device L % N) the whole prompt would queue behind one device.
+    {
+        std::vector<int> per_mount(mounts.size(), 0);
+        for (std::uint64_t slot = 0; slot < 40; ++slot) {
+            std::vector<std::string> p;
+            REQUIRE(policy.paths_for_slot(slot, &p).ok());
+            REQUIRE(p.size() == 1);
+            const std::uint64_t dev = policy.device_for_slot(slot);
+            CHECK(p[0].rfind(mounts[dev] + "/", 0) == 0);
+            per_mount[dev] += 1;
+        }
+        // 40 slots over 2 mounts: 20 each, so load is even, not merely legal.
+        for (int count : per_mount) CHECK(count == 20);
+    }
 
-    // A payload that does not divide evenly into whole stripe rounds must be
-    // rejected. Otherwise the final round is short and a segment's tail maps
-    // past the end of some shard -- silent corruption, not a clean error.
-    CHECK(!policy.geometry_valid(kPrefix + kUnit * 3));
-    CHECK(!policy.geometry_valid(kPrefix + 100));
-    // A slot with no room for a payload is not a valid geometry.
-    CHECK(!policy.geometry_valid(kPrefix));
-    CHECK(!policy.geometry_valid(0));
-
-    // A zero stripe unit is nonsense and must not be silently defaulted.
-    StripedPlacement no_unit(mounts, 0);
-    CHECK(!no_unit.geometry_valid(slot_bytes));
-
-    // The resolver requires a 4096-aligned stripe unit, so an unaligned one must
-    // be rejected at open() rather than on the first IO.
-    StripedPlacement unaligned(mounts, 1000);
-    CHECK(!unaligned.geometry_valid(slot_bytes));
-
-    // No mounts at all is a configuration error, reported rather than crashed.
-    StripedPlacement empty({}, kUnit);
-    CHECK(empty.shard_count() == 0);
-    CHECK(!empty.geometry_valid(slot_bytes));
+    // --- empty mount list is a configuration error, reported not crashed ---
+    RotatingFilePlacement empty({});
+    CHECK(!empty.geometry_valid());
     std::vector<std::string> none;
     CHECK(!empty.paths_for_slot(0, &none).ok());
+    CHECK(!policy.paths_for_slot(0, nullptr).ok());
 
-    // The URI must carry the name, the device list and the stripe unit in the
-    // exact shape the striped resolver parses:
-    //     striped://<name>?devs=<m1,m2,...>&unit=<bytes>
-    CHECK(policy.resolver_scheme() == "striped");
-    const std::string uri = policy.uri_for_slot(5);
-    CHECK(uri == "striped://5?devs=/mnt/nvme0/st,/mnt/nvme1/st&unit=65536");
-    CHECK(uri.rfind("striped://", 0) == 0);
-    CHECK(uri.find("?devs=") != std::string::npos);
-    CHECK(uri.find("&unit=65536") != std::string::npos);
+    // --- the URI is the exact file the resolver will map ---
+    //
+    // Any divergence between uri_for_slot() and paths_for_slot() would have
+    // materialisation write one file while resolution maps another, leaving DMA
+    // pointed at unallocated extents. Both are asserted byte-for-byte above.
+    CHECK(policy.resolver_scheme() == "file");
+    const std::string uri = policy.uri_for_slot(4);
+    CHECK(uri == "file:///mnt/nvme0/kv/chunks/4.obj");
+    CHECK(uri.rfind("file://", 0) == 0);
     // A pure function of the slot number, so targets can be cached by slot.
-    CHECK(policy.uri_for_slot(5) == uri);
-    CHECK(policy.uri_for_slot(6) != uri);
+    CHECK(policy.uri_for_slot(4) == uri);
+    CHECK(policy.uri_for_slot(5) != uri);
 
-    // --- four shards, the other deployed shape ---
-    StripedPlacement four({"/a", "/b", "/c", "/d"}, kUnit);
-    CHECK(four.shard_count() == 4);
+    // --- four mounts, the deployed shape ---
+    RotatingFilePlacement four({"/a", "/b", "/c", "/d"});
+    CHECK(four.shard_count() == 1);
     std::vector<std::string> fp;
     CHECK(four.paths_for_slot(9, &fp).ok());
-    REQUIRE(fp.size() == 4);
-    CHECK(fp[3] == "/d/striped/9.shard3");
-    // Same rule as the two-shard case: payload starts on a whole stripe round
-    // and every shard is a whole number of rounds.
-    CHECK(four.payload_offset() % (kUnit * 4) == 0);
-    const std::uint64_t four_slot_bytes = four.payload_offset() + kPayload;
-    CHECK(four.geometry_valid(four_slot_bytes));
-    const std::uint64_t four_bytes = four.shard_file_bytes(four_slot_bytes);
-    CHECK(four_bytes % kUnit == 0);
-    CHECK(4 * (four_bytes / kUnit) * kUnit >= four_slot_bytes);
+    REQUIRE(fp.size() == 1);
+    // 9 % 4 == 1 -> second mount.
+    CHECK(fp[0] == "/b/chunks/9.obj");
+    CHECK(four.paths_for_slot(11, &fp).ok());
+    CHECK(fp[0] == "/d/chunks/11.obj");
+
+    // --- a custom subdirectory is honoured by both paths and URIs ---
+    RotatingFilePlacement sub(mounts, "objects");
+    CHECK(sub.paths_for_slot(2, &fp).ok());
+    CHECK(fp[0] == "/mnt/nvme0/kv/objects/2.obj");
+    CHECK(sub.uri_for_slot(2) == "file://" + fp[0]);
 
     // --- the two policies agree on what they must agree on ---
-    // Both put the header at shard 0 offset 0, and each keeps its payload
-    // start on a whole stripe round (a single file has a one-round geometry,
-    // so a stripe-aligned offset there is the same 4096B reservation).
+    // Both put the header at file 0 offset 0 and start the payload right after
+    // it: a rotating slot and a single-root slot are the same object shape, and
+    // only the mount decision differs.
     SingleFilePlacement single("/mnt/nvme0/ns");
     CHECK(single.header_shard() == policy.header_shard());
     CHECK(single.header_offset_in_shard() == policy.header_offset_in_shard());
-    CHECK(single.payload_offset() == ObjectHeaderLayout::kHeaderBytes);
-    // A single file has no stripe geometry to align to: the payload just has to
-    // start on a device IO granularity boundary.
-    CHECK(single.payload_offset() % 4096 == 0);
+    CHECK(single.payload_offset() == policy.payload_offset());
+    CHECK(single.shard_count() == policy.shard_count());
+    CHECK(single.resolver_scheme() == policy.resolver_scheme());
 }
 
 // ======================================================================
@@ -408,18 +377,34 @@ void test_materialisation(const std::string& dir) {
     CHECK(!materialise_slot(paths, 1000).ok());
     CHECK(!materialise_slot({}, kSmallSlot).ok());
 
-    // --- striped materialisation creates every shard ---
-    StripedPlacement striped({dir + "/st0", dir + "/st1"}, 65536);
-    std::vector<std::string> shards;
-    REQUIRE(striped.paths_for_slot(3, &shards).ok());
-    REQUIRE(shards.size() == 2);
-    CHECK(materialise_slot(shards, kSmallSlot).ok());
-    for (const std::string& p : shards) {
-        struct stat ss{};
-        CHECK(::stat(p.c_str(), &ss) == 0);
-        CHECK(static_cast<std::uint64_t>(ss.st_size) == kSmallSlot);
-        CHECK(static_cast<std::uint64_t>(ss.st_blocks) * 512 >= kSmallSlot);
-    }
+    // --- rotating materialisation puts each slot on exactly one mount ---
+    //
+    // A slot is one file on one device; the mount rotates with the slot number
+    // so consecutive slots (consecutive chunks of a prompt) spread over the
+    // devices. Materialising slot 3 twice must be idempotent and must produce
+    // one file, not a shard set.
+    ::mkdir((dir + "/st0").c_str(), 0755);
+    ::mkdir((dir + "/st1").c_str(), 0755);
+    RotatingFilePlacement rotating({dir + "/st0", dir + "/st1"});
+    std::vector<std::string> placed;
+
+    REQUIRE(rotating.paths_for_slot(3, &placed).ok());
+    REQUIRE(placed.size() == 1);
+    // 3 % 2 == 1 -> second mount; 4 % 2 == 0 -> first.
+    CHECK(placed[0].rfind(dir + "/st1", 0) == 0);
+    REQUIRE(rotating.paths_for_slot(4, &placed).ok());
+    CHECK(placed[0].rfind(dir + "/st0", 0) == 0);
+
+    REQUIRE(rotating.paths_for_slot(4, &placed).ok());
+    CHECK(materialise_slot(placed, kSmallSlot).ok());
+    struct stat ss{};
+    CHECK(::stat(placed[0].c_str(), &ss) == 0);
+    CHECK(static_cast<std::uint64_t>(ss.st_size) == kSmallSlot);
+    CHECK(static_cast<std::uint64_t>(ss.st_blocks) * 512 >= kSmallSlot);
+    // No shard siblings: the slot is one contiguous file, so there is nothing
+    // else to materialise and nothing that could be left behind on crash.
+    struct stat sibling{};
+    CHECK(::stat((dir + "/st0/chunks/4.obj.shard1").c_str(), &sibling) != 0);
 
     // --- zeroing invalidates an object by erasing its header ---
     // A zeroed header decodes as "never written" rather than as corruption,
@@ -646,7 +631,7 @@ void test_checkpoint_io(const std::string& dir) {
 int main() {
     // Placement policies are pure computation: always run.
     test_single_file_placement();
-    test_striped_placement();
+    test_rotating_file_placement();
     test_aligned_buffer();
 
     const std::string dir = temp_dir();

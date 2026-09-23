@@ -19,9 +19,8 @@
 // Private headers — included here ONLY, never by consumer code.
 #include "csrc/data_paths/local_nvme/local_nvme_data_path.h"
 #include "csrc/data_paths/striped_local_nvme/striped_data_path.h"
-#include "csrc/payloads/striped_local_nvme/payload.h"
 #include "csrc/resolvers/local_file/resolver.h"
-#include "csrc/resolvers/striped_file/resolver.h"
+#include "csrc/resolvers/local_file/multi_mount_resolver.h"
 
 namespace tutti::presets {
 
@@ -149,9 +148,8 @@ RuntimeWithTelemetry make_local_nvme_runtime(const LocalNvmePreset& p) {
 
 RuntimeWithTelemetry make_striped_nvme_runtime(const StripedNvmePreset& p) {
     namespace snvme = tutti::data_paths::striped_local_nvme;
-    using tutti::resolvers::local_file::LocalFileResolver;
-    using tutti::resolvers::local_file::BackingDeviceConfig;
-    using tutti::resolvers::striped_file::StripedResolver;
+    using tutti::resolvers::local_file::MultiMountLocalFileResolver;
+    using tutti::detail::backend_ids::kStripedDataPathKey;
 
     std::vector<snvme::DeviceDescriptor> sdevs;
     for (const auto& d : p.devices) {
@@ -166,23 +164,27 @@ RuntimeWithTelemetry make_striped_nvme_runtime(const StripedNvmePreset& p) {
         p.max_batch_entries, p.max_in_flight_operations,
         p.prp_cache_capacity, p.threads_per_block);
 
-    std::vector<std::unique_ptr<StorageTargetResolver>> sub_resolvers;
+    // One "file" resolver dispatching by mount: a slot's file path already
+    // names the device it lives on (placement rotated slots across mounts),
+    // so resolution is prefix matching plus the full single-device pipeline.
+    std::vector<MultiMountLocalFileResolver::MountBinding> bindings;
+    bindings.reserve(p.devices.size());
     for (const auto& d : p.devices) {
-        sub_resolvers.push_back(std::make_unique<LocalFileResolver>(
-            d.pci_bdf, d.namespace_id, d.block_size,
-            BackingDeviceConfig{d.backing_device, 0}));
+        bindings.push_back({d.mount_path, d.pci_bdf, d.namespace_id,
+                            d.block_size, d.backing_device,
+                            std::string(kStripedDataPathKey)});
     }
-    auto* resolver = new StripedResolver(std::move(sub_resolvers), p.stripe_unit);
+    auto* resolver = new MultiMountLocalFileResolver(std::move(bindings));
 
     // Same reasoning as the single-device factory above: inline construction
     // with no other owner, so the runtime takes them and frees them after
-    // shutdown(). Note the striped resolver's sub-resolvers are already
-    // unique_ptr-held inside it, so only the top level changes here.
+    // shutdown(). The delegates are unique_ptr-held inside the table
+    // resolver, so only the top level changes here.
     OwnedComponents owned;
     owned.resolvers.push_back(OwnedResolver{
-        "striped", std::unique_ptr<StorageTargetResolver>(resolver)});
+        "file", std::unique_ptr<StorageTargetResolver>(resolver)});
     owned.data_paths.push_back(OwnedDataPath{
-        std::string(tutti::payloads::striped_local_nvme::kRecommendedDataPathKey),
+        std::string(kStripedDataPathKey),
         std::unique_ptr<DataPath>(dp), DataPathConfig{"striped-nvme"}});
 
     RuntimeConfig runtime_config;

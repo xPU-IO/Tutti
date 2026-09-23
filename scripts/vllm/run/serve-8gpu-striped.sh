@@ -26,49 +26,76 @@ PORT="${PORT:-8192}"
 # 这两个参数不影响 Tutti 的 key 命名空间，旧池数据继续可复用。
 TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-hy_v3}"
 MODEL="${MODEL:-/mnt/nvme4/models/Hy3-FP8}"
-SERVED_NAME="${SERVED_NAME:-tutti}"
+# 对外服务名：流量平台按服务组名 base_model_zh7 路由请求，必须挂成 vLLM
+# 别名，否则 404 "model does not exist"。tutti 保留给本地脚本（driver 默认
+# --model tutti）。vLLM 的 --served-model-name 接受空格分隔的多名字。
+SERVED_NAME="${SERVED_NAME:-tutti base_model_zh7}"
 TP_SIZE="${TP_SIZE:-8}"
 CHUNK_TOKENS="${CHUNK_TOKENS:-256}"
+# vLLM 的 KV block 大小（token 数）。决定 Tutti 侧的两条几何：
+#   page_bytes       = BLOCK_SIZE × 512 B   （单条 IO 的大小）
+#   blocks_per_chunk = CHUNK_TOKENS / BLOCK_SIZE（必须整除）
+# 取 128：单条 IO 64 KiB，一个 chunk = 2 条 IO。
+# 改这个值必须同步改 NUM_GPU_BLOCKS_OVERRIDE —— 后者的单位是 block 而非
+# token，block 定义翻倍而该值不变会让 HBM KV 池占用翻倍（反之则缩水）。
+BLOCK_SIZE="${BLOCK_SIZE:-128}"
 # 在线驱动只发不超过该长度的 prompt（脚本默认 --max-prompt-tokens 与之一致）。
-MAX_PROMPT_TOKENS="${MAX_PROMPT_TOKENS:-20000}"
+MAX_PROMPT_TOKENS="${MAX_PROMPT_TOKENS:-262144}"
 SAMPLES="${SAMPLES:-4}"
 POOL_TAG="${POOL_TAG:-online1}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-$((MAX_PROMPT_TOKENS + 16))}"
+# 模型上限来自 config.json 的 max_position_embeddings；MAX_MODEL_LEN 允许比
+# prompt 上限多 16（vLLM 惯例），但不得超过模型上限（264144 会直接启动失败）。
+MODEL_MAX_LEN="${MODEL_MAX_LEN:-262144}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-$(( MAX_PROMPT_TOKENS + 16 < MODEL_MAX_LEN ? MAX_PROMPT_TOKENS + 16 : MODEL_MAX_LEN ))}"
 
-# HBM KV 池上限（blocks，block_size=64）。**隔离 Tutti 路径的关键旋钮**：
-# 本机 vLLM 未注册 /reset_prefix_cache 端点（endpoint plugin 未注册），无法
-# 清 HBM 前缀缓存，只能把池压到装不下测试集，迫使 HBM 淘汰、复用落到 Tutti。
-# 本机默认 HBM 池是 1,289,081 tokens（约 20141 blocks），测试集 80k tokens
-# 只占 6%——不压小则第二轮起全部命中 HBM，Tutti 完全不参与。
-# 取值约束：
-#   * ≥ 单个最长 prompt 所需 blocks（MAX_PROMPT_TOKENS/64 ≈ 313），否则调度
-#     器无法容纳一个请求；
-#   * < 测试集总 blocks（SAMPLES × 每请求 blocks），否则不会发生淘汰。
-NUM_GPU_BLOCKS_OVERRIDE="${NUM_GPU_BLOCKS_OVERRIDE:-768}"
+# HBM KV 池上限（单位：block）。默认**不传**：用 vLLM 自然池（本机 ~10077
+# blocks = 1.29M tokens，TP8/bf16 下每 token 40 KiB，见 README 的几何推导）。
+# 自然池可容纳 ~4.9 条 256K 或 ~9.8 条 128K 请求并发——生产服务用它。
+#
+# 只有"隔离 Tutti 路径做实验"时才需要压小它：本机 vLLM 未注册
+# /reset_prefix_cache 端点，无法清 HBM 前缀缓存，把池压到装不下工作集才能
+# 逼 HBM 淘汰、让复用落到 Tutti（离线测试的做法：1040 blocks = 1.01 并发
+# 128K）。⚠️ 压小 = 并发被锁死（请求排队），线上服务不要压。
+# 取值约束：≥ ceil(MAX_PROMPT_TOKENS / BLOCK_SIZE)（2048 for 256K），否则
+# 调度器无法容纳一个请求。
+NUM_GPU_BLOCKS_OVERRIDE="${NUM_GPU_BLOCKS_OVERRIDE:-}"
 
-# 数据盘物理总量（方案 A）：直接写"这些盘一共占多少"，由 Python 层按条带
-# 几何换算成槽位数（geometry.apply_capacity_bytes）。默认 4 TiB → 四盘各
-# 约 1 TiB。用了它就不要同时给 num_chunks（两者互斥）。
-CAPACITY_BYTES="${CAPACITY_BYTES:-$(( 4 * 1024 * 1024 * 1024 * 1024 ))}"
+# 数据盘物理总量（方案 A）：**服务级总量**（8 卡加起来的总占用），默认 8 TiB。
+# 注意 apply_capacity_bytes 的语义是"每个 rank 的容量"，而 8 个 rank 共享同一
+# 组盘、各占一份 KV 分片，所以这里必须除以 TP_SIZE 再传给 store，否则每个
+# rank 都按整份总量建槽 = TP 倍超发，盘会被预建线程铺满（2026-09-22 事故：
+# 8TiB × 8 rank = 64TiB 需求铺满 4×5.8TB 盘，ENOSPC 后 KV 写全失败）。
+# 换算示例：8 TiB 总量 → 每 rank 1 TiB → 每盘（8 rank / 4 盘）2 TiB。
+TOTAL_CAPACITY_BYTES="${TOTAL_CAPACITY_BYTES:-$(( 8 * 1024 * 1024 * 1024 * 1024 ))}"
+CAPACITY_BYTES=$(( TOTAL_CAPACITY_BYTES / TP_SIZE ))
 # 同步预热槽位数：open() 期只付这一份（首个请求 + 头几秒的工作集）。
-# 其余容量由后台线程异步铺开（TUTTI_MATERIALIZE_*），写路径永不 create+fsync
-# 槽位——10 TB 级的容量因此不再等于几十分钟启动或 44ms/槽的前向停顿。
+# 之后的增长由后台线程按需跟随（TUTTI_PRECREATE_*），写路径永不 create+fsync
+# 槽位——容量因此不再等于几十分钟启动或 44ms/槽的前向停顿。
 HIGH_WATERMARK="${HIGH_WATERMARK:-4096}"
-# 后台预建：线程数（0 = 关闭，退回写路径按需建槽）。口径见 TUTTI_PRECREATE_SCOPE。
+# 后台预建：线程数（0 = 关闭，退回写路径按需建槽）。
 # 余量 = 保持"分配前沿之前"多少个槽位已就绪；跟不上需求时写入被裁剪（不阻塞）。
+# 预建只跟随分配前沿（盘上占用 ∝ 真实 KV），容量仅作硬上限——"铺满容量"的
+# 口径已从代码里删除（2026-09-22：盘占用 ∝ 容量会把盘写满并与在线 KV 争带宽）。
 export TUTTI_PRECREATE_THREADS="${TUTTI_PRECREATE_THREADS:-4}"
 export TUTTI_PRECREATE_HEADROOM="${TUTTI_PRECREATE_HEADROOM:-4096}"
 # 工作集（仅用于日志展示）
 CHUNKS_PER_REQ=$(( (MAX_PROMPT_TOKENS + CHUNK_TOKENS - 1) / CHUNK_TOKENS ))
 WORKING_SET=$(( SAMPLES * CHUNKS_PER_REQ ))
 
-echo "[serve] model=$MODEL tp=$TP_SIZE port=$PORT max_model_len=$MAX_MODEL_LEN"
-echo "[serve] HBM KV 上限: ${NUM_GPU_BLOCKS_OVERRIDE} blocks" \
-     "(${NUM_GPU_BLOCKS_OVERRIDE} × 64 = $(( NUM_GPU_BLOCKS_OVERRIDE * 64 )) tokens)"
+echo "[serve] model=$MODEL tp=$TP_SIZE port=$PORT max_model_len=$MAX_MODEL_LEN (prompt≤$MAX_PROMPT_TOKENS)"
+if [ -n "$NUM_GPU_BLOCKS_OVERRIDE" ]; then
+    echo "[serve] HBM KV 池: ${NUM_GPU_BLOCKS_OVERRIDE} blocks（覆盖值）" \
+         "(${NUM_GPU_BLOCKS_OVERRIDE} × ${BLOCK_SIZE} = $(( NUM_GPU_BLOCKS_OVERRIDE * BLOCK_SIZE )) tokens)"
+else
+    echo "[serve] HBM KV 池: vLLM 自然池（未覆盖；约 10077 blocks ≈ 1.29M tokens）"
+fi
 echo "[serve] chunks_per_req=$CHUNKS_PER_REQ working_set=$WORKING_SET"
-echo "[serve] pool: capacity_bytes=$CAPACITY_BYTES" \
-     "($(( CAPACITY_BYTES / 1024 / 1024 / 1024 / 1024 )) TiB 总量)" \
-     "prewarm_slots=$HIGH_WATERMARK"
+echo "[serve] IO 几何: block_size=$BLOCK_SIZE tokens/block" \
+     "blocks_per_chunk=$(( CHUNK_TOKENS / BLOCK_SIZE ))" \
+     "device_groups=[[0,1,2,3]] (8 rank 共享 4 盘，槽位轮转)"
+echo "[serve] pool: 服务级总量 $(( TOTAL_CAPACITY_BYTES / 1024 / 1024 / 1024 / 1024 )) TiB" \
+     "(每 rank $(( CAPACITY_BYTES / 1024 / 1024 / 1024 )) GiB)" \
+     "prewarm_slots=$HIGH_WATERMARK headroom=$TUTTI_PRECREATE_HEADROOM"
 echo "[serve] pool_tag=$POOL_TAG (换 tag = 全新冷池，脚本不删旧池)"
 
 # shellcheck source=/dev/null
@@ -111,13 +138,11 @@ read -r -d '' KV_CONFIG <<JSON || true
         "high_watermark": $HIGH_WATERMARK,
         "io_stream": "auto",
         "layout": "striped",
-        "stripe_unit": 65536,
         "preset": {
           "type": "striped",
           "daemon_config": "$REPO_ROOT/config/local/tutti_daemon.yaml",
           "gpu_id": "{LOCAL_RANK}",
-          "device_groups": [[0, 1], [2, 3]],
-          "stripe_unit": 65536,
+          "device_groups": [[0, 1, 2, 3]],
           "num_queues": 8
         }
       }
@@ -126,15 +151,21 @@ read -r -d '' KV_CONFIG <<JSON || true
 }
 JSON
 
+# HBM 池只在显式给了覆盖值时才传参（默认留空 = vLLM 自然池，生产口径）。
+HBM_ARGS=()
+if [ -n "$NUM_GPU_BLOCKS_OVERRIDE" ]; then
+    HBM_ARGS+=(--num-gpu-blocks-override "$NUM_GPU_BLOCKS_OVERRIDE")
+fi
+
 exec "$PYTHON" -m vllm.entrypoints.openai.api_server \
+    "${HBM_ARGS[@]}" \
     --model "$MODEL" \
-    --served-model-name "$SERVED_NAME" \
+    --served-model-name $SERVED_NAME \
     --tensor-parallel-size "$TP_SIZE" \
-    --block-size 64 \
+    --block-size "$BLOCK_SIZE" \
     --enforce-eager \
     --max-model-len "$MAX_MODEL_LEN" \
     --load-format "$LOAD_FORMAT" \
-    --num-gpu-blocks-override "$NUM_GPU_BLOCKS_OVERRIDE" \
     --enable-prefix-caching \
     --enable-log-requests \
     --enable-auto-tool-choice \

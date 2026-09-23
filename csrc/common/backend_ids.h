@@ -56,15 +56,15 @@ inline constexpr std::string_view kExt4ResolverTypeId =
 inline constexpr std::string_view kExt4DataPathKey = "local-nvme-ext4";
 inline constexpr std::string_view kExt4StoreScheme = "local_nvme_file";
 
-// ---- striped local NVMe（条带文件后端）----
+// ---- rotating local NVMe（多盘文件后端）----
+// 2026-09-22 起：放置模型改为"一个对象 = 一个文件，slot 号在 N 块盘间轮转"。
+// resolver 复用 local-file（按挂载点前缀分派到对应设备的 LocalFileResolver
+// 实例），payload 复用 ext4-local-nvme 的（文件即对象，无分片数学）。与
+// ext4-local-nvme 的区别只在 DataPath：本契约走多设备 fused 提交路径。
+// 历史名 "striped-*" 保留为配置面标识，避免一次改遍所有 YAML/Python 常量；
+// 语义见 striped_data_path.h 头注。
 inline constexpr std::string_view kStripedContract = "striped-local-nvme";
-inline constexpr std::string_view kStripedResolverType = "striped-file";
-inline constexpr std::string_view kStripedScheme = "striped";
 inline constexpr std::string_view kStripedDataPathType = "striped-local-nvme";
-inline constexpr std::string_view kStripedPayloadTypeId =
-    "striped-local-nvme-payload-v1";
-inline constexpr std::string_view kStripedResolverTypeId =
-    "striped-resolver-v1";
 inline constexpr std::string_view kStripedDataPathKey = "striped-local-nvme";
 inline constexpr std::string_view kStripedStoreScheme =
     "striped_local_nvme_file";

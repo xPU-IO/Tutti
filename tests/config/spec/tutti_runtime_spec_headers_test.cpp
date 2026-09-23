@@ -24,13 +24,12 @@ static_assert(std::is_default_constructible_v<tutti::config::ResolverSpec>);
 static_assert(std::is_default_constructible_v<tutti::config::DataPathSpec>);
 static_assert(std::is_default_constructible_v<tutti::config::BackendSpec>);
 static_assert(std::is_default_constructible_v<tutti::config::TuttiRuntimeSpec>);
-static_assert(tutti::config::kDefaultStripedStripeUnit ==
-              std::uint64_t{512} * 1024);
 static_assert(tutti::config::NvmeDataPathTuning::kDefaultThreadsPerBlock == 16);
 
 int main() {
+    // 2026-09-22: the multi-device backend has no knobs left (stripe_unit was
+    // removed with the striping itself); it only needs to be constructible.
     tutti::config::StripedLocalNvmeBackendConfig striped;
-    return striped.stripe_unit == tutti::config::kDefaultStripedStripeUnit
-               ? 0
-               : 1;
+    (void)striped;
+    return 0;
 }

@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 
@@ -26,6 +27,17 @@ from tutti.storage.tutti_nvme.object_layout import ObjectLayout
 
 SPAN = 2
 SEGMENT = 4096
+
+
+@pytest.fixture(autouse=True)
+def _neutralize_space_guard(monkeypatch):
+    """把磁盘空间护栏门限归零。
+
+    本文件测的是增长/复用/裁剪契约，不是空间策略；而 tmp_path 落在宿主根盘
+    上，根盘水位（CI/开发机常年接近满）会把预建整体卡住。护栏自身的行为由
+    ``test_space_guard_pauses_growth_and_resumes`` 显式覆盖门限来验证。
+    """
+    monkeypatch.setenv("TUTTI_PRECREATE_MIN_FREE_BYTES", "0")
 
 
 def _layout(tmp_path, *, capacity=64, prewarm=4, probe_only=True):
@@ -157,6 +169,10 @@ def test_background_growth_fills_capacity(tmp_path, caplog):
     （线程名不进 /proc，没有日志就完全看不见它）；批次之间不得空等，
     否则追赶速度会被睡眠周期拖慢几个数量级。
     """
+    # 信号是 INFO 级；pytest 9 的 caplog 默认只捕 WARNING（root logger
+    # 默认级别），不显式放开的话这条断言永远看不见记录（测试自引入起
+    # 在本环境从未通过）。
+    caplog.set_level(logging.INFO)
     layout = _layout(tmp_path, capacity=64, prewarm=4)
     store = layout._store
     assert layout.start_background_precreate(threads=2)
@@ -179,12 +195,11 @@ def test_background_growth_fills_capacity(tmp_path, caplog):
     layout.stop_background_precreate()
 
 
-def test_demand_scope_keeps_only_headroom(tmp_path):
-    """full_capacity=False：只保持需求余量，不为容量预先建文件。"""
+def test_precreate_keeps_only_headroom(tmp_path):
+    """容量只是上限：只为分配前沿之前的就绪余量建文件（"铺满容量"模式已删除）。"""
     layout = _layout(tmp_path, capacity=64, prewarm=4)
     store = layout._store
-    assert layout.start_background_precreate(threads=1, headroom=8,
-                                               full_capacity=False)
+    assert layout.start_background_precreate(threads=1, headroom=8)
     assert _wait_for(lambda: store.precreated_slots() >= 8)
     assert store.precreated_slots() < 64
     layout.stop_background_precreate()
@@ -204,6 +219,32 @@ def test_start_is_idempotent(tmp_path):
     layout = _layout(tmp_path, capacity=64, prewarm=4)
     assert layout.start_background_precreate(threads=1, headroom=8)
     assert layout.start_background_precreate(threads=1, headroom=8)
+    layout.stop_background_precreate()
+
+
+def test_space_guard_pauses_growth_and_resumes(tmp_path, caplog, monkeypatch):
+    """磁盘空间护栏：可用空间低于门限时暂停预建，恢复后自动继续。
+
+    故障形态（2026-09-22 事故）：容量配得超过物理盘（8TiB/rank × 8 rank >
+    4×5.8TB）时，预建线程一路补到 ENOSPC——写坏池子（半截文件）并把写路径
+    拖回"自己建槽"的慢路径。护栏用"暂停增长"替代"把盘写满"：写路径仍走
+    非阻塞裁剪契约，空间恢复后增长继续（线程不得因护栏退出）。
+    """
+    layout = _layout(tmp_path, capacity=64, prewarm=4)
+    store = layout._store
+    # 门限抬到不可能满足的高度 → 预建必须停手
+    monkeypatch.setenv("TUTTI_PRECREATE_MIN_FREE_BYTES", str(10 ** 18))
+    assert layout.start_background_precreate(threads=1)
+    time.sleep(0.6)
+    assert store.precreated_slots() == 0, "空间不足时不得预建"
+    assert any("BACKGROUND_PRECREATE_SPACE_LOW" in r.message
+               for r in caplog.records), "空间不足必须留下告警"
+    assert not any("BACKGROUND_PRECREATE_FAILED" in r.message
+                   for r in caplog.records), "护栏不是失败：线程必须活着"
+
+    # 门限恢复正常 → 增长自动继续（线程只是等空间，没有退出）
+    monkeypatch.setenv("TUTTI_PRECREATE_MIN_FREE_BYTES", "0")
+    assert _wait_for(lambda: store.precreated_slots() >= 64, timeout=15.0)
     layout.stop_background_precreate()
 
 

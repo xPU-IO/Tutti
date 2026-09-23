@@ -35,8 +35,6 @@ target_include_directories(tutti_striped_local_nvme_datapath PRIVATE
 target_link_libraries(tutti_striped_local_nvme_datapath
     PUBLIC
         tutti_local_nvme_datapath
-        tutti_striped_local_nvme_payload
-        tutti_striped_file_resolver
         libnvm
     PRIVATE
         ${TUTTI_ACCEL_RUNTIME_LIBS}

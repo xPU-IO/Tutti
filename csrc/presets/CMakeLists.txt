@@ -19,7 +19,6 @@ set_target_properties(tutti_presets PROPERTIES
 target_link_libraries(tutti_presets PUBLIC
     tutti_local_nvme_datapath
     tutti_striped_local_nvme_datapath
-    tutti_striped_file_resolver
 )
 
 target_link_libraries(tutti_presets PRIVATE

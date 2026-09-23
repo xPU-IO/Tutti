@@ -4,38 +4,46 @@
 //
 // StripedDataPath — single-kernel fused submission across N NVMe devices.
 //
-// Implements the DataPath SPI for striped:// targets backed by N local NVMe
+// Implements the DataPath SPI for file:// targets backed by N local NVMe
 // devices.  The key property (maintainer-mandated design, Round 15 S5):
 // ONE cudaLaunchKernel dispatches IO entries to N devices' queues, using a
-// per-op device table of N DeviceTargetHandle pointers.  Workspace (entries,
+// per-op device table of DeviceTargetHandle pointers.  Workspace (entries,
 // status, PRP-list pages, device table, event) is leased from a bounded
 // StripedArena — zero per-op cudaMalloc.
 //
+// Placement model (2026-09-22): every target is ONE file living entirely on
+// ONE of the N devices; the placement layer (RotatingFilePlacement) decides
+// which device by the slot number, and this DataPath finds the device by
+// matching the payload's controller PCI address.  A request is NEVER split
+// across devices -- long prompts get their N-way parallelism from having many
+// chunks, whose files rotate across the devices, in one submit.  Sub-IO
+// splitting happens only at MDTS and file-extent boundaries, exactly like
+// LocalNvmeDataPath.
+//
 // Scope constraint (documented, not a Runtime/SPI limitation): the SPI
 // (spi/data_path.h) permits a submit() batch to span multiple targets
-// within one DataPath. This DataPath honors that contract but has a
-// device-table CAPACITY of exactly N slots per op (one striped target's
-// full shard set). A batch whose requests span more than one striped
-// target therefore hits RESOURCE_EXHAUSTED for the requests beyond the
-// first target -- an explicit per-request capacity rejection (partial
+// within one DataPath. This DataPath honors that contract with a device-table
+// CAPACITY of N slots per op (one device table row per target). A batch whose
+// targets' devices exceed that capacity hits RESOURCE_EXHAUSTED for the
+// requests beyond it -- an explicit per-request capacity rejection (partial
 // commit), the same mechanism used for over-large batches elsewhere in
 // submit(), not a silent single-target assumption.
 //
 // Lifecycle:
 //   initialize()  — attach N controllers, create N queue groups, arena init
-//   open()        — extract StripedLocalNvmePayload, build N DeviceTargetHandles
+//   open()        — extract Ext4LocalNvmePayload, match PCI -> ONE device handle
 //   register_memory() — nvm_dma_map_data_device × N (same buffer, N IOVA tables)
-//   submit()      — stripe-split -> entries with dev_idx -> 1 H2D -> 1 launch -> 1 event
+//   submit()      — clamp at MDTS/extents -> entries with dev_idx -> 1 H2D -> 1 launch
 //   progress()    — poll the op's event; D2H + aggregate on signal
 //   query()       — return aggregated snapshot
 //   release()     — return op's arena lease
-//   close()       — release N target handles
+//   close()       — release target handle
 //   shutdown()    — release N controllers + queue groups + arena
 
 #include <tutti/spi/data_path.h>
 #include <tutti/status.h>
 #include <tutti/io_types.h>
-#include "csrc/payloads/striped_local_nvme/payload.h"
+#include "csrc/payloads/ext4_local_nvme/payload.h"
 #include "csrc/data_paths/striped_local_nvme/striped_arena.h"
 #include "csrc/data_paths/local_nvme/metadata/prp_page_cache.h"  // Round 16 S5
 #include "csrc/data_paths/local_nvme/metadata/prp_buf_pool.h"
@@ -232,26 +240,26 @@ private:
     // Byte-unit host-side extent (mirrors LocalNvmeDataPath::LbaExtent's
     // logical_offset_bytes/length role, kept in bytes here since the fused
     // kernel's device handle already carries LBA-unit extents; the host
-    // side only needs byte extents to clamp stripe sub-IOs at extent
-    // boundaries before they reach resolve_lba on the device).
+    // side only needs byte extents to clamp sub-IOs at extent boundaries
+    // before they reach resolve_lba on the device).
     struct HostExtent {
         std::uint64_t logical_offset_bytes = 0;
         std::uint64_t length_bytes = 0;
     };
 
+    // One target = one file on one device. The device is matched at open()
+    // from the payload's namespace identity (controller PCI address), so
+    // placement -- not this DataPath -- decides where a file lives.
     struct StripedTarget {
-        std::uint32_t num_shards = 0;
-        std::uint64_t stripe_unit = 0;
-        // Round 16 S7: per-target shard rotation, mirrored from the
-        // payload (legacy shard_placement equivalent).  0 = no rotation.
-        std::uint32_t shard_rotation = 0;
+        // Index into devices_ of the device this file lives on.
+        std::uint32_t dev_idx = 0;
         std::uint64_t logical_size = 0;
-        // N DeviceTargetHandle* (GPU pointers), one per shard.
+        // 1 DeviceTargetHandle* (GPU pointer), for dev_idx's device.
         std::vector<tutti::data_paths::local_nvme::DeviceTargetHandle*> dev_handles;
-        // N overflow extents buffers (owned, freed on close).
+        // overflow extents buffer (owned, freed on close).
         std::vector<void*> overflow_allocs;
-        // Per-shard host-side extents (for stripe-split boundary clamping).
-        std::vector<std::vector<HostExtent>> shard_extents;
+        // Host-side extents of the file (for sub-IO boundary clamping).
+        std::vector<HostExtent> extents;
         std::string domain_key;
         std::uint64_t generation = 0;
     };
@@ -338,11 +346,10 @@ private:
     bool target_has_inflight_ops_(std::uint64_t token) const;
     bool memory_has_inflight_ops_(std::uint64_t token) const;
 
-    // Build a DeviceTargetHandle + host extents for one shard.
-    bool build_shard_handle_(
-        std::uint32_t dev_idx,
-        const ResolvedTarget& shard_target,
-        StripedTarget& out);
+    // Build the DeviceTargetHandle + host extents for the target's file.
+    // Returns the matched device index through out.dev_idx.
+    bool build_file_handle_(const ResolvedTarget& target,
+                            StripedTarget& out);
 
     // D2H the op's status array, aggregate into op.state/status/bytes.
     void aggregate_completion_status_(OpEntry& op);
@@ -410,6 +417,29 @@ private:
     std::uint64_t test_kernel_launch_count_ = 0;
     std::uint64_t test_last_prebuilt_entry_count_ = 0;
     std::uint64_t test_last_dynamic_entry_count_ = 0;
+
+    // ---- Optional per-entry IO timing (env TUTTI_IO_TIMING=1) ----
+    // The fused kernel stamps 4 globaltimer values per entry; the wait path
+    // copies them back and periodically prints per-stage average/max.  Pure
+    // diagnostic: disabled (nullptr) unless the env var is set.
+    bool io_timing_enabled_ = false;
+    unsigned long long* d_timing_ = nullptr;
+    std::uint32_t timing_capacity_entries_ = 0;
+    std::vector<unsigned long long> timing_host_;
+    std::uint64_t timing_acc_batches_ = 0;
+    std::uint64_t timing_acc_entries_ = 0;
+    // Stages: [0] submit setup, [1] command execution (doorbell->CQE visible),
+    //         [2] completion reclaim, [3] per-entry lifetime.
+    std::uint64_t timing_acc_ns_[4] = {0, 0, 0, 0};
+    std::uint64_t timing_max_ns_[4] = {0, 0, 0, 0};
+    void io_timing_accumulate_(OpEntry& op);
+
+    // ---- Worker-pool kernel model (default: 2048 workers) ----
+    // 0 = legacy one-thread-per-entry kernel.  >0 = fixed pool of N worker
+    // threads pulling entries from a per-batch task cursor (the arena slot's
+    // trailing status element — per-slot, so concurrent submits on different
+    // CUDA streams never share a counter).  See fused_submit_kernel.cuh.
+    std::uint32_t pool_workers_ = 0;
 };
 
 } // namespace tutti::data_paths::striped_local_nvme

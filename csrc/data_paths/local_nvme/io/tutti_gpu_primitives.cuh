@@ -136,6 +136,15 @@
 #define TUTTI_CLOCK              clock()
 #define TUTTI_CLOCK64            clock64()
 
+// Device-global nanosecond clock (same time base on every SM).  Used by the
+// optional per-entry IO timing instrumentation (TUTTI_IO_TIMING).
+__device__ __forceinline__ unsigned long long tutti_globaltimer_ns_() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+#define TUTTI_GLOBALTIMER_NS()   tutti_globaltimer_ns_()
+
 #elif defined(TUTTI_USE_MUSA)
 
 // --- MUSA: vendor port supplies definitions -----------------------------
@@ -188,5 +197,6 @@ See doc/gpu-porting-guide.md (kernel primitives macro layer)."
 #define TUTTI_NANOSLEEP(ns)       ((void)(ns))
 #define TUTTI_CLOCK              (0u)
 #define TUTTI_CLOCK64            (0ull)
+#define TUTTI_GLOBALTIMER_NS()   (0ull)
 
 #endif

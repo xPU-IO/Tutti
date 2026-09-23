@@ -25,25 +25,23 @@ namespace {
 constexpr std::uint64_t kDefaultIoSize = 4 * 1024 * 1024;
 constexpr std::uint64_t kDeviceBufferAlignment = 64 * 1024;
 constexpr std::uint64_t kBlockAlignment = 4096;
-constexpr std::uint64_t kDefaultStripeUnit = 64 * 1024;
 constexpr std::uint64_t kIoTimeoutMs = 30000;
 
 struct Options {
     std::string config_path = TUTTI_RUNTIME_DEFAULT_CONFIG;
     std::vector<std::string> directories;
     std::uint64_t io_size = kDefaultIoSize;
-    std::uint64_t stripe_unit = kDefaultStripeUnit;
     bool keep_file = false;
 };
 
 void print_usage(const char* program) {
     std::fprintf(
         stderr,
-        "Usage: %s --directory PATH [--directory PATH] [--config PATH] "
-        "[--size BYTES] [--stripe-unit BYTES] [--keep-file]\n"
+        "Usage: %s --directory PATH [--directory PATH ...] [--config PATH] "
+        "[--size BYTES] [--keep-file]\n"
         "\n"
         "Pass one daemon-published accelerator view for local NVMe or two "
-        "views for striped NVMe.\n",
+        "or more views for multi-device NVMe (files rotate across them).\n",
         program);
 }
 
@@ -76,19 +74,15 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.directories.emplace_back(value);
         } else if (argument == "--size") {
             if (!parse_u64(value, options.io_size)) return false;
-        } else if (argument == "--stripe-unit") {
-            if (!parse_u64(value, options.stripe_unit)) return false;
         } else {
             return false;
         }
     }
     return !options.config_path.empty() &&
-           (options.directories.size() == 1 ||
-            options.directories.size() == 2) &&
+           options.directories.size() >= 1 &&
+           options.directories.size() <= 4 &&
            options.io_size > 0 && options.io_size % kBlockAlignment == 0 &&
-           options.io_size <= std::numeric_limits<std::size_t>::max() &&
-           options.stripe_unit > 0 &&
-           options.stripe_unit % kBlockAlignment == 0;
+           options.io_size <= std::numeric_limits<std::size_t>::max();
 }
 
 void print_status(const char* operation, const tutti::Status& status) {
@@ -155,7 +149,8 @@ bool create_scratch_file(const std::string& path, std::uint64_t size) {
 }
 
 struct ScratchTarget {
-    std::string uri;
+    std::vector<std::string> uris;
+    std::vector<std::uint64_t> per_file_sizes;
     std::vector<std::string> files;
     std::vector<std::string> created_directories;
 };
@@ -183,66 +178,36 @@ bool cleanup_scratch_target(const ScratchTarget& target) {
 bool create_scratch_target(const Options& options, ScratchTarget& target) {
     const std::string name =
         "tutti_runtime_example." + std::to_string(::getpid()) + ".bin";
-    if (options.directories.size() == 1) {
-        const std::string path = join_path(options.directories.front(), name);
-        if (!create_scratch_file(path, options.io_size)) return false;
+    const std::size_t device_count = options.directories.size();
+    // The whole I/O is split evenly across the directories, one file each --
+    // the shape a rotating multi-device layout produces (a single IO never
+    // spans devices; the batch spans them instead).
+    std::uint64_t per_file = options.io_size / device_count;
+    per_file = (per_file + kBlockAlignment - 1) / kBlockAlignment * kBlockAlignment;
+    if (per_file == 0) {
+        std::fprintf(stderr,
+                     "I/O size too small to split across %zu directories\n",
+                     device_count);
+        return false;
+    }
+    const std::uint64_t last_file =
+        options.io_size - per_file * (device_count - 1);
+
+    for (std::size_t index = 0; index < device_count; ++index) {
+        const std::uint64_t file_size = index + 1 == device_count
+                                             ? last_file
+                                             : per_file;
+        const std::string path = join_path(
+            options.directories[index],
+            name + "." + std::to_string(index));
+        if (!create_scratch_file(path, file_size)) {
+            (void)cleanup_scratch_target(target);
+            return false;
+        }
         target.files.push_back(path);
-        target.uri = "file://" + path;
-        return true;
+        target.per_file_sizes.push_back(file_size);
+        target.uris.push_back("file://" + path);
     }
-
-    const std::uint64_t device_count = options.directories.size();
-    if (options.stripe_unit >
-        std::numeric_limits<std::uint64_t>::max() / device_count) {
-        std::fprintf(stderr, "stripe geometry overflows uint64_t\n");
-        return false;
-    }
-    const std::uint64_t logical_cycle = options.stripe_unit * device_count;
-    if (options.io_size >
-        std::numeric_limits<std::uint64_t>::max() - (logical_cycle - 1)) {
-        std::fprintf(stderr, "striped I/O size rounding overflows uint64_t\n");
-        return false;
-    }
-    const std::uint64_t shard_size =
-        ((options.io_size + logical_cycle - 1) / logical_cycle) *
-        options.stripe_unit;
-
-    std::string mounts;
-    for (std::size_t index = 0; index < options.directories.size(); ++index) {
-        if (index != 0) mounts.push_back(',');
-        mounts += options.directories[index];
-
-        const std::string striped_directory =
-            join_path(options.directories[index], "striped");
-        if (::mkdir(striped_directory.c_str(), 0755) == 0) {
-            target.created_directories.push_back(striped_directory);
-        } else if (errno != EEXIST) {
-            std::fprintf(stderr, "mkdir(%s) failed: %s\n",
-                         striped_directory.c_str(), std::strerror(errno));
-            (void)cleanup_scratch_target(target);
-            return false;
-        } else {
-            struct stat status {};
-            if (::stat(striped_directory.c_str(), &status) != 0 ||
-                !S_ISDIR(status.st_mode)) {
-                std::fprintf(stderr, "%s exists but is not a directory\n",
-                             striped_directory.c_str());
-                (void)cleanup_scratch_target(target);
-                return false;
-            }
-        }
-
-        const std::string shard_path = join_path(
-            striped_directory,
-            name + ".shard" + std::to_string(index));
-        if (!create_scratch_file(shard_path, shard_size)) {
-            (void)cleanup_scratch_target(target);
-            return false;
-        }
-        target.files.push_back(shard_path);
-    }
-    target.uri = "striped://" + name + "?devs=" + mounts +
-                 "&unit=" + std::to_string(options.stripe_unit);
     return true;
 }
 
@@ -277,13 +242,15 @@ bool allocate_device_buffer(std::uint64_t size, DeviceBuffer& buffer) {
 }
 
 bool submit_and_wait(tutti::StorageRuntime& runtime,
-                     const tutti::IoRequest& request,
+                     const std::vector<tutti::IoRequest>& requests,
                      const tutti::HostSubmitContext& context) {
-    auto submitted = runtime.submit(&request, 1, context);
-    const bool accepted =
-        submitted.initial_states.size() == 1 &&
-        submitted.initial_states.front().state ==
-            tutti::IoRequestState::ACCEPTED;
+    auto submitted = runtime.submit(requests.data(), requests.size(), context);
+    bool accepted = submitted.initial_states.size() == requests.size();
+    if (accepted) {
+        for (const auto& state : submitted.initial_states) {
+            if (state.state != tutti::IoRequestState::ACCEPTED) accepted = false;
+        }
+    }
     if (!submitted.status.ok()) {
         print_status("submit", submitted.status);
     }
@@ -329,7 +296,7 @@ bool verify_contents(const std::vector<unsigned char>& expected,
 }
 
 bool run_io(tutti::StorageRuntime& runtime, const Options& options,
-            const std::string& target_uri) {
+            const ScratchTarget& scratch) {
     const std::int32_t accel_id = runtime.accel_id();
     if (accel_id < 0 ||
         !check_cuda(cudaSetDevice(accel_id), "cudaSetDevice")) {
@@ -350,16 +317,22 @@ bool run_io(tutti::StorageRuntime& runtime, const Options& options,
         return false;
     }
 
-    tutti::TargetHandle target;
+    std::vector<tutti::TargetHandle> targets(scratch.uris.size());
     tutti::MemoryHandle memory;
     bool ok = false;
     do {
-        auto opened = runtime.open(target_uri, {});
-        if (!opened.ok()) {
-            print_status("open", opened.status());
+        for (std::size_t index = 0; index < scratch.uris.size(); ++index) {
+            auto opened = runtime.open(scratch.uris[index], {});
+            if (!opened.ok()) {
+                print_status("open", opened.status());
+                break;
+            }
+            targets[index] = opened.value();
+        }
+        if (std::any_of(targets.begin(), targets.end(),
+                        [](const tutti::TargetHandle& t) { return !t.valid(); })) {
             break;
         }
-        target = opened.value();
 
         auto registered = runtime.register_memory(tutti::MemoryView{
             buffer.aligned, options.io_size, tutti::MemoryKind::DEVICE,
@@ -371,19 +344,27 @@ bool run_io(tutti::StorageRuntime& runtime, const Options& options,
         }
         memory = registered.value();
 
+        // One batch across all targets -- one request per file, exactly the
+        // multi-device submission shape production uses.
         const tutti::HostSubmitContext context{
             tutti::ExecutionDomain::DEVICE_EXECUTION, accel_id, buffer.stream};
-        const tutti::IoRequest write{
-            tutti::IoDirection::WRITE, memory, 0, target, 0, options.io_size};
-        if (!submit_and_wait(runtime, write, context)) break;
+        std::vector<tutti::IoRequest> batch(targets.size());
+        std::uint64_t memory_offset = 0;
+        for (std::size_t index = 0; index < batch.size(); ++index) {
+            batch[index] = {tutti::IoDirection::WRITE, memory, memory_offset,
+                            targets[index], 0,
+                            scratch.per_file_sizes[index]};
+            memory_offset += scratch.per_file_sizes[index];
+        }
+        if (!submit_and_wait(runtime, batch, context)) break;
+
         if (!check_cuda(cudaMemset(buffer.aligned, 0,
                                    static_cast<std::size_t>(options.io_size)),
                         "cudaMemset")) {
             break;
         }
-        const tutti::IoRequest read{
-            tutti::IoDirection::READ, memory, 0, target, 0, options.io_size};
-        if (!submit_and_wait(runtime, read, context)) break;
+        for (auto& request : batch) request.direction = tutti::IoDirection::READ;
+        if (!submit_and_wait(runtime, batch, context)) break;
 
         std::vector<unsigned char> observed(expected.size());
         if (!check_cuda(cudaMemcpy(observed.data(), buffer.aligned,
@@ -394,10 +375,12 @@ bool run_io(tutti::StorageRuntime& runtime, const Options& options,
         ok = verify_contents(expected, observed);
     } while (false);
 
-    if (target.valid()) {
-        const tutti::Status closed = runtime.close(target);
-        if (!closed.ok()) print_status("close", closed);
-        ok = closed.ok() && ok;
+    for (auto& target : targets) {
+        if (target.valid()) {
+            const tutti::Status closed = runtime.close(target);
+            if (!closed.ok()) print_status("close", closed);
+            ok = closed.ok() && ok;
+        }
     }
     if (memory.valid()) {
         const tutti::Status unregistered = runtime.unregister_memory(memory);
@@ -438,13 +421,15 @@ int main(int argc, char** argv) {
 
     const bool scratch_created = create_scratch_target(options, scratch);
     if (scratch_created) {
-        std::printf("Target URI: %s\n", scratch.uri.c_str());
+        for (const std::string& uri : scratch.uris) {
+            std::printf("Target URI: %s\n", uri.c_str());
+        }
         for (const std::string& path : scratch.files) {
             std::printf("Backing file: %s\n", path.c_str());
         }
     }
     bool ok = scratch_created;
-    if (scratch_created) ok = run_io(*runtime, options, scratch.uri);
+    if (scratch_created) ok = run_io(*runtime, options, scratch);
 
     const tutti::Status shutdown = owner->shutdown();
     if (!shutdown.ok()) print_status("TuttiRuntime::shutdown", shutdown);

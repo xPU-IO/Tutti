@@ -12,11 +12,6 @@ Status validate_striped_local_nvme_backend(const ResourceSpec& resource,
         return invalid_spec(path +
                             ".config does not match contract striped-local-nvme");
     }
-    if (backend_config->stripe_unit == 0 ||
-        backend_config->stripe_unit % 4096 != 0) {
-        return invalid_spec(path +
-                            ".config.stripe_unit must be non-zero and 4096-byte aligned");
-    }
     const auto* config = std::get_if<NvmeResourceConfig>(&resource.config);
     if (config == nullptr) {
         return invalid_spec(path + ".resource does not reference nvme config");

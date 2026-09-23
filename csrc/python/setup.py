@@ -128,6 +128,10 @@ STATIC_LIBS = [
         TUTTI_BUILD_DIR, "csrc", "resolvers", "libtutti_resolver_factory.a",
     ),
     os.path.join(
+        TUTTI_BUILD_DIR, "csrc", "resolvers", "local_file",
+        "libtutti_local_file_resolver.a",
+    ),
+    os.path.join(
         TUTTI_BUILD_DIR, "csrc", "storage_objects",
         "libtutti_storage_objects.a",
     ),

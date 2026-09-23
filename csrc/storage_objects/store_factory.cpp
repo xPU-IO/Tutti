@@ -24,8 +24,8 @@ namespace tutti {
 Result<std::unique_ptr<StorageObjectStore>> create_storage_object_store(
     std::string_view scheme) {
     // Both supported schemes are served by the same core; which placement gets
-    // built is decided at open() by StoreConfig::stripe_unit (0 selects the
-    // single-file layout) together with the device list.
+    // built is decided at open() from the device list alone (one device = a
+    // single root, several = slots rotating across the mounts).
     //
     // The scheme is therefore validated here rather than dispatched on: naming
     // a layout the store cannot provide should fail at creation, not silently

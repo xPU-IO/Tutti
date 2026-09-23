@@ -187,6 +187,7 @@ int main(int argc,char**argv){
     std::vector<std::string> directories;
     bool verify=true;
     bool striped=true;   // default matches the default (striped) YAML
+    bool host_buffers=false;  // data targets host-pinned memory (no GPU P2P)
     for(int i=1;i<argc;){
         const char*a=argv[i];
         if(!std::strcmp(a,"--layers")&&i+1<argc){n_layers=(uint32_t)std::strtoul(argv[++i],0,10);++i;}
@@ -204,6 +205,7 @@ int main(int argc,char**argv){
         else if(!std::strcmp(a,"--no-verify")){verify=false;++i;}
         else if(!std::strcmp(a,"--striped")){striped=true;++i;}
         else if(!std::strcmp(a,"--single")){striped=false;++i;}
+        else if(!std::strcmp(a,"--host-buffers")){host_buffers=true;++i;}
         else if(!std::strcmp(a,"--help")||!std::strcmp(a,"-h")){
             std::fprintf(stderr,
                 "Usage: %s --directory PATH [--directory PATH ...] [--config PATH] [workload flags]\n"
@@ -266,25 +268,23 @@ int main(int argc,char**argv){
     auto t0=std::chrono::steady_clock::now();
     std::vector<std::string> paths(n_chunks);
     if (striped) {
-        // One backing file per chunk and device/shard, under <view>/striped/.
-        const uint64_t total_stripes = 2ull * n_layers;
-        const uint64_t shard_size = ((total_stripes + ndev - 1) / ndev) * ts;
+        // Rotating placement (2026-09-22): one file per chunk, the chunk
+        // index picks the device (i%N). Consecutive chunks of a context
+        // therefore spread over all devices, and a single IO never crosses
+        // a device boundary.
         for (size_t d = 0; d < ndev; ++d) {
-            std::string sdir = join_path(directories[d], "striped");
+            std::string sdir = join_path(directories[d], "rotating");
             if(::mkdir(sdir.c_str(),0755)!=0&&errno!=EEXIST)
                 STEP_FAIL("mkdir %s: %s",sdir.c_str(),std::strerror(errno));
         }
         for(uint64_t i=0;i<n_chunks;++i){
             char nm[128];
             std::snprintf(nm,sizeof(nm),"kvlw_%lu",(unsigned long)i);
-            paths[i]=nm;  // store the name (not path) for striped:// URI
-            for(size_t d=0;d<ndev;++d){
-                std::string sp=join_path(join_path(directories[d],"striped"),
-                                         std::string(nm)+".shard"+std::to_string(d));
-                if(!create_file(sp,shard_size))STEP_FAIL("create_file %s",sp.c_str());
-            }
+            const size_t d = i % ndev;
+            paths[i] = join_path(join_path(directories[d], "rotating"), nm);
+            if(!create_file(paths[i],file_total))STEP_FAIL("create_file %s",paths[i].c_str());
         }
-        STEP_OK("Phase A (striped): %lu targets x %lu shards (%.1f GB) in %.2fs",
+        STEP_OK("Phase A (rotating): %lu files over %lu devices (%.1f GB) in %.2fs",
                 (unsigned long)n_chunks,(unsigned long)ndev,
                 (double)(n_chunks*file_total)/(1024*1024*1024),sec_since(t0));
     } else {
@@ -299,9 +299,14 @@ int main(int argc,char**argv){
 
     // ---- Phase B: per-chunk K/V tensors + register each ----
     std::vector<void*> _raw_ptrs;
+    const MemoryKind buf_kind = host_buffers ? MemoryKind::HOST : MemoryKind::DEVICE;
     auto gpu_alloc=[&](uint64_t sz)->void*{
         void*raw=nullptr;
-        CUDA_OK(cudaMalloc(&raw,sz+65536));
+        if(host_buffers){
+            CUDA_OK(cudaMallocHost(&raw,sz+65536));
+        }else{
+            CUDA_OK(cudaMalloc(&raw,sz+65536));
+        }
         _raw_ptrs.push_back(raw);
         return reinterpret_cast<void*>((reinterpret_cast<uintptr_t>(raw)+65535)&~uintptr_t(65535));
     };
@@ -310,53 +315,40 @@ int main(int argc,char**argv){
     for(uint64_t b=0;b<n_hit;++b){
         hk[b]=gpu_alloc(ts);
         hv[b]=gpu_alloc(ts);
-        auto r=rt->register_memory({hk[b],ts,MemoryKind::DEVICE,MemoryOwnership::CALLER_OWNED,gpu,TUTTI_COMPILED_ACCELERATOR_PROFILE,ts});
+        auto r=rt->register_memory({hk[b],ts,buf_kind,MemoryOwnership::CALLER_OWNED,gpu,TUTTI_COMPILED_ACCELERATOR_PROFILE,ts});
         if(!r.ok())STEP_FAIL("reg K hit %lu: %s",(unsigned long)b,r.status().message().c_str());
         hk_m[b]=r.value();
-        r=rt->register_memory({hv[b],ts,MemoryKind::DEVICE,MemoryOwnership::CALLER_OWNED,gpu,TUTTI_COMPILED_ACCELERATOR_PROFILE,ts});
+        r=rt->register_memory({hv[b],ts,buf_kind,MemoryOwnership::CALLER_OWNED,gpu,TUTTI_COMPILED_ACCELERATOR_PROFILE,ts});
         if(!r.ok())STEP_FAIL("reg V hit %lu: %s",(unsigned long)b,r.status().message().c_str());
         hv_m[b]=r.value();
     }
     for(uint64_t b=0;b<n_miss;++b){
         mk[b]=gpu_alloc(ts);
         mv[b]=gpu_alloc(ts);
-        auto r=rt->register_memory({mk[b],ts,MemoryKind::DEVICE,MemoryOwnership::CALLER_OWNED,gpu,TUTTI_COMPILED_ACCELERATOR_PROFILE,ts});
+        auto r=rt->register_memory({mk[b],ts,buf_kind,MemoryOwnership::CALLER_OWNED,gpu,TUTTI_COMPILED_ACCELERATOR_PROFILE,ts});
         if(!r.ok())STEP_FAIL("reg K miss %lu: %s",(unsigned long)b,r.status().message().c_str());
         mk_m[b]=r.value();
-        r=rt->register_memory({mv[b],ts,MemoryKind::DEVICE,MemoryOwnership::CALLER_OWNED,gpu,TUTTI_COMPILED_ACCELERATOR_PROFILE,ts});
+        r=rt->register_memory({mv[b],ts,buf_kind,MemoryOwnership::CALLER_OWNED,gpu,TUTTI_COMPILED_ACCELERATOR_PROFILE,ts});
         if(!r.ok())STEP_FAIL("reg V miss %lu: %s",(unsigned long)b,r.status().message().c_str());
         mv_m[b]=r.value();
     }
-    STEP_OK("Phase B: %lu hit + %lu miss chunks, %lu tensors registered",
+    STEP_OK("Phase B: %lu hit + %lu miss chunks, %lu %s tensors registered",
             (unsigned long)n_hit,(unsigned long)n_miss,
-            (unsigned long)(2*n_chunks));
+            (unsigned long)(2*n_chunks),host_buffers?"host-pinned":"device");
 
     // ---- Phase C: open targets ----
     std::vector<TargetHandle> tgt(n_chunks);
     for(uint64_t i=0;i<n_chunks;++i){
-        std::string uri;
-        OpenOptions opts;
-        if (striped) {
-            // Per-chunk shard rotation (rot=i%N): without it every request in a
-            // layer shares target_offset = L*ts, so shard = L%N is constant and
-            // the whole layer lands on ONE disk. With rot=i%N a layer's chunks
-            // spread evenly over all devices within one fused kernel launch.
-            std::string devs;
-            for(size_t d=0;d<ndev;++d){if(d)devs+=',';devs+=directories[d];}
-            uri = std::string("striped://") + paths[i] +
-                  "?devs=" + devs + "&unit=" +
-                  std::to_string(ts) + "&rot=" + std::to_string(i % ndev);
-            opts = OpenOptions{"striped"};
-        } else {
-            uri = std::string("file://") + paths[i];
-            opts = OpenOptions{"file"};
-        }
+        // Both layouts are plain files now: the rotating layout just names a
+        // file on the device chosen by the chunk index (see Phase A).
+        const std::string uri = std::string("file://") + paths[i];
+        const OpenOptions opts{"file"};
         auto o=rt->open(uri,opts);
         if(!o.ok())STEP_FAIL("open %s: %s",uri.c_str(),o.status().message().c_str());
         tgt[i]=o.value();
     }
     STEP_OK("Phase C: opened %lu targets (%s)",(unsigned long)n_chunks,
-            striped?"striped":"file");
+            striped?"rotating":"file");
 
     // ---- Phase D: 3 streams ----
     int pl=0,ph=0;CUDA_OK(cudaDeviceGetStreamPriorityRange(&pl,&ph));
@@ -391,6 +383,12 @@ int main(int argc,char**argv){
     };
 
     // ---- Phase E: pre-write HIT chunks ----
+    // Hit/miss file sets: hit chunk i lives in FILE hi[i].
+    std::vector<uint64_t> hi(n_hit), mi(n_miss);
+    {
+        for(uint64_t i=0;i<n_hit;++i)hi[i]=i;
+        for(uint64_t i=0;i<n_miss;++i)mi[i]=n_hit+i;
+    }
     {
         auto tw=std::chrono::steady_clock::now();
         HostSubmitContext ctx{ExecutionDomain::DEVICE_EXECUTION,gpu,s_w};
@@ -398,12 +396,16 @@ int main(int argc,char**argv){
             for(uint64_t b=0;b<n_hit;++b){
                 uint8_t sk=(uint8_t)((b*n_layers+L)&0xFF);
                 uint8_t sv=(uint8_t)(sk^0xA5);
-                presets::launch_fill_pattern(hk[b],sk,ts,s_w);
-                presets::launch_fill_pattern(hv[b],sv,ts,s_w);
+                if(host_buffers){
+                    std::memset(hk[b],sk,(size_t)ts);
+                    std::memset(hv[b],sv,(size_t)ts);
+                }else{
+                    presets::launch_fill_pattern(hk[b],sk,ts,s_w);
+                    presets::launch_fill_pattern(hv[b],sv,ts,s_w);
+                }
             }
             CUDA_OK(cudaStreamSynchronize(s_w));
-            auto reqs = build_writes(L, [&]{std::vector<uint64_t>v(n_hit);for(uint64_t i=0;i<n_hit;++i)v[i]=i;return v;}(),
-                                          hk_m, hv_m);
+            auto reqs = build_writes(L, hi, hk_m, hv_m);
             auto res = windowed_submit_wait(rt, reqs.data(), reqs.size(),
                                             ctx, ts, "prewrite");
             if(res.bytes != reqs.size() * ts)
@@ -432,13 +434,8 @@ int main(int argc,char**argv){
     float gemm_ms=0;CUDA_OK(cudaEventElapsedTime(&gemm_ms,ew0,ew1));
     CUDA_OK(cudaEventDestroy(ew0));CUDA_OK(cudaEventDestroy(ew1));
 
-    std::vector<uint64_t> hi(n_hit),mi(n_miss);
-    for(uint64_t i=0;i<n_hit;++i)hi[i]=i;
-    for(uint64_t i=0;i<n_miss;++i)mi[i]=n_hit+i;
-
     HostSubmitContext ctx_r{ExecutionDomain::DEVICE_EXECUTION,gpu,s_r};
     HostSubmitContext ctx_w{ExecutionDomain::DEVICE_EXECUTION,gpu,s_w};
-
     auto do_read=[&](uint32_t L,const std::vector<uint64_t>&idx,
                      const std::vector<MemoryHandle>&km,
                      const std::vector<MemoryHandle>&vm)->WindowedIoResult{
@@ -453,9 +450,10 @@ int main(int argc,char**argv){
     };
 
     // Warm the miss-tensor (mk/mv) PRP-cache pages BEFORE calibrating: the
-    // first-ever write batch pays a one-time PRP cold-build (H2D per page),
-    // which would otherwise be measured as "write time" below and inflate
-    // compute_us (and with it the simulated compute iterations).
+    // first-ever write batch pays a one-time PRP cold-build (host-pinned page
+    // fill via host memcpy, ~1us per list page; no H2D), which would
+    // otherwise be measured as "write time" below and inflate compute_us
+    // (and with it the simulated compute iterations).
     {
         auto warm = do_write(0, mi, mk_m, mv_m);
         (void)warm;
@@ -582,13 +580,21 @@ int main(int argc,char**argv){
         for(uint64_t b=0;b<n_hit;b+=std::max<uint64_t>(1,n_hit/16)){
             uint32_t L=(uint32_t)(b%n_layers);
             uint8_t exp=(uint8_t)((b*n_layers+L)&0xFF);
-            presets::launch_fill_pattern(hk[b],0xFF,ts,s_r);
-            CUDA_OK(cudaStreamSynchronize(s_r));
-            std::vector<uint64_t>one={b};
+            if(host_buffers){
+                std::memset(hk[b],0xFF,(size_t)ts);
+            }else{
+                presets::launch_fill_pattern(hk[b],0xFF,ts,s_r);
+                CUDA_OK(cudaStreamSynchronize(s_r));
+            }
+            std::vector<uint64_t>one={hi[b]};
             std::vector<MemoryHandle>okm={hk_m[b]},ovm={hv_m[b]};
             do_read(L,one,okm,ovm);
-            CUDA_OK(cudaMemcpyAsync(hb,hk[b],ts,cudaMemcpyDeviceToHost,s_r));
-            CUDA_OK(cudaStreamSynchronize(s_r));
+            if(host_buffers){
+                std::memcpy(hb,hk[b],(size_t)ts);
+            }else{
+                CUDA_OK(cudaMemcpyAsync(hb,hk[b],ts,cudaMemcpyDeviceToHost,s_r));
+                CUDA_OK(cudaStreamSynchronize(s_r));
+            }
             if(((uint8_t*)hb)[0]!=exp){++mm;LOG_INFO("  mismatch b=%lu L=%u exp=%02X got=%02X",(unsigned long)b,L,exp,((uint8_t*)hb)[0]);}
             ++ck;
         }
@@ -597,17 +603,30 @@ int main(int argc,char**argv){
             uint64_t b=n_hit+i;
             uint32_t L=(uint32_t)(i%n_layers);
             uint8_t seed=(uint8_t)((b*31+L*7)&0xFF);
-            presets::launch_fill_pattern(mk[i],seed,ts,s_w);
-            presets::launch_fill_pattern(mv[i],seed^0xA5,ts,s_w);
+            if(host_buffers){
+                std::memset(mk[i],seed,(size_t)ts);
+                std::memset(mv[i],seed^0xA5,(size_t)ts);
+            }else{
+                presets::launch_fill_pattern(mk[i],seed,ts,s_w);
+                presets::launch_fill_pattern(mv[i],seed^0xA5,ts,s_w);
+            }
             CUDA_OK(cudaStreamSynchronize(s_w));
-            std::vector<uint64_t>one={b};
+            std::vector<uint64_t>one={mi[i]};
             std::vector<MemoryHandle>okm={mk_m[i]},ovm={mv_m[i]};
             do_write(L,one,okm,ovm);
-            presets::launch_fill_pattern(mk[i],0,ts,s_r);
-            CUDA_OK(cudaStreamSynchronize(s_r));
+            if(host_buffers){
+                std::memset(mk[i],0,(size_t)ts);
+            }else{
+                presets::launch_fill_pattern(mk[i],0,ts,s_r);
+                CUDA_OK(cudaStreamSynchronize(s_r));
+            }
             do_read(L,one,okm,ovm);
-            CUDA_OK(cudaMemcpyAsync(hb,mk[i],ts,cudaMemcpyDeviceToHost,s_r));
-            CUDA_OK(cudaStreamSynchronize(s_r));
+            if(host_buffers){
+                std::memcpy(hb,mk[i],(size_t)ts);
+            }else{
+                CUDA_OK(cudaMemcpyAsync(hb,mk[i],ts,cudaMemcpyDeviceToHost,s_r));
+                CUDA_OK(cudaStreamSynchronize(s_r));
+            }
             if(((uint8_t*)hb)[0]!=seed){++mm;LOG_INFO("  miss mismatch b=%lu L=%u exp=%02X got=%02X",(unsigned long)b,L,seed,((uint8_t*)hb)[0]);}
             ++ck;
         }
@@ -622,19 +641,15 @@ int main(int argc,char**argv){
     for(auto&e:ec)CUDA_OK(cudaEventDestroy(e));
     for(uint64_t b=0;b<n_hit;++b){RT_STATUS(rt->unregister_memory(hk_m[b]));RT_STATUS(rt->unregister_memory(hv_m[b]));}
     for(uint64_t b=0;b<n_miss;++b){RT_STATUS(rt->unregister_memory(mk_m[b]));RT_STATUS(rt->unregister_memory(mv_m[b]));}
-    for(void* p:_raw_ptrs)CUDA_OK(cudaFree(p));
+    for(void* p:_raw_ptrs){
+        if(host_buffers)CUDA_OK(cudaFreeHost(p));
+        else CUDA_OK(cudaFree(p));
+    }
     for(uint64_t i=0;i<n_chunks;++i){
         RT_STATUS(rt->close(tgt[i]));
-        if (striped) {
-            for(size_t d=0;d<ndev;++d){
-                std::string sp=join_path(join_path(directories[d],"striped"),
-                                         paths[i]+".shard"+std::to_string(d));
-                if(::unlink(sp.c_str())!=0)
-                    STEP_FAIL("unlink %s failed",sp.c_str());
-            }
-        } else {
-            ::unlink(paths[i].c_str());
-        }
+        // Rotating placement: one chunk = one file; paths[i] IS the file on
+        // the device chosen in Phase A. No per-device shards to remove.
+        ::unlink(paths[i].c_str());
     }
     CUDA_OK(cudaStreamDestroy(s_r));CUDA_OK(cudaStreamDestroy(s_c));CUDA_OK(cudaStreamDestroy(s_w));
     {

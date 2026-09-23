@@ -115,22 +115,10 @@ Status ObjectStoreCore::open(const StoreConfig& config) {
     const Status backend = build_backend_locked();
     if (!backend.ok()) return backend;
 
-    // The placement owns where the payload starts: a striped layout rounds that
-    // prefix up to a whole stripe round (see StripedPlacement::payload_offset),
-    // so the space a slot occupies is prefix + payload, not header + payload.
+    // The placement owns where the payload starts: the space a slot occupies is
+    // its payload prefix plus the payload itself.
     slot_bytes_ = placement_->payload_offset() + config.layout.payload_bytes();
     shard_bytes_ = placement_->shard_file_bytes(slot_bytes_);
-
-    // Striped geometry must divide into whole stripe rounds. Otherwise the last
-    // round is short and a segment's tail maps past the end of a shard --
-    // silent corruption rather than a clean failure.
-    if (auto* striped = dynamic_cast<StripedPlacement*>(placement_.get())) {
-        if (!striped->geometry_valid(slot_bytes_)) {
-            return Status(StatusCode::INVALID_ARGUMENT,
-                          "striped geometry does not divide into whole stripe "
-                          "rounds for this payload size");
-        }
-    }
 
     SpaceAllocatorConfig alloc_config;
     // capacity is a ceiling; the slot count follows from slot_bytes_. Callers
@@ -272,12 +260,12 @@ Status ObjectStoreCore::build_backend_locked() {
         }
     }
 
-    if (config_.stripe_unit == 0) {
-        if (config_.devices.size() != 1) {
-            return Status(StatusCode::INVALID_ARGUMENT,
-                          "single-file layout requires exactly one device; set "
-                          "stripe_unit to stripe across several");
-        }
+    // One mount: every slot is a file under it, rotation is trivial. Several
+    // mounts: slots rotate across them by slot number, one file per slot.
+    // Slots live under a per-rank directory: several ranks of one deployment
+    // share the mounts, and slot numbers are per-rank -- without the rank
+    // directory they would overwrite each other's files.
+    if (config_.devices.size() == 1) {
         placement_ = std::make_unique<SingleFilePlacement>(
             config_.devices[0].mount_path);
         return {};
@@ -288,8 +276,12 @@ Status ObjectStoreCore::build_backend_locked() {
     for (const StoreDevice& device : config_.devices) {
         mounts.push_back(device.mount_path);
     }
-    placement_ =
-        std::make_unique<StripedPlacement>(mounts, config_.stripe_unit);
+    auto rotating = std::make_unique<RotatingFilePlacement>(
+        std::move(mounts), "r" + std::to_string(config_.rank_id));
+    if (!rotating->geometry_valid()) {
+        return Status(StatusCode::INVALID_ARGUMENT, "no mounts configured");
+    }
+    placement_ = std::move(rotating);
     return {};
 }
 

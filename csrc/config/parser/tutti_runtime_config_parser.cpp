@@ -148,10 +148,6 @@ Status parse_resolver(const YAML::Node& node, std::size_t index,
         return detail::parse_local_file_resolver(config, path + ".config",
                                                  resolver);
     }
-    if (resolver.type == tutti::detail::backend_ids::kStripedResolverType) {
-        return detail::parse_striped_file_resolver(config, path + ".config",
-                                                   resolver);
-    }
     if (resolver.type == backend_ids::kMemfsResolverType) {
         return detail::parse_memfs_resolver(config, path + ".config", resolver);
     }

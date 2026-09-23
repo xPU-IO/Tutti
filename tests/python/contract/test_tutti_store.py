@@ -1161,26 +1161,9 @@ def test_preset_rejects_out_of_range_unsigned_field(tmp_path):
     assert "out of range" in message, message
 
 
-@pytest.mark.parametrize("value", [65536, 2**40])
-def test_preset_accepts_wide_unsigned_field(tmp_path, value):
-    """uint64 字段（stripe_unit）必须接受正常正数，包括超出 uint32 的值。
-
-    回归：范围检查曾在有符号域里比较，而 ``uint64_t`` 的 max() 转回 int64 是
-    -1 —— 于是 ``value > kMax`` 对任何正数都成立，stripe_unit=65536 被解析层
-    拒绝，8 卡条带真机运行直接起不来。只有真机跑才会暴露（单测当时没有覆盖
-    uint64 字段），所以这条测试按"解析层不得报 out of range"断言。
-    """
-    tutti_runtime = _load_bindings_runtime()
-    # stripe_unit 只存在于条带 preset（单盘 preset 没有这个键）。
-    preset = {
-        "devices": [{"pci_bdf": "0000:00:00.0", "mount_path": str(tmp_path)}],
-        "stripe_unit": value,
-    }
-    with pytest.raises(Exception) as excinfo:
-        tutti_runtime.make_striped_nvme_runtime(preset)
-    message = str(excinfo.value)
-    assert "stripe_unit" not in message, message
-    assert "out of range" not in message, message
+# 2026-09-22：原 test_preset_accepts_wide_unsigned_field 已删除——条带 preset
+# 的唯一 uint64 字段 stripe_unit 随条带化一起移除后，preset 不再有 uint64 字段，
+# 该回归（有符号域比较吞掉合法值）失去了覆盖对象。
 
 
 def test_preset_accepts_negative_gpu_id(tmp_path):
@@ -1285,7 +1268,6 @@ def test_derive_striped_devices_from_daemon(tmp_path):
         "type": "striped",
         "daemon_config": str(daemon_path),
         "devices": [{"device_id": 0}, {"device_id": 2}],
-        "stripe_unit": 65536,
     }
     derived = _derive_device_fields(preset, yaml)
     devices = derived["devices"]
@@ -1306,7 +1288,11 @@ def test_derive_striped_devices_from_daemon(tmp_path):
 
 
 def test_striped_store_derives_mounts_from_preset(tmp_path):
-    """striped store：mounts 从 preset.devices 的 daemon 推导结果取得。"""
+    """striped store：mounts 从 preset.devices 的 daemon 推导结果取得。
+
+    （原 test_striped_store_rejects_stripe_unit_mismatch 已删除：stripe_unit
+    随条带化一起移除，"options 与 preset 不一致"的守卫失去了对象。）
+    """
     import yaml
 
     nvme0 = tmp_path / "nvme0"
@@ -1322,37 +1308,14 @@ def test_striped_store_derives_mounts_from_preset(tmp_path):
         "type": "striped",
         "daemon_config": str(daemon_path),
         "devices": [{"device_id": 0}, {"device_id": 2}],
-        "stripe_unit": 4096,
     }
     store = TuttiKVStore(
         tmp_path / "meta-root", 8, SEG,
-        layout="striped", preset=preset, stripe_unit=4096,
+        layout="striped", preset=preset,
     )
     assert store._layout.mounts == (
         str(nvme0.resolve()), str(nvme2.resolve())
     )
-
-
-def test_striped_store_rejects_stripe_unit_mismatch(tmp_path):
-    """options 与 preset 的 stripe_unit 不一致必须 fail-closed。"""
-    import yaml
-
-    daemon_path = tmp_path / "daemon.yaml"
-    daemon_path.write_text(yaml.safe_dump({"nvmes": [
-        {"device_id": 0, "pci_addr": "0000:08:00.0",
-         "backing_mount_path": str(tmp_path / "nvme0"), "namespace_id": 1},
-    ]}))
-    preset = {
-        "type": "striped",
-        "daemon_config": str(daemon_path),
-        "devices": [{"device_id": 0}],
-        "stripe_unit": 8192,
-    }
-    with pytest.raises(RuntimeError, match="stripe_unit 不一致"):
-        TuttiKVStore(
-            tmp_path / "meta-root", 8, SEG,
-            layout="striped", preset=preset, stripe_unit=4096,
-        )
 
 
 # ---------- layout 单元 ----------

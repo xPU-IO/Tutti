@@ -69,6 +69,11 @@ public:
         // dev_table_capacity entries with DeviceTargetHandle* pointers,
         // H2D-copies to d_dev_table, then the kernel indexes it by dev_idx.
         const void** d_dev_table = nullptr;  // GPU: this slot's device table base
+        // Worker-pool task cursor for this slot (one extra status element
+        // past the entry range).  Per-slot = per-batch: concurrent submits
+        // on different CUDA streams get different counters, so their pool
+        // kernels never steal each other's task indices.
+        unsigned int* d_task_counter = nullptr;
         std::uint32_t dev_table_capacity = 0;
         // Round 16 S6 (REQUIRED 0): per-slot descriptor pool for dynamic-path entries.
         const tutti::data_paths::local_nvme::AddressDescriptor* d_desc_pool = nullptr;

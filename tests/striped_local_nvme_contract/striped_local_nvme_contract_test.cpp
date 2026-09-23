@@ -1,30 +1,37 @@
 // tests/striped_local_nvme_contract/striped_local_nvme_contract_test.cpp
 //
-// E2E striped StorageRuntime hardware contract test (Round 15 Sessions 5-6).
+// E2E multi-device StorageRuntime hardware contract test (Round 15-16, reworked
+// 2026-09-22 for rotating placement).
 //
-// Proves StripedDataPath (single-kernel fused multi-device submission)
-// through the PUBLIC StorageRuntime API:
-//   striped:// URI -> open -> register_memory -> submit WRITE/READ ->
-//   wait -> release_io -> byte-verify -> close -> unregister -> shutdown.
+// Proves StripedDataPath (single-kernel fused multi-device submission) through
+// the PUBLIC StorageRuntime API:
+//   file:// URI -> open -> register_memory -> submit WRITE/READ -> wait ->
+//   release_io -> byte-verify -> close -> unregister -> shutdown.
+//
+// Placement model under test (2026-09-22): an object is ONE file on ONE
+// device; the file's path (which mount it lives under) selects the device.
+// A single IO never crosses devices. Parallelism across the N devices comes
+// from MANY files (many chunks of a long prompt) arriving together in ONE
+// submit -- exactly the scenario tests 83/84/92/94/95/96 drive.
 //
 // Required test scenarios (T-084 REQUIRED 2, numbered from 82):
-//   82. roundtrip: WRITE -> READ byte-verify, single-shard + cross-shard offsets
-//   83. single launch: submit -> exactly 1 DataPath::submit call, 1 kernel launch (N=1 and N=2)
-//   84. cross-disk parallel: dual-disk striped READ speedup > 1.3x vs single-disk
-//   85. stripe distribution: round-robin landing verified via raw backing-file reads
-//   86. lifecycle: in-flight close rejected (BUSY), drain then clean close/unregister/shutdown
+//   82. roundtrip: WRITE -> READ byte-verify, aligned/misaligned/large offsets
+//   83. single launch: batch of N requests (one per mount) -> exactly 1
+//       DataPath::submit call, 1 kernel launch (N=1 and N=2)
+//   84. cross-disk parallel: files rotating across 2 disks READ speedup
+//       > 1.3x vs the same files on 1 disk
+//   85. mount dispatch: files under mount 0/1 land on device 0/1 (raw read)
+//   86. lifecycle: in-flight close rejected (BUSY), drain then clean close
 //
-// Required test scenarios (T-085 REQUIRED 1, Round 15 Session 6):
+// Required test scenarios (T-085 REQUIRED 1):
 //   87. full public path: rt.open/register/submit/wait/release/close, zero
-//       striped-awareness at the call site (only generic Runtime types named)
+//       backend-awareness at the call site (only generic Runtime types named)
 //   88. block addressing: block_id * block_size logical offset (KV-pool model)
 //   89. restart persistence: WRITE -> full teardown -> brand-new
 //       Runtime+Resolver+DataPath re-opens the same URI -> READ byte-verify
 //   90. fault semantics: one illegal request in a mixed batch is rejected
-//       per-request while the rest (spanning both shards) complete -- partial commit
-//
-// Regression (820/0 + 137/0 hardware, HOST/CUDA non-hardware ctest) is
-// verified out-of-band (result6.md), not by this binary.
+//       per-request while the rest (spanning both mounts) complete -- partial
+//       commit
 //
 // Returns 0 on pass, 1 on fail, 77 on SKIP (hardware unavailable).
 //
@@ -39,9 +46,8 @@
 #include <tutti/io_types.h>
 #include <tutti/memory_types.h>
 #include "csrc/data_paths/striped_local_nvme/striped_data_path.h"
-#include "csrc/resolvers/striped_file/resolver.h"
 #include "csrc/resolvers/local_file/resolver.h"
-#include "csrc/payloads/striped_local_nvme/payload.h"
+#include "csrc/resolvers/local_file/multi_mount_resolver.h"
 
 #include "tests/hardware_test_directory.h"
 #include "tests/nvme_test_cli.h"
@@ -63,7 +69,6 @@
 
 using namespace tutti;
 using namespace tutti::data_paths::striped_local_nvme;
-using namespace tutti::resolvers::striped_file;
 using namespace tutti::resolvers::local_file;
 using namespace tutti::test_support;
 
@@ -110,11 +115,17 @@ static bool create_test_mounts(std::uint32_t num_devices) {
     return true;
 }
 
-static std::string shard_path(std::uint32_t device,
-                              const std::string& name,
-                              std::uint32_t shard) {
-    return g_test_mounts.at(device) + "/striped/" + name + ".shard" +
-           std::to_string(shard);
+// One object = one file, under the per-device mount. The mount index IS the
+// device index: files under mount i live on device i (see
+// MultiMountLocalFileResolver). The rotating placement layer picks the mount
+// by slot % N; this test drives the runtime directly, so it picks mounts
+// itself.
+static std::string slot_file(std::uint32_t mount, const std::string& name) {
+    return g_test_mounts.at(mount) + "/chunks/" + name + ".obj";
+}
+
+static std::string file_uri(const std::string& path) {
+    return "file://" + path;
 }
 
 static bool cleanup_test_mounts() {
@@ -232,7 +243,7 @@ static bool parse_args(int argc, char** argv, std::uint32_t& requested) {
         return false;
     }
     if (g_devices.size() > 4) {
-        std::fprintf(stderr, "striped contract supports at most 4 --nvme devices\n");
+        std::fprintf(stderr, "multi-device contract supports at most 4 --nvme devices\n");
         return false;
     }
     return true;
@@ -273,7 +284,7 @@ static bool read_file_raw(const std::string& path, std::uint64_t offset,
     int f = ::open(path.c_str(), O_RDONLY | O_DIRECT);
     if (f < 0) return false;
     // O_DIRECT requires block-aligned buffer/offset/length; callers use
-    // 64KiB stripe-unit multiples (offset=0), which satisfy 4096 alignment.
+    // 64KiB multiples (offset=0), which satisfy 4096 alignment.
     void* abuf = nullptr;
     if (::posix_memalign(&abuf, 4096, (size_t)len) != 0) { ::close(f); return false; }
     ssize_t n = ::pread(f, abuf, len, static_cast<off_t>(offset));
@@ -346,7 +357,7 @@ static bool submit_wait_all(StorageRuntime* rt, const IoRequest* reqs, std::size
 // -------------------------------------------------------------------------
 
 static constexpr const char* kDPKey = "striped-local-nvme";
-static constexpr std::uint64_t kStripeUnit = 65536;  // 64 KiB
+static constexpr std::uint64_t kUnit = 65536;  // 64 KiB (IO granularity)
 
 // Round 16 S3: GPU selection via env TUTTI_TEST_GPU (default 0).
 static std::int32_t test_gpu_id() {
@@ -358,26 +369,27 @@ static std::int32_t test_gpu_id() {
 }
 
 struct StripedEnv {
-    std::vector<DeviceDescriptor> devs;
-    std::vector<std::unique_ptr<StorageTargetResolver>> sub_resolvers;
-    std::unique_ptr<StripedResolver> striped_resolver;
+    std::unique_ptr<MultiMountLocalFileResolver> resolver;
     StripedDataPath dp;
     std::unique_ptr<StorageRuntime> rt;
 
-    explicit StripedEnv(std::uint32_t num_devices,
-                        std::uint64_t stripe_unit = kStripeUnit)
+    // Bind each mount to its device: a file's path selects the device, and
+    // the DataPath matches the device by the payload's controller PCI
+    // address at open() time.
+    explicit StripedEnv(std::uint32_t num_devices)
         : dp(build_devs(num_devices),
              /*cuda_device=*/(std::uint32_t)g_gpu_id,
              /*mdts_override=*/0, /*cq_poll_budget=*/2000000,
              /*max_batch_entries=*/4096, /*max_in_flight_operations=*/4) {
+        std::vector<MultiMountLocalFileResolver::MountBinding> bindings;
         for (std::uint32_t i = 0; i < num_devices; ++i) {
             const auto& device = g_devices.at(i);
-            sub_resolvers.push_back(std::make_unique<LocalFileResolver>(
-                device.pci_bdf, device.namespace_id, device.block_size,
-                BackingDeviceConfig{device.backing_device, 0}));
+            bindings.push_back({g_test_mounts.at(i), device.pci_bdf,
+                                device.namespace_id, device.block_size,
+                                device.backing_device, kDPKey});
         }
-        striped_resolver = std::make_unique<StripedResolver>(
-            std::move(sub_resolvers), stripe_unit);
+        resolver = std::make_unique<MultiMountLocalFileResolver>(
+            std::move(bindings));
     }
 
     // Round 16 S3: build DeviceDescriptor list for N=1..4 devices.
@@ -396,12 +408,10 @@ struct StripedEnv {
     }
 };
 
-static std::unique_ptr<StripedEnv> make_env(
-    std::uint32_t num_devices = 2,
-    std::uint64_t stripe_unit = kStripeUnit) {
-    auto env = std::make_unique<StripedEnv>(num_devices, stripe_unit);
+static std::unique_ptr<StripedEnv> make_env(std::uint32_t num_devices = 2) {
+    auto env = std::make_unique<StripedEnv>(num_devices);
     RuntimeComponents comps;
-    comps.resolvers.push_back({"striped", env->striped_resolver.get()});
+    comps.resolvers.push_back({"file", env->resolver.get()});
     comps.data_paths.push_back({kDPKey, &env->dp, DataPathConfig{"striped-local-nvme"}});
     auto created = StorageRuntime::create({}, std::move(comps));
     if (!created.ok()) {
@@ -413,39 +423,27 @@ static std::unique_ptr<StripedEnv> make_env(
     return env;
 }
 
-// device mount list matching devs= query param for N devices.
-// Round 16 S3: extended for N=3,4.
-static std::string devs_param(std::uint32_t n) {
-    std::string s;
-    for (std::uint32_t i = 0; i < n; ++i) {
-        if (i) s += ",";
-        s += g_test_mounts.at(i);
-    }
-    return s;
-}
-
 // -------------------------------------------------------------------------
-// Test 82: roundtrip -- WRITE -> READ byte-verify, single-shard + cross-shard
+// Test 82: roundtrip -- WRITE -> READ byte-verify on ONE file, at offsets
+// that exercise extent and MDTS clamping (misaligned start, large spans).
 // -------------------------------------------------------------------------
 
 static int test_82_roundtrip(StripedEnv* env) {
-    TEST_CASE("82. roundtrip (single-shard + cross-shard, position-dependent pattern)");
+    TEST_CASE("82. roundtrip (single file, aligned/misaligned/large offsets)");
 
-    const std::uint64_t shard_size = kStripeUnit * 16;  // 1 MiB/shard, 2 MiB total
-    std::string p0 = shard_path(0, "t82", 0);
-    std::string p1 = shard_path(1, "t82", 1);
-    if (!create_backing_file(p0, shard_size) || !create_backing_file(p1, shard_size)) {
-        CHECK(false, "create backing files");
+    const std::uint64_t file_size = kUnit * 16;  // 1 MiB
+    std::string p0 = slot_file(0, "t82");
+    if (!create_backing_file(p0, file_size)) {
+        CHECK(false, "create backing file");
         return 1;
     }
 
-    std::string uri = "striped://t82?devs=" + devs_param(2) + "&unit=65536";
-    auto opened = env->rt->open(uri, OpenOptions{"striped"});
-    CHECK(opened.ok(), "open striped target");
-    if (!opened.ok()) { ::unlink(p0.c_str()); ::unlink(p1.c_str()); return 1; }
+    auto opened = env->rt->open(file_uri(p0), OpenOptions{"file"});
+    CHECK(opened.ok(), "open file target");
+    if (!opened.ok()) { ::unlink(p0.c_str()); return 1; }
     auto target = opened.value();
 
-    const std::uint64_t buf_size = shard_size * 2;
+    const std::uint64_t buf_size = file_size;
     void* raw = nullptr;
     void* buf = cuda_malloc_aligned_64k(buf_size, &raw);
     CHECK(buf != nullptr, "alloc GPU buffer");
@@ -455,7 +453,7 @@ static int test_82_roundtrip(StripedEnv* env) {
     if (!mem_r.ok()) {
         if (raw) cudaFree(raw);
         env->rt->close(target);
-        ::unlink(p0.c_str()); ::unlink(p1.c_str());
+        ::unlink(p0.c_str());
         return 1;
     }
     auto mem = mem_r.value();
@@ -466,12 +464,11 @@ static int test_82_roundtrip(StripedEnv* env) {
 
     struct IoCase { std::uint64_t offset, length; const char* name; };
     IoCase cases[] = {
-        {0,                 kStripeUnit,             "single-shard (unit 0)"},
-        {kStripeUnit,       kStripeUnit,             "single-shard (unit 1, other shard)"},
-        {0,                 kStripeUnit * 2,         "cross-shard (2 units)"},
-        {kStripeUnit / 2,   kStripeUnit,             "cross-shard misaligned start"},
-        {0,                 kStripeUnit * 4,         "multi-unit (4 units, LIST-class)"},
-        {kStripeUnit - 4096, 4096 * 2,             "block-aligned pair straddling boundary"},
+        {0,               kUnit,       "one unit"},
+        {kUnit,           kUnit,       "one unit at offset 1"},
+        {0,               kUnit * 4,   "large span (4 units, LIST-class)"},
+        {kUnit / 2,       kUnit,       "misaligned start"},
+        {kUnit - 4096,    4096 * 2,    "block-aligned pair straddling boundary"},
     };
 
     bool all_ok = true;
@@ -510,50 +507,50 @@ static int test_82_roundtrip(StripedEnv* env) {
     env->rt->close(target);
     cudaStreamDestroy(stream);
     ::unlink(p0.c_str());
-    ::unlink(p1.c_str());
     return g_fail > 0 ? 1 : 0;
 }
 
 // -------------------------------------------------------------------------
-// Test 83: single launch -- N=1 and N=2, exactly 1 submit call + 1 launch
+// Test 83: single launch -- a batch of N requests, one file per mount,
+// still exactly 1 submit call + 1 kernel launch (N=1 and N=2).
 // -------------------------------------------------------------------------
 
 static int test_83_single_launch() {
-    TEST_CASE("83. single launch (N=1 and N=2 devices, exactly 1 kernel launch)");
+    TEST_CASE("83. single launch (N=1 and N=2 mounts, exactly 1 kernel launch)");
 
     auto run_for = [](std::uint32_t n, const char* tag) -> bool {
         auto env = make_env(n);
         if (!env) return false;
 
-        const std::uint64_t shard_size = kStripeUnit * 4;
+        const std::uint64_t file_size = kUnit * 4;
         std::string name = std::string("t83_") + tag;
-        std::string p0 = shard_path(0, name, 0);
-        std::string p1 = n == 2 ? shard_path(1, name, 1) : std::string{};
-        if (!create_backing_file(p0, shard_size) ||
-            (n == 2 && !create_backing_file(p1, shard_size))) {
-            ::unlink(p0.c_str());
-            if (n == 2) ::unlink(p1.c_str());
-            env->rt->shutdown(5000);
-            return false;
+        std::vector<std::string> paths(n);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            paths[i] = slot_file(i, name);
+            if (!create_backing_file(paths[i], file_size)) {
+                for (auto& p : paths) ::unlink(p.c_str());
+                env->rt->shutdown(5000);
+                return false;
+            }
         }
 
-        std::string uri = "striped://" + name + "?devs=" + devs_param(n) + "&unit=65536";
-        auto opened = env->rt->open(uri, OpenOptions{"striped"});
-        if (!opened.ok()) {
-            ::unlink(p0.c_str());
-            if (n == 2) ::unlink(p1.c_str());
-            env->rt->shutdown(5000);
-            return false;
+        std::vector<TargetHandle> targets(n);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            auto opened = env->rt->open(file_uri(paths[i]), OpenOptions{"file"});
+            if (!opened.ok()) {
+                for (auto& p : paths) ::unlink(p.c_str());
+                env->rt->shutdown(5000);
+                return false;
+            }
+            targets[i] = opened.value();
         }
-        auto target = opened.value();
 
-        const std::uint64_t io_size = shard_size * n;
+        const std::uint64_t io_size = file_size * n;
         void* raw = nullptr;
         void* buf = cuda_malloc_aligned_64k(io_size, &raw);
         if (buf == nullptr) {
-            env->rt->close(target);
-            ::unlink(p0.c_str());
-            if (n == 2) ::unlink(p1.c_str());
+            for (auto& t : targets) env->rt->close(t);
+            for (auto& p : paths) ::unlink(p.c_str());
             env->rt->shutdown(5000);
             return false;
         }
@@ -561,9 +558,8 @@ static int test_83_single_launch() {
             {buf, io_size, MemoryKind::DEVICE, MemoryOwnership::CALLER_OWNED, 0, ""});
         if (!mem_r.ok()) {
             if (raw) cudaFree(raw);
-            env->rt->close(target);
-            ::unlink(p0.c_str());
-            if (n == 2) ::unlink(p1.c_str());
+            for (auto& t : targets) env->rt->close(t);
+            for (auto& p : paths) ::unlink(p.c_str());
             env->rt->shutdown(5000);
             return false;
         }
@@ -573,10 +569,17 @@ static int test_83_single_launch() {
         launch_fill_pattern_gpu(buf, 0x11, io_size, stream);
         cudaStreamSynchronize(stream);
 
+        // One batch: one request per file (per mount). This is the shape a
+        // layer's chunk set takes in production.
+        std::vector<IoRequest> wreqs(n);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            wreqs[i] = {IoDirection::WRITE, mem_r.value(), i * file_size,
+                        targets[i], 0, file_size};
+        }
+
         env->dp.test_reset_submit_counters();
         HostSubmitContext ctx{ExecutionDomain::DEVICE_EXECUTION, 0, stream};
-        IoRequest wreq{IoDirection::WRITE, mem_r.value(), 0, target, 0, io_size};
-        bool ok = submit_wait_all(env->rt.get(), &wreq, 1, ctx);
+        bool ok = submit_wait_all(env->rt.get(), wreqs.data(), n, ctx);
 
         std::uint64_t submits = env->dp.test_submit_call_count();
         std::uint64_t launches = env->dp.test_kernel_launch_count();
@@ -586,10 +589,9 @@ static int test_83_single_launch() {
 
         env->rt->unregister_memory(mem_r.value());
         cudaFree(raw);
-        env->rt->close(target);
+        for (auto& t : targets) env->rt->close(t);
         cudaStreamDestroy(stream);
-        ::unlink(p0.c_str());
-        if (n == 2) ::unlink(p1.c_str());
+        for (auto& p : paths) ::unlink(p.c_str());
         env->rt->shutdown(5000);
         return ok;
     };
@@ -600,7 +602,8 @@ static int test_83_single_launch() {
 }
 
 // -------------------------------------------------------------------------
-// Test 84: cross-disk parallel speedup > 1.3x vs single-disk
+// Test 84: cross-disk parallel speedup -- the same file set rotating across
+// 2 disks reads >1.3x faster than all files on 1 disk.
 // -------------------------------------------------------------------------
 
 struct ReadPerfResult {
@@ -610,18 +613,18 @@ struct ReadPerfResult {
     double bandwidth_gbps = 0;
 };
 
-static ReadPerfResult measure_read_performance(std::uint32_t n,
+static ReadPerfResult measure_read_performance(std::uint32_t mounts,
                                                const char* tag) {
     ReadPerfResult result;
-    auto env = make_env(n);
+    auto env = make_env(mounts);
     if (!env) return result;
 
-    const std::uint64_t shard_size = 64ull * 1024 * 1024;
-    const std::uint64_t io_size = shard_size * n;
-    std::string name = std::string("t84_") + tag;
-    std::string p0 = shard_path(0, name, 0);
-    std::string p1 = n == 2 ? shard_path(1, name, 1) : std::string{};
-    TargetHandle target;
+    constexpr std::uint32_t kFiles = 16;
+    const std::uint64_t file_size = 4ull * 1024 * 1024;  // 4 MiB
+    const std::uint64_t io_size = file_size * kFiles;   // 64 MiB total
+
+    std::vector<std::string> paths(kFiles);
+    std::vector<TargetHandle> targets(kFiles);
     MemoryHandle memory;
     void* raw = nullptr;
     void* buffer = nullptr;
@@ -630,27 +633,26 @@ static ReadPerfResult measure_read_performance(std::uint32_t n,
     auto cleanup = [&]() {
         if (memory.valid()) env->rt->unregister_memory(memory);
         if (raw != nullptr) cudaFree(raw);
-        if (target.valid()) env->rt->close(target);
+        for (auto& t : targets) if (t.valid()) env->rt->close(t);
         if (stream != nullptr) cudaStreamDestroy(stream);
         env->rt->shutdown(5000);
-        ::unlink(p0.c_str());
-        if (n == 2) ::unlink(p1.c_str());
+        for (auto& p : paths) if (!p.empty()) ::unlink(p.c_str());
     };
 
-    if (!create_backing_file(p0, shard_size) ||
-        (n == 2 && !create_backing_file(p1, shard_size))) {
-        cleanup();
-        return result;
+    for (std::uint32_t f = 0; f < kFiles; ++f) {
+        paths[f] = slot_file(f % mounts, std::string("t84_") + tag + "_" +
+                                            std::to_string(f));
+        if (!create_backing_file(paths[f], file_size)) {
+            cleanup();
+            return result;
+        }
+        auto opened = env->rt->open(file_uri(paths[f]), OpenOptions{"file"});
+        if (!opened.ok()) {
+            cleanup();
+            return result;
+        }
+        targets[f] = opened.value();
     }
-
-    std::string uri = "striped://" + name + "?devs=" +
-                      devs_param(n) + "&unit=65536";
-    auto opened = env->rt->open(uri, OpenOptions{"striped"});
-    if (!opened.ok()) {
-        cleanup();
-        return result;
-    }
-    target = opened.value();
 
     buffer = cuda_malloc_aligned_64k(io_size, &raw);
     if (buffer == nullptr) {
@@ -670,9 +672,13 @@ static ReadPerfResult measure_read_performance(std::uint32_t n,
     HostSubmitContext context{ExecutionDomain::DEVICE_EXECUTION, 0, stream};
     launch_fill_pattern_gpu(buffer, 0x5A, io_size, stream);
     cudaStreamSynchronize(stream);
-    IoRequest write_request{
-        IoDirection::WRITE, memory, 0, target, 0, io_size};
-    if (!submit_wait_all(env->rt.get(), &write_request, 1, context)) {
+
+    std::vector<IoRequest> writes(kFiles);
+    for (std::uint32_t f = 0; f < kFiles; ++f) {
+        writes[f] = {IoDirection::WRITE, memory, f * file_size,
+                     targets[f], 0, file_size};
+    }
+    if (!submit_wait_all(env->rt.get(), writes.data(), kFiles, context)) {
         cleanup();
         return result;
     }
@@ -680,11 +686,13 @@ static ReadPerfResult measure_read_performance(std::uint32_t n,
 
     cudaMemsetAsync(buffer, 0, io_size, stream);
     cudaStreamSynchronize(stream);
-    IoRequest read_request{
-        IoDirection::READ, memory, 0, target, 0, io_size};
+    std::vector<IoRequest> reads(kFiles);
+    for (std::uint32_t f = 0; f < kFiles; ++f) {
+        reads[f] = {IoDirection::READ, memory, f * file_size,
+                    targets[f], 0, file_size};
+    }
     auto start = std::chrono::steady_clock::now();
-    result.ok = submit_wait_all(
-        env->rt.get(), &read_request, 1, context);
+    result.ok = submit_wait_all(env->rt.get(), reads.data(), kFiles, context);
     result.milliseconds = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - start).count();
     if (result.ok && result.milliseconds > 0) {
@@ -703,7 +711,7 @@ static int test_84_speedup() {
     ReadPerfResult dual = measure_read_performance(2, "dual");
     ReadPerfResult single = measure_read_performance(1, "single");
     CHECK(single.prepared && dual.prepared,
-          "prepare dual-disk and single-disk targets");
+          "prepare dual-disk and single-disk file sets");
     CHECK(single.ok && dual.ok, "both reads completed");
     if (!single.ok || !dual.ok) return 1;
 
@@ -711,8 +719,8 @@ static int test_84_speedup() {
         ? (2.0 * single.milliseconds) / dual.milliseconds : 0.0;
     std::printf("  single-disk READ (%.1f MiB): %.2f ms (%.2f GB/s)\n",
                64.0, single.milliseconds, single.bandwidth_gbps);
-    std::printf("  dual-disk striped READ (%.1f MiB): %.2f ms (%.2f GB/s)\n",
-               128.0, dual.milliseconds, dual.bandwidth_gbps);
+    std::printf("  dual-disk rotating READ (%.1f MiB): %.2f ms (%.2f GB/s)\n",
+               64.0, dual.milliseconds, dual.bandwidth_gbps);
     std::printf("  effective speedup: %.2fx\n", speedup);
     // Accept either a clean >1.3x speedup over this run's single-disk
     // baseline, OR an absolute aggregate bandwidth (>=12 GB/s) that by
@@ -726,68 +734,74 @@ static int test_84_speedup() {
 }
 
 // -------------------------------------------------------------------------
-// Test 85: stripe distribution -- round-robin verified via raw backing files
+// Test 85: mount dispatch -- files under mount 0/1 land on device 0/1,
+// verified by reading the backing files back.
 // -------------------------------------------------------------------------
 
 static int test_85_distribution(StripedEnv* env) {
-    TEST_CASE("85. stripe distribution (round-robin verified in backing files)");
+    TEST_CASE("85. mount dispatch (file's mount selects the device, verified in backing files)");
 
-    const std::uint64_t shard_size = kStripeUnit * 8;
-    std::string p0 = shard_path(0, "t85", 0);
-    std::string p1 = shard_path(1, "t85", 1);
-    if (!create_backing_file(p0, shard_size) || !create_backing_file(p1, shard_size)) {
+    const std::uint64_t file_size = kUnit * 2;
+    std::string p0 = slot_file(0, "t85a");
+    std::string p1 = slot_file(1, "t85b");
+    if (!create_backing_file(p0, file_size) || !create_backing_file(p1, file_size)) {
         CHECK(false, "create backing files");
         return 1;
     }
 
-    std::string uri = "striped://t85?devs=" + devs_param(2) + "&unit=65536";
-    auto opened = env->rt->open(uri, OpenOptions{"striped"});
-    CHECK(opened.ok(), "open striped target");
-    if (!opened.ok()) { ::unlink(p0.c_str()); ::unlink(p1.c_str()); return 1; }
-    auto target = opened.value();
-
-    const std::uint64_t io_size = kStripeUnit * 4;  // 4 units: 0,1,2,3
-    void* raw = nullptr;
-    void* buf = cuda_malloc_aligned_64k(io_size, &raw);
-    auto mem_r = env->rt->register_memory(
-        {buf, io_size, MemoryKind::DEVICE, MemoryOwnership::CALLER_OWNED, 0, ""});
-    CHECK(mem_r.ok(), "register_memory");
-    if (!mem_r.ok()) {
-        if (raw) cudaFree(raw);
-        env->rt->close(target);
+    auto oa = env->rt->open(file_uri(p0), OpenOptions{"file"});
+    auto ob = env->rt->open(file_uri(p1), OpenOptions{"file"});
+    CHECK(oa.ok() && ob.ok(), "open targets under mount 0 and mount 1");
+    if (!oa.ok() || !ob.ok()) {
         ::unlink(p0.c_str()); ::unlink(p1.c_str());
         return 1;
     }
 
-    std::vector<unsigned char> hpat(io_size);
-    for (std::uint64_t u = 0; u < 4; ++u)
-        for (std::uint64_t i = 0; i < kStripeUnit; ++i)
-            hpat[u * kStripeUnit + i] = static_cast<unsigned char>(0xA0 + u);
-    cudaMemcpy(buf, hpat.data(), io_size, cudaMemcpyHostToDevice);
+    const std::uint64_t buf_size = file_size * 2;
+    void* raw = nullptr;
+    void* buf = cuda_malloc_aligned_64k(buf_size, &raw);
+    auto mem_r = env->rt->register_memory(
+        {buf, buf_size, MemoryKind::DEVICE, MemoryOwnership::CALLER_OWNED, 0, ""});
+    CHECK(mem_r.ok(), "register_memory");
+    if (!mem_r.ok()) {
+        if (raw) cudaFree(raw);
+        env->rt->close(oa.value());
+        env->rt->close(ob.value());
+        ::unlink(p0.c_str()); ::unlink(p1.c_str());
+        return 1;
+    }
 
     cudaStream_t stream;
     cudaStreamCreate(&stream);
     HostSubmitContext ctx{ExecutionDomain::DEVICE_EXECUTION, 0, stream};
-    IoRequest wreq{IoDirection::WRITE, mem_r.value(), 0, target, 0, io_size};
-    CHECK(submit_wait_all(env->rt.get(), &wreq, 1, ctx), "write 4 units");
 
-    std::vector<unsigned char> shard0_data, shard1_data;
-    read_file_raw(p0, 0, kStripeUnit * 2, shard0_data);
-    read_file_raw(p1, 0, kStripeUnit * 2, shard1_data);
+    // Distinct patterns so the verification can tell the two files apart.
+    launch_fill_pattern_gpu(buf, 0xA0, file_size, stream);
+    launch_fill_pattern_gpu((char*)buf + file_size, 0xB0, file_size, stream);
+    cudaStreamSynchronize(stream);
 
-    bool shard0_ok = true, shard1_ok = true;
-    for (std::uint64_t i = 0; i < kStripeUnit; ++i) {
-        if (shard0_data.size() != kStripeUnit * 2 || shard0_data[i] != 0xA0 ||
-            shard0_data[kStripeUnit + i] != 0xA2) shard0_ok = false;
-        if (shard1_data.size() != kStripeUnit * 2 || shard1_data[i] != 0xA1 ||
-            shard1_data[kStripeUnit + i] != 0xA3) shard1_ok = false;
+    IoRequest wreqs[2] = {
+        {IoDirection::WRITE, mem_r.value(), 0,         oa.value(), 0, file_size},
+        {IoDirection::WRITE, mem_r.value(), file_size, ob.value(), 0, file_size},
+    };
+    CHECK(submit_wait_all(env->rt.get(), wreqs, 2, ctx), "write both files in one batch");
+
+    std::vector<unsigned char> data0, data1;
+    read_file_raw(p0, 0, file_size, data0);
+    read_file_raw(p1, 0, file_size, data1);
+
+    bool file0_ok = true, file1_ok = true;
+    for (std::uint64_t i = 0; i < file_size; ++i) {
+        if (data0.size() != file_size || data0[i] != 0xA0) file0_ok = false;
+        if (data1.size() != file_size || data1[i] != 0xB0) file1_ok = false;
     }
-    CHECK(shard0_ok, "shard 0 (disk1) holds units 0,2 (round-robin even units)");
-    CHECK(shard1_ok, "shard 1 (disk2) holds units 1,3 (round-robin odd units)");
+    CHECK(file0_ok, "file under mount 0 landed on device 0 (0xA0 pattern)");
+    CHECK(file1_ok, "file under mount 1 landed on device 1 (0xB0 pattern)");
 
     env->rt->unregister_memory(mem_r.value());
     cudaFree(raw);
-    env->rt->close(target);
+    env->rt->close(oa.value());
+    env->rt->close(ob.value());
     cudaStreamDestroy(stream);
     ::unlink(p0.c_str());
     ::unlink(p1.c_str());
@@ -801,21 +815,19 @@ static int test_85_distribution(StripedEnv* env) {
 static int test_86_lifecycle(StripedEnv* env) {
     TEST_CASE("86. lifecycle (in-flight close BUSY, drain, clean teardown)");
 
-    const std::uint64_t shard_size = kStripeUnit * 32;  // bigger, to keep IO in-flight briefly
-    std::string p0 = shard_path(0, "t86", 0);
-    std::string p1 = shard_path(1, "t86", 1);
-    if (!create_backing_file(p0, shard_size) || !create_backing_file(p1, shard_size)) {
-        CHECK(false, "create backing files");
+    const std::uint64_t file_size = kUnit * 32;  // bigger, to keep IO in-flight briefly
+    std::string p0 = slot_file(0, "t86");
+    if (!create_backing_file(p0, file_size)) {
+        CHECK(false, "create backing file");
         return 1;
     }
 
-    std::string uri = "striped://t86?devs=" + devs_param(2) + "&unit=65536";
-    auto opened = env->rt->open(uri, OpenOptions{"striped"});
-    CHECK(opened.ok(), "open striped target");
-    if (!opened.ok()) { ::unlink(p0.c_str()); ::unlink(p1.c_str()); return 1; }
+    auto opened = env->rt->open(file_uri(p0), OpenOptions{"file"});
+    CHECK(opened.ok(), "open file target");
+    if (!opened.ok()) { ::unlink(p0.c_str()); return 1; }
     auto target = opened.value();
 
-    const std::uint64_t io_size = shard_size * 2;
+    const std::uint64_t io_size = file_size;
     void* raw = nullptr;
     void* buf = cuda_malloc_aligned_64k(io_size, &raw);
     auto mem_r = env->rt->register_memory(
@@ -824,7 +836,7 @@ static int test_86_lifecycle(StripedEnv* env) {
     if (!mem_r.ok()) {
         if (raw) cudaFree(raw);
         env->rt->close(target);
-        ::unlink(p0.c_str()); ::unlink(p1.c_str());
+        ::unlink(p0.c_str());
         return 1;
     }
 
@@ -857,7 +869,6 @@ static int test_86_lifecycle(StripedEnv* env) {
     cudaFree(raw);
     cudaStreamDestroy(stream);
     ::unlink(p0.c_str());
-    ::unlink(p1.c_str());
 
     // The run-scoped per-device directories are removed by main() only after
     // the complete suite passes; failures retain their artifacts.
@@ -867,38 +878,36 @@ static int test_86_lifecycle(StripedEnv* env) {
 // -------------------------------------------------------------------------
 // Test 87: full public path -- open/register/submit/wait/release/close,
 // caller code below the marker references ONLY generic Runtime types
-// (TargetHandle/MemoryHandle/IoRequest/IoHandle) -- zero striped-awareness.
+// (TargetHandle/MemoryHandle/IoRequest/IoHandle) -- zero backend-awareness.
 // (Round 15 Session 6, REQUIRED 1.1)
 // -------------------------------------------------------------------------
 
 static int test_87_full_public_path(StripedEnv* env) {
-    TEST_CASE("87. full public path (zero striped-awareness at the call site)");
+    TEST_CASE("87. full public path (zero backend-awareness at the call site)");
     env->dp.test_arena_reset_alloc_counts();
 
-    const std::uint64_t shard_size = kStripeUnit * 4;
-    std::string p0 = shard_path(0, "t87", 0);
-    std::string p1 = shard_path(1, "t87", 1);
-    if (!create_backing_file(p0, shard_size) || !create_backing_file(p1, shard_size)) {
-        CHECK(false, "create backing files");
+    const std::uint64_t file_size = kUnit * 2;
+    std::string p0 = slot_file(0, "t87");
+    if (!create_backing_file(p0, file_size)) {
+        CHECK(false, "create backing file");
         return 1;
     }
 
-    std::string uri = "striped://t87?devs=" + devs_param(2) + "&unit=65536";
-    auto opened = env->rt->open(uri, OpenOptions{"striped"});
-    CHECK(opened.ok(), "rt.open(striped://...) -> plain TargetHandle");
-    if (!opened.ok()) { ::unlink(p0.c_str()); ::unlink(p1.c_str()); return 1; }
+    auto opened = env->rt->open(file_uri(p0), OpenOptions{"file"});
+    CHECK(opened.ok(), "rt.open(file://...) -> plain TargetHandle");
+    if (!opened.ok()) { ::unlink(p0.c_str()); return 1; }
 
     // ---- Below this point: only TargetHandle / MemoryHandle / IoRequest /
-    // IoHandle / StorageRuntime are named. No Striped* symbol appears in
-    // this block -- the call site is provably unaware it is talking to a
-    // striped backend. ----
+    // IoHandle / StorageRuntime are named. No backend-specific symbol appears
+    // in this block -- the call site is provably unaware of which devices are
+    // behind the target. ----
     TargetHandle target = opened.value();
     void* raw = nullptr;
-    void* buf = cuda_malloc_aligned_64k(kStripeUnit, &raw);
+    void* buf = cuda_malloc_aligned_64k(kUnit, &raw);
     CHECK(buf != nullptr, "alloc GPU buffer");
 
     Result<MemoryHandle> mem_r = env->rt->register_memory(
-        MemoryView{buf, kStripeUnit, MemoryKind::DEVICE, MemoryOwnership::CALLER_OWNED, 0, ""});
+        MemoryView{buf, kUnit, MemoryKind::DEVICE, MemoryOwnership::CALLER_OWNED, 0, ""});
     CHECK(mem_r.ok(), "register_memory -> plain MemoryHandle");
     bool ok = mem_r.ok();
     if (ok) {
@@ -907,19 +916,19 @@ static int test_87_full_public_path(StripedEnv* env) {
         cudaStreamCreate(&stream);
         HostSubmitContext ctx{ExecutionDomain::DEVICE_EXECUTION, 0, stream};
 
-        launch_fill_position_pattern_gpu(buf, 4200, kStripeUnit, stream);
+        launch_fill_position_pattern_gpu(buf, 4200, kUnit, stream);
         cudaStreamSynchronize(stream);
-        IoRequest wreq{IoDirection::WRITE, mem, 0, target, 0, kStripeUnit};
+        IoRequest wreq{IoDirection::WRITE, mem, 0, target, 0, kUnit};
         ok = ok && submit_wait_all(env->rt.get(), &wreq, 1, ctx);
 
-        launch_fill_pattern_gpu(buf, 0xEE, kStripeUnit, stream);
+        launch_fill_pattern_gpu(buf, 0xEE, kUnit, stream);
         cudaStreamSynchronize(stream);
-        IoRequest rreq{IoDirection::READ, mem, 0, target, 0, kStripeUnit};
+        IoRequest rreq{IoDirection::READ, mem, 0, target, 0, kUnit};
         ok = ok && submit_wait_all(env->rt.get(), &rreq, 1, ctx);
 
-        std::vector<unsigned char> hbuf(kStripeUnit);
-        cudaMemcpy(hbuf.data(), buf, kStripeUnit, cudaMemcpyDeviceToHost);
-        for (std::uint64_t i = 0; i < kStripeUnit && ok; ++i) {
+        std::vector<unsigned char> hbuf(kUnit);
+        cudaMemcpy(hbuf.data(), buf, kUnit, cudaMemcpyDeviceToHost);
+        for (std::uint64_t i = 0; i < kUnit && ok; ++i) {
             if (hbuf[i] != static_cast<unsigned char>((4200 + i) % 251u)) ok = false;
         }
 
@@ -929,44 +938,39 @@ static int test_87_full_public_path(StripedEnv* env) {
     CHECK(ok, "submit(WRITE) -> wait -> submit(READ) -> wait -> release -> byte-exact");
     const auto alloc_counts = env->dp.test_arena_alloc_counts();
     CHECK(alloc_counts.cuda_malloc == 0,
-          "striped submit performs zero cudaMalloc");
+          "multi-device submit performs zero cudaMalloc");
     CHECK(alloc_counts.gpu_prp_cuda_malloc == 0,
-          "striped submit performs zero GPU PRP allocation");
-    // ---- end zero-striped-awareness block ----
+          "multi-device submit performs zero GPU PRP allocation");
+    // ---- end zero-backend-awareness block ----
 
     if (raw) cudaFree(raw);
     env->rt->close(target);
     ::unlink(p0.c_str());
-    ::unlink(p1.c_str());
     return g_fail > 0 ? 1 : 0;
 }
 
 // -------------------------------------------------------------------------
 // Test 88: block addressing -- block_id * block_size logical offset,
 // matching a KV-pool usage model (fixed-size blocks, round-trip per block).
-// block_size = 2 * stripe_unit so each logical block deliberately straddles
-// both shards, mirroring how a real KV block would land under striping.
 // (Round 15 Session 6, REQUIRED 1.2)
 // -------------------------------------------------------------------------
 
 static int test_88_block_addressing(StripedEnv* env) {
     TEST_CASE("88. block addressing (block_id * block_size, KV-pool model)");
 
-    constexpr std::uint64_t kBlockSize = kStripeUnit * 2;  // 128 KiB/block
+    constexpr std::uint64_t kBlockSize = kUnit * 2;  // 128 KiB/block
     constexpr std::uint32_t kNumBlocks = 8;
-    const std::uint64_t shard_size = kBlockSize * kNumBlocks / 2;  // per shard
+    const std::uint64_t file_size = kBlockSize * kNumBlocks;
 
-    std::string p0 = shard_path(0, "t88", 0);
-    std::string p1 = shard_path(1, "t88", 1);
-    if (!create_backing_file(p0, shard_size) || !create_backing_file(p1, shard_size)) {
-        CHECK(false, "create backing files");
+    std::string p0 = slot_file(0, "t88");
+    if (!create_backing_file(p0, file_size)) {
+        CHECK(false, "create backing file");
         return 1;
     }
 
-    std::string uri = "striped://t88?devs=" + devs_param(2) + "&unit=65536";
-    auto opened = env->rt->open(uri, OpenOptions{"striped"});
-    CHECK(opened.ok(), "open striped target");
-    if (!opened.ok()) { ::unlink(p0.c_str()); ::unlink(p1.c_str()); return 1; }
+    auto opened = env->rt->open(file_uri(p0), OpenOptions{"file"});
+    CHECK(opened.ok(), "open file target");
+    if (!opened.ok()) { ::unlink(p0.c_str()); return 1; }
     auto target = opened.value();
 
     void* raw = nullptr;
@@ -978,7 +982,7 @@ static int test_88_block_addressing(StripedEnv* env) {
     if (!mem_r.ok()) {
         if (raw) cudaFree(raw);
         env->rt->close(target);
-        ::unlink(p0.c_str()); ::unlink(p1.c_str());
+        ::unlink(p0.c_str());
         return 1;
     }
     auto mem = mem_r.value();
@@ -1024,37 +1028,33 @@ static int test_88_block_addressing(StripedEnv* env) {
     env->rt->close(target);
     cudaStreamDestroy(stream);
     ::unlink(p0.c_str());
-    ::unlink(p1.c_str());
     return g_fail > 0 ? 1 : 0;
 }
 
 // -------------------------------------------------------------------------
 // Test 89: restart persistence -- WRITE, full teardown (close/unregister/
-// shutdown), then a BRAND NEW StorageRuntime + StripedResolver +
-// StripedDataPath instance re-opens the SAME URI and READs back byte-exact.
-// This is the KV-cache persistence-across-restart scenario.
+// shutdown), then a BRAND NEW StorageRuntime + resolver + DataPath instance
+// re-opens the SAME URI and READs back byte-exact. This is the KV-cache
+// persistence-across-restart scenario.
 // (Round 15 Session 6, REQUIRED 1.3)
 // -------------------------------------------------------------------------
 
 static int test_89_restart_persistence() {
     TEST_CASE("89. restart persistence (new Runtime+Resolver+DataPath re-opens same URI)");
 
-    const std::uint64_t shard_size = kStripeUnit * 8;
-    std::string p0 = shard_path(0, "t89", 0);
-    std::string p1 = shard_path(1, "t89", 1);
-    if (!create_backing_file(p0, shard_size) || !create_backing_file(p1, shard_size)) {
-        CHECK(false, "create backing files");
+    const std::uint64_t file_size = kUnit * 4;
+    std::string p0 = slot_file(0, "t89");
+    if (!create_backing_file(p0, file_size)) {
+        CHECK(false, "create backing file");
         return 1;
     }
 
-    std::string uri = "striped://t89?devs=" + devs_param(2) + "&unit=65536";
+    const std::string uri = file_uri(p0);
 
-    // Single-shard offset (unit 0, lands entirely on shard 0) and
-    // cross-shard offset (2 units, spans shard 0 + shard 1).
     struct Region { std::uint64_t offset, length; std::uint64_t pattern_base; };
     Region regions[] = {
-        {0,               kStripeUnit,     1000},  // single-shard
-        {kStripeUnit,     kStripeUnit * 2, 9000},  // cross-shard
+        {0,           kUnit,     1000},
+        {kUnit,       kUnit * 2, 9000},
     };
 
     // ---- Phase 1: write with env_a, then FULLY tear it down ----
@@ -1063,11 +1063,11 @@ static int test_89_restart_persistence() {
         auto env_a = make_env(2);
         CHECK(env_a != nullptr, "create env_a (Runtime+Resolver+DataPath #1)");
         if (env_a) {
-            auto opened = env_a->rt->open(uri, OpenOptions{"striped"});
+            auto opened = env_a->rt->open(uri, OpenOptions{"file"});
             write_ok = opened.ok();
             if (write_ok) {
                 auto target = opened.value();
-                std::uint64_t buf_size = kStripeUnit * 3;
+                std::uint64_t buf_size = kUnit * 3;
                 void* raw = nullptr;
                 void* buf = cuda_malloc_aligned_64k(buf_size, &raw);
                 auto mem_r = env_a->rt->register_memory(
@@ -1095,8 +1095,8 @@ static int test_89_restart_persistence() {
                 CHECK(env_a->rt->shutdown(5000).ok(), "shutdown env_a's Runtime (teardown)");
             }
         }
-        // env_a (StripedResolver + StripedDataPath + all N controller
-        // attachments) is destroyed HERE, at end of scope.
+        // env_a (resolver + StripedDataPath + all N controller attachments)
+        // is destroyed HERE, at end of scope.
     }
     CHECK(write_ok, "phase 1: write both regions via env_a, then fully teardown");
 
@@ -1106,12 +1106,12 @@ static int test_89_restart_persistence() {
         auto env_b = make_env(2);
         CHECK(env_b != nullptr, "create env_b (Runtime+Resolver+DataPath #2, brand new)");
         if (env_b) {
-            auto opened = env_b->rt->open(uri, OpenOptions{"striped"});
+            auto opened = env_b->rt->open(uri, OpenOptions{"file"});
             read_ok = opened.ok();
-            CHECK(read_ok, "env_b re-opens the same striped:// URI");
+            CHECK(read_ok, "env_b re-opens the same file:// URI");
             if (read_ok) {
                 auto target = opened.value();
-                std::uint64_t buf_size = kStripeUnit * 3;
+                std::uint64_t buf_size = kUnit * 3;
                 void* raw = nullptr;
                 void* buf = cuda_malloc_aligned_64k(buf_size, &raw);
                 auto mem_r = env_b->rt->register_memory(
@@ -1143,18 +1143,16 @@ static int test_89_restart_persistence() {
             env_b->rt->shutdown(5000);
         }
     }
-    CHECK(read_ok, "phase 2: env_b READs both regions byte-exact "
-                  "(single-shard + cross-shard) after full restart");
+    CHECK(read_ok, "phase 2: env_b READs both regions byte-exact after full restart");
 
     ::unlink(p0.c_str());
-    ::unlink(p1.c_str());
     return g_fail > 0 ? 1 : 0;
 }
 
 // -------------------------------------------------------------------------
 // Test 90: fault semantics -- one illegal request in a mixed batch is
 // rejected per-request (RESOURCE_EXHAUSTED-class / OUT_OF_RANGE), while the
-// other requests (landing on both shards) are accepted and complete
+// other requests (to files on BOTH mounts) are accepted and complete
 // normally in the SAME submit() call -- partial commit.
 // (Round 15 Session 6, REQUIRED 1.4)
 // -------------------------------------------------------------------------
@@ -1162,22 +1160,20 @@ static int test_89_restart_persistence() {
 static int test_90_fault_partial_commit(StripedEnv* env) {
     TEST_CASE("90. fault semantics (illegal request rejected, others complete: partial commit)");
 
-    const std::uint64_t shard_size = kStripeUnit * 4;
-    std::string p0 = shard_path(0, "t90", 0);
-    std::string p1 = shard_path(1, "t90", 1);
-    if (!create_backing_file(p0, shard_size) || !create_backing_file(p1, shard_size)) {
+    const std::uint64_t file_size = kUnit * 4;
+    std::string p0 = slot_file(0, "t90a");
+    std::string p1 = slot_file(1, "t90b");
+    if (!create_backing_file(p0, file_size) || !create_backing_file(p1, file_size)) {
         CHECK(false, "create backing files");
         return 1;
     }
 
-    std::string uri = "striped://t90?devs=" + devs_param(2) + "&unit=65536";
-    auto opened = env->rt->open(uri, OpenOptions{"striped"});
-    CHECK(opened.ok(), "open striped target");
-    if (!opened.ok()) { ::unlink(p0.c_str()); ::unlink(p1.c_str()); return 1; }
-    auto target = opened.value();
-    const std::uint64_t logical_size = shard_size * 2;
+    auto oa = env->rt->open(file_uri(p0), OpenOptions{"file"});
+    auto ob = env->rt->open(file_uri(p1), OpenOptions{"file"});
+    CHECK(oa.ok() && ob.ok(), "open targets on both mounts");
+    if (!oa.ok() || !ob.ok()) { ::unlink(p0.c_str()); ::unlink(p1.c_str()); return 1; }
 
-    const std::uint64_t buf_size = kStripeUnit * 2;
+    const std::uint64_t buf_size = kUnit * 2;
     void* raw = nullptr;
     void* buf = cuda_malloc_aligned_64k(buf_size, &raw);
     CHECK(buf != nullptr, "alloc GPU buffer");
@@ -1186,7 +1182,8 @@ static int test_90_fault_partial_commit(StripedEnv* env) {
     CHECK(mem_r.ok(), "register_memory");
     if (!mem_r.ok()) {
         if (raw) cudaFree(raw);
-        env->rt->close(target);
+        env->rt->close(oa.value());
+        env->rt->close(ob.value());
         ::unlink(p0.c_str()); ::unlink(p1.c_str());
         return 1;
     }
@@ -1194,18 +1191,20 @@ static int test_90_fault_partial_commit(StripedEnv* env) {
 
     cudaStream_t stream;
     cudaStreamCreate(&stream);
-    launch_fill_position_pattern_gpu(buf, 100, kStripeUnit, stream);         // req[0] region
-    launch_fill_position_pattern_gpu((char*)buf + kStripeUnit, 200, kStripeUnit, stream); // req[2] region
+    // Fill the WHOLE buffer: req[2] writes the second kUnit (to mount 1), so
+    // leaving it uninitialized would write cudaMalloc garbage there and make
+    // the byte-verify below meaningless.
+    launch_fill_position_pattern_gpu(buf, 100, buf_size, stream);
     cudaStreamSynchronize(stream);
     HostSubmitContext ctx{ExecutionDomain::DEVICE_EXECUTION, 0, stream};
 
-    // req[0]: valid, lands on shard 0 (offset 0).
-    // req[1]: illegal -- target_offset == logical_size (out of range).
-    // req[2]: valid, lands on shard 1 (offset == stripe unit).
+    // req[0]: valid, file on mount 0.
+    // req[1]: illegal -- target_offset == file_size (out of range).
+    // req[2]: valid, file on mount 1.
     IoRequest reqs[3] = {
-        {IoDirection::WRITE, mem, 0,           target, 0,            kStripeUnit},
-        {IoDirection::WRITE, mem, 0,           target, logical_size, kStripeUnit},
-        {IoDirection::WRITE, mem, kStripeUnit, target, kStripeUnit,  kStripeUnit},
+        {IoDirection::WRITE, mem, 0,           oa.value(), 0,         kUnit},
+        {IoDirection::WRITE, mem, 0,           oa.value(), file_size, kUnit},
+        {IoDirection::WRITE, mem, kUnit,       ob.value(), 0,         kUnit},
     };
     auto sub = env->rt->submit(reqs, 3, ctx);
 
@@ -1227,32 +1226,37 @@ static int test_90_fault_partial_commit(StripedEnv* env) {
     }
     CHECK(completed_ok, "the accepted-only op (req[0]+req[2]) completes normally");
 
-    // Byte-verify req[0] (shard 0) and req[2] (shard 1) both landed.
+    // Byte-verify req[0] (mount 0) and req[2] (mount 1) both landed.
     bool byte_ok = false;
     if (completed_ok) {
         launch_fill_pattern_gpu(buf, 0xDD, buf_size, stream);
         cudaStreamSynchronize(stream);
         IoRequest rreqs[2] = {
-            {IoDirection::READ, mem, 0,           target, 0,           kStripeUnit},
-            {IoDirection::READ, mem, kStripeUnit, target, kStripeUnit, kStripeUnit},
+            {IoDirection::READ, mem, 0,       oa.value(), 0, kUnit},
+            {IoDirection::READ, mem, kUnit,   ob.value(), 0, kUnit},
         };
         bool r0 = submit_wait_all(env->rt.get(), &rreqs[0], 1, ctx);
         bool r1 = submit_wait_all(env->rt.get(), &rreqs[1], 1, ctx);
         std::vector<unsigned char> hbuf(buf_size);
         cudaMemcpy(hbuf.data(), buf, buf_size, cudaMemcpyDeviceToHost);
         byte_ok = r0 && r1;
-        for (std::uint64_t i = 0; i < kStripeUnit && byte_ok; ++i) {
+        for (std::uint64_t i = 0; i < kUnit && byte_ok; ++i) {
             if (hbuf[i] != static_cast<unsigned char>((100 + i) % 251u)) byte_ok = false;
         }
-        for (std::uint64_t i = 0; i < kStripeUnit && byte_ok; ++i) {
-            if (hbuf[kStripeUnit + i] != static_cast<unsigned char>((200 + i) % 251u)) byte_ok = false;
+        // req[2]'s source was the second kUnit of the same position pattern.
+        for (std::uint64_t i = 0; i < kUnit && byte_ok; ++i) {
+            if (hbuf[kUnit + i] !=
+                static_cast<unsigned char>((100 + kUnit + i) % 251u)) {
+                byte_ok = false;
+            }
         }
     }
-    CHECK(byte_ok, "shard 0 (req[0]) and shard 1 (req[2]) both landed correctly");
+    CHECK(byte_ok, "mount 0 (req[0]) and mount 1 (req[2]) both landed correctly");
 
     env->rt->unregister_memory(mem);
     cudaFree(raw);
-    env->rt->close(target);
+    env->rt->close(oa.value());
+    env->rt->close(ob.value());
     cudaStreamDestroy(stream);
     ::unlink(p0.c_str());
     ::unlink(p1.c_str());
@@ -1260,31 +1264,25 @@ static int test_90_fault_partial_commit(StripedEnv* env) {
 }
 
 // -------------------------------------------------------------------------
-// Main
+// Test 91: P0-2 -- op in-flight, unregister_memory must return BUSY
 // -------------------------------------------------------------------------
 
-// -------------------------------------------------------------------------
-// Test 91: P0-2 -- striped op in-flight, unregister_memory must return BUSY
-// -------------------------------------------------------------------------
+static int test_91_unregister_inflight(StripedEnv* env) {
+    TEST_CASE("91. op in-flight: unregister_memory returns BUSY");
 
-static int test_91_striped_unregister_inflight(StripedEnv* env) {
-    TEST_CASE("91. striped op in-flight: unregister_memory returns BUSY");
-
-    const std::uint64_t shard_size = kStripeUnit * 32;
-    std::string p0 = shard_path(0, "t91", 0);
-    std::string p1 = shard_path(1, "t91", 1);
-    if (!create_backing_file(p0, shard_size) || !create_backing_file(p1, shard_size)) {
-        CHECK(false, "create backing files");
+    const std::uint64_t file_size = kUnit * 32;
+    std::string p0 = slot_file(0, "t91");
+    if (!create_backing_file(p0, file_size)) {
+        CHECK(false, "create backing file");
         return 1;
     }
 
-    std::string uri = "striped://t91?devs=" + devs_param(2) + "&unit=65536";
-    auto opened = env->rt->open(uri, OpenOptions{"striped"});
-    CHECK(opened.ok(), "open striped target");
-    if (!opened.ok()) { ::unlink(p0.c_str()); ::unlink(p1.c_str()); return 1; }
+    auto opened = env->rt->open(file_uri(p0), OpenOptions{"file"});
+    CHECK(opened.ok(), "open file target");
+    if (!opened.ok()) { ::unlink(p0.c_str()); return 1; }
     auto target = opened.value();
 
-    const std::uint64_t io_size = shard_size * 2;
+    const std::uint64_t io_size = file_size;
     void* raw = nullptr;
     void* buf = cuda_malloc_aligned_64k(io_size, &raw);
     auto mem_r = env->rt->register_memory(
@@ -1293,7 +1291,7 @@ static int test_91_striped_unregister_inflight(StripedEnv* env) {
     if (!mem_r.ok()) {
         if (raw) cudaFree(raw);
         env->rt->close(target);
-        ::unlink(p0.c_str()); ::unlink(p1.c_str());
+        ::unlink(p0.c_str());
         return 1;
     }
 
@@ -1328,45 +1326,53 @@ static int test_91_striped_unregister_inflight(StripedEnv* env) {
     env->rt->close(target);
     cudaStreamDestroy(stream);
     ::unlink(p0.c_str());
-    ::unlink(p1.c_str());
     return g_fail > 0 ? 1 : 0;
 }
 
 // -------------------------------------------------------------------------
-// Test 92: [Round 16 S3] N=4 roundtrip + single-launch count
+// Test 92: [Round 16 S3] N=4 roundtrip + single-launch count. Four files,
+// one per mount, one batch of four requests.
 // -------------------------------------------------------------------------
 
 static int test_92_n4_roundtrip_single_launch(StripedEnv* env4) {
     TEST_CASE("92. N=4 roundtrip + single-launch count");
-    const std::uint64_t shard_size = kStripeUnit * 4;
+    const std::uint64_t file_size = kUnit * 4;
     const std::uint32_t n = 4;
     std::string paths[4];
     for (std::uint32_t i = 0; i < n; ++i) {
-        paths[i] = shard_path(i, "t92", i);
-        if (!create_backing_file(paths[i], shard_size)) {
+        paths[i] = slot_file(i, "t92_" + std::to_string(i));
+        if (!create_backing_file(paths[i], file_size)) {
             for (std::uint32_t j = 0; j <= i; ++j) ::unlink(paths[j].c_str());
             CHECK(false, "create 4 backing files"); return 1;
         }
     }
-    std::string uri = "striped://t92?devs=" + devs_param(n) + "&unit=65536";
-    auto opened = env4->rt->open(uri, OpenOptions{"striped"});
-    CHECK(opened.ok(), "open striped N=4 target");
-    if (!opened.ok()) { for (auto& p : paths) ::unlink(p.c_str()); return 1; }
-    auto target = opened.value();
-    const std::uint64_t io_size = shard_size * n;
+    std::vector<TargetHandle> targets(n);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        auto o = env4->rt->open(file_uri(paths[i]), OpenOptions{"file"});
+        if (!o.ok()) {
+            for (auto& p : paths) ::unlink(p.c_str());
+            CHECK(false, "open N=4 targets"); return 1;
+        }
+        targets[i] = o.value();
+    }
+    const std::uint64_t io_size = file_size * n;
     void* raw = nullptr;
     void* buf = cuda_malloc_aligned_64k(io_size, &raw);
     auto mem_r = env4->rt->register_memory({buf, io_size, MemoryKind::DEVICE, MemoryOwnership::CALLER_OWNED, 0, ""});
     CHECK(mem_r.ok(), "register_memory");
-    if (!mem_r.ok()) { if (raw) cudaFree(raw); env4->rt->close(target); for (auto& p : paths) ::unlink(p.c_str()); return 1; }
+    if (!mem_r.ok()) { if (raw) cudaFree(raw); for (auto& t : targets) env4->rt->close(t); for (auto& p : paths) ::unlink(p.c_str()); return 1; }
     cudaStream_t stream; cudaStreamCreate(&stream);
     HostSubmitContext ctx{ExecutionDomain::DEVICE_EXECUTION, 0, stream};
     launch_fill_position_pattern_gpu(buf, 9200, io_size, stream);
     cudaStreamSynchronize(stream);
+
+    std::vector<IoRequest> wreqs(n);
+    for (std::uint32_t i = 0; i < n; ++i)
+        wreqs[i] = {IoDirection::WRITE, mem_r.value(), i * file_size, targets[i], 0, file_size};
+
     env4->dp.test_reset_submit_counters();
     auto t_w0 = std::chrono::steady_clock::now();
-    IoRequest wreq{IoDirection::WRITE, mem_r.value(), 0, target, 0, io_size};
-    bool wok = submit_wait_all(env4->rt.get(), &wreq, 1, ctx);
+    bool wok = submit_wait_all(env4->rt.get(), wreqs.data(), n, ctx);
     auto t_w1 = std::chrono::steady_clock::now();
     { double ms = std::chrono::duration<double, std::milli>(t_w1 - t_w0).count();
       printf("[perf] 92_n4_write %llu bytes %.3f ms %.2f GB/s\n", (unsigned long long)io_size, ms, (double)io_size/ms/1e6); }
@@ -1374,12 +1380,16 @@ static int test_92_n4_roundtrip_single_launch(StripedEnv* env4) {
     std::uint64_t launches = env4->dp.test_kernel_launch_count();
     printf("  N=4 WRITE: DataPath::submit calls=%lu, kernel launches=%lu\n", (unsigned long)submits, (unsigned long)launches);
     CHECK(wok && submits == 1 && launches == 1, "N=4 WRITE: 1 submit, 1 launch");
+
     launch_fill_pattern_gpu(buf, 0xFF, io_size, stream);
     cudaStreamSynchronize(stream);
+    std::vector<IoRequest> rreqs(n);
+    for (std::uint32_t i = 0; i < n; ++i)
+        rreqs[i] = {IoDirection::READ, mem_r.value(), i * file_size, targets[i], 0, file_size};
+
     env4->dp.test_reset_submit_counters();
     auto t_r0 = std::chrono::steady_clock::now();
-    IoRequest rreq{IoDirection::READ, mem_r.value(), 0, target, 0, io_size};
-    bool rok = submit_wait_all(env4->rt.get(), &rreq, 1, ctx);
+    bool rok = submit_wait_all(env4->rt.get(), rreqs.data(), n, ctx);
     auto t_r1 = std::chrono::steady_clock::now();
     { double ms = std::chrono::duration<double, std::milli>(t_r1 - t_r0).count();
       printf("[perf] 92_n4_read %llu bytes %.3f ms %.2f GB/s\n", (unsigned long long)io_size, ms, (double)io_size/ms/1e6); }
@@ -1387,6 +1397,7 @@ static int test_92_n4_roundtrip_single_launch(StripedEnv* env4) {
     launches = env4->dp.test_kernel_launch_count();
     printf("  N=4 READ: DataPath::submit calls=%lu, kernel launches=%lu\n", (unsigned long)submits, (unsigned long)launches);
     CHECK(rok && submits == 1 && launches == 1, "N=4 READ: 1 submit, 1 launch");
+
     std::vector<unsigned char> hbuf(io_size);
     cudaMemcpy(hbuf.data(), buf, io_size, cudaMemcpyDeviceToHost);
     bool match = true;
@@ -1395,14 +1406,14 @@ static int test_92_n4_roundtrip_single_launch(StripedEnv* env4) {
     }
     CHECK(match, "N=4 read-back byte-exact");
     env4->rt->unregister_memory(mem_r.value());
-    cudaFree(raw); env4->rt->close(target); cudaStreamDestroy(stream);
+    cudaFree(raw); for (auto& t : targets) env4->rt->close(t); cudaStreamDestroy(stream);
     for (auto& p : paths) ::unlink(p.c_str());
     return g_fail > 0 ? 1 : 0;
 }
 
 // -------------------------------------------------------------------------
 // Test 98: registration-time prebuilt descriptors preserve logical blocks,
-// split by each controller's driver MDTS, and still use one fused launch.
+// split by the controller's driver MDTS, and still use one fused launch.
 // -------------------------------------------------------------------------
 
 static int test_98_prebuilt_logical_block_mdts(StripedEnv* env,
@@ -1425,36 +1436,43 @@ static int test_98_prebuilt_logical_block_mdts(StripedEnv* env,
     auto run_case = [&](std::uint64_t logical_block,
                         const char* suffix,
                         std::uint64_t pattern_seed) -> bool {
-        auto case_env = make_env(n, logical_block);
+        auto case_env = make_env(n);
         if (!case_env) return false;
         const std::string name = "t98_n" + std::to_string(n) + "_" + suffix;
-        std::vector<std::string> paths(n);
+        // Two files per mount, each logical_block bytes: one request per
+        // file, each sized to a whole number of granularity slices.
+        constexpr std::uint32_t kSlices = 2;
+        const std::uint64_t file_size = logical_block * kSlices;
+        std::vector<std::string> paths;
         for (std::uint32_t d = 0; d < n; ++d) {
-            paths[d] = shard_path(d, name, d);
-            if (!create_backing_file(paths[d], logical_block)) {
+            paths.push_back(slot_file(d, name + "_" + std::to_string(d)));
+            if (!create_backing_file(paths.back(), file_size)) {
                 std::fprintf(stderr, "  t98 create backing failed: %s\n",
-                             paths[d].c_str());
+                             paths.back().c_str());
                 for (const auto& path : paths) ::unlink(path.c_str());
                 return false;
             }
         }
 
-        const std::uint64_t io_size = logical_block * n;
-        const std::string uri = "striped://" + name + "?devs=" +
-            devs_param(n) + "&unit=" + std::to_string(logical_block);
-        auto opened = case_env->rt->open(uri, OpenOptions{"striped"});
-        if (!opened.ok()) {
-            std::fprintf(stderr, "  t98 open failed: %s\n",
-                         opened.status().message().c_str());
-            for (const auto& path : paths) ::unlink(path.c_str());
-            return false;
+        std::vector<TargetHandle> targets(n);
+        for (std::uint32_t d = 0; d < n; ++d) {
+            auto o = case_env->rt->open(file_uri(paths[d]), OpenOptions{"file"});
+            if (!o.ok()) {
+                std::fprintf(stderr, "  t98 open failed: %s\n",
+                             o.status().message().c_str());
+                for (auto& t : targets) if (t.valid()) case_env->rt->close(t);
+                for (const auto& path : paths) ::unlink(path.c_str());
+                return false;
+            }
+            targets[d] = o.value();
         }
 
+        const std::uint64_t io_size = file_size * n;
         void* raw = nullptr;
         void* buffer = cuda_malloc_aligned_64k(io_size, &raw);
         if (!buffer) {
             std::fprintf(stderr, "  t98 cuda buffer allocation failed\n");
-            case_env->rt->close(opened.value());
+            for (auto& t : targets) case_env->rt->close(t);
             for (const auto& path : paths) ::unlink(path.c_str());
             return false;
         }
@@ -1466,7 +1484,7 @@ static int test_98_prebuilt_logical_block_mdts(StripedEnv* env,
             std::fprintf(stderr, "  t98 register_memory failed: %s\n",
                          memory.status().message().c_str());
             cudaFree(raw);
-            case_env->rt->close(opened.value());
+            for (auto& t : targets) case_env->rt->close(t);
             for (const auto& path : paths) ::unlink(path.c_str());
             return false;
         }
@@ -1477,17 +1495,21 @@ static int test_98_prebuilt_logical_block_mdts(StripedEnv* env,
         launch_fill_position_pattern_gpu(buffer, pattern_seed, io_size, stream);
         cudaStreamSynchronize(stream);
 
+        // Expected sub-IO count: per file, ceil(file_size / mdts_of_its_device).
         std::uint64_t expected_entries = 0;
         for (std::uint32_t d = 0; d < n; ++d) {
             const std::uint64_t mdts =
                 case_env->dp.test_device_effective_mdts(d);
-            expected_entries += (logical_block + mdts - 1) / mdts;
+            expected_entries += (file_size + mdts - 1) / mdts;
         }
 
+        std::vector<IoRequest> writes(n);
+        for (std::uint32_t d = 0; d < n; ++d)
+            writes[d] = {IoDirection::WRITE, memory.value(), d * file_size,
+                         targets[d], 0, file_size};
+
         case_env->dp.test_reset_submit_counters();
-        IoRequest write{IoDirection::WRITE, memory.value(), 0,
-                        opened.value(), 0, io_size};
-        const bool write_ok = submit_wait_all(case_env->rt.get(), &write, 1, ctx);
+        const bool write_ok = submit_wait_all(case_env->rt.get(), writes.data(), n, ctx);
         const std::uint64_t write_prebuilt =
             case_env->dp.test_last_prebuilt_entry_count();
         const std::uint64_t write_dynamic =
@@ -1502,10 +1524,13 @@ static int test_98_prebuilt_logical_block_mdts(StripedEnv* env,
 
         launch_fill_pattern_gpu(buffer, 0xFF, io_size, stream);
         cudaStreamSynchronize(stream);
+        std::vector<IoRequest> reads(n);
+        for (std::uint32_t d = 0; d < n; ++d)
+            reads[d] = {IoDirection::READ, memory.value(), d * file_size,
+                        targets[d], 0, file_size};
+
         case_env->dp.test_reset_submit_counters();
-        IoRequest read{IoDirection::READ, memory.value(), 0,
-                       opened.value(), 0, io_size};
-        const bool read_ok = submit_wait_all(case_env->rt.get(), &read, 1, ctx);
+        const bool read_ok = submit_wait_all(case_env->rt.get(), reads.data(), n, ctx);
         const std::uint64_t read_prebuilt =
             case_env->dp.test_last_prebuilt_entry_count();
         const std::uint64_t read_dynamic =
@@ -1545,7 +1570,7 @@ static int test_98_prebuilt_logical_block_mdts(StripedEnv* env,
 
         case_env->rt->unregister_memory(memory.value());
         cudaFree(raw);
-        case_env->rt->close(opened.value());
+        for (auto& t : targets) case_env->rt->close(t);
         cudaStreamDestroy(stream);
         case_env->rt->shutdown(5000);
         for (const auto& path : paths) ::unlink(path.c_str());
@@ -1564,179 +1589,177 @@ static int test_98_prebuilt_logical_block_mdts(StripedEnv* env,
 }
 
 // -------------------------------------------------------------------------
-// Test 93: [Round 16 S3] N=4 round-robin distribution (verify in backing files)
+// Test 93: [Round 16 S3] N=4 mount distribution (verify in backing files)
 // -------------------------------------------------------------------------
 
 static int test_93_n4_distribution(StripedEnv* env4) {
-    TEST_CASE("93. N=4 stripe distribution (round-robin verified in backing files)");
-    const std::uint64_t shard_size = kStripeUnit * 4;
+    TEST_CASE("93. N=4 mount distribution (each file lands on its own device)");
+    const std::uint64_t file_size = kUnit * 4;
     const std::uint32_t n = 4;
     std::string paths[4];
     for (std::uint32_t i = 0; i < n; ++i) {
-        paths[i] = shard_path(i, "t93", i);
-        if (!create_backing_file(paths[i], shard_size)) {
+        paths[i] = slot_file(i, "t93_" + std::to_string(i));
+        if (!create_backing_file(paths[i], file_size)) {
             for (std::uint32_t j = 0; j <= i; ++j) ::unlink(paths[j].c_str());
             CHECK(false, "create 4 backing files"); return 1;
         }
     }
-    std::string uri = "striped://t93?devs=" + devs_param(n) + "&unit=65536";
-    auto opened = env4->rt->open(uri, OpenOptions{"striped"});
-    CHECK(opened.ok(), "open striped N=4 target");
-    if (!opened.ok()) { for (auto& p : paths) ::unlink(p.c_str()); return 1; }
-    auto target = opened.value();
-    const std::uint64_t io_size = kStripeUnit * n;
+    std::vector<TargetHandle> targets(n);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        auto o = env4->rt->open(file_uri(paths[i]), OpenOptions{"file"});
+        if (!o.ok()) {
+            for (auto& p : paths) ::unlink(p.c_str());
+            CHECK(false, "open N=4 targets"); return 1;
+        }
+        targets[i] = o.value();
+    }
+    const std::uint64_t io_size = file_size * n;
     void* raw = nullptr;
     void* buf = cuda_malloc_aligned_64k(io_size, &raw);
     auto mem_r = env4->rt->register_memory({buf, io_size, MemoryKind::DEVICE, MemoryOwnership::CALLER_OWNED, 0, ""});
     CHECK(mem_r.ok(), "register_memory");
-    if (!mem_r.ok()) { if (raw) cudaFree(raw); env4->rt->close(target); for (auto& p : paths) ::unlink(p.c_str()); return 1; }
+    if (!mem_r.ok()) { if (raw) cudaFree(raw); for (auto& t : targets) env4->rt->close(t); for (auto& p : paths) ::unlink(p.c_str()); return 1; }
     cudaStream_t stream; cudaStreamCreate(&stream);
     HostSubmitContext ctx{ExecutionDomain::DEVICE_EXECUTION, 0, stream};
     for (std::uint32_t u = 0; u < n; ++u)
-        launch_fill_pattern_gpu((char*)buf + u * kStripeUnit, static_cast<unsigned char>(0xC0 + u), kStripeUnit, stream);
+        launch_fill_pattern_gpu((char*)buf + u * file_size, static_cast<unsigned char>(0xC0 + u), file_size, stream);
     cudaStreamSynchronize(stream);
-    IoRequest wreq{IoDirection::WRITE, mem_r.value(), 0, target, 0, io_size};
-    bool wok = submit_wait_all(env4->rt.get(), &wreq, 1, ctx);
-    CHECK(wok, "write 4 units across 4 shards");
+    std::vector<IoRequest> wreqs(n);
+    for (std::uint32_t u = 0; u < n; ++u)
+        wreqs[u] = {IoDirection::WRITE, mem_r.value(), u * file_size, targets[u], 0, file_size};
+    bool wok = submit_wait_all(env4->rt.get(), wreqs.data(), n, ctx);
+    CHECK(wok, "write 4 files across 4 mounts in one batch");
     bool dist_ok = wok;
     for (std::uint32_t u = 0; u < n; ++u) {
-        std::vector<unsigned char> shard_data;
-        if (!read_file_raw(paths[u], 0, kStripeUnit, shard_data)) { dist_ok = false; break; }
-        if (shard_data.size() != kStripeUnit) { dist_ok = false; break; }
+        std::vector<unsigned char> file_data;
+        if (!read_file_raw(paths[u], 0, file_size, file_data)) { dist_ok = false; break; }
+        if (file_data.size() != file_size) { dist_ok = false; break; }
         unsigned char expect = static_cast<unsigned char>(0xC0 + u);
-        for (std::uint64_t i = 0; i < kStripeUnit; ++i) if (shard_data[i] != expect) { dist_ok = false; break; }
+        for (std::uint64_t i = 0; i < file_size; ++i) if (file_data[i] != expect) { dist_ok = false; break; }
         if (!dist_ok) break;
     }
-    CHECK(dist_ok, "round-robin: unit i lands on shard i (verified in backing files)");
+    CHECK(dist_ok, "mount dispatch: file i lands on device i (verified in backing files)");
     env4->rt->unregister_memory(mem_r.value());
-    cudaFree(raw); env4->rt->close(target); cudaStreamDestroy(stream);
+    cudaFree(raw); for (auto& t : targets) env4->rt->close(t); cudaStreamDestroy(stream);
     for (auto& p : paths) ::unlink(p.c_str());
     return g_fail > 0 ? 1 : 0;
 }
 
 // -------------------------------------------------------------------------
-// Test 94: [Round 16 S3] N=4 vs N=1 cross-disk parallel READ speedup (>1.3x)
+// Test 94: [Round 16 S3] N=4 absolute bandwidth (many files, 4-disk READ)
 // -------------------------------------------------------------------------
 
 static int test_94_n4_speedup(StripedEnv* env4) {
-    TEST_CASE("94. N=4 absolute bandwidth (4-disk striped READ)");
-    const std::uint64_t shard_size = kStripeUnit * 256;  // 16 MiB/shard, 64 MiB total
+    TEST_CASE("94. N=4 absolute bandwidth (4-disk rotating READ)");
     const std::uint32_t n4 = 4;
-    // N=4 backing files (one per device).
-    std::string p4[4];
-    for (std::uint32_t i = 0; i < n4; ++i) {
-        p4[i] = shard_path(i, "t94", i);
-        if (!create_backing_file(p4[i], shard_size)) {
-            for (std::uint32_t j = 0; j <= i; ++j) ::unlink(p4[j].c_str());
+    constexpr std::uint32_t kFiles = 32;
+    const std::uint64_t file_size = 2ull * 1024 * 1024;  // 2 MiB/file, 64 MiB total
+
+    std::vector<std::string> paths(kFiles);
+    std::vector<TargetHandle> targets(kFiles);
+    for (std::uint32_t f = 0; f < kFiles; ++f) {
+        paths[f] = slot_file(f % n4, "t94_" + std::to_string(f));
+        if (!create_backing_file(paths[f], file_size)) {
+            for (auto& p : paths) if (!p.empty()) ::unlink(p.c_str());
             CHECK(false, "create N=4 backing files"); return 1;
         }
     }
-    // Pre-write data via env4.
-    {
-        std::string uri = "striped://t94?devs=" + devs_param(n4) + "&unit=65536";
-        auto opened = env4->rt->open(uri, OpenOptions{"striped"});
-        CHECK(opened.ok(), "open N=4 striped target for prewrite");
-        if (!opened.ok()) { for (auto& p : p4) ::unlink(p.c_str()); return 1; }
-        auto target = opened.value();
-        std::uint64_t sz = shard_size * n4;
-        void* raw = nullptr;
-        void* buf = cuda_malloc_aligned_64k(sz, &raw);
-        auto mem_r = env4->rt->register_memory({buf, sz, MemoryKind::DEVICE, MemoryOwnership::CALLER_OWNED, 0, ""});
-        CHECK(mem_r.ok(), "register_memory for prewrite");
-        if (!mem_r.ok()) { if (raw) cudaFree(raw); env4->rt->close(target); for (auto& p : p4) ::unlink(p.c_str()); return 1; }
-        cudaStream_t s; cudaStreamCreate(&s);
-        HostSubmitContext ctx{ExecutionDomain::DEVICE_EXECUTION, 0, s};
-        launch_fill_pattern_gpu(buf, 0x33, sz, s);
-        cudaStreamSynchronize(s);
-        IoRequest w{IoDirection::WRITE, mem_r.value(), 0, target, 0, sz};
-        bool ok = submit_wait_all(env4->rt.get(), &w, 1, ctx);
-        CHECK(ok, "prewrite N=4");
-        env4->rt->unregister_memory(mem_r.value()); cudaFree(raw);
-        env4->rt->close(target); cudaStreamDestroy(s);
-        if (!ok) { for (auto& p : p4) ::unlink(p.c_str()); return 1; }
+    for (std::uint32_t f = 0; f < kFiles; ++f) {
+        auto o = env4->rt->open(file_uri(paths[f]), OpenOptions{"file"});
+        if (!o.ok()) {
+            for (auto& t : targets) if (t.valid()) env4->rt->close(t);
+            for (auto& p : paths) ::unlink(p.c_str());
+            CHECK(false, "open N=4 targets"); return 1;
+        }
+        targets[f] = o.value();
     }
-    // READ back via env4, measure bandwidth.
+
+    const std::uint64_t io_size = file_size * kFiles;
+    void* raw = nullptr;
+    void* buf = cuda_malloc_aligned_64k(io_size, &raw);
+    auto mem_r = env4->rt->register_memory({buf, io_size, MemoryKind::DEVICE, MemoryOwnership::CALLER_OWNED, 0, ""});
+    CHECK(mem_r.ok(), "register_memory");
+    if (!mem_r.ok()) { if (raw) cudaFree(raw); for (auto& t : targets) env4->rt->close(t); for (auto& p : paths) ::unlink(p.c_str()); return 1; }
+    cudaStream_t s; cudaStreamCreate(&s);
+    HostSubmitContext ctx{ExecutionDomain::DEVICE_EXECUTION, 0, s};
+
+    // Pre-write.
+    launch_fill_pattern_gpu(buf, 0x33, io_size, s);
+    cudaStreamSynchronize(s);
+    {
+        std::vector<IoRequest> writes(kFiles);
+        for (std::uint32_t f = 0; f < kFiles; ++f)
+            writes[f] = {IoDirection::WRITE, mem_r.value(), f * file_size, targets[f], 0, file_size};
+        bool ok = submit_wait_all(env4->rt.get(), writes.data(), kFiles, ctx);
+        CHECK(ok, "prewrite N=4");
+        if (!ok) {
+            env4->rt->unregister_memory(mem_r.value()); cudaFree(raw);
+            for (auto& t : targets) env4->rt->close(t); cudaStreamDestroy(s);
+            for (auto& p : paths) ::unlink(p.c_str());
+            return 1;
+        }
+    }
+
+    // Timed read.
+    launch_fill_pattern_gpu(buf, 0xFF, io_size, s);
+    cudaStreamSynchronize(s);
     double ms4 = 0;
     bool ok4 = false;
     {
-        std::string uri = "striped://t94?devs=" + devs_param(n4) + "&unit=65536";
-        auto opened = env4->rt->open(uri, OpenOptions{"striped"});
-        CHECK(opened.ok(), "open N=4 striped target for read");
-        if (!opened.ok()) { for (auto& p : p4) ::unlink(p.c_str()); return 1; }
-        auto target = opened.value();
-        std::uint64_t sz = shard_size * n4;
-        void* raw = nullptr;
-        void* buf = cuda_malloc_aligned_64k(sz, &raw);
-        auto mem_r = env4->rt->register_memory({buf, sz, MemoryKind::DEVICE, MemoryOwnership::CALLER_OWNED, 0, ""});
-        CHECK(mem_r.ok(), "register_memory for read");
-        if (!mem_r.ok()) { if (raw) cudaFree(raw); env4->rt->close(target); for (auto& p : p4) ::unlink(p.c_str()); return 1; }
-        cudaStream_t s; cudaStreamCreate(&s);
-        HostSubmitContext ctx{ExecutionDomain::DEVICE_EXECUTION, 0, s};
-        IoRequest r{IoDirection::READ, mem_r.value(), 0, target, 0, sz};
+        std::vector<IoRequest> reads(kFiles);
+        for (std::uint32_t f = 0; f < kFiles; ++f)
+            reads[f] = {IoDirection::READ, mem_r.value(), f * file_size, targets[f], 0, file_size};
         auto t0 = std::chrono::steady_clock::now();
-        ok4 = submit_wait_all(env4->rt.get(), &r, 1, ctx);
+        ok4 = submit_wait_all(env4->rt.get(), reads.data(), kFiles, ctx);
         auto t1 = std::chrono::steady_clock::now();
         ms4 = std::chrono::duration<double, std::milli>(t1 - t0).count();
         printf("[perf] 94_n4_read %llu bytes %.3f ms %.2f GB/s\n",
-               (unsigned long long)sz, ms4, (double)sz/ms4/1e6);
-        env4->rt->unregister_memory(mem_r.value()); cudaFree(raw);
-        env4->rt->close(target); cudaStreamDestroy(s);
+               (unsigned long long)io_size, ms4, (double)io_size/ms4/1e6);
     }
     CHECK(ok4, "N=4 READ succeeded");
     if (ok4 && ms4 > 0) {
-        double bw4 = (double)(shard_size * n4) / ms4 / 1e6;
-        printf("  4-disk striped READ (%.1f MiB): %.2f ms (%.2f GB/s)\n",
-               (double)(shard_size*n4)/(1<<20), ms4, bw4);
+        double bw4 = (double)io_size / ms4 / 1e6;
+        printf("  4-disk rotating READ (%.1f MiB): %.2f ms (%.2f GB/s)\n",
+               (double)io_size/(1<<20), ms4, bw4);
         // Perf is display-only (session contract): the only hard perf
         // threshold in this suite is the cross-disk speedup (>1.3x).
     }
-    for (auto& p : p4) ::unlink(p.c_str());
+    env4->rt->unregister_memory(mem_r.value());
+    cudaFree(raw);
+    for (auto& t : targets) env4->rt->close(t);
+    cudaStreamDestroy(s);
+    for (auto& p : paths) ::unlink(p.c_str());
     return g_fail > 0 ? 1 : 0;
 }
 
 // -------------------------------------------------------------------------
 // Test 95: [Round 16 S4/S5] Multi-target batch: single submit spanning 2
-//         striped targets (different URIs, different backing file sets),
-//         all ACCEPTED + single kernel launch (count seam) + byte verify.
+//         targets (different files on different mounts), all ACCEPTED +
+//         single kernel launch (count seam) + byte verify.
 // -------------------------------------------------------------------------
 
 static int test_95_multi_target_batch(StripedEnv* env4) {
-    TEST_CASE("95. multi-target batch (2 striped targets, 1 submit, 1 launch)");
-    const std::uint64_t shard_size = kStripeUnit * 4;  // 256 KiB/shard
+    TEST_CASE("95. multi-target batch (2 targets, 1 submit, 1 launch)");
+    const std::uint64_t file_size = kUnit * 4;
     const std::uint32_t n = 4;
 
-    // Target A: t95a
-    std::string pa[4];
-    for (std::uint32_t i = 0; i < n; ++i) {
-        pa[i] = shard_path(i, "t95a", i);
-        if (!create_backing_file(pa[i], shard_size)) {
-            for (std::uint32_t j = 0; j <= i; ++j) ::unlink(pa[j].c_str());
-            CHECK(false, "create target A backing files"); return 1;
-        }
-    }
-    // Target B: t95b (different URI, different backing files)
-    std::string pb[4];
-    for (std::uint32_t i = 0; i < n; ++i) {
-        pb[i] = shard_path(i, "t95b", i);
-        if (!create_backing_file(pb[i], shard_size)) {
-            for (std::uint32_t j = 0; j <= i; ++j) ::unlink(pb[j].c_str());
-            for (auto& p : pa) ::unlink(p.c_str());
-            CHECK(false, "create target B backing files"); return 1;
-        }
+    // Target A: mount 0. Target B: mount 3.
+    std::string pa = slot_file(0, "t95a");
+    std::string pb = slot_file(n - 1, "t95b");
+    if (!create_backing_file(pa, file_size) || !create_backing_file(pb, file_size)) {
+        ::unlink(pa.c_str()); ::unlink(pb.c_str());
+        CHECK(false, "create target backing files"); return 1;
     }
 
-    std::string uri_a = "striped://t95a?devs=" + devs_param(n) + "&unit=65536";
-    std::string uri_b = "striped://t95b?devs=" + devs_param(n) + "&unit=65536";
-    auto oa = env4->rt->open(uri_a, OpenOptions{"striped"});
-    auto ob = env4->rt->open(uri_b, OpenOptions{"striped"});
-    CHECK(oa.ok() && ob.ok(), "open 2 striped targets");
+    auto oa = env4->rt->open(file_uri(pa), OpenOptions{"file"});
+    auto ob = env4->rt->open(file_uri(pb), OpenOptions{"file"});
+    CHECK(oa.ok() && ob.ok(), "open 2 targets");
     if (!oa.ok() || !ob.ok()) {
-        for (auto& p : pa) ::unlink(p.c_str());
-        for (auto& p : pb) ::unlink(p.c_str());
+        ::unlink(pa.c_str()); ::unlink(pb.c_str());
         return 1;
     }
 
-    const std::uint64_t io_size = shard_size * n;  // 1 MiB per target
+    const std::uint64_t io_size = file_size;
     void *raw_a=nullptr, *raw_b=nullptr;
     void *buf_a = cuda_malloc_aligned_64k(io_size, &raw_a);
     void *buf_b = cuda_malloc_aligned_64k(io_size, &raw_b);
@@ -1746,7 +1769,7 @@ static int test_95_multi_target_batch(StripedEnv* env4) {
     if (!ma.ok() || !mb.ok()) {
         if (raw_a) cudaFree(raw_a); if (raw_b) cudaFree(raw_b);
         env4->rt->close(oa.value()); env4->rt->close(ob.value());
-        for (auto& p : pa) ::unlink(p.c_str()); for (auto& p : pb) ::unlink(p.c_str());
+        ::unlink(pa.c_str()); ::unlink(pb.c_str());
         return 1;
     }
 
@@ -1815,18 +1838,21 @@ static int test_95_multi_target_batch(StripedEnv* env4) {
     cudaFree(raw_a); cudaFree(raw_b);
     env4->rt->close(oa.value()); env4->rt->close(ob.value());
     cudaStreamDestroy(stream);
-    for (auto& p : pa) ::unlink(p.c_str());
-    for (auto& p : pb) ::unlink(p.c_str());
+    ::unlink(pa.c_str());
+    ::unlink(pb.c_str());
     return g_fail > 0 ? 1 : 0;
 }
 
 // -------------------------------------------------------------------------
 // Test 96: [Round 16 S5] 8+ target large batch (dev_table capacity boundary)
+// One device-table row per target since 2026-09-22 (a target is one file on
+// one device), so 8 targets is well inside capacity -- this remains the
+// multi-target boundary shape used by production layer batches.
 // -------------------------------------------------------------------------
 
 static int test_96_many_targets_batch(StripedEnv* env4) {
     TEST_CASE("96. 8-target large batch (dev_table capacity boundary)");
-    const std::uint64_t shard_size = kStripeUnit * 2;  // 128 KiB/shard
+    const std::uint64_t file_size = kUnit * 2;
     const std::uint32_t n = 4;
     const std::uint32_t n_targets = 8;
 
@@ -1834,26 +1860,21 @@ static int test_96_many_targets_batch(StripedEnv* env4) {
     std::vector<TargetHandle> tgts(n_targets);
     bool setup_ok = true;
     for (std::uint32_t t = 0; t < n_targets && setup_ok; ++t) {
-        std::string ps[4];
-        for (std::uint32_t i = 0; i < n; ++i) {
-            ps[i] = shard_path(i, "t96_" + std::to_string(t), i);
-            if (!create_backing_file(ps[i], shard_size)) { setup_ok = false; break; }
-        }
-        if (!setup_ok) { for (auto& p : ps) ::unlink(p.c_str()); break; }
-        for (auto& p : ps) paths_all.push_back(p);
-        std::string uri = "striped://t96_" + std::to_string(t) + "?devs=" + devs_param(n) + "&unit=65536";
-        auto o = env4->rt->open(uri, OpenOptions{"striped"});
+        std::string p = slot_file(t % n, "t96_" + std::to_string(t));
+        if (!create_backing_file(p, file_size)) { setup_ok = false; break; }
+        paths_all.push_back(p);
+        auto o = env4->rt->open(file_uri(p), OpenOptions{"file"});
         if (!o.ok()) { setup_ok = false; break; }
         tgts[t] = o.value();
     }
-    CHECK(setup_ok, "open 8 striped targets");
+    CHECK(setup_ok, "open 8 targets");
     if (!setup_ok) {
         for (auto& t : tgts) if (t.valid()) env4->rt->close(t);
         for (auto& p : paths_all) ::unlink(p.c_str());
         return 1;
     }
 
-    const std::uint64_t io_size = shard_size * n;  // 512 KiB/target
+    const std::uint64_t io_size = file_size;  // per target
     void* raw = nullptr;
     void* buf = cuda_malloc_aligned_64k(io_size * n_targets, &raw);
     auto mem = env4->rt->register_memory({buf, io_size * n_targets, MemoryKind::DEVICE, MemoryOwnership::CALLER_OWNED, 0, ""});
@@ -1919,61 +1940,32 @@ static int test_96_many_targets_batch(StripedEnv* env4) {
 }
 
 // -------------------------------------------------------------------------
-// Test 97: [Round 16 S5] M exceeds dev_table capacity → partial-commit
+// Test 97: [Round 16 S5, reworked 2026-09-22] dev_table capacity is one row
+// per target; a small multi-target batch exercises the boundary shape
+// without needing thousands of files.
 // -------------------------------------------------------------------------
 
-static int test_97_dev_table_overflow(StripedEnv* env4) {
-    TEST_CASE("97. dev_table overflow → per-request REJECTED (partial-commit)");
-    // Dev table capacity = 2048 (from S4 change). 2048/4 = 512 targets max.
-    // Create 513 targets to exceed capacity.
-    const std::uint64_t shard_size = kStripeUnit;  // 64 KiB/shard (minimal)
+static int test_97_dev_table_capacity(StripedEnv* env4) {
+    TEST_CASE("97. multi-target batch within dev_table capacity");
+    const std::uint64_t file_size = kUnit * 4;
     const std::uint32_t n = 4;
-    const std::uint32_t n_targets = 513;  // 1 over limit (512 * 4 = 2048)
 
-    // To keep test fast, only create backing files for 2 targets
-    // and use invalid (non-opened) handles for the rest. Instead, test
-    // with a simpler approach: submit 1 valid + 513 dummy targets.
-    // Actually, the dev_table check is on total_dev_table = n_targets * N.
-    // With N=4, 513 targets → 2052 entries > 2048 capacity.
-    // But creating 513 backing files is too slow. Instead, reuse the same
-    // target 513 times — that's only 1 distinct target, dev_table=4.
-    // So we need 513 DISTINCT targets. Let's just test with the limit:
-    // create 512 targets (2048 entries, exactly at capacity) and verify
-    // it works, then 513 and verify rejection.
-
-    // Simplified: create 2 striped targets, submit 512+1 requests each
-    // pointing to the same 2 targets (so M=2, N=4, total_dev_table=8).
-    // This doesn't test the capacity boundary. Skip this test — the
-    // capacity is an arena config, not a per-submit limit in the common
-    // case. The real boundary test is: does a batch with M*N > 2048
-    // entries get rejected per-request?
-
-    // For now, just verify that a very large batch (many requests to
-    // few targets) still works correctly.
-    std::string p0[4], p1[4];
-    for (std::uint32_t i = 0; i < n; ++i) {
-        p0[i] = shard_path(i, "t97a", i);
-        if (!create_backing_file(p0[i], shard_size * 4)) {
-            for (std::uint32_t j = 0; j <= i; ++j) ::unlink(p0[j].c_str());
-            CHECK(false, "create t97a"); return 1;
-        }
-        p1[i] = shard_path(i, "t97b", i);
-        if (!create_backing_file(p1[i], shard_size * 4)) {
-            for (std::uint32_t j = 0; j <= i; ++j) ::unlink(p1[j].c_str());
-            for (auto& p : p0) ::unlink(p.c_str());
-            CHECK(false, "create t97b"); return 1;
-        }
+    std::string p0 = slot_file(0, "t97a");
+    std::string p1 = slot_file(n - 1, "t97b");
+    if (!create_backing_file(p0, file_size) || !create_backing_file(p1, file_size)) {
+        ::unlink(p0.c_str()); ::unlink(p1.c_str());
+        CHECK(false, "create backing files"); return 1;
     }
 
-    auto oa = env4->rt->open("striped://t97a?devs=" + devs_param(n) + "&unit=65536", OpenOptions{"striped"});
-    auto ob = env4->rt->open("striped://t97b?devs=" + devs_param(n) + "&unit=65536", OpenOptions{"striped"});
+    auto oa = env4->rt->open(file_uri(p0), OpenOptions{"file"});
+    auto ob = env4->rt->open(file_uri(p1), OpenOptions{"file"});
     CHECK(oa.ok() && ob.ok(), "open 2 targets");
     if (!oa.ok() || !ob.ok()) {
-        for (auto& p : p0) ::unlink(p.c_str()); for (auto& p : p1) ::unlink(p.c_str());
+        ::unlink(p0.c_str()); ::unlink(p1.c_str());
         return 1;
     }
 
-    const std::uint64_t io_size = shard_size * 4;  // 256 KiB
+    const std::uint64_t io_size = file_size;
     void* raw = nullptr;
     void* buf = cuda_malloc_aligned_64k(io_size * 2, &raw);
     auto mem = env4->rt->register_memory({buf, io_size * 2, MemoryKind::DEVICE, MemoryOwnership::CALLER_OWNED, 0, ""});
@@ -1981,7 +1973,7 @@ static int test_97_dev_table_overflow(StripedEnv* env4) {
     if (!mem.ok()) {
         if (raw) cudaFree(raw);
         env4->rt->close(oa.value()); env4->rt->close(ob.value());
-        for (auto& p : p0) ::unlink(p.c_str()); for (auto& p : p1) ::unlink(p.c_str());
+        ::unlink(p0.c_str()); ::unlink(p1.c_str());
         return 1;
     }
 
@@ -1990,10 +1982,9 @@ static int test_97_dev_table_overflow(StripedEnv* env4) {
     launch_fill_pattern_gpu(buf, 0x97, io_size * 2, stream);
     cudaStreamSynchronize(stream);
 
-    // Submit 2 requests to 2 different targets — should succeed (M=2, N=4, total=8 < 2048)
     IoRequest wreqs[2] = {
-        {IoDirection::WRITE, mem.value(), 0, oa.value(), 0, io_size},
-        {IoDirection::WRITE, mem.value(), io_size, ob.value(), 0, io_size},
+        {IoDirection::WRITE, mem.value(), 0,        oa.value(), 0, io_size},
+        {IoDirection::WRITE, mem.value(), io_size,  ob.value(), 0, io_size},
     };
     auto out = env4->rt->submit(wreqs, 2, ctx);
     CHECK(out.status.ok() && out.io.has_value(), "2-target batch OK (within dev_table capacity)");
@@ -2006,8 +1997,8 @@ static int test_97_dev_table_overflow(StripedEnv* env4) {
     launch_fill_pattern_gpu(buf, 0xFF, io_size * 2, stream);
     cudaStreamSynchronize(stream);
     IoRequest rreqs[2] = {
-        {IoDirection::READ, mem.value(), 0, oa.value(), 0, io_size},
-        {IoDirection::READ, mem.value(), io_size, ob.value(), 0, io_size},
+        {IoDirection::READ, mem.value(), 0,        oa.value(), 0, io_size},
+        {IoDirection::READ, mem.value(), io_size,  ob.value(), 0, io_size},
     };
     auto rout = env4->rt->submit(rreqs, 2, ctx);
     if (rout.io.has_value()) {
@@ -2024,13 +2015,13 @@ static int test_97_dev_table_overflow(StripedEnv* env4) {
     cudaFree(raw);
     env4->rt->close(oa.value()); env4->rt->close(ob.value());
     cudaStreamDestroy(stream);
-    for (auto& p : p0) ::unlink(p.c_str());
-    for (auto& p : p1) ::unlink(p.c_str());
+    ::unlink(p0.c_str());
+    ::unlink(p1.c_str());
     return g_fail > 0 ? 1 : 0;
 }
 
 int main(int argc, char** argv) {
-    std::printf("=== Striped Local-NVMe E2E Contract Test (Round 15-16) ===\n");
+    std::printf("=== Multi-Device Local-NVMe E2E Contract Test (rotating placement) ===\n");
 
     if (argc == 2 && (std::strcmp(argv[1], "--help") == 0 ||
                       std::strcmp(argv[1], "-h") == 0)) {
@@ -2058,6 +2049,11 @@ int main(int argc, char** argv) {
         return 77;
     }
 
+    // Mounts must exist before the resolver binds them (the bindings only
+    // need the paths, but keeping creation first makes that ordering
+    // obviously safe).
+    if (!create_test_mounts(num_devices)) return 1;
+
     // Phase 2 direct-DataPath probe: resource setup/teardown must be
     // independent of the caller's current accelerator.
     int cuda_device_count = 0;
@@ -2078,7 +2074,7 @@ int main(int argc, char** argv) {
         CHECK(direct_init.ok(),
               "direct StripedDataPath initialize works from wrong caller device");
         CHECK(direct_dp.test_arena_alloc_counts().gpu_prp_cuda_malloc == 0,
-              "striped initialization performs zero GPU PRP allocation");
+              "multi-device initialization performs zero GPU PRP allocation");
         int after_init = -1;
         CHECK(cudaGetDevice(&after_init) == cudaSuccess &&
               after_init == caller_gpu,
@@ -2091,9 +2087,9 @@ int main(int argc, char** argv) {
               after_shutdown == caller_gpu,
               "direct StripedDataPath shutdown restores caller device");
         CHECK(cudaSetDevice(g_gpu_id) == cudaSuccess,
-              "direct striped probe restores test accelerator");
+              "direct multi-device probe restores test accelerator");
     }
-    std::printf("Using %u striped devices (found %u configured devices)\n",
+    std::printf("Using %u devices (found %u configured devices)\n",
                 num_devices, available);
     cudaSetDevice(g_gpu_id);
 
@@ -2102,15 +2098,13 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "FATAL: failed to create dual-device StorageRuntime\n");
         return 1;
     }
-    std::printf("Dual-device StorageRuntime created (StripedResolver + StripedDataPath, N=2)\n");
-
-    if (!create_test_mounts(num_devices)) return 1;
+    std::printf("Dual-device StorageRuntime created (MultiMountLocalFileResolver + StripedDataPath, N=2)\n");
 
     int rc = 0;
     rc |= test_82_roundtrip(env2.get());
     rc |= test_85_distribution(env2.get());
     rc |= test_86_lifecycle(env2.get());
-    rc |= test_91_striped_unregister_inflight(env2.get());
+    rc |= test_91_unregister_inflight(env2.get());
     rc |= test_87_full_public_path(env2.get());
     rc |= test_88_block_addressing(env2.get());
     rc |= test_90_fault_partial_commit(env2.get());
@@ -2127,13 +2121,13 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "FATAL: failed to create quad-device StorageRuntime\n");
             rc = 1;
         } else {
-            std::printf("Quad-device StorageRuntime created (StripedResolver + StripedDataPath, N=4)\n");
+            std::printf("Quad-device StorageRuntime created (MultiMountLocalFileResolver + StripedDataPath, N=4)\n");
             rc |= test_92_n4_roundtrip_single_launch(env4.get());
             rc |= test_98_prebuilt_logical_block_mdts(env4.get(), 4);
             rc |= test_93_n4_distribution(env4.get());
             rc |= test_95_multi_target_batch(env4.get());
             rc |= test_96_many_targets_batch(env4.get());
-            rc |= test_97_dev_table_overflow(env4.get());
+            rc |= test_97_dev_table_capacity(env4.get());
             rc |= test_94_n4_speedup(env4.get());
             env4->rt->shutdown(5000);
         }

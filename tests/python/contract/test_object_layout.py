@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 pytest.importorskip("tutti_runtime._core")
@@ -23,7 +25,7 @@ def _io_key(chunk: bytes, layer: int) -> bytes:
     return chunk + layer.to_bytes(2, "little")
 
 
-def _layout(tmp_path, *, mounts=None, stripe_unit=0, rank_id=0):
+def _layout(tmp_path, *, mounts=None, rank_id=0):
     root = tmp_path / "ns"
     root.mkdir(parents=True, exist_ok=True)
     if mounts is None:
@@ -34,7 +36,6 @@ def _layout(tmp_path, *, mounts=None, stripe_unit=0, rank_id=0):
         root,
         SEGMENT,
         mounts=[str(m) for m in mounts],
-        stripe_unit=stripe_unit,
         capacity_chunks=8,
         prewarm_chunks=4,
         rank_id=rank_id,
@@ -128,10 +129,10 @@ def test_release_removes_object_from_recovery_set(tmp_path):
 
 
 def test_striped_uri_carries_geometry(tmp_path):
-    """条带布局的 URI 直接由现有 striped resolver 消费。
+    """多盘布局的 URI 由 local-file resolver 消费：路径即文件。
 
-    条带几何要求 payload 能被 ``stripe_unit × N`` 整除（否则末轮条带不满，
-    段会跨到没有预留空间的盘上），所以这里单独取几何。
+    槽位号在 mounts 间轮转——连续 chunk（一个 prompt 的相邻槽位）摊到
+    每块盘上；payload 无整除约束（无条带几何）。
     """
     mounts = [tmp_path / "d0", tmp_path / "d1"]
     for mount in mounts:
@@ -142,7 +143,6 @@ def test_striped_uri_carries_geometry(tmp_path):
         root,
         8192,
         mounts=[str(m) for m in mounts],
-        stripe_unit=4096,
         capacity_chunks=8,
         prewarm_chunks=4,
         background_reclaim=False,
@@ -153,15 +153,18 @@ def test_striped_uri_carries_geometry(tmp_path):
     layout.prepare_put([_io_key(chunk, 0)], capacity_chunks=8)
 
     uri = layout.target_uri(chunk)
-    assert uri.startswith("striped://")
-    assert f"devs={mounts[0]},{mounts[1]}" in uri
-    assert "unit=4096" in uri
+    assert uri.startswith("file://")
+    from urllib.parse import urlsplit
+    path = urlsplit(uri).netloc + urlsplit(uri).path
+    # 文件恰好落在其中一块盘的 rank 子目录下。
+    assert path.startswith(str(mounts[0])) or path.startswith(str(mounts[1]))
+    assert f"/r0/{int(Path(path).stem)}.obj" in path
 
 
 def test_commit_before_layer_span_is_impossible(tmp_path):
     """层宽未定案时不允许提交：对象几何未知，无法判定"写齐"。"""
     root = tmp_path / "ns"
     root.mkdir(parents=True, exist_ok=True)
-    layout = ObjectLayout(root, SEGMENT, mounts=[str(tmp_path)], stripe_unit=0)
+    layout = ObjectLayout(root, SEGMENT, mounts=[str(tmp_path)])
     with pytest.raises(RuntimeError, match="set_layer_span"):
         layout.prepare_put([_io_key(b"i" * 16, 0)], capacity_chunks=4)

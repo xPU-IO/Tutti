@@ -1809,6 +1809,31 @@ private:
         };
         std::vector<DataPathValidation> data_path_validations;
         std::vector<MemoryValidation> memory_validations;
+        // Hash index over memory_validations.  Batches can reference
+        // thousands of distinct (data_path, memory) pairs (e.g. per-chunk
+        // registrations), which made the previous linear find_if O(N*M)
+        // per submit — measured at 30%+ of host CPU in the layerwise
+        // overlap workload.
+        struct MemoryValidationKey {
+            DataPath* data_path;
+            std::uint32_t memory_slot;
+            bool operator==(const MemoryValidationKey& other) const {
+                return data_path == other.data_path &&
+                       memory_slot == other.memory_slot;
+            }
+        };
+        struct MemoryValidationHash {
+            std::size_t operator()(const MemoryValidationKey& key) const {
+                const std::size_t h1 = std::hash<void*>()(key.data_path);
+                const std::size_t h2 =
+                    std::hash<std::uint32_t>()(key.memory_slot);
+                return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) +
+                             (h1 >> 2));
+            }
+        };
+        std::unordered_map<MemoryValidationKey, std::size_t,
+                           MemoryValidationHash>
+            memory_validation_index;
         Status first_rejection(StatusCode::INVALID_ARGUMENT,
                                "all requests rejected");
         bool have_rejection = false;
@@ -1854,21 +1879,21 @@ private:
                 reject_one(index, data_path_validation->status);
                 continue;
             }
-            auto memory_validation = std::find_if(
-                memory_validations.begin(), memory_validations.end(),
-                [&](const MemoryValidation& cached) {
-                    return cached.data_path == target.data_path &&
-                           cached.memory_slot == request.memory.slot_;
-                });
-            if (memory_validation == memory_validations.end()) {
+            const MemoryValidationKey memory_key{target.data_path,
+                                                 request.memory.slot_};
+            auto memory_index_it = memory_validation_index.find(memory_key);
+            if (memory_index_it == memory_validation_index.end()) {
                 memory_validations.push_back(MemoryValidation{
                     target.data_path, request.memory.slot_,
                     validate_component_memory_(
                         memory, *data_path_validation->capabilities)});
-                memory_validation = std::prev(memory_validations.end());
+                memory_index_it = memory_validation_index.emplace(
+                    memory_key, memory_validations.size() - 1).first;
             }
-            if (!memory_validation->status.ok()) {
-                reject_one(index, memory_validation->status);
+            const MemoryValidation& memory_validation =
+                memory_validations[memory_index_it->second];
+            if (!memory_validation.status.ok()) {
+                reject_one(index, memory_validation.status);
                 continue;
             }
             status = validate_component_request_(

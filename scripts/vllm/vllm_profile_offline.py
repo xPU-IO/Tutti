@@ -242,16 +242,7 @@ def main() -> int:
         default="file_per_chunk",
         help=(
             "KV 落盘布局：file_per_chunk（默认，chunk 整块落单盘）或 "
-            "striped（多盘条带，需配 --device-groups）"
-        ),
-    )
-    parser.add_argument(
-        "--stripe-unit",
-        type=int,
-        default=65536,
-        help=(
-            "striped 条带粒度（字节，默认 64KiB）。须不小于单个 IO entry "
-            "（block_size × 每 token 每层每 rank 的 KV 字节），以免把提交切碎"
+            "striped（多盘，槽位轮转，需配 --device-groups）"
         ),
     )
     parser.add_argument(
@@ -382,11 +373,9 @@ def main() -> int:
             if not groups or any(not group for group in groups):
                 parser.error("--device-groups 解析为空，示例：'0,1;2,3'")
             store_options["layout"] = "striped"
-            store_options["stripe_unit"] = args.stripe_unit
             store_options["preset"].update({
                 "type": "striped",
                 "device_groups": groups,
-                "stripe_unit": args.stripe_unit,
                 "num_queues": args.num_queues,
             })
         else:

@@ -15,7 +15,7 @@ int main() {
     resource.allocation.queues_per_controller = 4;
     spec.storage.resources.push_back({"nvme", "nvme", resource});
     spec.storage.resolvers.push_back(
-        {"resolver", "striped-file", "striped", StripedFileResolverConfig{}});
+        {"resolver", "local-file", "file", LocalFileResolverConfig{}});
     spec.storage.datapaths.push_back(
         {"datapath", "striped-local-nvme", StripedLocalNvmeDataPathConfig{}});
     spec.storage.backends.push_back(
@@ -35,8 +35,8 @@ int main() {
         "storage.resources[0].allocation.device_ids = [0, 1]\n"
         "storage.resources[0].allocation.queues_per_controller = 4\n"
         "storage.resolvers[0].id = \"resolver\"\n"
-        "storage.resolvers[0].type = \"striped-file\"\n"
-        "storage.resolvers[0].scheme = \"striped\"\n"
+        "storage.resolvers[0].type = \"local-file\"\n"
+        "storage.resolvers[0].scheme = \"file\"\n"
         "storage.datapaths[0].id = \"datapath\"\n"
         "storage.datapaths[0].type = \"striped-local-nvme\"\n"
         "storage.datapaths[0].config.handle_cache_capacity = 0\n"
@@ -50,8 +50,7 @@ int main() {
         "storage.backends[0].contract = \"striped-local-nvme\"\n"
         "storage.backends[0].resolver = \"resolver\"\n"
         "storage.backends[0].datapath = \"datapath\"\n"
-        "storage.backends[0].resource = \"nvme\"\n"
-        "storage.backends[0].config.stripe_unit = 524288\n";
+        "storage.backends[0].resource = \"nvme\"\n";
     if (debug.value() != expected) {
         std::fprintf(stderr, "unexpected debug output:\n%s", debug.value().c_str());
         return 1;

@@ -521,15 +521,24 @@ class TuttiDirectBackend:
         last_layer = self.geometry.num_layers - 1
         io_keys = [derive_io_key(chunk_id, last_layer)
                    for chunk_id in chunk_ids]
+        # 槽位分配耗时（判据：动态分配是否落进前向计算的关键路径）。
+        # 异步预建生效时 reserve 只做内存分配：命中就绪槽位，未命中即拒绝
+        # （不建文件、不阻塞）；只有预建未启动才退化成现场 create+写实零+
+        # fsync（~44ms/槽），那一刻 alloc_ms 会量级抬升并阻塞前向线程。
+        alloc_t0 = time.perf_counter()
         admitted, rejected = self._store._layout.prepare_put(
             io_keys, self._store._num_chunks
+        )
+        alloc_ms = (time.perf_counter() - alloc_t0) * 1e3
+        self._log_slot_alloc(
+            len(chunk_ids), len(admitted), rejected, alloc_ms
         )
         if rejected:
             _LOG.warning(
                 "DIRECT_WRITE_ADMISSION_SHORTFALL requested=%d admitted=%d "
-                "rejected=%d capacity=%d",
+                "rejected=%d capacity=%d alloc_ms=%.3f",
                 len(chunk_ids), len(admitted), rejected,
-                self._store._num_chunks,
+                self._store._num_chunks, alloc_ms,
             )
         self._prepared_write_request = chunk_ids
         self._prepared_write_chunks = tuple(
@@ -537,6 +546,30 @@ class TuttiDirectBackend:
             if derive_io_key(chunk_id, last_layer) in admitted
         )
         return self._prepared_write_chunks
+
+    def _log_slot_alloc(self, requested: int, admitted: int, rejected: int,
+                        alloc_ms: float) -> None:
+        """动态槽位分配的时间线（每次写批前移一条；纯观测，失败静默）。
+
+        ``alloc_ms`` 是对象层 reserve 的墙钟耗时，``rejected`` 是"就绪槽位
+        不足被裁剪"的数量。``precreated/target`` 是后台预建的就绪水位与
+        目标：两者相近说明分配吃的是预建余量（快路径，纯内存）；rejected
+        上升说明余量跟不上分配前沿——此时写入被裁剪而**不阻塞计算**，是
+        可接受的降级，但需要在日志里与"现场建槽的慢路径"区分开。
+        """
+        precreated = target = -1
+        try:
+            native = self._store._layout._store
+            precreated = int(native.precreated_slots())
+            target = int(native.precreate_target())
+        except Exception:
+            pass
+        _LOG.log(
+            logging.WARNING if rejected else logging.INFO,
+            "DIRECT_SLOT_ALLOC requested=%d admitted=%d rejected=%d "
+            "alloc_ms=%.3f precreated=%d target=%d",
+            requested, admitted, rejected, alloc_ms, precreated, target,
+        )
 
     def begin_target_plan(self, keys, direction: str) -> DirectTargetPlan:
         if direction not in ("read", "write"):
@@ -1131,7 +1164,7 @@ class TuttiKVStore:
 
     def __init__(self, root, num_chunks: int, segment_bytes: int,
                  runtime=None, io_stream=None, preset=None,
-                 layout="file_per_chunk", mounts=None, stripe_unit=None,
+                 layout="file_per_chunk", mounts=None,
                  initial_slots=None, low_watermark=None,
                  high_watermark=None, max_slots=None,
                  pool_wait_timeout_s: float = 5.0,
@@ -1144,8 +1177,8 @@ class TuttiKVStore:
         preset 的字符串值恰为纯十进制整数时转为 int（配置占位符替换后
         的数字字符串由此归一，如 device_id / gpu_id）。
 
-        ``layout="striped"`` 选择条带逻辑 target；其 ``mounts`` 与
-        ``stripe_unit`` 仅作用于该布局，默认 file_per_chunk 不变。
+        ``layout="striped"`` 选择多盘布局：一个槽位一个文件，槽位号在
+        ``mounts`` 间轮转；默认 file_per_chunk（单 mount）不变。
         """
         if num_chunks <= 0:
             raise ValueError(f"num_chunks 必须为正数，得到 {num_chunks}")
@@ -1187,22 +1220,10 @@ class TuttiKVStore:
         self._key_namespace: bytes | None = None
         if layout in (None, "file_per_chunk", "file"):
             layout_mounts = [str(self._root)]
-            layout_stripe_unit = 0
         elif layout == "striped":
             if mounts is None:
                 mounts = _preset_mounts(self._preset)
-            if stripe_unit is None:
-                raise ValueError("striped target 必须提供 stripe_unit")
-            preset_unit = (self._preset or {}).get("stripe_unit")
-            if preset_unit is not None and int(preset_unit) != int(stripe_unit):
-                # Python 布局与 C++ 组装器必须同粒度，否则 IO 的
-                # logical→shard 映射会和文件布局错位。
-                raise RuntimeError(
-                    f"stripe_unit 不一致：options={stripe_unit} "
-                    f"preset={preset_unit}"
-                )
             layout_mounts = [str(mount) for mount in mounts]
-            layout_stripe_unit = int(stripe_unit)
         else:
             raise ValueError(f"未知 tutti_nvme layout：{layout!r}")
         # 预建/预热口径必须在对象层打开（set_layer_span）之前定下来：它决定
@@ -1215,7 +1236,6 @@ class TuttiKVStore:
             self._root,
             segment_bytes,
             mounts=layout_mounts,
-            stripe_unit=layout_stripe_unit,
             capacity_chunks=self._num_chunks,
             prewarm_chunks=warm_chunks,
             rank_id=rank_id,
@@ -1301,15 +1321,9 @@ class TuttiKVStore:
                 f"got {precreate_threads!r}"
             )
         self._precreate_threads = precreate_threads
-        # 预建口径：
-        #   capacity（默认）—— 容量比盘上已有的多多少就补多少；
-        #   demand         —— 只保持分配前沿之前的就绪余量，不为容量预建。
-        raw_scope = os.environ.get("TUTTI_PRECREATE_SCOPE")
-        self._precreate_full_capacity = (
-            raw_scope.strip().lower() not in {"demand", "0", "false", "no", "off"}
-            if raw_scope is not None else True
-        )
-        # 就绪余量（槽位）：只在 demand 口径下有意义。
+        # 就绪余量（槽位）：预建只跟随分配前沿保持这一段就绪，容量只是上限
+        # （曾有一个"一路补到容量上限"的口径，已删除——盘占用 ∝ 容量而非
+        # 工作集，且会与在线 KV 争带宽/写满盘）。
         raw_headroom = os.environ.get("TUTTI_PRECREATE_HEADROOM")
         self._precreate_headroom = (
             int(raw_headroom) if raw_headroom and raw_headroom.isdigit() else 0
@@ -1962,7 +1976,6 @@ class TuttiKVStore:
             self._layout.start_background_precreate(
                 self._precreate_threads,
                 headroom=self._precreate_headroom,
-                full_capacity=self._precreate_full_capacity,
             )
 
     def object_pool_snapshot(self) -> dict | None:

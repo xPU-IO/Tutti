@@ -180,15 +180,14 @@ def apply_capacity_bytes(options: dict, *, segment_bytes: int,
     换算，与 ``apply_device_groups`` 之前调用：当时 ``preset.device_groups``
     仍完整，可算出总盘数）。
 
-    换算依据条带几何：一个 slot 的 payload 按组内盘数分摊到每盘，再向上
-    对齐到 ``stripe_unit``（与 C++ ``StripedPlacement::shard_file_bytes``
-    同式），于是
+    换算依据放置几何：一个 slot 是一个文件，占 ``payload + 对象头`` 字节
+    （对象头 4KiB 由对象层加入；这里按 payload 的整数倍近似，误差 <0.1%），
+    slot 在 N 块盘间轮转，于是
 
-        每盘字节 = num_chunks × 每盘每 slot 字节
-        物理总量 = 每盘字节 × 总盘数
+        物理总量 = num_chunks × 每 slot 字节
 
-    对 HY3 的实例：payload 10 MiB ÷ 2 盘 = 5 MiB/盘/槽，4 盘共 4 TiB 时
-    num_chunks = 4 TiB ÷ (5 MiB × 4) = 209716。
+    对 HY3 的实例：payload 10 MiB/槽，4 盘共 4 TiB 时
+    num_chunks = 4 TiB ÷ 10 MiB = 419430。
     """
     if "capacity_bytes" not in options:
         return options
@@ -209,36 +208,12 @@ def apply_capacity_bytes(options: dict, *, segment_bytes: int,
             f"{segment_bytes}, num_layers={num_layers}"
         )
 
-    preset = options.get("preset")
-    preset = preset if isinstance(preset, dict) else {}
-    groups = preset.get("device_groups")
-    if isinstance(groups, (list, tuple)) and groups:
-        group_disks = len(groups[0])
-        total_disks = sum(len(group) for group in groups)
-    else:
-        devices = preset.get("devices")
-        group_disks = len(devices) if isinstance(devices, (list, tuple)) else 0
-        total_disks = group_disks
-    if group_disks <= 0 or total_disks <= 0:
-        raise ValueError(
-            "capacity_bytes 换算需要数据盘信息（preset.device_groups 或 "
-            "preset.devices）"
-        )
-
-    stripe_unit = int(
-        options.get("stripe_unit") or preset.get("stripe_unit") or 65536
-    )
-    # 条带布局（组内多盘）才需要按 unit 对齐：一个 slot 的 payload 先按
-    # 组内盘数分摊，再向上对齐到条带粒度；单盘部署每盘就是整块 payload。
-    per_disk = segment_bytes * num_layers
-    if group_disks > 1:
-        per_disk = cdiv(cdiv(per_disk, group_disks), stripe_unit) * stripe_unit
-
-    num_chunks = capacity_bytes // (per_disk * total_disks)
+    per_slot = segment_bytes * num_layers
+    num_chunks = capacity_bytes // per_slot
     if num_chunks < 1:
         raise ValueError(
             f"capacity_bytes({capacity_bytes}) 小于单槽位物理占用"
-            f"({per_disk * total_disks} 字节 × 槽位)"
+            f"({per_slot} 字节 × 槽位)"
         )
     options["num_chunks"] = int(num_chunks)
     return options

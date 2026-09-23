@@ -517,6 +517,13 @@ private:
     std::uint32_t block_size_ = 0;
     std::string controller_pci_addr_;
 
+    // ---- Worker-pool kernel model (default: 2048 workers) ----
+    // 0 = legacy one-thread-per-entry kernel.  >0 = fixed pool of N worker
+    // threads pulling entries from a per-batch task cursor (the arena
+    // slot's trailing status element — per-slot, so concurrent submits on
+    // different CUDA streams never share a counter).  See submit_one.cuh.
+    std::uint32_t pool_workers_ = 0;
+
     // IO limits.
     std::uint64_t mdts_bytes_ = 0;        // configured override (0 = use hardware)
     std::uint64_t hardware_mdts_bytes_ = 0; // from dev_info.max_data_size

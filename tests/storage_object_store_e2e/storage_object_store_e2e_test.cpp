@@ -677,16 +677,10 @@ void test_factory() {
     CHECK(!no_devices.ok());
     CHECK(no_devices.code() == StatusCode::INVALID_ARGUMENT);
 
-    // Striping across several devices needs a stripe unit; one device with a
-    // stripe unit set is equally contradictory.
-    StoreConfig two = cfg;
-    StoreDevice d;
-    d.mount_path = "/tmp/unused";
-    d.backing_device_path = "/dev/null";
-    d.block_size = 512;
-    two.devices = {d, d};
-    two.stripe_unit = 0;
-    CHECK(!store->open(two).ok());
+    // Several devices are no longer contradictory: each slot lands on exactly
+    // one of them (see RotatingFilePlacement), so the only requirement a device
+    // list has is that every entry names a mount -- which the case above
+    // already covers.
 }
 
 } // namespace

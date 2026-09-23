@@ -42,5 +42,4 @@ storage:
       resolver: multi-accelerator-striped-file-resolver
       datapath: multi-accelerator-striped-local-nvme-datapath
       resource: multi-accelerator-striped-nvme
-      config:
-        stripe_unit: 65536
+      config: {}

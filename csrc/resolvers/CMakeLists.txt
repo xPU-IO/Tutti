@@ -10,7 +10,6 @@ target_link_libraries(tutti_resolver_factory PUBLIC
     tutti_runtime_spec
     tutti_resource
     tutti_local_file_resolver
-    tutti_striped_file_resolver
     tutti_spi
 )
 

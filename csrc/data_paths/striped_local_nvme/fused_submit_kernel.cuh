@@ -66,6 +66,14 @@ struct StripedDeviceSubmitEntry {
 //   cq_poll_budget — max CQ poll iterations before timeout
 //   threads_per_block — configured CUDA block size
 //   inject_flag — test seam bitmask (0 = normal production)
+//   d_timing    — 4 x count globaltimer stamps, or nullptr
+//   stream      — CUDA stream
+//   pool_workers — 0 = one thread per entry (legacy); >0 = worker-pool
+//                  model with exactly this many worker threads
+//   d_task_counter — device atomic task cursor for the pool model; must
+//                  be a valid allocation whenever pool_workers > 0 (the
+//                  launcher resets it to 0 on the same stream before the
+//                  launch). Ignored when pool_workers == 0.
 // Returns cudaError_t from cudaGetLastError() after the launch.
 cudaError_t launch_fused_submit(
     const StripedDeviceSubmitEntry* d_entries,
@@ -76,7 +84,10 @@ cudaError_t launch_fused_submit(
     std::uint32_t                   cq_poll_budget,
     std::uint32_t                   threads_per_block,
     std::uint32_t                   inject_flag,
-    void*                           stream);
+    unsigned long long*             d_timing,   // 4 x count, or nullptr
+    void*                           stream,
+    std::uint32_t                   pool_workers,
+    unsigned int*                   d_task_counter);
 
 } // namespace tutti::data_paths::striped_local_nvme
 
@@ -112,13 +123,15 @@ void fused_submit_kernel(const StripedDeviceSubmitEntry* entries,
                          std::uint32_t                   count,
                          std::uint32_t                   num_devs,
                          std::uint32_t                   cq_poll_budget,
-                         std::uint32_t                   inject_flag)
+                         std::uint32_t                   inject_flag,
+                         unsigned long long*             timing)
 {
     const std::uint32_t tid = TUTTI_THREAD_IDX_X + TUTTI_BLOCK_IDX_X * TUTTI_BLOCK_DIM_X;
     if (tid >= count) return;
 
     const StripedDeviceSubmitEntry e = entries[tid];
     EntryCompletionStatus* s = status ? &status[tid] : nullptr;
+    unsigned long long* t = timing ? timing + 4u * tid : nullptr;
 
     // Bounds-check dev_idx (defensive; host should never produce OOB).
     if (e.dev_idx >= num_devs) {
@@ -133,10 +146,66 @@ void fused_submit_kernel(const StripedDeviceSubmitEntry* entries,
     const AddressDescriptor* desc = e.prp_entry;
     if (e.direction == 0) {
         submit_read_one(h, desc->prp1, desc->prp2, e.shard_offset, desc->data_length,
-                        s, cq_poll_budget, inject_flag);
+                        s, cq_poll_budget, inject_flag, t);
     } else {
         submit_write_one(h, desc->prp1, desc->prp2, e.shard_offset, desc->data_length,
-                         s, cq_poll_budget, inject_flag);
+                         s, cq_poll_budget, inject_flag, t);
+    }
+}
+
+// -------------------------------------------------------------------------
+// fused_submit_kernel_pool — worker-pool model (env TUTTI_POOL_WORKERS=N).
+//
+// A fixed set of `total_workers` threads (instead of one thread per entry)
+// pulls entries from a device-side atomic task cursor and runs each entry
+// to completion (LBA resolve + SQE submit + CQ poll) before pulling the
+// next one.  Every atomicAdd hands out each entry index exactly once, so
+// completion is still a single kernel exit = single event = single stream
+// fence; per-entry status/timing slots are exclusive to their worker.
+//
+// Why: with one thread per entry, a large batch spawns thousands of
+// concurrently spinning threads, and measured per-command turnaround
+// degrades as in-flight depth grows (CQ poll traffic + queue-lock
+// contention).  Here the worker count IS the in-flight bound — a small
+// pool keeps each command's completion latency near SSD service time.
+// -------------------------------------------------------------------------
+TUTTI_GLOBAL
+void fused_submit_kernel_pool(const StripedDeviceSubmitEntry* entries,
+                              EntryCompletionStatus*          status,
+                              const DeviceTargetHandle* const* dev_table,
+                              std::uint32_t                   count,
+                              std::uint32_t                   num_devs,
+                              std::uint32_t                   cq_poll_budget,
+                              std::uint32_t                   inject_flag,
+                              unsigned long long*             timing,
+                              unsigned int*                   next_task,
+                              std::uint32_t                   total_workers)
+{
+    const std::uint32_t tid = TUTTI_THREAD_IDX_X + TUTTI_BLOCK_IDX_X * TUTTI_BLOCK_DIM_X;
+    if (tid >= total_workers) return;
+
+    for (;;) {
+        const std::uint32_t idx = atomicAdd(next_task, 1u);
+        if (idx >= count) return;
+
+        const StripedDeviceSubmitEntry e = entries[idx];
+        EntryCompletionStatus* s = status ? &status[idx] : nullptr;
+        unsigned long long* t = timing ? timing + 4u * idx : nullptr;
+
+        if (e.dev_idx >= num_devs) {
+            if (s) { s->result = 1; }  // treat as resolve failure
+            continue;
+        }
+
+        const DeviceTargetHandle* h = dev_table[e.dev_idx];
+        const AddressDescriptor* desc = e.prp_entry;
+        if (e.direction == 0) {
+            submit_read_one(h, desc->prp1, desc->prp2, e.shard_offset, desc->data_length,
+                            s, cq_poll_budget, inject_flag, t);
+        } else {
+            submit_write_one(h, desc->prp1, desc->prp2, e.shard_offset, desc->data_length,
+                             s, cq_poll_budget, inject_flag, t);
+        }
     }
 }
 

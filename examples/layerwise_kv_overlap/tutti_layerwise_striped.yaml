@@ -48,8 +48,8 @@ storage:
   # -------------------------------------------------------------------------
   resolvers:
     - id: layerwise-striped-file-resolver
-      type: striped-file             # 解析 striped:// URI
-      scheme: striped
+      type: local-file              # 解析 file:// URI（按挂载点分派到各盘）
+      scheme: file
       config: {}
 
   # -------------------------------------------------------------------------
@@ -93,8 +93,8 @@ storage:
   # -------------------------------------------------------------------------
   # backends —— 组装绑定：resolver + datapath + resource 三者接到一起
   #   contract: 契约名，striped 固定为 striped-local-nvme（单盘为 ext4-local-nvme）
-  #   config.stripe_unit: 条带单元（字节）。本工作负载应等于 K/V tensor 大小
-  #     （默认 --tensor-kb 512 = 524288），使一个 tensor 完整落在单块盘上
+  #   2026-09-22：放置模型为"一个 tensor 一个文件、在盘间轮转"，backend
+  #   不再有可配置项（条带化已移除，--tensor-kb 即单 IO 粒度）。
   # -------------------------------------------------------------------------
   backends:
     - id: layerwise-striped-storage
@@ -102,5 +102,4 @@ storage:
       resolver: layerwise-striped-file-resolver
       datapath: layerwise-striped-local-nvme-datapath
       resource: layerwise-striped-nvme
-      config:
-        stripe_unit: 524288          # 512 KiB，须为 4 KiB 的倍数
+      config: {}

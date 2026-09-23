@@ -629,6 +629,20 @@ Status LocalNvmeDataPath::initialize_impl_(const DataPathConfig& config,
         }
     }
 
+    // Worker-pool kernel model: DEFAULT (2048 fixed workers pulling entries
+    // from a per-batch atomic cursor; see submit_one.cuh).  Env
+    // TUTTI_POOL_WORKERS overrides: 0 = legacy one-thread-per-entry kernel.
+    {
+        long pool_val = 2048;
+        if (const char* pool_env = std::getenv("TUTTI_POOL_WORKERS")) {
+            pool_val = std::atol(pool_env);
+        }
+        if (pool_val < 0) pool_val = 0;
+        if (pool_val > 0) {
+            pool_workers_ = static_cast<std::uint32_t>(pool_val);
+        }
+    }
+
     initialized_ = true;
     return Status::Ok();
 }
@@ -1858,7 +1872,8 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
         nvtxRangePushA("tutti.local_nvme.io_kernel");
         launch_err = launch_submit_one(
             d_entries, d_status, total_entries, cq_poll_budget_,
-            threads_per_block_, inject_flag, ctx.stream);
+            threads_per_block_, inject_flag, ctx.stream,
+            pool_workers_, lease.d_task_counter);
         nvtxRangePop();
         nvtxRangePop();
     }

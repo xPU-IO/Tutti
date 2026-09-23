@@ -1,0 +1,49 @@
+# ============================================================================
+# nvme_bw_probe —— 单盘带宽探针配置
+#
+# 单盘 ext4-local-nvme 合同；队列/批参数给到能扫高并发的量级。
+# ============================================================================
+
+accelerator:
+  profile: CUDA
+
+runtime:
+  accel_id: 0
+
+storage:
+  resources:
+    - id: bw-probe-local-nvme
+      type: nvme
+      provider:
+        type: nvme-service
+        endpoint: "127.0.0.1:50051"
+      allocation:
+        selection: explicit           # 单盘：逐台独立使用（非条带）
+        device_ids: [0]
+        queues_per_controller: 32     # 每盘用户队列数（QP）
+
+  resolvers:
+    - id: bw-probe-file-resolver
+      type: local-file                # 解析 file:// URI
+      scheme: file
+      config: {}
+
+  datapaths:
+    - id: bw-probe-local-nvme-datapath
+      type: local-nvme                # 单盘数据路径
+      config:
+        handle_cache_capacity: 16     # 单文件单句柄，16 槽绰绰有余
+        prp_cache_capacity: 262144     # PRP 页缓存（host DRAM 池），1 GiB
+        handle_cache_l2_capacity: 0    # 自动取 4×L1
+        threads_per_block: 32         # ≤ 获批队列数
+        max_in_flight_operations: 4   # 探针串行 submit+wait，2 已足
+        max_batch_entries: 8192        # 单批条目上限（depth 扫描的最大值）
+        io_granularity: 0             # 动态 PRP
+
+  backends:
+    - id: bw-probe-storage
+      contract: ext4-local-nvme        # 单盘契约名
+      resolver: bw-probe-file-resolver
+      datapath: bw-probe-local-nvme-datapath
+      resource: bw-probe-local-nvme
+      config: {}

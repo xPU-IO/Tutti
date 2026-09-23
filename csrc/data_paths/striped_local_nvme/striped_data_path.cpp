@@ -92,7 +92,6 @@ void set_completion_failure(IoCompletionDetail& detail,
 } // namespace
 
 using namespace tutti::payloads::ext4_local_nvme;
-using namespace tutti::payloads::striped_local_nvme;
 using tutti::data_paths::local_nvme::DeviceTargetHandle;
 using tutti::data_paths::local_nvme::DeviceLbaExtent;
 using tutti::data_paths::local_nvme::EntryCompletionStatus;
@@ -160,6 +159,10 @@ StripedDataPath::StripedDataPath(std::vector<DeviceDescriptor> devices,
 }
 
 StripedDataPath::~StripedDataPath() {
+    if (d_timing_) {
+        cudaFree(d_timing_);
+        d_timing_ = nullptr;
+    }
     if (initialized_) {
         const Status stopped = shutdown(1000000000ULL);
         if (!stopped.ok()) {
@@ -502,8 +505,7 @@ Status StripedDataPath::initialize_impl_(const DataPathConfig& config,
     caps_.memory_alignment_bytes = block_size_;
     caps_.length_alignment_bytes = block_size_;
 
-    // Arena init: dev_table_capacity_per_slot = N (one submit's device
-    // table spans exactly the striped target's N shards).
+    // Arena init.
     // 控制器校验原先在 StripedArena::init 内完成；arena 不再持有控制器
     // 句柄后，这里显式校验（行为不变：空设备/空控制器都 fail-closed）。
     if (devices_.empty()) {
@@ -523,15 +525,11 @@ Status StripedDataPath::initialize_impl_(const DataPathConfig& config,
     arena_cfg.max_entries_per_slot = max_batch_entries_;
     arena_cfg.page_size = static_cast<std::uint32_t>(page_size);
     arena_cfg.cuda_device = cuda_device_;
-    // Round 16 S4: device table supports M targets × N shards.
-    // Capacity must cover the LARGEST legal batch: up to max_batch_entries
-    // distinct targets, each contributing N shard pointers (e.g. a 921-
-    // target read batch on 4 devices needs 3684 slots > the old 2048
-    // hard-coded cap, which rejected whole 256K-context layers).
+    // Device table supports M targets, ONE device row each (a target is one
+    // file on one device). Capacity must cover the largest legal batch: up to
+    // max_batch_entries distinct targets each contributing one pointer.
     arena_cfg.dev_table_capacity_per_slot =
-        std::max(static_cast<std::uint32_t>(2048),
-                 max_batch_entries_ *
-                     static_cast<std::uint32_t>(devices_.size()));
+        std::max(static_cast<std::uint32_t>(2048), max_batch_entries_);
     if (!arena_.init(arena_cfg)) {
         rollback_devices();
         return Status(StatusCode::NOT_READY, "StripedArena init failed");
@@ -559,6 +557,44 @@ Status StripedDataPath::initialize_impl_(const DataPathConfig& config,
             if (!prp_caches_[i]->init(pcfg, devices_[i].ctrl)) {
                 return Status(StatusCode::NOT_READY, "PrpPageCache init failed");
             }
+        }
+    }
+
+    // Optional kernel-side IO timing instrumentation. Allocated once; the
+    // kernel stamps 4 globaltimer values per entry, the wait path reads them
+    // back and aggregates. Off unless TUTTI_IO_TIMING is set in the env.
+    if (const char* timing_env = std::getenv("TUTTI_IO_TIMING")) {
+        if (std::atoi(timing_env) != 0) {
+            const std::uint32_t capacity =
+                std::max<std::uint32_t>(max_batch_entries_, 1);
+            cudaError_t te = cudaMalloc(
+                reinterpret_cast<void**>(&d_timing_),
+                static_cast<std::size_t>(capacity) * 4u *
+                    sizeof(unsigned long long));
+            if (te == cudaSuccess) {
+                io_timing_enabled_ = true;
+                timing_capacity_entries_ = capacity;
+            } else {
+                cudaGetLastError();
+                d_timing_ = nullptr;
+            }
+        }
+    }
+
+    // Worker-pool kernel model: DEFAULT.  A fixed pool of 2048 worker threads
+    // pulls entries from a per-batch atomic cursor (see
+    // fused_submit_kernel.cuh for the model).  Equal throughput to the
+    // legacy one-thread-per-entry kernel, but 4-16x fewer GPU threads and
+    // ~2.4x shallower per-command device queueing.  Env TUTTI_POOL_WORKERS
+    // overrides: 0 selects the legacy kernel, N>0 selects N workers.
+    {
+        long pool_val = 2048;
+        if (const char* pool_env = std::getenv("TUTTI_POOL_WORKERS")) {
+            pool_val = std::atol(pool_env);
+        }
+        if (pool_val < 0) pool_val = 0;
+        if (pool_val > 0) {
+            pool_workers_ = static_cast<std::uint32_t>(pool_val);
         }
     }
 
@@ -616,11 +652,9 @@ Status StripedDataPath::shutdown_impl_(std::uint64_t timeout_ns) {
     ops_.clear();
 
     for (auto& [tok, tgt] : targets_) {
-        for (std::uint32_t s = 0; s < tgt.num_shards; ++s) {
-            if (tgt.dev_handles[s]) {
-                free_device_target(tgt.dev_handles[s], tgt.overflow_allocs[s],
-                                   cuda_device_);
-            }
+        if (tgt.dev_handles[0]) {
+            free_device_target(tgt.dev_handles[0], tgt.overflow_allocs[0],
+                               cuda_device_);
         }
     }
     targets_.clear();
@@ -648,7 +682,7 @@ Status StripedDataPath::shutdown_impl_(std::uint64_t timeout_ns) {
 }
 
 // =========================================================================
-// open — extract StripedLocalNvmePayload, build N DeviceTargetHandles
+// open — extract Ext4LocalNvmePayload, match PCI -> ONE device handle
 // =========================================================================
 
 Result<DataPathTarget> StripedDataPath::open_impl_(const ResolvedTarget& target) {
@@ -657,44 +691,12 @@ Result<DataPathTarget> StripedDataPath::open_impl_(const ResolvedTarget& target)
             Status(StatusCode::NOT_READY, "not initialized"));
     }
 
-    auto payload_result = tutti::payloads::striped_local_nvme::view_payload(target);
-    if (!payload_result.ok()) {
-        return Result<DataPathTarget>::Failure(
-            Status(payload_result.status().code(),
-                   "open: payload view failed: " +
-                   payload_result.status().message()));
-    }
-    const StripedLocalNvmePayload* p = payload_result.value();
-
-    if (p->num_shards() != devices_.size()) {
+    StripedTarget tgt;
+    if (!build_file_handle_(target, tgt)) {
         return Result<DataPathTarget>::Failure(
             Status(StatusCode::INVALID_ARGUMENT,
-                   "payload num_shards=" + std::to_string(p->num_shards()) +
-                   " != devices=" + std::to_string(devices_.size())));
-    }
-
-    StripedTarget tgt;
-    tgt.num_shards = p->num_shards();
-    tgt.stripe_unit = p->stripe_unit();
-    tgt.shard_rotation = p->shard_rotation();  // Round 16 S7
-    tgt.logical_size = p->logical_size();
-    tgt.dev_handles.assign(tgt.num_shards, nullptr);
-    tgt.overflow_allocs.assign(tgt.num_shards, nullptr);
-    tgt.shard_extents.resize(tgt.num_shards);
-
-    for (std::uint32_t s = 0; s < tgt.num_shards; ++s) {
-        if (!build_shard_handle_(s, p->shards()[s], tgt)) {
-            for (std::uint32_t j = 0; j < s; ++j) {
-                if (tgt.dev_handles[j]) {
-                    free_device_target(tgt.dev_handles[j], tgt.overflow_allocs[j],
-                                       cuda_device_);
-                }
-            }
-            return Result<DataPathTarget>::Failure(
-                Status(StatusCode::DEVICE_ERROR,
-                       "open: failed to build handle for shard " +
-                       std::to_string(s)));
-        }
+                   "open: no configured device matches the target's "
+                   "namespace identity"));
     }
 
     std::uint64_t tok = next_target_token_++;
@@ -710,12 +712,10 @@ Result<DataPathTarget> StripedDataPath::open_impl_(const ResolvedTarget& target)
         detail::SpiIdentityMint::mint<detail::DataPathTargetTag>(tok, 1));
 }
 
-bool StripedDataPath::build_shard_handle_(
-    std::uint32_t dev_idx,
-    const ResolvedTarget& shard_target,
-    StripedTarget& out) {
+bool StripedDataPath::build_file_handle_(const ResolvedTarget& target,
+                                         StripedTarget& out) {
 
-    auto ep = tutti::payloads::ext4_local_nvme::view_payload(shard_target);
+    auto ep = tutti::payloads::ext4_local_nvme::view_payload(target);
     if (!ep.ok()) return false;
     const Ext4LocalNvmePayload* ext = ep.value();
 
@@ -723,15 +723,25 @@ bool StripedDataPath::build_shard_handle_(
     const auto& src_extents = ext->extents();
     if (ns.block_size == 0) return false;
 
-    DeviceSlot& slot = devices_[dev_idx];
-    if ((!slot.desc.controller_pci_addr.empty() &&
-         ns.controller_pci_addr != slot.desc.controller_pci_addr) ||
-        ns.namespace_id != slot.desc.namespace_id ||
-        ns.block_size != slot.desc.block_size) {
-        return false;
+    // The device this file lives on is decided by the payload's namespace
+    // identity, not by an index in the URI: placement rotated slots across
+    // mounts, and this is where that decision is honoured.
+    std::uint32_t dev_idx = UINT32_MAX;
+    for (std::uint32_t i = 0; i < devices_.size(); ++i) {
+        const DeviceSlot& slot = devices_[i];
+        if ((!slot.desc.controller_pci_addr.empty() &&
+             ns.controller_pci_addr != slot.desc.controller_pci_addr) ||
+            ns.namespace_id != slot.desc.namespace_id ||
+            ns.block_size != slot.desc.block_size) {
+            continue;
+        }
+        if (!slot.queue_group || slot.queue_group->d_qps() == nullptr) continue;
+        dev_idx = i;
+        break;
     }
-    if (!slot.queue_group || slot.queue_group->d_qps() == nullptr) return false;
+    if (dev_idx == UINT32_MAX) return false;
 
+    DeviceSlot& slot = devices_[dev_idx];
     std::uint32_t bs = ns.block_size;
     std::uint32_t bs_log = 0;
     while ((1u << bs_log) < bs) ++bs_log;
@@ -740,7 +750,7 @@ bool StripedDataPath::build_shard_handle_(
     DeviceTargetHandle tmpl;
     std::memset(&tmpl, 0, sizeof(tmpl));
     tmpl.file_id = dev_idx;
-    tmpl.logical_size_bytes = shard_target.logical_size();
+    tmpl.logical_size_bytes = target.logical_size();
     tmpl.header_bytes = 0;
     tmpl.nvme_block_size = bs;
     tmpl.nvme_block_size_log = bs_log;
@@ -781,13 +791,15 @@ bool StripedDataPath::build_shard_handle_(
         return false;
     }
 
-    out.dev_handles[dev_idx] = dev_h;
-    out.overflow_allocs[dev_idx] = dev_ov;
+    out.dev_idx = dev_idx;
+    out.dev_handles.assign(1, dev_h);
+    out.overflow_allocs.assign(1, dev_ov);
+    out.logical_size = target.logical_size();
 
-    // Host-side byte extents for stripe-split boundary clamping.
-    out.shard_extents[dev_idx].reserve(src_extents.size());
+    // Host-side byte extents for sub-IO boundary clamping.
+    out.extents.reserve(src_extents.size());
     for (const auto& e : src_extents) {
-        out.shard_extents[dev_idx].push_back({e.logical_offset, e.length});
+        out.extents.push_back({e.logical_offset, e.length});
     }
 
     return true;
@@ -813,11 +825,9 @@ Status StripedDataPath::close_impl_(DataPathTarget target) {
         return Status(StatusCode::BUSY, "close: target has in-flight operations");
     }
 
-    for (std::uint32_t s = 0; s < it->second.num_shards; ++s) {
-        if (it->second.dev_handles[s]) {
-            free_device_target(it->second.dev_handles[s],
-                               it->second.overflow_allocs[s], cuda_device_);
-        }
+    if (it->second.dev_handles[0]) {
+        free_device_target(it->second.dev_handles[0],
+                           it->second.overflow_allocs[0], cuda_device_);
     }
     targets_.erase(it);
     return Status::Ok();
@@ -1231,7 +1241,8 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
         return outcome;
     }
     const std::uint32_t n_targets = (std::uint32_t)targets_in_batch.size();
-    const std::uint32_t total_dev_table = n_targets * static_cast<std::uint32_t>(devices_.size());
+    // One device-table row per target (the one device its file lives on).
+    const std::uint32_t total_dev_table = n_targets;
 
     const std::uint32_t page_size =
         static_cast<std::uint32_t>(devices_[0].page_size);
@@ -1327,7 +1338,10 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
         req_mregs[i] = mreg;
         std::uint32_t direction = (intent.direction == IoDirection::READ) ? 0 : 1;
 
-        // Stripe-split + MDTS fan-out.
+        // Sub-IO split: MDTS + file-extent clamping only. A request never
+        // crosses devices -- parallelism across the N devices comes from the
+        // many chunks of a long prompt, whose files rotate across devices,
+        // arriving together in one submit.
         std::uint64_t remaining = intent.length;
         std::uint64_t cur_off = intent.target_offset;
         std::uint64_t cur_mem = intent.memory_offset;
@@ -1342,47 +1356,45 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
         const bool use_prebuilt = mreg->prebuilt.valid;
 
         while (remaining > 0) {
-            // Round 16 S7: shard formula includes the per-target rotation
-            // (legacy shard_placement equivalent).  rot == 0 reproduces the
-            // pre-S7 formula exactly.  Must stay identical to
-            // StripedLocalNvmePayload::map_to_shard().
-            std::uint32_t shard = static_cast<std::uint32_t>(
-                ((cur_off / tgt->stripe_unit) + tgt->shard_rotation) %
-                tgt->num_shards);
-            std::uint64_t shard_off =
-                (cur_off / (tgt->stripe_unit * tgt->num_shards)) * tgt->stripe_unit +
-                (cur_off % tgt->stripe_unit);
+            const std::uint32_t dev = tgt->dev_idx;
+            const std::uint64_t file_off = cur_off;
 
-            std::uint64_t unit_remaining = tgt->stripe_unit - (cur_off % tgt->stripe_unit);
-            std::uint64_t sub_io = std::min(remaining, unit_remaining);
+            std::uint64_t sub_io = remaining;
             const std::uint64_t controller_mdts =
-                device_effective_mdts_(shard);
+                device_effective_mdts_(dev);
             sub_io = std::min(sub_io, controller_mdts);
 
-            // Clamp to the shard's own extent boundary.
+            // Clamp to the file's extent boundary.
             std::uint64_t ext_end = 0;
-            for (const auto& ext : tgt->shard_extents[shard]) {
+            for (const auto& ext : tgt->extents) {
                 std::uint64_t ext_start = ext.logical_offset_bytes;
                 std::uint64_t ext_e = ext_start + ext.length_bytes;
-                if (shard_off >= ext_start && shard_off < ext_e) {
+                if (file_off >= ext_start && file_off < ext_e) {
                     ext_end = ext_e;
                     break;
                 }
             }
             if (ext_end > 0) {
-                sub_io = std::min(sub_io, ext_end - shard_off);
+                sub_io = std::min(sub_io, ext_end - file_off);
             }
 
             StripedDeviceSubmitEntry entry{};
-            entry.dev_idx = tgt_idx * static_cast<std::uint32_t>(devices_.size()) + shard;
+            // Device-table index: the table has ONE row per target (built
+            // as [target0's device, target1's device, ...]), so the index is
+            // the target's row -- NOT tgt_idx*N+dev (the old per-shard-table
+            // layout, which would read past the copied rows and hand the
+            // kernel a foreign handle). The device identity itself is baked
+            // into the handle (d_qps/extents/file_id), so nothing else in
+            // the entry needs it.
+            entry.dev_idx = tgt_idx;
             entry.direction = direction;
-            entry.shard_offset = shard_off;
+            entry.shard_offset = file_off;
 
             const std::uint64_t slice_bytes =
                 mreg->prebuilt.bytes_per_slice;
             const auto* prebuilt_table =
-                use_prebuilt && shard < mreg->prebuilt.devices.size()
-                    ? &mreg->prebuilt.devices[shard]
+                use_prebuilt && dev < mreg->prebuilt.devices.size()
+                    ? &mreg->prebuilt.devices[dev]
                     : nullptr;
             const std::uint64_t offset_in_slice = use_prebuilt
                 ? cur_mem % slice_bytes : 0;
@@ -1424,7 +1436,7 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
             // arena pool; entry.prp_entry is set to nullptr sentinel and
             // fixed up after H2D.
             entry.prp_entry = nullptr;  // sentinel: "dynamic, needs fixup"
-            nvm_dma_t* dma = req_mregs[i]->dmas[shard];
+            nvm_dma_t* dma = req_mregs[i]->dmas[dev];
             std::uint32_t start_page = static_cast<std::uint32_t>(cur_mem / page_size);
             std::uint32_t pages_in_io = static_cast<std::uint32_t>(
                 (sub_io + page_size - 1) / page_size);
@@ -1449,7 +1461,7 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
                 desc.prp2 = 0;  // filled after PRP-list alloc
                 list_infos.push_back({
                     static_cast<std::uint32_t>(h_entries.size()),
-                    start_page, pages_in_io, shard, dma,
+                    start_page, pages_in_io, dev, dma,
                     requests[i].memory.token(),
                     static_cast<std::uint32_t>(h_dynamic_descs.size())});  // desc_idx
             }
@@ -1630,15 +1642,14 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
     }
 
     // Round 16 S4: H2D copy M targets' dev_handles into device table.
-    // Layout: [target0_shard0, target0_shard1, ..., target0_shardN-1,
-    //          target1_shard0, ...]
+    // Layout: [target0_dev, target1_dev, ...] — one row per target, the
+    // device that target's file lives on.
     {
         std::vector<DeviceTargetHandle*> h_dev_table;
         h_dev_table.reserve(total_dev_table);
         for (std::uint32_t ti = 0; ti < n_targets; ++ti) {
             const auto* t = targets_in_batch[ti].tgt;
-            for (std::uint32_t s = 0; s < t->num_shards; ++s)
-                h_dev_table.push_back(t->dev_handles[s]);
+            h_dev_table.push_back(t->dev_handles[0]);
         }
         ce = cudaMemcpyAsync(const_cast<void*>(static_cast<const void*>(lease.d_dev_table)),
                             h_dev_table.data(),
@@ -1672,7 +1683,12 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
         d_entries, d_status,
         reinterpret_cast<const DeviceTargetHandle* const*>(lease.d_dev_table),
         total_entries, total_dev_table, cq_poll_budget_, threads_per_block_,
-        0, ctx.stream);
+        0,
+        (io_timing_enabled_ && total_entries <= timing_capacity_entries_)
+            ? d_timing_ : nullptr,
+        ctx.stream,
+        pool_workers_,
+        lease.d_task_counter);
     nvtxRangePop();
     nvtxRangePop();
     if (launch_err != cudaSuccess) {
@@ -1842,6 +1858,9 @@ void StripedDataPath::aggregate_completion_status_(OpEntry& op) {
         return;
     }
 
+    // Optional kernel-side per-entry timing readback (TUTTI_IO_TIMING=1).
+    io_timing_accumulate_(op);
+
     // The entries array is NOT D2H'd: it was only used to gate byte
     // accounting, and op.entry_lengths (host-side) already carries the
     // per-entry sizes.  Saves one (entry_count * 24B) D2H per batch.
@@ -1884,6 +1903,71 @@ void StripedDataPath::aggregate_completion_status_(OpEntry& op) {
         op.status = Status::Ok();
         op.bytes_transferred = confirmed_bytes;
         op.completion_detail.confirmed_bytes = confirmed_bytes;
+    }
+}
+
+// =========================================================================
+// io_timing_accumulate_ — optional per-entry kernel timing readback
+// =========================================================================
+//
+// Pulls the 4 x entry_count globaltimer stamps written by the fused kernel
+// and folds them into running per-stage statistics (average + peak), printed
+// every 100 batches.  Enabled only when TUTTI_IO_TIMING=1 was set before
+// initialize(); otherwise this is a no-op and the kernel receives no timing
+// pointer at all.
+
+void StripedDataPath::io_timing_accumulate_(OpEntry& op) {
+    if (!io_timing_enabled_ || !d_timing_) return;
+    const std::size_t n =
+        std::min<std::size_t>(op.entry_count, timing_capacity_entries_);
+    if (n == 0) return;
+
+    timing_host_.resize(n * 4u);
+    const cudaError_t ce =
+        cudaMemcpy(timing_host_.data(), d_timing_,
+                   n * 4u * sizeof(unsigned long long),
+                   cudaMemcpyDeviceToHost);
+    if (ce != cudaSuccess) {
+        cudaGetLastError();
+        return;
+    }
+
+    unsigned long long sum[4] = {0, 0, 0, 0};
+    unsigned long long peak[4] = {0, 0, 0, 0};
+    std::uint64_t sampled = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        const unsigned long long* t = &timing_host_[i * 4u];
+        if (t[0] == 0 || t[1] < t[0] || t[2] < t[1] || t[3] < t[2]) continue;
+        const unsigned long long d[4] = {t[1] - t[0], t[2] - t[1],
+                                         t[3] - t[2], t[3] - t[0]};
+        for (int k = 0; k < 4; ++k) {
+            sum[k] += d[k];
+            if (d[k] > peak[k]) peak[k] = d[k];
+        }
+        ++sampled;
+    }
+    if (sampled == 0) return;
+
+    ++timing_acc_batches_;
+    timing_acc_entries_ += sampled;
+    for (int k = 0; k < 4; ++k) {
+        timing_acc_ns_[k] += sum[k];
+        if (peak[k] > timing_max_ns_[k]) timing_max_ns_[k] = peak[k];
+    }
+
+    if (timing_acc_batches_ % 100 == 0) {
+        const double e = static_cast<double>(timing_acc_entries_);
+        std::fprintf(
+            stderr,
+            "[striped-io-timing] %llu batches / %llu entries | "
+            "setup avg=%.2fus max=%.2fus | exec avg=%.2fus max=%.2fus | "
+            "reclaim avg=%.2fus max=%.2fus | lifetime avg=%.2fus max=%.2fus\n",
+            static_cast<unsigned long long>(timing_acc_batches_),
+            static_cast<unsigned long long>(timing_acc_entries_),
+            timing_acc_ns_[0] / e / 1000.0, timing_max_ns_[0] / 1000.0,
+            timing_acc_ns_[1] / e / 1000.0, timing_max_ns_[1] / 1000.0,
+            timing_acc_ns_[2] / e / 1000.0, timing_max_ns_[2] / 1000.0,
+            timing_acc_ns_[3] / e / 1000.0, timing_max_ns_[3] / 1000.0);
     }
 }
 

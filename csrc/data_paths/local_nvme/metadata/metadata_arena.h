@@ -52,6 +52,11 @@ public:
         // entries the host writes the computed descriptor here and
         // H2D-copies it before launch.  Capacity = max_entries_per_slot.
         AddressDescriptor* d_desc_pool = nullptr;    // GPU: this slot's descriptor base
+        // Worker-pool task cursor for this slot (one extra status element
+        // past the entry range).  Per-slot = per-batch: concurrent submits
+        // on different CUDA streams get different counters, so their pool
+        // kernels never steal each other's task indices.
+        unsigned int* d_task_counter = nullptr;
     };
 
     // Allocation counters — test seam to prove zero hot-path allocation.

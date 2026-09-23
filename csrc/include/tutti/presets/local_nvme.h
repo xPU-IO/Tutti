@@ -2,14 +2,14 @@
 
 // tutti/include/tutti/presets/local_nvme.h
 //
-// Preset assembly layer for Local NVMe + Striped NVMe DataPaths.
+// Preset assembly layer for Local NVMe + multi-device NVMe DataPaths.
 //
 // This header is part of the public API: it exposes factory functions
 // that construct a fully-assembled StorageRuntime with the appropriate
 // DataPath(s) + resolver(s) injected. The factory .cpp includes private
 // headers (LocalNvmeDataPath, StripedDataPath, LocalFileResolver,
-// StripedResolver) but the returned types are public (StorageRuntime +
-// RuntimeTelemetry).
+// MultiMountLocalFileResolver) but the returned types are public
+// (StorageRuntime + RuntimeTelemetry).
 //
 // Consumers (examples, tests, applications) call make_*_runtime() and
 // receive a ready-to-use StorageRuntime without referencing any private
@@ -58,20 +58,26 @@ struct LocalNvmePreset {
     std::uint32_t prp_cache_capacity = 4096;
 };
 
-// Configuration for 4-disk striped mode.
+// Configuration for multi-device mode: N NVMe devices, ONE fused DataPath.
+//
+// Placement model (2026-09-22): an object is ONE file on ONE device; the
+// slot number rotates files across devices (RotatingFilePlacement), and
+// parallelism across the N devices comes from the many chunks of a long
+// prompt arriving together in one submit -- never from splitting a single
+// IO. The DataPath matches each target's file to its device by the
+// payload's controller PCI address.
 struct StripedNvmePreset {
     std::vector<NvmeDeviceConfig> devices;  // typically 4
     std::int32_t accel_id = 0;  // 见 LocalNvmePreset::accel_id
     std::uint32_t num_queues = 32;           // per-device
-    std::uint64_t stripe_unit = 524288;     // 512 KiB (tensor-aligned)
     // 单次 submit() 的 sub-IO 条目上限。KV 直连路径一层的条目数 = 本步要搬的
     // block 数，由负载决定（长 prompt + 高并发时实测 9248 > 旧上限 8192），
     // 调用方无法先验保证；上限按 1M token/rank 的 HBM 池极限（16384 blocks
     // × 32 KiB）取整，覆盖单层理论最大宽度。
     // 显存账（per rank，num_slots = 2×max_in_flight = 8，N=2 盘）：
     //   entry 24B + status 8B + descriptor 24B = 56B/条目
-    //   dev_table = max(2048, entries×N) × 8B
-    //   → 16384×56 + 32768×8 = 1.125 MiB/slot × 8 = 9 MiB（8192 时为 4.5 MiB）
+    //   dev_table = max(2048, entries) × 8B（一条目一设备行）
+    //   → 16384×56 + 16384×8 = 1.0 MiB/slot × 8 = 8 MiB
     // 仍超上限的批由上层按上限切成多次 submit（见 store._submit_retry）。
     std::uint32_t max_batch_entries = 16384;
     std::uint32_t max_in_flight_operations = 4;

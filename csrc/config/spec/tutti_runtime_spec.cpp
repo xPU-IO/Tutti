@@ -80,9 +80,6 @@ Status validate_resolver(const ResolverSpec& spec, const std::string& path) {
     if (spec.type == tutti::detail::backend_ids::kExt4ResolverType) {
         return detail::validate_local_file_resolver(spec, path);
     }
-    if (spec.type == tutti::detail::backend_ids::kStripedResolverType) {
-        return detail::validate_striped_file_resolver(spec, path);
-    }
     if (spec.type == backend_ids::kMemfsResolverType) {
         return detail::validate_memfs_resolver(spec, path);
     }
@@ -209,8 +206,8 @@ const SpecContract* find_spec_contract(std::string_view name) {
         {backend_ids::kExt4Contract, backend_ids::kExt4ResolverType,
          backend_ids::kExt4Scheme, backend_ids::kExt4DataPathType, "nvme",
          1, 1},
-        {backend_ids::kStripedContract, backend_ids::kStripedResolverType,
-         backend_ids::kStripedScheme, backend_ids::kStripedDataPathType,
+        {backend_ids::kStripedContract, backend_ids::kExt4ResolverType,
+         backend_ids::kExt4Scheme, backend_ids::kStripedDataPathType,
          "nvme", 2, std::numeric_limits<std::size_t>::max()},
         {backend_ids::kMemfsContract, backend_ids::kMemfsResolverType,
          backend_ids::kMemfsScheme, backend_ids::kMemfsDataPathType,
@@ -450,10 +447,6 @@ Result<std::string> TuttiRuntimeSpec::to_debug_string() const {
         string_line(output, path + ".resolver", backend.resolver);
         string_line(output, path + ".datapath", backend.datapath);
         string_line(output, path + ".resource", backend.resource);
-        if (const auto* config =
-                std::get_if<StripedLocalNvmeBackendConfig>(&backend.config)) {
-            line(output, path + ".config.stripe_unit", config->stripe_unit);
-        }
     }
     return Result<std::string>::Success(output.str());
 }

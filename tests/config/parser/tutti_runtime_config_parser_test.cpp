@@ -108,20 +108,22 @@ int main() {
               std::string::npos);
     }
     {
+        // 2026-09-22: the multi-device backend accepts no config keys any
+        // more (stripe_unit was removed with the striping itself), so any
+        // key under config is rejected by the parser.
         const std::string striped_bad_type =
             "accelerator: {profile: CUDA}\n"
             "runtime: {accel_id: 0}\n"
             "storage:\n"
             "  resources:\n"
             "    - {id: nvme, type: nvme, provider: {type: nvme-service, endpoint: e}, allocation: {selection: striped, device_ids: [0, 1], queues_per_controller: 2}}\n"
-            "  resolvers: [{id: r, type: striped-file, scheme: striped}]\n"
+            "  resolvers: [{id: r, type: local-file, scheme: file}]\n"
             "  datapaths: [{id: d, type: striped-local-nvme}]\n"
-            "  backends: [{id: b, contract: striped-local-nvme, resolver: r, datapath: d, resource: nvme, config: {stripe_unit: wrong}}]\n";
+            "  backends: [{id: b, contract: striped-local-nvme, resolver: r, datapath: d, resource: nvme, config: {stripe_unit: 65536}}]\n";
         TempConfig file(striped_bad_type);
         auto parsed = tutti::config::parse_tutti_runtime_config(file.path());
         CHECK(!parsed.ok());
-        CHECK(parsed.status().message().find(
-                  "storage.backends[0].config.stripe_unit") !=
+        CHECK(parsed.status().message().find("stripe_unit") !=
               std::string::npos);
     }
     {
@@ -144,19 +146,19 @@ int main() {
             "storage:\n"
             "  resources:\n"
             "    - {id: nvme, type: nvme, provider: {type: nvme-service, endpoint: e}, allocation: {selection: striped, device_ids: [0, 1], queues_per_controller: 2}}\n"
-            "  resolvers: [{id: r, type: striped-file, scheme: striped}]\n"
+            "  resolvers: [{id: r, type: local-file, scheme: file}]\n"
             "  datapaths: [{id: d, type: striped-local-nvme}]\n"
             "  backends: [{id: b, contract: striped-local-nvme, resolver: r, datapath: d, resource: nvme}]\n";
         TempConfig file(striped);
         auto parsed = tutti::config::parse_tutti_runtime_config(file.path());
         CHECK(parsed.ok());
         if (parsed.ok()) {
+            // 2026-09-22: the multi-device backend has no knobs left, so a
+            // parsed StripedLocalNvmeBackendConfig is all there is to check.
             const auto* config =
                 std::get_if<tutti::config::StripedLocalNvmeBackendConfig>(
                     &parsed.value().storage.backends.front().config);
             CHECK(config != nullptr);
-            CHECK(config != nullptr &&
-                  config->stripe_unit == tutti::config::kDefaultStripedStripeUnit);
         }
     }
     std::printf("parser tests: %s\n", failures == 0 ? "PASS" : "FAIL");

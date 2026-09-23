@@ -1,6 +1,8 @@
 # csrc/resolvers/local_file/CMakeLists.txt
 #
-# Private resolver target: header-only LocalFileResolver using FS_IOC_FIEMAP.
+# Private resolver target: LocalFileResolver (header-only) plus
+# MultiMountLocalFileResolver (one "file" resolver dispatching by mount
+# prefix across several devices).
 #
 # Consumers link tutti_local_file_resolver to obtain:
 #   - workspace root include (for <tutti/resolvers/local_file/resolver.h>)
@@ -10,14 +12,20 @@
 # Hardware-free at the header level (Linux FIEMAP headers are always available).
 # Does NOT propagate to tutti_api / tutti_spi / install public headers.
 
-add_library(tutti_local_file_resolver INTERFACE)
+add_library(tutti_local_file_resolver
+    multi_mount_resolver.cpp
+)
+# Linked into the pybind extension (_core.so): object code must be PIC.
+set_target_properties(tutti_local_file_resolver PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+)
 
 # Workspace root so that <tutti/resolvers/local_file/resolver.h> resolves.
-target_include_directories(tutti_local_file_resolver INTERFACE
+target_include_directories(tutti_local_file_resolver PUBLIC
     $<BUILD_INTERFACE:${TUTTI_REPOSITORY_ROOT}>
 )
 
-target_link_libraries(tutti_local_file_resolver INTERFACE
+target_link_libraries(tutti_local_file_resolver PUBLIC
     tutti_local_file_payload
     tutti_spi
 )

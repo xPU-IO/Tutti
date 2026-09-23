@@ -143,9 +143,8 @@ struct StoreConfig {
     //
     // Slot-count form of the same knob. A caller that thinks in objects (chunks)
     // should size the cache in slots: only the store knows the object geometry,
-    // and a byte figure derived by the caller would be wrong for a striped
-    // layout, whose payload prefix is rounded up to a whole stripe round -- that
-    // mismatch silently produced fewer slots than asked for. Non-zero wins.
+    // so a byte figure derived by the caller can disagree with the real per-slot
+    // space and silently produce fewer slots than asked for. Non-zero wins.
     std::uint64_t capacity_slots = 0;
     std::uint64_t capacity_bytes = 0;
 
@@ -155,12 +154,10 @@ struct StoreConfig {
     // fail-closed (open() returns INVALID_ARGUMENT and preserves the data).
     std::vector<std::uint8_t> namespace_fingerprint;
 
-    // Backing devices, in stripe order. Exactly one for a single-file layout.
+    // Backing devices. One device: every slot is a file under its mount. Two or
+    // more: slots rotate over them by slot number, one file per slot on one
+    // device (see RotatingFilePlacement).
     std::vector<StoreDevice> devices;
-
-    // Round-robin granularity across devices. 0 selects the single-file layout,
-    // which requires exactly one device.
-    std::uint64_t stripe_unit = 0;
 
     // Bytes of usable space to materialise before open() returns. 0 = none.
     // Slot-count form of prewarm_bytes (non-zero wins). See capacity_slots.

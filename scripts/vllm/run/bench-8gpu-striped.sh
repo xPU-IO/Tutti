@@ -53,6 +53,12 @@ TP_SIZE=8
 #                                     占 95.6 GiB 的 96.9%，逼近上限）
 # 该内存与 KV cache 争同一块余量，故取"刚够"而非"越大越安全"。
 MAX_IN_FLIGHT="${MAX_IN_FLIGHT:-}"   # 空 = 用生产侧按 2 x num_layers 的推导值
+# 模型加载格式：默认 phxsafetensors（Phoenix GDS 直读，绕过 page cache）。
+# 前提（缺一即启动失败）：
+#   1. phoenixfs 内核模块已 insmod（手动执行，脚本不代跑）；
+#   2. LD_LIBRARY_PATH 含 libphoenix 的 lib 目录。
+# 想退回普通加载：LOAD_FORMAT=auto bash bench-8gpu-striped.sh ...
+LOAD_FORMAT="${LOAD_FORMAT:-phxsafetensors}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -76,6 +82,16 @@ source "$SCRIPT_DIR/profile-env.sh"
 
 PYTHON="${TUTTI_PYTHON:?profile-env.sh did not set TUTTI_PYTHON}"
 DRIVER="$REPO_ROOT/scripts/vllm/vllm_profile_offline.py"
+
+# phxsafetensors 的 python 侧 (phxloader) 不在 vllm-env 里，是 Phoenix 仓库的
+# namespace 包：phoenix 模式下把适配器目录前置到 PYTHONPATH。
+if [[ "$LOAD_FORMAT" == "phxsafetensors" ]]; then
+    PHX_VLLM_ADAPTER="${PHX_VLLM_ADAPTER:-/data/home/ryeqiu/phoenix/adapters/vLLM}"
+    [[ -d "$PHX_VLLM_ADAPTER/phxloader" ]] || {
+        echo "phxloader missing: $PHX_VLLM_ADAPTER/phxloader (set PHX_VLLM_ADAPTER)" >&2; exit 1;
+    }
+    export PYTHONPATH="$PHX_VLLM_ADAPTER${PYTHONPATH:+:$PYTHONPATH}"
+fi
 
 [[ -x "$PYTHON" ]] || { echo "interpreter missing: $PYTHON" >&2; exit 1; }
 [[ -f "$DRIVER" ]]  || { echo "driver missing: $DRIVER" >&2; exit 1; }
@@ -101,6 +117,7 @@ CHUNKS_PER_REQUEST=$(( (TOKENS + 255) / 256 ))
 ARGS=(
     "$DRIVER"
     --model "$MODEL"
+    --load-format "$LOAD_FORMAT"
     --tensor-parallel-size "$TP_SIZE"
     --tokens "$TOKENS"
     --reuse-pct "$REUSE_PCT"
@@ -126,29 +143,25 @@ else
     # 读计划 0 次，而 B 的墙钟又很漂亮（因为它确实复用了，只是没经过 NVMe），
     # 于是极易误判为"直连读很快"。
     ARGS+=( --reset-local-prefix-between-requests )
-    # rank0-3 -> disks {0,1}, rank4-7 -> disks {2,3}. Each rank gets its own
-    # pool root: several ranks sharing one root would append to the same files.
-    #
-    # --kv-layout striped is mandatory here, not cosmetic: without it the driver
-    # takes its single-device branch and derives device_id={LOCAL_RANK}, so rank
-    # 5 asks the daemon for NVMe device 5 on a 4-disk host and every worker dies
-    # with "daemon 配置无 device_id=5 的 NVMe 条目".
+    # 8 ranks share one rotating group of 4 disks (slot i % 4 round-robin;
+    # placement layer does the per-rank subdirectory).  --kv-layout striped
+    # is mandatory here, not cosmetic: without it the driver takes its
+    # single-device branch and derives device_id={LOCAL_RANK}, so rank 5
+    # asks the daemon for NVMe device 5 on a 4-disk host and every worker
+    # dies with "daemon 配置无 device_id=5 的 NVMe 条目".
     #
     # --device-groups is semicolon-between-groups, comma-within-group. A JSON
-    # spelling like '[[0,1],[2,3]]' parses to nonsense and silently falls back to
-    # the same failure.
+    # spelling like '[[0,1],[2,3]]' parses to nonsense and silently falls back
+    # to the same failure.
     ARGS+=(
         --kv-layout striped
-        --device-groups '0,1;2,3'
+        --device-groups '0,1,2,3'
         # {LOCAL_RANK} 是 driver 的占位符（大括号、无 $）。写成 shell 的
         # ${LOCAL_RANK} 会被转义成字面量 "$0"，于是 8 个 rank 全写进同一个名为
         # "...-$0" 的目录——池按 rank 隔离的语义失效，且互相追加同名文件。
         --kv-root "/mnt/nvme0/tutti-kv-8gpu-${POOL_TAG}-{LOCAL_RANK}"
-        # 64 KiB. A TP8 layer segment is 128 KiB, so a layer spans exactly two
-        # stripes -- one per disk -- without cutting an entry in half.
-        --stripe-unit 65536
-        # Per device. The default of 32 would have 4 ranks x 32 = 128 queues on a
-        # disk whose usable pool is 119, which fails with EAGAIN.
+        # Per device. 8 ranks x 8 queues = 64 on a disk whose usable pool is
+        # 119, which fits (the default 32 would need 256 and fail EAGAIN).
         --num-queues 8
         # 默认不传 --max-in-flight-operations：生产侧（factory）已按
         # 2 x num_layers 推导出下限，此处保持默认即是在验证那条路径。
@@ -211,6 +224,9 @@ if [[ "$USE_NSYS" == 1 ]]; then
     #     250ms 级 compute 气泡期间既无 kernel 也无 CUDA runtime 调用，时间就
     #     花在未采集的库调用（cuBLASLt 启发式搜索、cuDNN）里——不看这两类
     #     就永远只能看到"空白"。代价是事件数量显著增加。
+    #  ⑤ GPU metrics（1 kHz）：PCIe 带宽利用率在报告的 GPU metrics (GPUm)
+    #     表里——pcie_rx/pcie_tx 是每卡吞吐计数器，nvlink 域为 0（无 NVLink
+    #     流量时）。8 卡全采（cuda-visible 跟随 CUDA_VISIBLE_DEVICES）。
     nsys profile \
         --output "$REPORT" \
         --force-overwrite true \
@@ -221,6 +237,8 @@ if [[ "$USE_NSYS" == 1 ]]; then
         --cuda-memory-usage false \
         --sample none \
         --cpuctxsw none \
+        --gpu-metrics-devices=cuda-visible \
+        --gpu-metrics-frequency=1000 \
         "$PYTHON" "${ARGS[@]}" 2>&1 | tee "$LOG"
 else
     "$PYTHON" "${ARGS[@]}" 2>&1 | tee "$LOG"

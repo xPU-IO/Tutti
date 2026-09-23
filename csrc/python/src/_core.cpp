@@ -745,7 +745,7 @@ tutti::presets::LocalNvmePreset parse_local_preset(const py::dict& d) {
 tutti::presets::StripedNvmePreset parse_striped_preset(const py::dict& d) {
     check_unknown_keys(
         d,
-        {"devices", "gpu_id", "num_queues", "stripe_unit",
+        {"devices", "gpu_id", "num_queues",
          "max_batch_entries", "max_in_flight_operations",
          "threads_per_block", "prp_cache_capacity"},
         "striped nvme preset");
@@ -767,7 +767,6 @@ tutti::presets::StripedNvmePreset parse_striped_preset(const py::dict& d) {
     }
     opt_int_field(d, "gpu_id", p.accel_id);
     opt_int_field(d, "num_queues", p.num_queues);
-    opt_int_field(d, "stripe_unit", p.stripe_unit);
     opt_int_field(d, "max_batch_entries", p.max_batch_entries);
     opt_int_field(d, "max_in_flight_operations", p.max_in_flight_operations);
     opt_int_field(d, "threads_per_block", p.threads_per_block);
@@ -917,9 +916,6 @@ tutti::StoreConfig store_config_from_py(const py::dict& config) {
     }
     for (const py::handle item : py::cast<py::list>(config["devices"])) {
         out.devices.push_back(store_device_from_py(item));
-    }
-    if (config.contains("stripe_unit")) {
-        out.stripe_unit = py::cast<std::uint64_t>(config["stripe_unit"]);
     }
     if (config.contains("prewarm_bytes")) {
         out.prewarm_bytes = py::cast<std::uint64_t>(config["prewarm_bytes"]);

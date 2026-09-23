@@ -345,12 +345,12 @@ class TestDeviceGroups:
 class TestCapacityBytesToChunks:
     """``capacity_bytes``（数据盘物理总量）→ ``num_chunks`` 的换算。
 
-    方案 A 语义：用户按"这些盘一共占多少"给值；Python 层按条带几何换算成
-    槽位数，底层仍只按槽位数建文件（不感知容量单位）。
+    方案 A 语义：用户按"这些盘一共占多少"给值；Python 层按放置几何换算成
+    槽位数，底层仍只按槽位数建文件（不感知容量单位）。一个槽位是一个
+    文件（整块 payload），slot 在盘间轮转。
     """
 
-    # HY3 几何：80 层 × 128 KiB = 10 MiB/槽；device_groups=[[0,1],[2,3]]
-    # 表示组内 2 盘、共 4 盘 → 每槽每盘 5 MiB。
+    # HY3 几何：80 层 × 128 KiB = 10 MiB/槽（一个文件）。
     SEGMENT_BYTES = 131072
     NUM_LAYERS = 80
     TI_BYTES = 1024 ** 4
@@ -358,12 +358,10 @@ class TestCapacityBytesToChunks:
     @staticmethod
     def _base_options():
         return {
-            "stripe_unit": 65536,
             "preset": {
                 "type": "striped",
                 "gpu_id": "{LOCAL_RANK}",
                 "device_groups": [[0, 1], [2, 3]],
-                "stripe_unit": 65536,
             },
         }
 
@@ -374,14 +372,14 @@ class TestCapacityBytesToChunks:
         )
 
     def test_four_tib_fills_four_disks(self):
-        """4 TiB → 每盘约 1 TiB（209715 槽 × 5 MiB，误差 < 一个槽位）。"""
+        """4 TiB → 419430 槽（每槽一个 10 MiB 文件，误差 < 一个槽位）。"""
         options = self._base_options()
         options["capacity_bytes"] = 4 * self.TI_BYTES
         got = self._convert(options)
-        assert got["num_chunks"] == 209715
-        per_disk = got["num_chunks"] * 5 * 1024 * 1024
-        assert per_disk <= self.TI_BYTES
-        assert self.TI_BYTES - per_disk < 5 * 1024 * 1024
+        assert got["num_chunks"] == 419430
+        used = got["num_chunks"] * 10 * 1024 * 1024
+        assert used <= 4 * self.TI_BYTES
+        assert 4 * self.TI_BYTES - used < 10 * 1024 * 1024
 
     def test_absent_key_leaves_options_untouched(self):
         got = self._convert(self._base_options())
@@ -408,11 +406,18 @@ class TestCapacityBytesToChunks:
             self._convert(options)
 
     def test_rejects_without_disk_shape(self):
-        with pytest.raises(ValueError, match="数据盘"):
-            self._convert({"capacity_bytes": self.TI_BYTES})
+        """（已改语义）放置无几何可换算：capacity_bytes 不再需要盘形状。
+
+        每 slot 一个文件（payload + 对象头），换算只依赖 payload 乘积；
+        留下这条是为了钉住"不要求 device_groups/devices"这一行为变化。
+        """
+        got = self._convert({"capacity_bytes": self.TI_BYTES})
+        assert got["num_chunks"] == (
+            self.TI_BYTES // (self.SEGMENT_BYTES * self.NUM_LAYERS)
+        )
 
     def test_single_disk_uses_whole_payload_per_slot(self):
-        """单盘部署不做条带分摊：每盘每槽就是整块 payload（10 MiB）。"""
+        """单盘部署：每槽就是一个文件（10 MiB），与多盘同式。"""
         options = {
             "capacity_bytes": self.TI_BYTES,
             "preset": {"devices": [{"device_id": 0}]},

@@ -30,9 +30,6 @@ Status parse_memory_resource(const YAML::Node& node, const std::string& path,
 Status parse_local_file_resolver(const YAML::Node& config,
                                  const std::string& path,
                                  ResolverSpec& resolver);
-Status parse_striped_file_resolver(const YAML::Node& config,
-                                   const std::string& path,
-                                   ResolverSpec& resolver);
 Status parse_memfs_resolver(const YAML::Node& config, const std::string& path,
                             ResolverSpec& resolver);
 Status parse_local_nvme_datapath(const YAML::Node& config,
