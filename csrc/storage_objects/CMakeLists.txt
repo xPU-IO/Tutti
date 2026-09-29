@@ -22,6 +22,8 @@ add_library(tutti_storage_objects STATIC
     store_factory.cpp
 )
 
+find_package(Threads REQUIRED)
+
 # Repo root on the include path so private headers are addressed as
 # "csrc/storage_objects/...", which is what keeps them out of the public
 # <tutti/...> namespace.
@@ -31,6 +33,7 @@ target_include_directories(tutti_storage_objects PUBLIC
 
 target_link_libraries(tutti_storage_objects PUBLIC
     tutti_spi
+    Threads::Threads
 )
 
 # Deliberately NOT linked against the resolvers. Resolution belongs to

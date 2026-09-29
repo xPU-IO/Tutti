@@ -253,6 +253,10 @@ struct StoreUsage {
     std::uint64_t reserved_bytes = 0;    // reserved, not yet committed
     std::uint64_t reclaiming_bytes = 0;  // being reclaimed, not yet allocatable
     std::uint64_t usable_bytes = 0;      // allocatable right now
+    std::uint64_t free_slots = 0;        // materialised slots ready to reserve
+    std::uint64_t reclaiming_slots = 0;  // slots awaiting physical zeroing
+    std::uint64_t reclaimed_total = 0;   // successful scrubs since open()
+    std::uint64_t reclaim_failures = 0;  // scrub attempts that were requeued
 
     // Per backing device occupancy, in the backend's device order. Striped
     // layouts are not required to be balanced -- the constraint is only that
