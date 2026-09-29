@@ -974,6 +974,72 @@ def runtime_submit_count(store):
     return len(store._runtime.submit_calls)
 
 
+def test_direct_partial_chunk_read_skips_shared_blocks_without_shifting_offsets():
+    runtime = FakeRuntime()
+    store = FakeStoreOwner(runtime)
+    backend = TuttiDirectBackend(store)
+    backend.register_paged_caches(
+        FakePool(128), num_layers=3, blocks_per_chunk=2,
+        chunk_tokens=256, segment_bytes=8192, max_chunks_per_wave=2,
+    )
+    key = b"p" * 16
+    store._live.add(derive_io_key(key, 1))
+    backend.get_paged_batch([key], 1, [[-1, 5]]).wait()
+    requests, _ = runtime.submit_calls[0]
+    assert len(requests) == 1
+    geometry = backend.geometry
+    assert requests[0][1] == (FakeLayout.payload_offset
+                              + geometry.segment_bytes + geometry.page_bytes)
+    assert requests[0][3] == (5 * geometry.block_stride_bytes
+                              + geometry.layer_stride_bytes)
+    with pytest.raises(DirectAdmissionError, match="outside"):
+        backend.put_paged_batch([key], 1, [[-1, 5]])
+    with pytest.raises(DirectAdmissionError, match="no destination"):
+        backend.get_paged_batch([key], 1, [[-1, -1]])
+    with pytest.raises(DirectAdmissionError, match="outside"):
+        backend.get_paged_batch([key], 1, [[-2, 5]])
+    assert len(runtime.submit_calls) == 1
+    backend.close()
+
+
+@pytest.mark.parametrize("block_size", [16, 128])
+def test_worker_partial_chunk_load_preserves_local_prefix_and_error_mapping(block_size):
+    class Engine:
+        direct = True
+        read_plan_supported = True
+
+        def hash_keys(self, token_ids):
+            return [b"a" * 16, b"b" * 16], b"parent"
+
+        def pin(self, keys):
+            pass
+
+        def start_read_plan(self, *args, **kwargs):
+            return SimpleNamespace(failed=None)
+
+    worker = WorkerImpl(Engine())
+    blocks = list(range(4, 4 + 512 // block_size))
+    worker._metadata = SimpleNamespace(requests=[SimpleNamespace(
+        req_id="partial", token_ids=list(range(512)),
+        load_start_token=block_size, load_tokens=512 - block_size, block_ids=blocks,
+        save_chunk_start=0, save_chunk_count=0,
+    )])
+    worker._chunk_tokens = 256
+    worker._block_size = block_size
+    worker._max_chunks_per_wave = 2
+    worker._callback_to_physical = (0, 1, 2)
+    worker._ensure_bound = lambda: None
+    worker._finalize_load_state = lambda: None
+    worker.start_load_kv(None)
+    assert worker._load_keys == [b"a" * 16, b"b" * 16]
+    per_chunk = 256 // block_size
+    assert worker._load_block_tables == [
+        [-1] + blocks[1:per_chunk], blocks[per_chunk:],
+    ]
+    worker._mark_load_failure()
+    assert worker._load_error_blocks == set(blocks[1:])
+
+
 class FakeCompletion:
     def __init__(self, log, layer):
         self.log = log

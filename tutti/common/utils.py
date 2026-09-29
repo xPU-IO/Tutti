@@ -27,7 +27,7 @@ def positive_int(config: dict, key: str) -> int:
 
 
 def flatten_block_ids(block_tables) -> tuple[int, ...]:
-    """Flatten wave-local block tables for fail-closed error reporting."""
+    """Flatten destination block IDs, excluding read-skip sentinels."""
     if block_tables is None:
         return ()
     if isinstance(block_tables, (bytes, bytearray, str)):
@@ -35,12 +35,14 @@ def flatten_block_ids(block_tables) -> tuple[int, ...]:
     try:
         values = list(block_tables)
     except TypeError:
-        return (block_tables,) if isinstance(block_tables, int) else ()
+        return ((block_tables,) if isinstance(block_tables, int)
+                and block_tables >= 0 else ())
     flattened = []
     for value in values:
         if isinstance(value, (list, tuple, set)):
-            flattened.extend(item for item in value if isinstance(item, int))
-        elif isinstance(value, int):
+            flattened.extend(item for item in value
+                             if isinstance(item, int) and item >= 0)
+        elif isinstance(value, int) and value >= 0:
             flattened.append(value)
     return tuple(flattened)
 

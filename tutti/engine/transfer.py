@@ -81,10 +81,13 @@ class DirectTransfer:
             )
         return method(list(keys), layer_idx, list(block_tables))
 
-    def validate_block_tables(self, block_tables) -> None:
+    def validate_block_tables(self, block_tables, *, allow_read_skips=False) -> None:
         method = getattr(self._backend, "validate_block_tables", None)
         if callable(method):
-            method(list(block_tables))
+            if allow_read_skips:
+                method(list(block_tables), allow_read_skips=True)
+            else:
+                method(list(block_tables))
 
     def close(self) -> None:
         close = getattr(self._backend, "close", None)
