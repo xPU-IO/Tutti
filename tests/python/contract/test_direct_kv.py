@@ -1564,6 +1564,55 @@ def test_worker_write_batch_excludes_resident_chunks():
     engine.close()
 
 
+def test_worker_rolls_back_physically_rejected_chunks_immediately():
+    """物理对象池部分受理时，逻辑 pending 必须立即回滚并上报失败。"""
+    runtime = FakeRuntime()
+    store = FakeEngineStore(runtime)
+    engine = KVEngine(
+        {
+            "chunk_tokens": 256,
+            "chunk_kv_bytes": 3 * 8192,
+            "max_chunks_per_wave": 4,
+            "num_layers": 3,
+        },
+        store,
+    )
+    assert engine.try_bind_direct(FakePool(128), 3, 2)
+
+    first_tokens = list(range(256))
+    second_tokens = list(range(256, 512))
+    first_key = engine.hash_keys(first_tokens)[0][0]
+    second_key = engine.hash_keys(second_tokens)[0][0]
+    worker = WorkerImpl(engine)
+    worker._ensure_bound = lambda: None
+    worker._chunk_tokens = 256
+    worker._block_size = 128
+    worker._metadata = SimpleNamespace(requests=[
+        SimpleNamespace(
+            token_ids=first_tokens, save_chunk_start=0, save_chunk_count=1,
+            block_ids=[0, 1], save_generations=["g-first"],
+        ),
+        SimpleNamespace(
+            token_ids=second_tokens, save_chunk_start=0, save_chunk_count=1,
+            block_ids=[2, 3], save_generations=["g-second"],
+        ),
+    ])
+
+    # Scheduler/index admission accepts both, but the physical pool accepts
+    # only one. This models direct prepare_write_targets under pressure.
+    engine.prepare_write_targets = lambda keys: [bytes(keys[0])]
+    worker._prepare_write_batch()
+
+    assert worker._save_keys == [first_key]
+    assert second_key not in engine._index._pending
+    assert first_key in engine._index._pending
+    assert second_key in worker._store_failed
+    payload = worker.build_connector_worker_meta()
+    assert payload is not None
+    assert second_key in payload.failed
+    engine.close()
+
+
 def _bound_engine(capacity=4):
     runtime = FakeRuntime()
     store = FakeEngineStore(runtime)

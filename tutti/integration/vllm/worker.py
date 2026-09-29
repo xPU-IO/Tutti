@@ -947,6 +947,22 @@ class WorkerImpl:
             # 调用等价（幂等），提前到这里以避开计算下发关键路径。
             admitted = self._engine.prepare_write_targets(keys)
             if admitted is not None:
+                admitted_set = {bytes(key) for key in admitted}
+                rejected = list(dict.fromkeys(
+                    bytes(key) for key in keys if bytes(key) not in admitted_set
+                ))
+                if rejected:
+                    # The scheduler reserved every plan.new_key, while the
+                    # physical object pool may accept only a prefix. Finalize
+                    # rejected keys now; waiting for the stale-pending safety
+                    # net incorrectly makes ordinary capacity pressure look
+                    # like a missing save callback.
+                    self._engine.confirm_store(rejected, ok=False)
+                    self._record_store_outcome(rejected, ok=False)
+                    _LOG.info(
+                        "DIRECT_WRITE_REJECT_ROLLBACK count=%d",
+                        len(rejected),
+                    )
                 # 池容量受理可能少于本批：驱逐压力下"调度侧索引容量"与
                 # "对象池槽位"两层受理状态会短暂不一致。未受理的 chunk
                 # 不进写计划、本步不写（对象层契约），必须在此裁剪——
