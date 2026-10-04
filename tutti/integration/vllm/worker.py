@@ -216,15 +216,15 @@ _LOG = logging.getLogger(__name__)
 
 def _load_chunk_span(start_token: int, token_count: int,
                      chunk_tokens: int) -> tuple[int, int]:
-    """加载区间 [start, start+count) 覆盖的完整 chunk 区间。
+    """返回覆盖加载区间的 chunk，包括部分命中的首个 chunk。
 
-    返回 (首个 chunk 序号, chunk 数)：起点向上取整到 chunk 边界
-    （首个不完整 chunk 让渡给重算），终点向下取整。区间非法或
-    无完整 chunk → (0, 0)。
+    终点须与 chunk 对齐；首 chunk 中本地已缓存的块由读计划跳过。
     """
     if start_token < 0 or token_count <= 0:
         return 0, 0
-    first = (start_token + chunk_tokens - 1) // chunk_tokens
+    if (start_token + token_count) % chunk_tokens:
+        raise ValueError("external load end must be chunk-aligned")
+    first = start_token // chunk_tokens
     last = (start_token + token_count) // chunk_tokens
     return first, max(0, last - first)
 
@@ -345,6 +345,10 @@ class PagedTransferHooks:
     def _transfer(self, block_tables, slots, layer_idx: int,
                   direction: str) -> None:
         """搬运一层；连续槽位的多个 chunk 合并为一次 kernel。"""
+        if direction == "to_staging" and any(
+            block < 0 for table in block_tables for block in table
+        ):
+            raise ValueError("read-skip blocks cannot be used for a store")
         paged = self._layer_view(layer_idx)
         if (len(block_tables) == len(slots)
                 and self._can_batch_slots(slots)):
@@ -398,8 +402,10 @@ class PagedTransferHooks:
         if direction == "to_staging":
             staging_view.copy_(paged[block_ids, offsets])
         else:
+            valid = slot_mapping >= 0
             paged.index_put_(
-                (block_ids, offsets), staging_view.to(paged.device)
+                (block_ids[valid], offsets[valid]),
+                staging_view.to(paged.device)[valid]
             )
 
     def _slot_mapping(self, blocks) -> torch.Tensor:
@@ -633,9 +639,8 @@ class WorkerImpl:
         """组读取批并在 direct 模式连续预提交全部物理层。
 
         加载区间 = [load_start_token, load_start_token + load_tokens)：
-        vLLM 本地前缀命中的 token 已计入请求 computed，connector 只
-        补其后区间——起点非 chunk 边界时首个不完整 chunk 让渡
-        （重算兜底），key 与块表按同一 chunk 区间切片。
+        connector 只补本地前缀之后的区间。首 chunk 的本地已缓存块
+        标记为 -1，读路径跳过这些共享块，其余块必须全部加载。
         """
         started_ns = time.perf_counter_ns()
         self._direct_start_load_started_ns = started_ns
@@ -682,6 +687,8 @@ class WorkerImpl:
                 getattr(self._metadata, "requests", []) or []):
             if meta.load_tokens <= 0:
                 continue
+            if meta.load_start_token % self._block_size:
+                raise ValueError("external load start must be block-aligned")
             first_chunk, n_chunks = _load_chunk_span(
                 meta.load_start_token, meta.load_tokens, self._chunk_tokens
             )
@@ -707,9 +714,15 @@ class WorkerImpl:
                     )
                 continue
             keys.extend(req_keys)
-            block_tables.extend(
-                self._chunk_block_tables(meta, first_chunk + n_chunks)[first_chunk:]
-            )
+            tables = self._chunk_block_tables(
+                meta, first_chunk + n_chunks
+            )[first_chunk:]
+            # -1 means read-skip. Never DMA over shared, locally cached APC
+            # blocks; the remaining blocks in this chunk still need loading.
+            skip = (meta.load_start_token % self._chunk_tokens) // self._block_size
+            if skip:
+                tables[0][:skip] = [-1] * skip
+            block_tables.extend(tables)
             self._load_request_spans.append(_LoadRequestSpan(
                 request_ordinal=request_ordinal,
                 req_id=str(getattr(meta, "req_id", request_ordinal)),
@@ -718,7 +731,7 @@ class WorkerImpl:
                 chunk_count=n_chunks,
             ))
         if keys:
-            self._validate_direct_or_fail(block_tables)
+            self._validate_direct_or_fail(block_tables, allow_read_skips=True)
             self._load_keys = keys
             self._load_block_tables = block_tables
             self._pinned = True
@@ -960,6 +973,22 @@ class WorkerImpl:
             # 调用等价（幂等），提前到这里以避开计算下发关键路径。
             admitted = self._engine.prepare_write_targets(keys)
             if admitted is not None:
+                admitted_set = {bytes(key) for key in admitted}
+                rejected = list(dict.fromkeys(
+                    bytes(key) for key in keys if bytes(key) not in admitted_set
+                ))
+                if rejected:
+                    # The scheduler reserved every plan.new_key, while the
+                    # physical object pool may accept only a prefix. Finalize
+                    # rejected keys now; waiting for the stale-pending safety
+                    # net incorrectly makes ordinary capacity pressure look
+                    # like a missing save callback.
+                    self._engine.confirm_store(rejected, ok=False)
+                    self._record_store_outcome(rejected, ok=False)
+                    _LOG.info(
+                        "DIRECT_WRITE_REJECT_ROLLBACK count=%d",
+                        len(rejected),
+                    )
                 # 池容量受理可能少于本批：驱逐压力下"调度侧索引容量"与
                 # "对象池槽位"两层受理状态会短暂不一致。未受理的 chunk
                 # 不进写计划、本步不写（对象层契约），必须在此裁剪——
@@ -1480,6 +1509,7 @@ class WorkerImpl:
                 int(block)
                 for chunk_blocks in self._load_block_tables
                 for block in chunk_blocks
+                if block >= 0
             }
             return
         failed_flat_chunks = set()
@@ -1564,7 +1594,8 @@ class WorkerImpl:
                     span.flat_chunk_start + local_start,
                     span.flat_chunk_start + local_end):
                 blocks = self._load_block_tables[index]
-                self._load_error_blocks.update(int(block) for block in blocks)
+                self._load_error_blocks.update(int(block) for block in blocks
+                                               if block >= 0)
 
     def _diag_callback(self, direction: str, layer_name: str,
                        callback: int, physical: int) -> None:
@@ -1610,7 +1641,8 @@ class WorkerImpl:
         """把读取未遂区间覆盖的块上报为重算。"""
         per_chunk = -(-self._chunk_tokens // self._block_size)
         blocks = meta.block_ids
-        start_blk = first_chunk * per_chunk
+        start_blk = max(first_chunk * per_chunk,
+                        meta.load_start_token // self._block_size)
         end_blk = min((first_chunk + n_chunks) * per_chunk, len(blocks))
         if end_blk > start_blk:
             self._load_error_blocks.update(blocks[start_blk:end_blk])
@@ -1818,7 +1850,7 @@ class WorkerImpl:
         self._write_window = write_window
         self._bound = True
 
-    def _validate_direct_or_fail(self, block_tables) -> None:
+    def _validate_direct_or_fail(self, block_tables, *, allow_read_skips=False) -> None:
         """提交前校验直连 block tables；不符即失败，不再降级到 staged。
 
         触发条件是 block table 长度与该 chunk 的块数不符，即 chunk 不满。保存
@@ -1831,7 +1863,10 @@ class WorkerImpl:
         if not callable(validate):
             return
         try:
-            validate(block_tables)
+            if allow_read_skips:
+                validate(block_tables, allow_read_skips=True)
+            else:
+                validate(block_tables)
         except Exception as exc:
             # 仍经 Engine 抛出：它把"直连绑定后不再降级"这条契约收在一处，
             # 并把原因包装成 DirectTransferUnavailable。

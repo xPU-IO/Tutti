@@ -1032,6 +1032,10 @@ public:
         out["reserved_bytes"] = usage.reserved_bytes;
         out["reclaiming_bytes"] = usage.reclaiming_bytes;
         out["usable_bytes"] = usage.usable_bytes;
+        out["free_slots"] = usage.free_slots;
+        out["reclaiming_slots"] = usage.reclaiming_slots;
+        out["reclaimed_total"] = usage.reclaimed_total;
+        out["reclaim_failures"] = usage.reclaim_failures;
         out["per_device_bytes"] = usage.per_device_bytes;
         return out;
     }

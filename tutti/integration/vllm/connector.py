@@ -199,8 +199,11 @@ class TuttiConnectorV1(KVConnectorBase_V1):
         # 请求对象切片——scheduled_cached_reqs.new_token_ids 仅 PP 时
         # 非空，常规部署恒为空表）
         self._live_requests: dict[str, object] = {}
-        # 外部加载区间起点（update_state_after_alloc 时的已计 token 数）
+        # 外部加载区间起点（命中查询传入的本地已计算 token 数）
         self._load_starts: dict[str, int] = {}
+        # vLLM passes the APC hit to lookup before updating Request.computed.
+        # Keep the latest lookup boundary until allocation succeeds.
+        self._lookup_starts: dict[str, int] = {}
         # 命中统计（原先是每请求一条 info 日志，改为累计计数 + debug）
         self._hit_tokens_total = 0
         self._hit_requests_total = 0
@@ -334,9 +337,9 @@ class TuttiConnectorV1(KVConnectorBase_V1):
     # ---- scheduler 角色回调 ----
 
     def get_num_new_matched_tokens(self, request, num_computed_tokens: int) -> tuple[int | None, bool]:
-        """按前缀命中报告外部可提供的 token 数（无副作用，可重复调用）。
+        """按前缀命中报告外部可提供的 token 数（可重复查询）。
 
-        返回值：超出 num_computed_tokens 的可加载 token 数（chunk 对齐、
+        返回值：超出 num_computed_tokens 的可加载 token 数（终点 chunk 对齐、
         受最小检索量与单步加载上限约束），读取为步内同步完成。
 
         索引以调度进程内存为权威：驻留由 worker 落盘成功后经
@@ -347,16 +350,22 @@ class TuttiConnectorV1(KVConnectorBase_V1):
         tokens = list(getattr(request, "prompt_token_ids", None) or [])
         tokens += list(getattr(request, "output_token_ids", None) or [])
         hit = self._index.lookup_prefix(tokens)
-        new = max(0, hit - num_computed_tokens)
         # 命中上限：为生成首 token 保留至少一个待计算 token
         # （num_new_tokens ≥ 1，vLLM 调度推进前提；legacy 同语义）。
         # 先 clamp 后对齐——上限内取最大 chunk 对齐值。
-        new = min(new, max(0, len(tokens) - 1 - num_computed_tokens))
-        new = new // self._chunk_tokens * self._chunk_tokens
+        end = min(hit, max(0, len(tokens) - 1))
+        if self._max_tokens_per_load:
+            end = min(end, num_computed_tokens + self._max_tokens_per_load)
+        # Align the absolute END, not the count: an APC hit may cover only
+        # part of a storage chunk. Every advertised token must be restored.
+        end = end // self._chunk_tokens * self._chunk_tokens
+        new = max(0, end - num_computed_tokens)
         if self._min_retrieve_tokens and new < self._min_retrieve_tokens:
             new = 0
-        if self._max_tokens_per_load:
-            new = min(new, self._max_tokens_per_load)
+        if new:
+            self._lookup_starts[request.request_id] = num_computed_tokens
+        else:
+            self._lookup_starts.pop(request.request_id, None)
         if new > 0:
             # 每请求一条、且是热路径：降为 debug 并聚合计数（见阶段 D 指标）。
             self._hit_tokens_total += new
@@ -372,15 +381,19 @@ class TuttiConnectorV1(KVConnectorBase_V1):
 
         同时保留活请求引用：请求对象的 token 序列随 decode 持续
         增长，cached 步的增量切片依赖该引用（见 build_connector_meta）。
-        外部加载区间起点 = 请求当前已计 token 数（vLLM 本地前缀
-        命中计入其中，connector 只补其后区间）。
+        外部加载区间起点取自最近的命中查询。vLLM 此时尚未把本地
+        前缀命中数写回 Request.num_computed_tokens，不能据此推导。
         """
         self._live_requests[request.request_id] = request
+        local_tokens = self._lookup_starts.pop(
+            request.request_id, int(getattr(request, "num_computed_tokens", 0))
+        )
         if num_external_tokens > 0:
             self._pending_loads[request.request_id] = num_external_tokens
-            self._load_starts[request.request_id] = int(
-                getattr(request, "num_computed_tokens", 0)
-            )
+            self._load_starts[request.request_id] = local_tokens
+        else:
+            self._pending_loads.pop(request.request_id, None)
+            self._load_starts.pop(request.request_id, None)
 
     def _log_step_summary(self, scheduler_output) -> None:
         """每步容量/命中汇总：debug 明细 + info 级长跑体检。
@@ -472,6 +485,7 @@ class TuttiConnectorV1(KVConnectorBase_V1):
             self._live_requests.pop(req_id, None)
             self._pending_loads.pop(req_id, None)
             self._load_starts.pop(req_id, None)
+            self._lookup_starts.pop(req_id, None)
         scheduled: list[str] = []
         for new_req in scheduler_output.scheduled_new_reqs:
             block_ids = flatten_blocks(new_req.block_ids)
@@ -634,6 +648,7 @@ class TuttiConnectorV1(KVConnectorBase_V1):
         self._pending_loads.pop(request.request_id, None)
         self._live_requests.pop(request.request_id, None)
         self._load_starts.pop(request.request_id, None)
+        self._lookup_starts.pop(request.request_id, None)
         return False, None
 
     # ---- 内部 ----

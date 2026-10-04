@@ -1198,9 +1198,11 @@ class KVEngine:
         self._deferred_restore()
         return True
 
-    def validate_direct_block_tables(self, block_tables) -> None:
+    def validate_direct_block_tables(self, block_tables, *, allow_read_skips=False) -> None:
         if isinstance(self._transfer, DirectTransfer):
-            self._transfer.validate_block_tables(block_tables)
+            self._transfer.validate_block_tables(
+                block_tables, allow_read_skips=allow_read_skips
+            )
 
     def fallback_from_direct(self, reason: Exception) -> None:
         """直连准入失败时的处置：解除绑定后抛出，不再降级到 staged。

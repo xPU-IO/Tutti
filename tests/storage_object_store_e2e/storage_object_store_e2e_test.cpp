@@ -25,12 +25,14 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -399,6 +401,38 @@ void test_capacity(const std::string& base) {
     CHECK(store->close().ok());
 }
 
+void test_background_reclaim(const std::string& base) {
+    const std::string root = base + "/background_reclaim";
+    auto store = make_store(root);
+    StoreConfig cfg = make_config(root, 1);
+    cfg.background_reclaim = true;
+    REQUIRE(store->open(cfg).ok());
+
+    const ObjectKey first = key_of(0xC1);
+    const ObjectKey second = key_of(0xC2);
+    auto reserved = store->reserve(&first, 1);
+    REQUIRE(reserved.ok());
+    REQUIRE(reserved.value().accepted.size() == 1);
+    REQUIRE(write_payload(root, 0, 0x31));
+    REQUIRE(store->commit(&first, 1).ok());
+    auto released = store->release(&first, 1);
+    REQUIRE(released.ok());
+    REQUIRE(released.value() == 1);
+
+    bool reusable = false;
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        auto retry = store->reserve(&second, 1);
+        if (retry.ok() && !retry.value().accepted.empty()) {
+            reusable = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    CHECK(reusable);
+    CHECK(store->usage().reclaiming_bytes == 0);
+    CHECK(store->close().ok());
+}
+
 // ======================================================================
 // 6. Reclaim erases the object, and ABA is detectable
 // ======================================================================
@@ -713,6 +747,7 @@ int main() {
         test_crash_before_commit(dir);
         test_corrupted_header(dir);
         test_capacity(dir);
+        test_background_reclaim(dir);
         test_reclaim_and_aba(dir);
         test_fingerprint(dir);
         test_pin_and_abort(dir);

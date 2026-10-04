@@ -31,9 +31,11 @@
 // needs extents.
 
 #include <cstdint>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -141,6 +143,7 @@ private:
                                std::uint64_t generation, std::uint64_t commit_seq);
     Status load_checkpoint_locked();
     Status persist_checkpoint_locked();
+    void reclaim_worker_loop();
     // Sequence number in each container, 0 meaning empty or unreadable.
     void read_container_sequences_locked(
         std::uint64_t* sequences,
@@ -168,6 +171,13 @@ private:
     std::uint64_t checkpoint_seq_ = 0;
     std::uint64_t container_bytes_ = 0;
     bool checkpoint_dirty_ = false;
+
+    std::thread reclaim_worker_;
+    std::condition_variable reclaim_cv_;
+    bool reclaim_stop_ = false;
+    bool reclaim_pending_ = false;
+    std::uint64_t reclaimed_total_ = 0;
+    std::uint64_t reclaim_failures_ = 0;
 
     SpaceAllocator allocator_;
 

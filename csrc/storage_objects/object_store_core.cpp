@@ -3,6 +3,7 @@
 #include "csrc/storage_objects/object_store_core.h"
 
 #include <algorithm>
+#include <chrono>
 #include <utility>
 
 #include "csrc/storage_objects/slot_media.h"
@@ -120,6 +121,10 @@ Status ObjectStoreCore::open(const StoreConfig& config) {
     }
 
     config_ = config;
+    reclaimed_total_ = 0;
+    reclaim_failures_ = 0;
+    reclaim_stop_ = false;
+    reclaim_pending_ = false;
 
     // A slot occupies its reserved prefix (object header) plus the payload.
     slot_bytes_ = header_bytes + payload_bytes;
@@ -215,10 +220,23 @@ Status ObjectStoreCore::open(const StoreConfig& config) {
     }
 
     opened_ = true;
+    if (config_.background_reclaim && !config_.read_only) {
+        reclaim_pending_ = allocator_.stats().reclaiming_slots != 0;
+        reclaim_worker_ = std::thread(&ObjectStoreCore::reclaim_worker_loop,
+                                      this);
+    }
     return {};
 }
 
 Status ObjectStoreCore::close() {
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (!opened_) return {};
+        reclaim_stop_ = true;
+        reclaim_cv_.notify_all();
+    }
+    if (reclaim_worker_.joinable()) reclaim_worker_.join();
+
     std::lock_guard<std::mutex> guard(mutex_);
     if (!opened_) return {};
     // Flush a dirty checkpoint first. commit() writes the object header (the
@@ -237,6 +255,8 @@ Status ObjectStoreCore::close() {
     own_residency_.close();
     peer_residency_.clear();
     opened_ = false;
+    reclaim_stop_ = false;
+    reclaim_pending_ = false;
     return status;
 }
 
@@ -432,6 +452,10 @@ StoreUsage ObjectStoreCore::usage() const {
     u.reserved_bytes = s.reserved_slots * slot_bytes_;
     u.reclaiming_bytes = s.reclaiming_slots * slot_bytes_;
     u.usable_bytes = (s.free_slots + s.unmaterialised_slots) * slot_bytes_;
+    u.free_slots = s.free_slots;
+    u.reclaiming_slots = s.reclaiming_slots;
+    u.reclaimed_total = reclaimed_total_;
+    u.reclaim_failures = reclaim_failures_;
 
     // Per device: slots rotate over the devices, so slot s is on s % N.
     const std::uint64_t devices = config_.devices.size();
@@ -613,7 +637,11 @@ Status ObjectStoreCore::abort(const ObjectKey* keys, std::size_t count) {
         slot_owner_.erase(it->second.slot);
         index_.erase(it);
     }
-    if (!slots.empty()) allocator_.abort(slots.data(), slots.size());
+    if (!slots.empty()) {
+        allocator_.abort(slots.data(), slots.size());
+        reclaim_pending_ = true;
+        reclaim_cv_.notify_one();
+    }
     return {};
 }
 
@@ -650,6 +678,8 @@ Result<std::uint64_t> ObjectStoreCore::release(const ObjectKey* keys,
     if (!slots.empty()) {
         allocator_.release(slots.data(), slots.size());
         checkpoint_dirty_ = true;
+        reclaim_pending_ = true;
+        reclaim_cv_.notify_one();
     }
     return Result<std::uint64_t>::Success(released);
 }
@@ -706,11 +736,36 @@ std::uint64_t ObjectStoreCore::drain_reclaim(std::uint64_t max) {
         // Requeue rather than drop: a transient IO error must not permanently
         // leak capacity.
         allocator_.requeue_reclaim(failed.data(), failed.size());
+        reclaim_failures_ += failed.size();
     }
     if (!done.empty()) {
         allocator_.finish_reclaim(done.data(), done.size());
+        reclaimed_total_ += done.size();
     }
     return done.size();
+}
+
+void ObjectStoreCore::reclaim_worker_loop() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    for (;;) {
+        reclaim_cv_.wait(lock, [this] {
+            return reclaim_stop_ || reclaim_pending_;
+        });
+        if (reclaim_stop_) return;
+        reclaim_pending_ = false;
+        lock.unlock();
+        (void)drain_reclaim(64);
+        lock.lock();
+
+        // Keep retrying a failed scrub, but avoid a tight loop when the media
+        // is temporarily unavailable. A release racing with this check will
+        // set reclaim_pending_ and notify the same worker.
+        if (!reclaim_stop_ && allocator_.stats().reclaiming_slots != 0) {
+            reclaim_pending_ = true;
+            reclaim_cv_.wait_for(lock, std::chrono::milliseconds(10),
+                                 [this] { return reclaim_stop_; });
+        }
+    }
 }
 
 std::uint64_t ObjectStoreCore::precreated_slots() const {

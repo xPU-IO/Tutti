@@ -687,7 +687,7 @@ class TuttiDirectBackend:
                 f"direct target generation mismatch for chunk {entry.chunk_id!r}"
             )
 
-    def validate_block_tables(self, block_tables):
+    def validate_block_tables(self, block_tables, *, allow_read_skips=False):
         geometry = self.geometry
         validated_tables = []
         for table in block_tables:
@@ -705,12 +705,17 @@ class TuttiDirectBackend:
                         f"direct block id must be int, got {raw_block_id!r}"
                     )
                 block_id = int(raw_block_id)
+                if allow_read_skips and block_id == -1:
+                    validated.append(block_id)
+                    continue
                 if not 0 <= block_id < geometry.num_blocks:
                     raise DirectAdmissionError(
                         f"direct block id {block_id} is outside "
                         f"[0, {geometry.num_blocks})"
                     )
                 validated.append(block_id)
+            if all(block == -1 for block in validated):
+                raise DirectAdmissionError("direct read chunk has no destination blocks")
             validated_tables.append(validated)
         try:
             caps = self._store._runtime.caps()
@@ -752,7 +757,9 @@ class TuttiDirectBackend:
         with nvtx_range(
             f"tutti.direct.prepare|direction={direction}|layer={layer_idx}"
         ):
-            validated_tables = self.validate_block_tables(block_tables)
+            validated_tables = self.validate_block_tables(
+                block_tables, allow_read_skips=direction == "read"
+            )
         io_keys = [derive_io_key(key, int(layer_idx)) for key in keys]
         if direction == "read" and any(io_key not in store._live for io_key in io_keys):
             missing = next(io_key for io_key in io_keys if io_key not in store._live)
@@ -773,6 +780,8 @@ class TuttiDirectBackend:
                 self._validate_plan_entry(plan_entry)
                 target = plan_entry.target_ticket
                 for block_ordinal, block_id in enumerate(table):
+                    if block_id == -1:
+                        continue
                     memory_offset = (
                         block_id * geometry.block_stride_bytes
                         + int(layer_idx) * geometry.layer_stride_bytes
