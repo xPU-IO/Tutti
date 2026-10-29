@@ -884,6 +884,14 @@ class TuttiConnectorV1(KVConnectorBase_V1):
             if (rid == req_id or rid in self._async_outstanding
                     or rid in self._async_pending):
                 continue
+            # Only a request currently in vLLM's RUNNING batch can hide a
+            # detached read. WAITING/PREEMPTED requests still live in the
+            # connector map, but counting them as ``others`` admits async
+            # loads with no foreground compute heartbeat and can leave the
+            # detached feeder parked indefinitely.
+            status = getattr(request, "status", None)
+            if status is not None and getattr(status, "name", str(status)) != "RUNNING":
+                continue
             others += 1
             computed = int(getattr(request, "num_computed_tokens", 0) or 0)
             used += -(-computed // self._block_size)

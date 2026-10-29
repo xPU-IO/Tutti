@@ -1084,6 +1084,10 @@ class TestLoadSemantics:
         h = _make_harness()
         prompt = list(range(2 * CHUNK_TOKENS))
         keys = self._prefill_save(h, prompt, [0])
+        h.scheduler._total_blocks = 1000
+        h.scheduler._live_requests["compute"] = _fake_request(
+            "compute", [99] * CHUNK_TOKENS, num_computed_tokens=CHUNK_TOKENS
+        )
         req2 = _fake_request("r2", prompt, num_computed_tokens=0)
         matched, is_async = h.scheduler.get_num_new_matched_tokens(req2, 0)
         assert is_async
