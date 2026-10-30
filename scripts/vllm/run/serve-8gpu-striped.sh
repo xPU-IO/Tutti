@@ -59,6 +59,11 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-$(( MAX_PROMPT_TOKENS + 16 < MODEL_MAX_LEN ? MAX
 # a benchmark explicitly overrides it.
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
 FLASHINFER_AUTOTUNE="${FLASHINFER_AUTOTUNE:-1}"
+LANGUAGE_MODEL_ONLY="${LANGUAGE_MODEL_ONLY:-0}"
+case "$LANGUAGE_MODEL_ONLY" in
+0|1) ;;
+*) echo 'LANGUAGE_MODEL_ONLY must be 0 or 1' >&2; exit 2 ;;
+esac
 
 # HBM KV 池上限（单位：block）。默认**不传**：用 vLLM 自然池。
 # FP8 的可用 token 总量约 2.46M；512-token block 的块数由 vLLM 实测决定。
@@ -240,6 +245,9 @@ COMMAND=(
     --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS"
     --kv-transfer-config "$KV_CONFIG"
 )
+if [[ "$LANGUAGE_MODEL_ONLY" == 1 ]]; then
+    COMMAND+=(--language-model-only)
+fi
 if (( DRY_RUN )); then
     echo "[serve] kv_config=$KV_CONFIG"
     printf '[serve] command:'; printf ' %q' "${COMMAND[@]}"; printf '\n'
