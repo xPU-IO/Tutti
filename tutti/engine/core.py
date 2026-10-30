@@ -345,6 +345,7 @@ class _AsyncReadPlan:
             self._service = engine._get_read_service()
             self._cleanup_job = None
             self._started = False
+            self._feeder_epoch = getattr(engine, "_prefill_feeder_epoch", None)
             engine._async_read_plans.add(self)
             self._feeder = self._service.submit(self, priority=1)
         except Exception:
@@ -392,6 +393,30 @@ class _AsyncReadPlan:
             with self._lock:
                 self._polled += 1
 
+    def _detached_submit_allowed(self) -> bool:
+        """Honor feeder epochs while keeping detached plans independent.
+
+        A foreground step records ``compute_done`` before closing its feeder.
+        A detached plan must pause at that boundary and resume only after the
+        worker opens the next feeder epoch. Otherwise it can continue to submit
+        layers against the stale epoch and either race the next foreground
+        plan or violate the layerwise callback contract.
+        """
+        engine = self.engine
+        epoch = getattr(engine, "_prefill_feeder_epoch", None)
+        if self._feeder_epoch != epoch:
+            self._feeder_epoch = epoch
+        else:
+            compute_done = getattr(engine, "_prefill_compute_done", None)
+            if compute_done is not None:
+                query = getattr(compute_done, "query", None)
+                try:
+                    if callable(query) and bool(query()):
+                        return False
+                except Exception:
+                    return False
+        return engine._background_read_allowed(detached=True)
+
     def advance(self) -> bool:
         if self._ended:
             self._feeder_done.set()
@@ -416,7 +441,7 @@ class _AsyncReadPlan:
                 return self._finish_submission()
             engine = self.engine
             if not self._started:
-                if not engine._background_read_allowed(detached=True):
+                if not self._detached_submit_allowed():
                     return False
                 if self._managed:
                     self._backend.start_detached_read(self._target_plan)
@@ -431,9 +456,26 @@ class _AsyncReadPlan:
                         if not allowed or self._stop.is_set():
                             return False
                         with nvtx_range(f"tutti.async.layer_submit|physical={physical}|chunks={len(self.keys)}"):
-                            method = (engine._transfer.try_load_layer
-                                      if callable(getattr(self._backend, "try_get_paged_batch", None))
-                                      else engine._transfer.load_layer)
+                            # Layerwise pages use the stable per-layer submit
+                            # API here.  Their partial-submit retry state is
+                            # foreground-callback driven; polling it as a
+                            # detached plan can leave the request parked
+                            # forever.  Ordinary cross-layer direct backends
+                            # retain the nonblocking try path and its bounded
+                            # capacity retry behavior.
+                            use_try = (
+                                getattr(
+                                    self._backend,
+                                    "supports_detached_try_read", True,
+                                )
+                                and callable(
+                                    getattr(engine._transfer, "try_load_layer", None)
+                                )
+                            )
+                            method = (
+                                engine._transfer.try_load_layer
+                                if use_try else engine._transfer.load_layer
+                            )
                             completion = method(
                                 self.keys, physical, self.block_tables, target_plan=self._target_plan)
             if completion is None:
@@ -479,7 +521,7 @@ class _AsyncReadPlan:
         if not self._service.acquire_background(self._target_plan):
             return False
         engine = self.engine
-        if engine._background_read_allowed(detached=True):
+        if self._detached_submit_allowed():
             return True
         if not getattr(engine, "_prefill_feeder_open", False):
             return False

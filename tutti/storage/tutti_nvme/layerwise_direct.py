@@ -44,6 +44,12 @@ def page_geometry(tensor, page_bytes: int) -> LayerPageGeometry:
 class TuttiLayerwiseDirectBackend(TuttiDirectBackend):
     """Per-entity page geometry; fixed disk segments may contain unused padding."""
 
+    # The partial-submit state machine is coupled to layerwise callback
+    # progression. Detached request feeders use the stable load_layer API and
+    # poll its completion handle instead, preserving request-level overlap
+    # without parking a request on a foreground-only retry state.
+    supports_detached_try_read = False
+
     def __init__(self, store):
         super().__init__(store)
         self._layer_pages = ()
