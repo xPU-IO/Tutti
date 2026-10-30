@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import hashlib
 from pathlib import Path
 
 import pytest
 
-from tutti.index.chunk_index import ChunkIndex, StorePlan
+from tutti.index.chunk_index import ChunkIndex, StorePlan, _chunk_digest
 
 CT = 4  # 每个 chunk 的 token 数
 
@@ -37,6 +38,18 @@ class TestConstructor:
 
 
 class TestHashKeys:
+    def test_bulk_token_encoding_keeps_existing_key_format(self):
+        idx = ChunkIndex(4, CT)
+        parent = b"namespace"
+        chunk = _tokens(CT, 3)
+        expected_payload = b"".join(
+            token.to_bytes(8, "little") for token in chunk
+        )
+        expected = hashlib.blake2b(
+            parent + expected_payload, digest_size=16
+        ).digest()
+        assert _chunk_digest(parent, chunk) == expected
+
     def test_empty_and_short_input_yield_no_keys(self):
         idx = ChunkIndex(4, CT)
         assert idx.hash_keys([]) == ([], b"")
@@ -75,6 +88,15 @@ class TestHashKeys:
         idx = ChunkIndex(4, CT)
         with pytest.raises(ValueError):
             idx.hash_keys(_tokens(CT, 1), start=-1)
+
+    def test_max_keys_limits_incremental_work(self):
+        idx = ChunkIndex(8, CT)
+        tokens = _tokens(4 * CT, 1)
+        first, parent = idx.hash_keys(tokens, max_keys=1)
+        full, full_parent = idx.hash_keys(tokens)
+        assert first == full[:1]
+        assert parent == first[0]
+        assert full_parent == full[-1]
 
 
 class TestLookupPrefix:

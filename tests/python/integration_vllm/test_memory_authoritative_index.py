@@ -89,6 +89,34 @@ def test_lookup_never_scans_the_store(scheduler, monkeypatch):
     assert scans == []
 
 
+def test_lookup_reuses_request_prefix_hashes(scheduler, monkeypatch):
+    """Repeated scheduler callbacks do not re-hash a 128K-style prefix."""
+    tokens = list(range(4 * CHUNK_TOKENS))
+    req = _request("hash-cache", tokens)
+    index = scheduler._index
+    keys, _ = index.hash_keys(tokens)
+    assert index.plan_store(keys) is not None
+    index.confirm_store(keys)
+
+    calls = []
+    original = index.hash_keys
+
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(index, "hash_keys", counted)
+    for _ in range(8):
+        scheduler.get_num_new_matched_tokens(req, 0)
+    assert len(calls) == len(keys)
+
+    # Decode appends to the same output list: only the newly completed chunk
+    # needs a hash, and an incomplete tail needs none.
+    req.output_token_ids.extend(range(4 * CHUNK_TOKENS, 5 * CHUNK_TOKENS))
+    scheduler.get_num_new_matched_tokens(req, 0)
+    assert len(calls) == len(keys) + 1
+
+
 def test_all_rank_commits_publish_residency(scheduler):
     """全 TP rank 报告成功才发布驻留（与旧扫盘门禁同语义）。"""
     index = scheduler._index

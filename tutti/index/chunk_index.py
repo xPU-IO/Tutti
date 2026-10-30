@@ -25,6 +25,8 @@ token 序列按 chunk_tokens 切块并链式哈希为 key 序列，key 即跨进
 from __future__ import annotations
 
 import hashlib
+import sys
+from array import array
 from collections import Counter, OrderedDict
 from dataclasses import dataclass
 from typing import Iterable, Sequence
@@ -51,7 +53,13 @@ class StorePlan:
 
 def _chunk_digest(parent: bytes, chunk: Sequence[int]) -> bytes:
     """计算一个 chunk 的 key：blake2b(parent + 逐 token 8 字节小端拼接)。"""
-    payload = b"".join(t.to_bytes(_TOKEN_BYTES, "little") for t in chunk)
+    # ``b''.join(int.to_bytes(...) for ...)`` 在 128K prompt 上会让 Python
+    # 为每个 token 创建一个临时 bytes 对象。array 的 C 实现一次性完成
+    # 8-byte 编码；大端机器上显式换序，保证和旧实现及盘上 key 完全一致。
+    payload_array = array("Q", chunk)
+    if sys.byteorder != "little":
+        payload_array.byteswap()
+    payload = payload_array.tobytes()
     return hashlib.blake2b(parent + payload, digest_size=_KEY_BYTES).digest()
 
 
@@ -239,11 +247,26 @@ class ChunkIndex:
             self._resident.move_to_end(parent)
         return matched
 
+    def lookup_prefix_keys(self, keys: Sequence[bytes]) -> int:
+        """按已计算好的 key 链查询连续驻留前缀。
+
+        调度热路径会对同一个请求重复查询。请求侧可以缓存 key 链，
+        这里仅做驻留/LRU 查询，从而避免每一步重新哈希整个 prompt。
+        """
+        matched = 0
+        for key in keys:
+            if key not in self._resident:
+                break
+            matched += self._chunk_tokens
+            self._resident.move_to_end(key)
+        return matched
+
     def hash_keys(
         self,
         token_ids: Sequence[int],
         start: int = 0,
         parent: bytes | None = None,
+        max_keys: int | None = None,
     ) -> tuple[list[bytes], bytes]:
         """把 token_ids 从下标 start 起折叠为 key 序列。
 
@@ -254,11 +277,16 @@ class ChunkIndex:
         """
         if start < 0:
             raise ValueError(f"start must be non-negative, got {start!r}")
+        if max_keys is not None and max_keys <= 0:
+            raise ValueError(f"max_keys must be positive, got {max_keys!r}")
         if parent is None:
             parent = self._namespace
         keys: list[bytes] = []
         step = self._chunk_tokens
-        for i in range(start, len(token_ids) - step + 1, step):
+        end = len(token_ids) - step + 1
+        if max_keys is not None:
+            end = min(end, start + max_keys * step)
+        for i in range(start, end, step):
             parent = _chunk_digest(parent, token_ids[i:i + step])
             keys.append(parent)
         return keys, parent

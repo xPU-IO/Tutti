@@ -72,14 +72,19 @@ class SchedulerMetadataIndex:
         self._require_open()
         return self._index.lookup_prefix(token_ids)
 
+    def lookup_prefix_keys(self, keys: Sequence[bytes]) -> int:
+        self._require_open()
+        return self._index.lookup_prefix_keys(keys)
+
     def hash_keys(
         self,
         token_ids: Sequence[int],
         start: int = 0,
         parent: bytes | None = None,
+        max_keys: int | None = None,
     ) -> tuple[list[bytes], bytes]:
         self._require_open()
-        return self._index.hash_keys(token_ids, start, parent)
+        return self._index.hash_keys(token_ids, start, parent, max_keys)
 
     def plan_store(self, keys) -> StorePlan | None:
         self._require_open()

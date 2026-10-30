@@ -1490,13 +1490,14 @@ class KVEngine:
         token_ids: Sequence[int],
         start: int = 0,
         parent: bytes | None = None,
+        max_keys: int | None = None,
     ) -> tuple[list[bytes], bytes]:
         """把 token 序列折叠为 chunk key 链（转发语义索引）。
 
         parent 未给时自命名空间起（见 ChunkIndex.hash_keys）。
         """
         self._require_open()
-        return self._index.hash_keys(token_ids, start, parent)
+        return self._index.hash_keys(token_ids, start, parent, max_keys)
 
     def plan_store(self, keys) -> StorePlan | None:
         """受理写入计划并预留容量（转发语义索引）。

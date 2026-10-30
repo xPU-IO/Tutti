@@ -121,6 +121,23 @@ class _RequestTracker:
 
 
 @dataclass
+class _PrefixHashCache:
+    """One request's incrementally computed prefix key chain.
+
+    vLLM keeps prompt tokens immutable and appends decode tokens to the same
+    output list.  The list identities and lengths are used as the cheap
+    version check; replacing either list invalidates the cache.
+    """
+
+    prompt_id: int
+    output_id: int
+    prompt_len: int
+    output_len: int
+    keys: list[bytes] = field(default_factory=list)
+    parent: bytes | None = None
+
+
+@dataclass
 class _ReqMeta:
     """单个请求的传输计划（只用基本类型；worker 进程内自行展开）。"""
 
@@ -205,6 +222,14 @@ class TuttiConnectorV1(KVConnectorBase_V1):
         )
         # 调度侧请求记账
         self._trackers: dict[str, _RequestTracker] = {}
+        # Prefix key chains are request-local and bounded by the number of
+        # complete chunks (typically 512 for a 128K prompt).  They avoid
+        # re-hashing the same prefix on every scheduler callback.
+        self._prefix_hash_cache: dict[str, _PrefixHashCache] = {}
+        self._prefix_hash_calls = 0
+        self._prefix_hash_cache_hits = 0
+        self._prefix_hash_chunks = 0
+        self._prefix_hash_ms = deque(maxlen=1024)
         self._pending_loads: dict[str, int] = {}
         # 调度侧活请求引用（fork 语义：cached 步的 token 增量须从活
         # 请求对象切片——scheduled_cached_reqs.new_token_ids 仅 PP 时
@@ -394,7 +419,7 @@ class TuttiConnectorV1(KVConnectorBase_V1):
         """
         tokens = list(getattr(request, "prompt_token_ids", None) or [])
         tokens += list(getattr(request, "output_token_ids", None) or [])
-        hit = self._index.lookup_prefix(tokens)
+        hit = self._lookup_request_prefix(request, tokens)
         new = max(0, hit - num_computed_tokens)
         # 命中上限：为生成首 token 保留至少一个待计算 token
         # （num_new_tokens ≥ 1，vLLM 调度推进前提；legacy 同语义）。
@@ -546,6 +571,18 @@ class TuttiConnectorV1(KVConnectorBase_V1):
             snapshot.get("eviction_drift_total"),
             snapshot.get("pending_reclaimed_total"),
         )
+        hash_p50 = self._percentile(list(self._prefix_hash_ms), .50)
+        hash_p95 = self._percentile(list(self._prefix_hash_ms), .95)
+        hash_rate = (
+            self._prefix_hash_cache_hits / self._prefix_hash_calls
+            if self._prefix_hash_calls else 0.0
+        )
+        logger.info(
+            "[tutti] index-profile hash_calls=%d cache_reuse=%.3f "
+            "hashed_chunks=%d hash_ms_p50=%s hash_ms_p95=%s",
+            self._prefix_hash_calls, hash_rate, self._prefix_hash_chunks,
+            _fmt(hash_p50, 3), _fmt(hash_p95, 3),
+        )
         if self._policy is not None:
             p = self._policy.snapshot()
             logger.info(
@@ -635,6 +672,7 @@ class TuttiConnectorV1(KVConnectorBase_V1):
             self._live_requests.pop(req_id, None)
             self._pending_loads.pop(req_id, None)
             self._load_starts.pop(req_id, None)
+            self._prefix_hash_cache.pop(str(req_id), None)
         prefill_work = False
         scheduled_tokens = getattr(scheduler_output, "num_scheduled_tokens", None) or {}
         for req_id, count in scheduled_tokens.items():
@@ -858,6 +896,7 @@ class TuttiConnectorV1(KVConnectorBase_V1):
         self._live_requests.pop(request.request_id, None)
         self._load_starts.pop(request.request_id, None)
         self._match_starts.pop(request.request_id, None)
+        self._prefix_hash_cache.pop(str(request.request_id), None)
         self._load_async.pop(request.request_id, None)
         self._async_started_ns.pop(request.request_id, None)
         self._async_ready_ns.pop(request.request_id, None)
@@ -866,6 +905,60 @@ class TuttiConnectorV1(KVConnectorBase_V1):
         return False, None
 
     # ---- 内部 ----
+
+    def _lookup_request_prefix(self, request, tokens: list[int]) -> int:
+        """Incrementally hash and query one request's prefix.
+
+        Only one new chunk is hashed per call, and only while all previously
+        computed chunks are resident.  This preserves the old early-stop
+        behavior on a cold cache while making repeated scheduler calls O(1)
+        until the request grows across a chunk boundary.
+        """
+        req_id = str(request.request_id)
+        started_ns = time.perf_counter_ns()
+        self._prefix_hash_calls += 1
+        prompt = getattr(request, "prompt_token_ids", None)
+        output = getattr(request, "output_token_ids", None)
+        prompt = prompt if prompt is not None else ()
+        output = output if output is not None else ()
+        prompt_len = len(prompt)
+        output_len = len(output)
+        cached = self._prefix_hash_cache.get(req_id)
+        if (cached is None or cached.prompt_id != id(prompt)
+                or cached.output_id != id(output)
+                or cached.prompt_len != prompt_len
+                or output_len < cached.output_len):
+            cached = _PrefixHashCache(
+                prompt_id=id(prompt), output_id=id(output),
+                prompt_len=prompt_len, output_len=output_len,
+            )
+            self._prefix_hash_cache[req_id] = cached
+        else:
+            cached.output_len = output_len
+            self._prefix_hash_cache_hits += 1
+
+        total_chunks = len(tokens) // self._chunk_tokens
+        old_chunks = len(cached.keys)
+        while len(cached.keys) < total_chunks:
+            # If the already computed chain stops at a cold chunk, do not
+            # spend CPU hashing later chunks that cannot be used yet.  Once
+            # the chunk becomes resident, the next callback resumes here.
+            if (self._index.lookup_prefix_keys(cached.keys)
+                    < len(cached.keys) * self._chunk_tokens):
+                break
+            start = len(cached.keys) * self._chunk_tokens
+            new_keys, parent = self._index.hash_keys(
+                tokens, start=start, parent=cached.parent, max_keys=1
+            )
+            if not new_keys:
+                break
+            cached.keys.append(new_keys[0])
+            cached.parent = parent
+        self._prefix_hash_chunks += len(cached.keys) - old_chunks
+        self._prefix_hash_ms.append(
+            max(0.0, (time.perf_counter_ns() - started_ns) / 1e6)
+        )
+        return self._index.lookup_prefix_keys(cached.keys)
 
     def _block_usage(self, req_id: str) -> tuple[int, int, int | None]:
         """(在算的其他请求数, 异步加载占着的块数, 估计空闲块数)。
