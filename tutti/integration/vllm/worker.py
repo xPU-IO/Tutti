@@ -1088,10 +1088,22 @@ class WorkerImpl:
                 # 否则后续 _submit 以 "plan lacks chunk" fail-closed，
                 # 打死 worker 连带整个 server（2026-09-20 在线驱逐压测）。
                 before = len(keys)
+                planned_keys = list(keys)
                 keys, generations, block_tables = self._select_new_chunks(
                     keys, generations, block_tables, admitted
                 )
                 if len(keys) != before:
+                    # ``plan_store`` reserved every key before the physical
+                    # object pool applied its own capacity gate.  Dropped
+                    # keys must be settled immediately; otherwise they stay
+                    # pending until the age based reclaim path, steadily
+                    # leaking capacity and turning normal pressure into a
+                    # permanent DIRECT_WRITE_CAPACITY_TRIM loop.
+                    kept = set(keys)
+                    dropped = [key for key in planned_keys if key not in kept]
+                    if dropped:
+                        self._engine.confirm_store(dropped, ok=False)
+                        self._record_store_outcome(dropped, ok=False)
                     _LOG.warning(
                         "DIRECT_WRITE_CAPACITY_TRIM 池容量受理 %d/%d chunk"
                         "（未受理的本步不写；容量耗尽在驱逐压力下是稳态）",

@@ -2548,6 +2548,29 @@ def test_worker_write_batch_excludes_resident_chunks():
     engine.close()
 
 
+def test_worker_write_capacity_trim_rolls_back_pending_keys(monkeypatch):
+    """Physical slot shortfall must not leak semantic pending reservations."""
+    engine = _bound_engine()
+    tokens = list(range(256))
+    key = engine.hash_keys(tokens)[0][0]
+    worker = WorkerImpl(engine)
+    worker._ensure_bound = lambda: None
+    worker._chunk_tokens = 256
+    worker._block_size = 128
+    worker._metadata = SimpleNamespace(requests=[SimpleNamespace(
+        token_ids=tokens, save_chunk_start=0, save_chunk_count=1,
+        block_ids=[0, 1], save_generations=["g"],
+    )])
+    monkeypatch.setattr(engine, "prepare_write_targets", lambda _keys: [])
+
+    worker._prepare_write_batch()
+
+    assert worker._save_keys == []
+    assert engine._index.stats()["pending"] == 0
+    assert key in worker._store_failed
+    engine.close()
+
+
 def _bound_engine(capacity=4):
     runtime = FakeRuntime()
     store = FakeEngineStore(runtime)

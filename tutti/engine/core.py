@@ -446,6 +446,11 @@ class _AsyncReadPlan:
                 if self._managed:
                     self._backend.start_detached_read(self._target_plan)
                 self._started = True
+            elif not self._detached_submit_allowed():
+                # A completed foreground fence can appear between detached
+                # layer submissions. Pause before the next layer until the
+                # worker opens the next feeder epoch.
+                return False
             physical = self.physical_layers[len(self._submitted_layers)]
             if self._managed:
                 completion = self._backend.try_get_paged_batch(
