@@ -499,6 +499,8 @@ class WorkerImpl:
         )
         # configure 注入
         self._chunk_tokens = 0
+        self._physical_chunk_tokens = 0
+        self._blocks_per_chunk = 0
         self._chunk_kv_bytes = 0
         self._max_chunks_per_wave = 0
         self._block_size = 16
@@ -600,6 +602,8 @@ class WorkerImpl:
         chunk_kv_bytes: int,
         max_chunks_per_wave: int,
         block_size: int,
+        physical_chunk_tokens: int | None = None,
+        blocks_per_chunk: int | None = None,
         lookahead_k: int | None = None,
         kv_group_layer_names=None,
     ) -> None:
@@ -609,6 +613,7 @@ class WorkerImpl:
         统一透传策略参数；缺省保持构造时的值。
         """
         self._chunk_tokens = chunk_tokens
+        self._physical_chunk_tokens = physical_chunk_tokens or chunk_tokens
         self._chunk_kv_bytes = chunk_kv_bytes
         self._max_chunks_per_wave = max_chunks_per_wave
         if lookahead_k is not None:
@@ -619,6 +624,9 @@ class WorkerImpl:
                 )
             self._lookahead_k = lookahead_k
         self._block_size = block_size
+        self._blocks_per_chunk = blocks_per_chunk or (
+            -(-self._physical_chunk_tokens // self._block_size)
+        )
         if kv_group_layer_names is not None:
             self._kv_group_layer_names = tuple(kv_group_layer_names)
         if self._diag_enabled:
@@ -2152,7 +2160,9 @@ class WorkerImpl:
     def _chunk_block_tables(self, meta, count: int) -> list[list[int]]:
         """计算前 count 个 chunk 各自的块号表（块号可任意分布）。"""
         blocks = meta.block_ids
-        per_chunk = -(-self._chunk_tokens // self._block_size)
+        per_chunk = self._blocks_per_chunk or (
+            -(-self._physical_chunk_tokens // self._block_size)
+        )
         return [
             list(blocks[i * per_chunk:(i + 1) * per_chunk])
             for i in range(count)
@@ -2161,7 +2171,9 @@ class WorkerImpl:
     def _report_load_errors(self, request_ordinal: int, meta,
                             first_chunk: int, n_chunks: int) -> None:
         """把读取未遂区间覆盖的块上报为重算。"""
-        per_chunk = -(-self._chunk_tokens // self._block_size)
+        per_chunk = self._blocks_per_chunk or (
+            -(-self._physical_chunk_tokens // self._block_size)
+        )
         blocks = meta.block_ids
         start_blk = first_chunk * per_chunk
         end_blk = min((first_chunk + n_chunks) * per_chunk, len(blocks))
@@ -2278,7 +2290,9 @@ class WorkerImpl:
             )
         self._configure_callback_map(num_layers)
         segment_bytes = self._chunk_kv_bytes // num_layers
-        blocks_per_chunk = -(-self._chunk_tokens // self._block_size)
+        blocks_per_chunk = self._blocks_per_chunk or (
+            -(-self._physical_chunk_tokens // self._block_size)
+        )
         direct_pool = self._cross_pool if self._cross_pool is not None else self._kv_caches
         try_direct = getattr(self._engine, "try_bind_direct", None)
         if callable(try_direct) and try_direct(
@@ -2352,7 +2366,7 @@ class WorkerImpl:
             )
             hooks = PagedTransferHooks(
                 layer_view, staging, segment_bytes,
-                self._chunk_tokens, self._block_size, fmt,
+                self._physical_chunk_tokens, self._block_size, fmt,
             )
             gather_fn, scatter_fn = hooks.gather, hooks.scatter
         bind_caches = self._kv_caches if self._kv_caches else (

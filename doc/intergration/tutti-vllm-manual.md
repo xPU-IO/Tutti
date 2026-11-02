@@ -116,7 +116,9 @@ bash scripts/vllm/run/bench-8gpu-striped.sh \
 注意`POOL_TAG`不隔离payload；本次验收使用测试专属同文件系统目录，没有复用Hy3生产段文件。
 
 支持限制：仅NVIDIA packed NHD主KV和连续index页、同一逻辑block表、64KiB base对齐及
-4KiB IO对齐。要求`enforce_eager=True`，CUDA graph、split K/V、HND及多group尚未支持。
+4KiB IO对齐。MiniMax TP8 支持 DCP=1/2；DCP=2 使用 rank-local token shard，关闭旧的
+`replica_io` fanout。逐层 KV 回调可运行在 `enforce_eager=True`，或 Inductor
+`mode=3,cudagraph_mode=PIECEWISE`；FULL CUDA graph、split K/V、HND及多group尚未支持。
 不会为了对齐再复制整份KV池。不要用`KV_CACHE_DTYPE=fp8`代替本次验证的`auto`。
 上述离线 driver 没有 EP、FP8 KV 或独立最大 context 参数，不能把在线参数直接当作
 离线已验证配置。在线服务另经本机 TP8/EP8、主 KV `fp8_e4m3`、index `bf16`、block128、

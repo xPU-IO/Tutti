@@ -35,7 +35,8 @@ def test_minimax_replica_members_and_namespace(monkeypatch):
     for rank in range(8):
         groups = replica_groups_for(e, rank)
         assert len(groups) == 117
-        assert all(group == (rank,) for group in groups[:60])
+        expected_main = (rank // 2 * 2, rank // 2 * 2 + 1)
+        assert all(group == expected_main for group in groups[:60])
         assert all(group == tuple(range(8)) for group in groups[60:])
     assert key_namespace(c, e) != key_namespace(c, dict(e, replica_io=False))
 
@@ -47,11 +48,10 @@ def test_replica_background_load_mode_allowed(monkeypatch, mode):
     validate_replica_io(config(), extra())
 
 
-def test_async_completion_rejected(monkeypatch):
+def test_async_completion_allowed(monkeypatch):
     monkeypatch.setenv("TUTTI_LOAD_MODE", "sync")
     monkeypatch.setenv("TUTTI_ASYNC_COMPLETION", "1")
-    with pytest.raises(ValueError, match="synchronous NVMe"):
-        validate_replica_io(config(), extra())
+    validate_replica_io(config(), extra())
 
 
 @pytest.mark.parametrize("change", ["tp", "model", "heads", "eager", "entities", "type"])
@@ -94,14 +94,31 @@ def test_replica_allows_explicit_compilation_without_graph(monkeypatch):
     validate_replica_io(c, extra())
 
 
-@pytest.mark.parametrize("graph", ["FULL", "PIECEWISE", None])
-def test_replica_rejects_graph_capture_even_with_compilation(monkeypatch, graph):
+@pytest.mark.parametrize("graph", ["FULL", None])
+def test_replica_rejects_unsupported_graph_capture(monkeypatch, graph):
     monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "0")
     c = config()
     c.model_config.enforce_eager = False
     c.compilation_config = NS(mode=3, cudagraph_mode=graph)
     with pytest.raises(ValueError, match="CUDA graph"):
         validate_replica_io(c, extra())
+
+
+def test_replica_allows_piecewise_capture(monkeypatch):
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "0")
+    c = config()
+    c.model_config.enforce_eager = False
+    c.compilation_config = NS(mode=3, cudagraph_mode=NS(name="PIECEWISE"))
+    validate_replica_io(c, extra())
+
+
+def test_dcp2_disables_replica_io_and_preserves_unique_head_shards():
+    c, e = config(), extra()
+    c.parallel_config.decode_context_parallel_size = 2
+    with pytest.raises(ValueError, match="disable replica_io"):
+        validate_replica_io(c, e)
+    e["replica_io"] = False
+    validate_replica_io(c, e)
 
 
 def test_configuration_module_does_not_import_data_plane():

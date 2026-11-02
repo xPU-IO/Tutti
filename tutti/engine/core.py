@@ -1451,6 +1451,14 @@ class KVEngine:
     def __init__(self, config: dict, store):
         """config 见类契约；store 为 KVStore 实现。参数非法 → ValueError。"""
         self._chunk_tokens = positive_int(config, "chunk_tokens")
+        physical_chunk_tokens = config.get(
+            "physical_chunk_tokens", self._chunk_tokens
+        )
+        if not is_int(physical_chunk_tokens) or physical_chunk_tokens <= 0:
+            raise ValueError(
+                "config['physical_chunk_tokens'] must be a positive integer"
+            )
+        self._physical_chunk_tokens = int(physical_chunk_tokens)
         self._chunk_kv_bytes = positive_int(config, "chunk_kv_bytes")
         self._max_chunks_per_wave = positive_int(config, "max_chunks_per_wave")
         for name in ("gather_fn", "scatter_fn"):
@@ -1531,6 +1539,11 @@ class KVEngine:
         """查询前缀命中的 token 数（转发语义索引）。"""
         self._require_open()
         return self._index.lookup_prefix(token_ids)
+
+    def lookup_prefix_keys(self, keys: Sequence[bytes]) -> int:
+        """Query a previously hashed prefix chain by chunk key."""
+        self._require_open()
+        return self._index.lookup_prefix_keys(keys)
 
     def hash_keys(
         self,
@@ -1705,7 +1718,7 @@ class KVEngine:
             self._config,
             num_layers=num_layers,
             blocks_per_chunk=blocks_per_chunk,
-            chunk_tokens=self._chunk_tokens,
+            chunk_tokens=self._physical_chunk_tokens,
             segment_bytes=segment_bytes,
             max_chunks_per_wave=self._max_chunks_per_wave,
         )
@@ -1864,7 +1877,7 @@ class KVEngine:
                 config,
                 num_layers=num_layers,
                 blocks_per_chunk=blocks_per_chunk,
-                chunk_tokens=self._chunk_tokens,
+                chunk_tokens=self._physical_chunk_tokens,
                 segment_bytes=segment_bytes,
                 max_chunks_per_wave=self._max_chunks_per_wave,
             )

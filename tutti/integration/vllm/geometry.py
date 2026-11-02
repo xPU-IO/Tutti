@@ -79,13 +79,15 @@ def apply_wave_default(extra: dict, *, blocks_per_chunk: int = 1) -> dict:
     return resolved
 
 
-def resolve_geometry(extra: dict, kv_cache_config) -> dict:
+def resolve_geometry(extra: dict, kv_cache_config, *, dcp_size: int = 1) -> dict:
     """从 vLLM cache spec 推导 Tutti 的单组、定宽逐层几何。
 
     旧测试/调用方没有 KVCacheConfig 时仍可显式提供 num_layers 与
     chunk_kv_bytes。生产路径有 KVCacheConfig 时，显式值只允许与权威
     spec 一致，避免 scheduler 与 worker 使用不同字节布局。
     """
+    if not isinstance(dcp_size, int) or isinstance(dcp_size, bool) or dcp_size <= 0:
+        raise ValueError(f"dcp_size must be a positive integer, got {dcp_size!r}")
     if "prefetch_k" in extra:
         raise ValueError("prefetch_k 已删除，请使用 lookahead_k")
     resolved = dict(extra)
@@ -167,7 +169,20 @@ def resolve_geometry(extra: dict, kv_cache_config) -> dict:
         resolved["kv_layer_page_bytes"] = tuple(page_sizes)
 
     num_layers = len(layer_names)
-    blocks_per_chunk = resolved["chunk_tokens"] // block_size
+    if resolved["chunk_tokens"] % dcp_size:
+        raise ValueError(
+            f"chunk_tokens({resolved['chunk_tokens']}) must be divisible by "
+            f"dcp_size({dcp_size})"
+        )
+    # Keep hash chunks in global-token units. A DCP rank stores only its local
+    # token shard, so its physical transfer chunk is smaller by dcp_size.
+    physical_chunk_tokens = resolved["chunk_tokens"] // dcp_size
+    if physical_chunk_tokens % block_size:
+        raise ValueError(
+            f"physical chunk tokens({physical_chunk_tokens}) must be divisible "
+            f"by block_size({block_size})"
+        )
+    blocks_per_chunk = physical_chunk_tokens // block_size
     segment_bytes = blocks_per_chunk * max(page_sizes)
     chunk_kv_bytes = num_layers * segment_bytes
     for key, derived in (
@@ -183,6 +198,10 @@ def resolve_geometry(extra: dict, kv_cache_config) -> dict:
         resolved[key] = derived
     resolved["kv_group_layer_names"] = tuple(layer_names)
     resolved["kv_block_tokens"] = block_size
+    resolved["scheduler_block_tokens"] = block_size * dcp_size
+    resolved["dcp_size"] = dcp_size
+    resolved["physical_chunk_tokens"] = physical_chunk_tokens
+    resolved["blocks_per_chunk"] = blocks_per_chunk
     resolved["kv_page_bytes"] = max(page_sizes)
     return apply_wave_default(resolved, blocks_per_chunk=blocks_per_chunk)
 
@@ -217,7 +236,9 @@ def resolve_io_budget(options: dict, extra: dict, vllm_config) -> dict:
         # Async reads can aggregate requests across scheduler steps. Shrinking
         # their batch by a single-step limit would multiply retained op handles.
         if known and load_mode == "sync":
-            blocks_per_chunk = extra["chunk_tokens"] // block_tokens
+            blocks_per_chunk = int(extra.get(
+                "blocks_per_chunk", extra["chunk_tokens"] // block_tokens
+            ))
             wave_blocks = extra["max_chunks_per_wave"] * blocks_per_chunk
             requests = cdiv(context, block_tokens) * sequences
             expansion = cdiv(page_bytes, 4096)
@@ -357,16 +378,20 @@ def key_namespace(vllm_config, extra: dict) -> str:
     model = getattr(getattr(vllm_config, "model_config", None), "model", "")
     cache_cfg = getattr(vllm_config, "cache_config", None)
     dtype = getattr(cache_cfg, "cache_dtype", "") or ""
-    tp = getattr(getattr(vllm_config, "parallel_config", None),
-                 "tensor_parallel_size", 1)
+    parallel = getattr(vllm_config, "parallel_config", None)
+    tp = getattr(parallel, "tensor_parallel_size", 1)
+    dcp = int(getattr(parallel, "decode_context_parallel_size", 1) or 1)
+    interleave = int(getattr(parallel, "cp_kv_cache_interleave_size", 1) or 1)
     return "|".join([
         "v2",
         f"model={model}",
         f"dtype={dtype}",
         f"tp={tp}",
+        f"dcp={dcp}",
+        f"cp_interleave={interleave}",
         f"chunk_kv_bytes={extra.get('chunk_kv_bytes')}",
         f"chunk_tokens={extra.get('chunk_tokens')}",
         *([f"entity_pages={extra['kv_group_page_bytes']}", "kv_layout=NHD-v1"]
           if "kv_group_page_bytes" in extra else []),
-        *(["replica_io=minimax-tp8-index-only-v2"] if extra.get("replica_io", False) else []),
+        *(["replica_io=minimax-dcp-aware-v4"] if extra.get("replica_io", False) else []),
     ])

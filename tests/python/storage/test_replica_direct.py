@@ -372,6 +372,20 @@ def test_async_compute_wait_still_enqueues_plain_owned_io_handles(monkeypatch):
     assert calls == [([11, 12], 123)]
 
 
+def test_async_replica_wait_uses_the_owned_io_stream(monkeypatch):
+    from types import SimpleNamespace as NS
+    import tutti.storage.tutti_nvme.store as module
+    monkeypatch.setattr(module, "_ASYNC_COMPLETION", True)
+    calls = []
+    store = NS(
+        _runtime=NS(enqueue_wait=lambda handles, stream: calls.append((handles, stream))),
+        _stream_for=lambda direction: (456, NS(cuda_stream=456)),
+    )
+    completion = NS(_settled=False, _handles=[21, 22])
+    assert module.TuttiKVStore.enqueue_io_wait(store, [completion], "read_async") is True
+    assert calls == [([21, 22], 456)]
+
+
 def test_busy_close_keeps_final_registered_backing_and_readonly_exports():
     from types import SimpleNamespace as NS
     from tutti.storage.tutti_nvme.replica_direct import TuttiReplicaDirectBackend

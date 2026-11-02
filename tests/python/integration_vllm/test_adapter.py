@@ -235,11 +235,10 @@ class TestMounting:
             _make_vllm_config()
         ) == "NHD"
 
-    def test_dcp_rejected_before_engine_open(self):
+    def test_dcp2_is_accepted_before_engine_open(self):
         cfg = _make_vllm_config()
         cfg.parallel_config.decode_context_parallel_size = 2
-        with pytest.raises(ValueError, match="decode_context_parallel_size=2"):
-            TuttiConnectorV1(cfg, KVConnectorRole.SCHEDULER, object())
+        TuttiConnectorV1(cfg, KVConnectorRole.SCHEDULER, object())
 
     def test_missing_engine_key_rejected(self):
         cfg = _make_vllm_config()
@@ -268,6 +267,15 @@ class TestGeometryResolution:
         }
         got = resolve_geometry(extra, self._kv_cache_config())
         assert got["num_layers"] == NUM_LAYERS
+        assert got["chunk_kv_bytes"] == 2 * SEG * NUM_LAYERS
+
+    def test_dcp2_uses_rank_local_physical_chunk_geometry(self):
+        extra = {"chunk_tokens": 4 * BLOCK_SIZE}
+        got = resolve_geometry(extra, self._kv_cache_config(), dcp_size=2)
+        assert got["chunk_tokens"] == 4 * BLOCK_SIZE
+        assert got["physical_chunk_tokens"] == 2 * BLOCK_SIZE
+        assert got["scheduler_block_tokens"] == 2 * BLOCK_SIZE
+        assert got["blocks_per_chunk"] == 2
         assert got["chunk_kv_bytes"] == 2 * SEG * NUM_LAYERS
 
     def test_connector_injects_derived_geometry_into_store(self):

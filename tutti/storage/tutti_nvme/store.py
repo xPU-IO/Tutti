@@ -2233,6 +2233,35 @@ class TuttiKVStore:
             self._runtime.enqueue_wait(list(handles), int(stream))
         return True
 
+    def enqueue_io_wait(self, completions, direction: str) -> bool:
+        """Enqueue async IO completion waits on a store-owned CUDA stream.
+
+        Replica fanout uses this before recording its owner-page fence.  The
+        generic completion helper targets the current compute stream, which is
+        unavailable on the read-service thread and would otherwise leave a
+        submit-only event masquerading as DMA completion.
+        """
+        if not _ASYNC_COMPLETION:
+            return False
+        if any(getattr(completion, "fence_event", None) is not None
+               for completion in completions):
+            return False
+        handles = []
+        for completion in completions:
+            if getattr(completion, "_settled", False):
+                continue
+            handles.extend(getattr(completion, "_handles", ()) or ())
+        if not handles:
+            return True
+        stream, stream_obj = self._stream_for(direction)
+        if stream_obj is not None:
+            stream = int(stream_obj.cuda_stream)
+        if not stream:
+            raise RuntimeError(f"async IO wait stream is unavailable: {direction}")
+        with nvtx_range(f"tutti.direct.enqueue_io_wait|direction={direction}|handles={len(handles)}"):
+            self._runtime.enqueue_wait(list(handles), int(stream))
+        return True
+
     def read_copy_stream_handle(self) -> int:
         """Return the controlled stream handle used for scatter release fences."""
         return int(self._read_copy_stream or 0)

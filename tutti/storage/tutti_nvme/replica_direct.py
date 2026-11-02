@@ -795,9 +795,6 @@ class TuttiReplicaDirectBackend(TuttiLayerwiseDirectBackend):
                 finished = state["submit"].advance()
             finally:
                 parts = self._capture_submissions(state)
-            from .store import _ASYNC_COMPLETION
-            if _ASYNC_COMPLETION:
-                self._store.enqueue_compute_wait(parts[count:])
             if not finished:
                 return
             completion = self._batch_completion(parts)
@@ -807,17 +804,37 @@ class TuttiReplicaDirectBackend(TuttiLayerwiseDirectBackend):
             state["io_done"] = done
             if parts:
                 self._owned_work[-1] = (parts[-1], done)
+            from .store import _ASYNC_COMPLETION
+            if _ASYNC_COMPLETION:
+                if not self._store.enqueue_io_wait(parts, self._io_direction):
+                    raise RuntimeError("replica async IO wait could not be enqueued")
             done.record(self._store._stream_for(self._io_direction)[1])
             if len(members) == 1:
+                # In async mode ``done`` is recorded after enqueue_io_wait,
+                # so it is a real DMA-completion fence rather than a submit
+                # event.  Keep the handle retained for final status draining.
                 completion.fence_event = done
+                if _ASYNC_COMPLETION:
+                    state["cq_done"] = True
                 self._local_completions[physical] = completion
         if len(members) > 1:
-            self._signals.ready(physical, done.ipc_handle())
+            state["ready_handle"] = done.ipc_handle()
+            state["ready_published"] = False
+            if not _ASYNC_COMPLETION:
+                self._signals.ready(physical, state["ready_handle"])
+                state["ready_published"] = True
         state["phase"] = "ready"
         state["deadline"] = time.monotonic() + _POLL_SECONDS
 
     def _advance_owned(self, state):
         if state.get("cq_done"):
+            return
+        from .store import _ASYNC_COMPLETION
+        # Local entities do not need a host CQ gate: the worker will enqueue
+        # runtime.enqueue_wait for their handle on the compute stream.  Polling
+        # here would settle/release the handle before that device wait is
+        # enqueued, turning the submit-only fence into an unsafe shortcut.
+        if _ASYNC_COMPLETION and len(state["members"]) == 1:
             return
         parts = state.get("parts")
         if parts is None:
@@ -836,11 +853,20 @@ class TuttiReplicaDirectBackend(TuttiLayerwiseDirectBackend):
             outcome = completion.wait_result(0)
             if index not in accounted:
                 self._stats["read_bytes"] += sum(r.confirmed_bytes for r in outcome.results)
+                completion._replica_stats_accounted = True
                 accounted.add(index)
             if not outcome.ok:
                 raise RuntimeError(str(outcome))
         if state["phase"] != "submit" and all(status is True for status in statuses):
             state["cq_done"] = True
+            if (_ASYNC_COMPLETION and len(state["members"]) > 1
+                    and not state.get("ready_published", False)):
+                # The host has now observed terminal success.  Publishing the
+                # already-recorded IPC event is safe because peers cannot see
+                # it until this control notification arrives; no submit-only
+                # event is used as an early data dependency.
+                self._signals.ready(state["physical"], state["ready_handle"])
+                state["ready_published"] = True
 
     def _peer_phase_ready(self, state, phase):
         keys = [f"{self._epoch}/{phase}/{state['physical']}/{rank}" for rank in state["members"]]
@@ -854,6 +880,13 @@ class TuttiReplicaDirectBackend(TuttiLayerwiseDirectBackend):
         physical, members = state["physical"], state["members"]
         if physical != self._entity_sequence[self._next_entity]:
             raise RuntimeError("replica prefetch entity order differs")
+        from .store import _ASYNC_COMPLETION
+        # Replica consumers must not read an owner page until its async
+        # completion has been observed as terminal-success.  This gate is
+        # intentionally host-side for now; it removes the long-lived NVMe
+        # submit kernel while preserving fail-closed behavior on CQ errors.
+        if _ASYNC_COMPLETION and len(members) > 1 and not state.get("cq_done"):
+            return
         if len(members) == 1:
             ready = state["io_done"]
         else:
@@ -945,6 +978,11 @@ class TuttiReplicaDirectBackend(TuttiLayerwiseDirectBackend):
                                 raise TimeoutError("replica IO drain timed out; backing retained")
                             time.sleep(0.001)
                         outcome = completion.wait_result()
+                        if not getattr(completion, "_replica_stats_accounted", False):
+                            self._stats["read_bytes"] += sum(
+                                item.confirmed_bytes for item in outcome.results
+                            )
+                            completion._replica_stats_accounted = True
                         if not outcome.ok:
                             self._fail(RuntimeError(str(outcome)))
             if self._parent is None and self._store._deferred_completions:

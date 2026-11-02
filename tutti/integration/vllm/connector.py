@@ -179,7 +179,13 @@ class TuttiConnectorV1(KVConnectorBase_V1):
     def __init__(self, vllm_config, role, kv_cache_config=None):
         """三参与 vLLM 工厂签名对齐；role 决定本实例承载的回调面。"""
         super().__init__(vllm_config, role, kv_cache_config)
-        extra = resolve_geometry(extra_config(vllm_config), kv_cache_config)
+        dcp = int(getattr(
+            getattr(vllm_config, "parallel_config", None),
+            "decode_context_parallel_size", 1,
+        ) or 1)
+        extra = resolve_geometry(
+            extra_config(vllm_config), kv_cache_config, dcp_size=dcp
+        )
         from .replica_layout import validate_replica_io
         validate_replica_io(vllm_config, extra)
         self._vllm_config = vllm_config
@@ -188,17 +194,10 @@ class TuttiConnectorV1(KVConnectorBase_V1):
         if self._layerwise_kv:
             from .replica_layout import validate_layerwise_execution
             validate_layerwise_execution(vllm_config)
-        dcp = getattr(
-            getattr(vllm_config, "parallel_config", None),
-            "decode_context_parallel_size",
-            1,
-        )
-        if dcp != 1:
-            # Scheduler blocks and worker slot mappings are DCP-rank/interleave
-            # dependent. Fail before either role constructs its store/index.
+        if dcp not in (1, 2):
             raise ValueError(
-                "TuttiConnectorV1 当前不支持 decode context parallelism；"
-                f"decode_context_parallel_size={dcp}，必须为 1"
+                "TuttiConnectorV1 supports decode_context_parallel_size 1 or 2; "
+                f"got {dcp}"
             )
         # 两个角色承载的对象类型不同，分开命名以免同一个字段承载两种语义：
         # WORKER 持有数据面引擎（KVEngine），SCHEDULER 持有仅元数据索引
@@ -210,6 +209,9 @@ class TuttiConnectorV1(KVConnectorBase_V1):
         else:
             self._index = scheduler_index_for(vllm_config, extra)
         self._chunk_tokens = extra["chunk_tokens"]
+        self._physical_chunk_tokens = extra.get(
+            "physical_chunk_tokens", self._chunk_tokens
+        )
         self._min_retrieve_tokens = extra.get("min_retrieve_tokens", 0)
         self._max_tokens_per_load = extra.get("max_tokens_per_load", 0)
         # 内存权威索引的发布门禁：全部 TP rank 报告持久化成功才驻留。
@@ -217,9 +219,11 @@ class TuttiConnectorV1(KVConnectorBase_V1):
             getattr(vllm_config, "parallel_config", None),
             "tensor_parallel_size", 1,
         ) or 1)
-        self._block_size = getattr(
-            getattr(vllm_config, "cache_config", None), "block_size", 16
+        self._block_size = extra.get(
+            "scheduler_block_tokens",
+            getattr(getattr(vllm_config, "cache_config", None), "block_size", 16),
         )
+        self._kv_block_tokens = extra.get("kv_block_tokens", self._block_size)
         # 调度侧请求记账
         self._trackers: dict[str, _RequestTracker] = {}
         # Prefix key chains are request-local and bounded by the number of
@@ -307,7 +311,9 @@ class TuttiConnectorV1(KVConnectorBase_V1):
                 chunk_tokens=self._chunk_tokens,
                 chunk_kv_bytes=extra["chunk_kv_bytes"],
                 max_chunks_per_wave=extra["max_chunks_per_wave"],
-                block_size=self._block_size,
+                block_size=self._kv_block_tokens,
+                physical_chunk_tokens=self._physical_chunk_tokens,
+                blocks_per_chunk=extra.get("blocks_per_chunk"),
                 lookahead_k=extra.get("lookahead_k", 2),
                 kv_group_layer_names=extra.get("kv_group_layer_names"),
             )

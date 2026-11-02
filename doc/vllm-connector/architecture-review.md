@@ -1521,7 +1521,10 @@ FlashInfer:      [block, 2, token, head, dim]
 - `third_pkgs/vllm/vllm/v1/core/single_type_kv_cache_manager.py:73`
 - `third_pkgs/vllm/vllm/v1/worker/block_table.py:214`
 
-当前已在 connector 构造、调用 `_engine_for()` 打开 store 之前拒绝 `decode_context_parallel_size != 1`。这消除了静默错误映射；完整支持仍需复用 vendored offloading connector 的 rank/interleave-aware canonical mapping，并升级 namespace schema。
+当前 Tutti connector 支持 MiniMax 的 `decode_context_parallel_size=1/2`。DCP2 的全局
+chunk 按 rank-local token shard 拆成物理 chunk，namespace 纳入 DCP/interleave；旧
+`replica_io` fanout 在 DCP2 下关闭，避免把不同 token shard 当作副本。其它模型和
+其它 DCP 大小仍 fail-fast，不能据此宣称通用 DCP 支持。
 
 ### P0-4b：HMA/multi-group 未支持，Qwen 不能作为 Tutti 数据面验证模型
 

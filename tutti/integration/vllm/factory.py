@@ -100,6 +100,9 @@ def worker_engine_for(vllm_config, extra: dict):
         # 可选层数预告：查询侧（不做 bind）的驱逐展开与冷启动完整性
         # 判定依赖层数；与缓存键无关（同配置实例共享同引擎）。
         config = {k: extra[k] for k in _ENGINE_KEYS}
+        config["physical_chunk_tokens"] = extra.get(
+            "physical_chunk_tokens", extra["chunk_tokens"]
+        )
         for key in _ENGINE_OPTIONAL_KEYS:
             if key in extra:
                 config[key] = extra[key]
@@ -128,7 +131,8 @@ def scheduler_index_for(vllm_config, extra: dict):
         raw_options = resolve_io_budget(raw_options, extra, vllm_config)
     keys = tuple(sorted(
         (k, extra.get(k))
-        for k in (*_ENGINE_KEYS, "num_layers", "replica_io")
+        for k in (*_ENGINE_KEYS, "num_layers", "replica_io", "dcp_size",
+                  "physical_chunk_tokens", "blocks_per_chunk")
     ))
     entry = _SCHEDULER_CACHE.get(id(vllm_config))
     if entry is None or entry[0] is not vllm_config:
@@ -186,6 +190,9 @@ def scheduler_index_for(vllm_config, extra: dict):
         options["layer_span"] = int(extra["num_layers"])
         store = create_metadata_store(store_spec["type"], options)
         config = {k: extra[k] for k in _ENGINE_KEYS}
+        config["physical_chunk_tokens"] = extra.get(
+            "physical_chunk_tokens", extra["chunk_tokens"]
+        )
         config["num_layers"] = extra["num_layers"]
         if "kv_layer_page_bytes" in extra:
             config["kv_layer_page_bytes"] = extra["kv_layer_page_bytes"]
