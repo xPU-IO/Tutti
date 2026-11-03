@@ -208,6 +208,7 @@ def main() -> int:
     parser.add_argument("--load-format", default="auto")
     parser.add_argument("--capacity", help="每rank KV payload预算，须带单位，例如 1 TiB")
     parser.add_argument("--tensor-parallel-size", type=int, default=4)
+    parser.add_argument("--decode-context-parallel-size", type=int, default=1)
     parser.add_argument("--enable-expert-parallel", action="store_true")
     parser.add_argument("--enable-ep-weight-filter", action="store_true")
     parser.add_argument("--kv-cache-dtype")
@@ -437,6 +438,9 @@ def main() -> int:
                 "gpu_id": "{LOCAL_RANK}",
             },
         }
+        payload_tag = os.environ.get("TUTTI_E2E_PAYLOAD_TAG")
+        if payload_tag:
+            store_options["payload_tag"] = payload_tag
         if args.device_groups:
             # 多盘：每 rank 的槽位在其盘组间轮转（数据盘目录来自 daemon 配置）。
             groups = [
@@ -501,6 +505,7 @@ def main() -> int:
     llm = LLM(
         model=args.model,
         tensor_parallel_size=args.tensor_parallel_size,
+        decode_context_parallel_size=args.decode_context_parallel_size,
         block_size=args.block_size,
         enforce_eager=not args.enable_compile,
         max_model_len=(

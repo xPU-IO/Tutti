@@ -2047,6 +2047,23 @@ def test_store_derives_mounts_from_preset(tmp_path):
     )
 
 
+def test_store_payload_tag_scopes_segment_mounts(tmp_path):
+    """Benchmark payload tags isolate segment files without changing runtime mounts."""
+    preset = {
+        "type": "nvme-device-group",
+        "devices": [{"mount_path": str(tmp_path)}],
+    }
+    store = TuttiKVStore(
+        tmp_path / "meta-root", 8, SEG, preset=preset,
+        payload_tag="block256",
+    )
+    assert store._layout.mounts == (
+        str((tmp_path / "tutti-payload-block256").resolve()),
+    )
+    with pytest.raises(ValueError, match="payload_tag"):
+        TuttiKVStore(tmp_path / "bad", 8, SEG, payload_tag="../escape")
+
+
 @pytest.mark.parametrize("preset_type", ["raid0", None])
 def test_raid0_preset_requires_one_mount_and_defaults_to_raid0(preset_type, tmp_path):
     from tutti.storage.tutti_nvme.runtime_factory import prepare_preset

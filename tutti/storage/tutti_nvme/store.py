@@ -16,6 +16,7 @@ from __future__ import annotations
 import ctypes
 import logging
 import os
+import re
 import time
 import threading
 from contextlib import nullcontext
@@ -1602,7 +1603,8 @@ class TuttiKVStore:
                  segment_header_bytes: int = DEFAULT_SEGMENT_HEADER_BYTES,
                  rank_id: int = 0, tp_size: int = 1,
                  defer_writes_after_reads: bool | None = None,
-                 layer_page_bytes=None, replica_groups=None):
+                 layer_page_bytes=None, replica_groups=None,
+                 payload_tag: str | None = None):
         """preset 为 dict 时优先于 TUTTI_NVME_PRESET 环境变量构造 runtime。
 
         preset 的字符串值恰为纯十进制整数时转为 int（配置占位符替换后
@@ -1636,12 +1638,24 @@ class TuttiKVStore:
         self._segment_bytes = segment_bytes
         self._layer_page_bytes = tuple(layer_page_bytes or ())
         self._replica_groups = tuple(tuple(group) for group in (replica_groups or ()))
+        if payload_tag is not None:
+            if (not isinstance(payload_tag, str)
+                    or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", payload_tag)):
+                raise ValueError(
+                    "payload_tag must be a simple directory-safe name"
+                )
+        self._payload_tag = payload_tag
         self._runtime = runtime
         self._own_runtime = runtime is None
         self._preset = prepare_preset(preset, mounts=mounts) if preset is not None else None
         self._key_namespace: bytes | None = None
         if mounts is None:
             mounts = _preset_mounts(self._preset) or [str(self._root)]
+        if self._payload_tag:
+            mounts = [
+                str(Path(mount) / f"tutti-payload-{self._payload_tag}")
+                for mount in mounts
+            ]
         # 文件系统的全部职责（槽位分配、对象头、检查点、恢复、容量）都在
         # 这一层之下：本类只保留内存簿记与 runtime 票据缓存。
         self._layout = ObjectLayout(
