@@ -2160,8 +2160,9 @@ class WorkerImpl:
     def _chunk_block_tables(self, meta, count: int) -> list[list[int]]:
         """计算前 count 个 chunk 各自的块号表（块号可任意分布）。"""
         blocks = meta.block_ids
+        physical_tokens = self._physical_chunk_tokens or self._chunk_tokens
         per_chunk = self._blocks_per_chunk or (
-            -(-self._physical_chunk_tokens // self._block_size)
+            -(-physical_tokens // self._block_size)
         )
         return [
             list(blocks[i * per_chunk:(i + 1) * per_chunk])
@@ -2172,7 +2173,8 @@ class WorkerImpl:
                             first_chunk: int, n_chunks: int) -> None:
         """把读取未遂区间覆盖的块上报为重算。"""
         per_chunk = self._blocks_per_chunk or (
-            -(-self._physical_chunk_tokens // self._block_size)
+            -(-(self._physical_chunk_tokens or self._chunk_tokens)
+               // self._block_size)
         )
         blocks = meta.block_ids
         start_blk = first_chunk * per_chunk
@@ -2291,7 +2293,8 @@ class WorkerImpl:
         self._configure_callback_map(num_layers)
         segment_bytes = self._chunk_kv_bytes // num_layers
         blocks_per_chunk = self._blocks_per_chunk or (
-            -(-self._physical_chunk_tokens // self._block_size)
+            -(-(self._physical_chunk_tokens or self._chunk_tokens)
+               // self._block_size)
         )
         direct_pool = self._cross_pool if self._cross_pool is not None else self._kv_caches
         try_direct = getattr(self._engine, "try_bind_direct", None)
@@ -2366,7 +2369,8 @@ class WorkerImpl:
             )
             hooks = PagedTransferHooks(
                 layer_view, staging, segment_bytes,
-                self._physical_chunk_tokens, self._block_size, fmt,
+                self._physical_chunk_tokens or self._chunk_tokens,
+                self._block_size, fmt,
             )
             gather_fn, scatter_fn = hooks.gather, hooks.scatter
         bind_caches = self._kv_caches if self._kv_caches else (
