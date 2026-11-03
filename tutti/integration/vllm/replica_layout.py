@@ -31,11 +31,6 @@ def validate_replica_io(vllm_config, extra):
                 "prefill_context_parallel_size")) or
             dcp_size not in (1, 2)):
         raise ValueError("replica_io requires single-node TP8, DP/PP/PCP=1 and DCP=1/2")
-    if dcp_size > 1:
-        raise ValueError(
-            "DCP=2 shards the replicated MiniMax KV heads by context; "
-            "disable replica_io because those rank pages are no longer duplicates"
-        )
     model = vllm_config.model_config
     hf = getattr(model, "hf_config", None)
     text = getattr(model, "hf_text_config", None)
@@ -57,10 +52,10 @@ def validate_replica_io(vllm_config, extra):
 def replica_groups_for(extra, rank):
     """Return the physical owner group for each MiniMax cache entity.
 
-    TP8 with four global KV heads has two physical copies of each main KV
-    head. vLLM's shard mapping duplicates adjacent ranks, so main entities
-    use (0,1), (2,3), (4,5), (6,7). The index projection is replicated on all
-    ranks and therefore uses one eight-rank owner group.
+    With DCP=1, TP8's four KV heads are duplicated on adjacent rank pairs,
+    while the index cache is replicated across all ranks. Under DCP=2,
+    adjacent pairs own different context shards: main KV stays rank-local,
+    while index-cache replicas exist among ranks with the same DCP rank.
     """
     if not extra.get("replica_io", False):
         return ()
@@ -68,8 +63,10 @@ def replica_groups_for(extra, rank):
     if not 0 <= rank < 8:
         raise ValueError(f"replica rank must be in [0, 8), got {rank!r}")
     dcp_size = int(extra.get("dcp_size", 1))
-    main_group = (rank // 2 * 2, rank // 2 * 2 + 1)
+    main_group = ((rank // 2 * 2, rank // 2 * 2 + 1)
+                  if dcp_size == 1 else (rank,))
+    index_group = tuple(r for r in range(8) if r % dcp_size == rank % dcp_size)
     return tuple(
-        tuple(range(8)) if name.endswith(".index_cache") else main_group
+        index_group if name.endswith(".index_cache") else main_group
         for name in extra["kv_group_layer_names"]
     )

@@ -1,6 +1,7 @@
 """GPU-direct page IO for independently allocated, block-addressable KV entities."""
 from dataclasses import dataclass
 import logging
+import os
 
 from .store import DirectAdmissionError, DirectPoolGeometry, TuttiDirectBackend
 
@@ -55,6 +56,12 @@ class TuttiLayerwiseDirectBackend(TuttiDirectBackend):
         self._layer_pages = ()
         self._layer_tickets = []
         self._layer_tensors = ()
+        prp_mode = os.environ.get("TUTTI_PRP_MODE", "dynamic").strip().lower()
+        if prp_mode not in ("dynamic", "full_prebuild"):
+            raise DirectAdmissionError(
+                "TUTTI_PRP_MODE must be 'dynamic' or 'full_prebuild'"
+            )
+        self._prp_prebuild = prp_mode == "full_prebuild"
 
     def register_paged_caches(self, pool, *, num_layers, blocks_per_chunk,
                               chunk_tokens, segment_bytes, max_chunks_per_wave=None):
@@ -78,13 +85,23 @@ class TuttiLayerwiseDirectBackend(TuttiDirectBackend):
                                       chunk_tokens // blocks_per_chunk, blocks_per_chunk,
                                       segment_bytes, device)
         self._check_runtime_capacity(geometry, max_chunks_per_wave=max_chunks_per_wave)
+        prebuilt_layers = 0
+        fallback_layers = 0
         try:
-            for tensor in tensors:
+            for tensor, page in zip(tensors, pages):
                 size = tensor.numel() * tensor.element_size()
-                if tensor.data_ptr() % 65536:
-                    raise DirectAdmissionError("layerwise cache base must be 64KiB aligned; no extra KV copy is allocated")
+                aligned = tensor.data_ptr() % 65536 == 0
+                if not aligned and not self._prp_prebuild:
+                    raise DirectAdmissionError(
+                        "layerwise cache base must be 64KiB aligned; "
+                        "no extra KV copy is allocated"
+                    )
+                io_granularity = page.page_bytes if self._prp_prebuild and aligned else 0
+                prebuilt_layers += io_granularity > 0
+                fallback_layers += self._prp_prebuild and not aligned
                 ticket = self._store._runtime.register_memory(
-                    tensor.data_ptr(), size, "device", accel_id=device, io_granularity=0)
+                    tensor.data_ptr(), size, "device", accel_id=device,
+                    io_granularity=io_granularity)
                 self._layer_tickets.append(int(ticket))
         except Exception:
             try:
@@ -96,6 +113,18 @@ class TuttiLayerwiseDirectBackend(TuttiDirectBackend):
         self._geometry = geometry
         self._layer_pages = pages
         self._memory_ticket = self._layer_tickets[0]
+        prp_pages_per_controller = sum(
+            page.num_blocks for page in pages if page.page_bytes > 2 * 4096
+        )
+        _LOG.warning(
+            "DIRECT_PRP_MODE mode=%s entities=%d estimated_prp_pages_per_controller=%d "
+            "estimated_host_pinned_bytes_per_controller=%d prebuilt_layers=%d "
+            "dynamic_fallback_layers=%d",
+            "full_prebuild" if self._prp_prebuild else "dynamic",
+            len(pages), prp_pages_per_controller,
+            prp_pages_per_controller * 4096,
+            prebuilt_layers, fallback_layers,
+        )
         _LOG.warning("DIRECT_LAYERWISE_ACCEPTED entities=%d blocks=%d physical_pages=%s disk_segment=%d accel=%d",
                      num_layers, geometry.num_blocks, page_sizes, segment_bytes, device)
         return True

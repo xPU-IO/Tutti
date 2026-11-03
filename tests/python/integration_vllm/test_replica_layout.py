@@ -112,13 +112,16 @@ def test_replica_allows_piecewise_capture(monkeypatch):
     validate_replica_io(c, extra())
 
 
-def test_dcp2_disables_replica_io_and_preserves_unique_head_shards():
+def test_dcp2_replica_io_only_shares_same_context_shards():
     c, e = config(), extra()
     c.parallel_config.decode_context_parallel_size = 2
-    with pytest.raises(ValueError, match="disable replica_io"):
-        validate_replica_io(c, e)
-    e["replica_io"] = False
     validate_replica_io(c, e)
+    e["dcp_size"] = 2
+    for rank in range(8):
+        groups = replica_groups_for(e, rank)
+        assert all(group == (rank,) for group in groups[:60])
+        expected_index_group = tuple(r for r in range(8) if r % 2 == rank % 2)
+        assert all(group == expected_index_group for group in groups[60:])
 
 
 def test_configuration_module_does_not_import_data_plane():

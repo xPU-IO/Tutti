@@ -71,6 +71,40 @@ def test_layerwise_requests_use_entity_ticket_and_fixed_disk_width():
     ]
 
 
+def test_full_prp_prebuild_registers_each_physical_page(monkeypatch):
+    from tutti.storage.tutti_nvme.layerwise_direct import TuttiLayerwiseDirectBackend
+
+    class Tensor:
+        shape = (4, 128, 128)
+        stride = lambda self: (16384, 128, 1)
+        is_cuda = True
+        get_device = lambda self: 0
+        data_ptr = lambda self: 65536
+        numel = lambda self: 4 * 128 * 128
+        element_size = lambda self: 2
+
+    class Runtime:
+        def __init__(self):
+            self.calls = []
+
+        def register_memory(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return len(self.calls)
+
+    monkeypatch.setenv("TUTTI_PRP_MODE", "full_prebuild")
+    runtime = Runtime()
+    store = SimpleNamespace(
+        _layer_page_bytes=(32768,), _runtime=runtime, _rank_id=0,
+    )
+    backend = TuttiLayerwiseDirectBackend(store)
+    backend._check_runtime_capacity = lambda *args, **kwargs: None
+    backend.register_paged_caches(
+        {"index": Tensor()}, num_layers=1, blocks_per_chunk=1,
+        chunk_tokens=128, segment_bytes=32768,
+    )
+    assert runtime.calls[0][1]["io_granularity"] == 32768
+
+
 @pytest.mark.parametrize("fail_last", [False, True])
 def test_layerwise_close_releases_all_tickets_after_drain_error(fail_last):
     calls = []
