@@ -87,6 +87,8 @@ class _RequestTracker:
     req_id: str
     token_ids: list[int]
     block_ids: list[int]
+    chunk_keys: list[bytes] = field(default_factory=list)
+    canonical_keys: bool = False
     saved_tokens: int = 0
 
     def update(self, new_token_ids: list[int], new_block_ids: list[int],
@@ -144,6 +146,10 @@ class _ReqMeta:
     req_id: str
     token_ids: list[int]
     block_ids: list[int]
+    # vLLM Request.block_hashes projected to Tutti chunk boundaries.  The
+    # worker receives the exact scheduler keys and does not hash tokens again.
+    chunk_keys: list[bytes] = field(default_factory=list)
+    canonical_keys: bool = False
     load_tokens: int = 0
     load_start_token: int = 0   # 加载区间起点（本地前缀命中边界）
     save_chunk_start: int = 0
@@ -494,10 +500,13 @@ class TuttiConnectorV1(KVConnectorBase_V1):
             tokens += list(getattr(request, "output_token_ids", None) or [])
             get_ids = getattr(blocks, "get_block_ids", None)
             block_ids = flatten_blocks(get_ids() if callable(get_ids) else blocks)
+            chunk_keys = self._vllm_chunk_keys(request, len(tokens))
             self._async_pending[req_id] = _ReqMeta(
                 req_id=req_id,
                 token_ids=tokens,
                 block_ids=block_ids,
+                chunk_keys=list(chunk_keys or []),
+                canonical_keys=chunk_keys is not None,
                 load_tokens=int(num_external_tokens),
                 load_start_token=start,
                 load_async=True,
@@ -690,8 +699,11 @@ class TuttiConnectorV1(KVConnectorBase_V1):
             block_ids = flatten_blocks(new_req.block_ids)
             cap = len(block_ids) * self._block_size
             tokens = list(new_req.prompt_token_ids)[:cap]
+            live = self._live_requests.get(new_req.req_id)
+            chunk_keys = self._vllm_chunk_keys(live, len(tokens))
             self._trackers[new_req.req_id] = _RequestTracker(
-                new_req.req_id, tokens, block_ids
+                new_req.req_id, tokens, block_ids,
+                chunk_keys or [], chunk_keys is not None,
             )
             scheduled.append(new_req.req_id)
         cached = scheduler_output.scheduled_cached_reqs
@@ -717,6 +729,10 @@ class TuttiConnectorV1(KVConnectorBase_V1):
                     new_tokens, blocks_i or [],
                     replace_blocks=req_id in resumed,
                 )
+                chunk_keys = self._vllm_chunk_keys(live, len(tracker.token_ids))
+                if chunk_keys is not None:
+                    tracker.chunk_keys = chunk_keys
+                    tracker.canonical_keys = True
                 scheduled.append(req_id)
 
         requests: list[_ReqMeta] = []
@@ -730,13 +746,15 @@ class TuttiConnectorV1(KVConnectorBase_V1):
                 req_id=req_id,
                 token_ids=list(tracker.token_ids),
                 block_ids=list(tracker.block_ids),
+                chunk_keys=list(tracker.chunk_keys),
+                canonical_keys=tracker.canonical_keys,
                 load_tokens=self._pending_loads.pop(req_id, 0),
                 load_start_token=self._load_starts.pop(req_id, 0),
                 save_chunk_start=start,
                 save_chunk_count=count,
             )
             if count > 0:
-                keys, _ = self._index.hash_keys(tracker.token_ids)
+                keys = self._tracker_keys(tracker)
                 save_specs.append((meta, keys[start:start + count]))
             requests.append(meta)
 
@@ -944,6 +962,9 @@ class TuttiConnectorV1(KVConnectorBase_V1):
             self._prefix_hash_cache_hits += 1
 
         total_chunks = len(tokens) // self._chunk_tokens
+        external_keys = self._vllm_chunk_keys(request, len(tokens))
+        if external_keys is not None:
+            return self._index.lookup_prefix_keys(external_keys[:total_chunks])
         old_chunks = len(cached.keys)
         while len(cached.keys) < total_chunks:
             # If the already computed chain stops at a cold chunk, do not
@@ -965,6 +986,48 @@ class TuttiConnectorV1(KVConnectorBase_V1):
             max(0.0, (time.perf_counter_ns() - started_ns) / 1e6)
         )
         return self._index.lookup_prefix_keys(cached.keys)
+
+    def _vllm_chunk_keys(self, request, token_count: int) -> list[bytes] | None:
+        """Project vLLM's canonical block hashes onto Tutti chunks.
+
+        Tutti's on-disk key remains 16 bytes for compatibility with existing
+        objects; using the prefix of vLLM's SHA-256 block hash preserves the
+        upstream hash chain and avoids a second token-hashing implementation.
+        Return ``None`` when the request or configured chunk geometry does
+        not expose compatible upstream hashes.
+        """
+        if request is None:
+            return None
+        hashes = list(getattr(request, "block_hashes", ()) or ())
+        if not hashes:
+            return None
+        block_tokens = int(self._block_size)
+        if block_tokens <= 0 or self._chunk_tokens % block_tokens:
+            return None
+        per_chunk = self._chunk_tokens // block_tokens
+        complete_chunks = min(token_count // self._chunk_tokens,
+                              len(hashes) // per_chunk)
+        if complete_chunks <= 0:
+            return []
+        keys = []
+        for idx in range(complete_chunks):
+            raw = bytes(hashes[(idx + 1) * per_chunk - 1])
+            if len(raw) < 16:
+                return None
+            keys.append(raw[:16])
+        return keys
+
+    def _tracker_keys(self, tracker: _RequestTracker) -> list[bytes]:
+        keys = list(tracker.chunk_keys)
+        expected = len(tracker.token_ids) // self._chunk_tokens
+        if tracker.canonical_keys:
+            if len(keys) < expected:
+                raise RuntimeError(
+                    "vLLM block hashes do not cover complete Tutti chunks"
+                )
+            return keys
+        # Compatibility for unit-test request doubles without block_hashes.
+        return self._index.hash_keys(tracker.token_ids)[0]
 
     def _block_usage(self, req_id: str) -> tuple[int, int, int | None]:
         """(在算的其他请求数, 异步加载占着的块数, 估计空闲块数)。

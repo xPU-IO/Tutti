@@ -86,19 +86,17 @@ class TuttiLayerwiseDirectBackend(TuttiDirectBackend):
                                       segment_bytes, device)
         self._check_runtime_capacity(geometry, max_chunks_per_wave=max_chunks_per_wave)
         prebuilt_layers = 0
-        fallback_layers = 0
         try:
             for tensor, page in zip(tensors, pages):
                 size = tensor.numel() * tensor.element_size()
                 aligned = tensor.data_ptr() % 65536 == 0
-                if not aligned and not self._prp_prebuild:
+                if not aligned:
                     raise DirectAdmissionError(
                         "layerwise cache base must be 64KiB aligned; "
                         "no extra KV copy is allocated"
                     )
-                io_granularity = page.page_bytes if self._prp_prebuild and aligned else 0
+                io_granularity = page.page_bytes if self._prp_prebuild else 0
                 prebuilt_layers += io_granularity > 0
-                fallback_layers += self._prp_prebuild and not aligned
                 ticket = self._store._runtime.register_memory(
                     tensor.data_ptr(), size, "device", accel_id=device,
                     io_granularity=io_granularity)
@@ -118,12 +116,11 @@ class TuttiLayerwiseDirectBackend(TuttiDirectBackend):
         )
         _LOG.warning(
             "DIRECT_PRP_MODE mode=%s entities=%d estimated_prp_pages_per_controller=%d "
-            "estimated_host_pinned_bytes_per_controller=%d prebuilt_layers=%d "
-            "dynamic_fallback_layers=%d",
+            "estimated_host_pinned_bytes_per_controller=%d prebuilt_layers=%d",
             "full_prebuild" if self._prp_prebuild else "dynamic",
             len(pages), prp_pages_per_controller,
             prp_pages_per_controller * 4096,
-            prebuilt_layers, fallback_layers,
+            prebuilt_layers,
         )
         _LOG.warning("DIRECT_LAYERWISE_ACCEPTED entities=%d blocks=%d physical_pages=%s disk_segment=%d accel=%d",
                      num_layers, geometry.num_blocks, page_sizes, segment_bytes, device)

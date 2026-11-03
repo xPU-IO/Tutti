@@ -594,6 +594,16 @@ class WorkerImpl:
         self._prefetch_stats = [0, 0, 0, 0]
         self._prefetch_wait_ms: list[float] = []
 
+    def _meta_keys(self, meta) -> list[bytes]:
+        keys = list(getattr(meta, "chunk_keys", ()) or ())
+        if getattr(meta, "canonical_keys", False):
+            if not keys:
+                raise RuntimeError("scheduler omitted canonical Tutti chunk keys")
+            return keys
+        # Compatibility with metadata produced by older scheduler workers and
+        # focused unit tests. Production metadata carries vLLM block hashes.
+        return self._engine.hash_keys(meta.token_ids)[0]
+
     # ---- 配置与登记 ----
 
     def configure(
@@ -769,7 +779,7 @@ class WorkerImpl:
             )
             if n_chunks <= 0:
                 continue
-            req_keys, _ = self._engine.hash_keys(meta.token_ids)
+            req_keys = self._meta_keys(meta)
             req_keys = req_keys[first_chunk : first_chunk + n_chunks]
             flat_chunk_start = len(keys)
             try:
@@ -1040,7 +1050,7 @@ class WorkerImpl:
         for meta in getattr(self._metadata, "requests", []) or []:
             if meta.save_chunk_count <= 0:
                 continue
-            req_keys, _ = self._engine.hash_keys(meta.token_ids)
+            req_keys = self._meta_keys(meta)
             start = meta.save_chunk_start
             end = start + meta.save_chunk_count
             keys.extend(req_keys[start:end])
@@ -1555,7 +1565,7 @@ class WorkerImpl:
                 # scheduler 判定全部已驻留或未受理，没有预留可释放
                 continue
             try:
-                req_keys, _ = self._engine.hash_keys(meta.token_ids)
+                req_keys = self._meta_keys(meta)
             except Exception:
                 continue
             start = meta.save_chunk_start
@@ -1640,7 +1650,7 @@ class WorkerImpl:
         if n_chunks <= 0:
             self._async_finished.add(req_id)
             return
-        req_keys, _ = self._engine.hash_keys(meta.token_ids)
+        req_keys = self._meta_keys(meta)
         req_keys = req_keys[first_chunk:first_chunk + n_chunks]
         tables = self._chunk_block_tables(meta, first_chunk + n_chunks)[first_chunk:]
         blocks = {int(block) for table in tables for block in table}
