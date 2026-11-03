@@ -43,6 +43,11 @@ _FEEDER_DIAG = os.environ.get("TUTTI_FEEDER_DIAGNOSTICS") == "1"
 _DIRECT_FEEDER_WAIT_SECONDS = 120.0
 # 一次等待超过该阈值（毫秒）就记一行，用于观测 compute 与 feeder 的竞速余量。
 _DIRECT_FEEDER_WAIT_LOG_MS = 1.0
+# Submit a small layer window per read-service turn.  Each layer still gets
+# its own completion/fence; the window only removes host wake/tick overhead.
+_DIRECT_FEED_WINDOW = max(
+    1, int(os.environ.get("TUTTI_DIRECT_FEED_WINDOW", "4"))
+)
 
 
 class _ReadPlan:
@@ -954,8 +959,18 @@ class _DirectAllLayerReadPlan:
 
     def advance(self) -> bool:
         if not self._feeder_stop.is_set() and self.terminal_failure is None:
-            if self.next_read_to_submit < self.layer_count:
+            submitted = 0
+            while (
+                submitted < _DIRECT_FEED_WINDOW
+                and self.next_read_to_submit < self.layer_count
+                and not self._feeder_stop.is_set()
+                and self.terminal_failure is None
+            ):
+                before = self.next_read_to_submit
                 self._submit_layer(self.next_read_to_submit)
+                if self.next_read_to_submit == before:
+                    break
+                submitted += 1
             if self.next_read_to_submit < self.layer_count and self.terminal_failure is None:
                 return False
         self._submit_all_total_ms = (
