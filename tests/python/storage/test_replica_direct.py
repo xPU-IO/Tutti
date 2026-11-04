@@ -1754,6 +1754,19 @@ def test_foreground_replica_feed_window_caps_layers_waiting_for_peer_fence(monke
     assert task.advance() is True
 
 
+def test_replica_no_ack_releases_local_fence_without_peer_ack(monkeypatch):
+    import tutti.storage.tutti_nvme.replica_direct as module
+
+    backend, items, tables, calls = _recovery_backend(monkeypatch)
+    monkeypatch.setattr(module, "_REPLICA_NO_ACK", True)
+    _advance_test_scatter(backend)
+    state = backend._prefetch_task.states[0]
+    assert state["phase"] == "fence"
+    assert state["local_fence_published"] is True
+    assert calls.count("launch") == 1
+    assert not any(key.startswith("1/ack/") for key in backend._signals.store.data)
+
+
 def test_background_task_finishes_batch_cq_and_fence_before_next_window(monkeypatch):
     backend, task, calls, cq, window = _service_task_backend(monkeypatch, background=True)
     assert task.advance() is False

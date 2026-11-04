@@ -37,6 +37,7 @@ _REPLICA_FEED_WINDOW = max(
     1, int(os.environ.get("TUTTI_REPLICA_FEED_WINDOW", "4"))
 )
 _REPLICA_LOCAL_FENCE = os.environ.get("TUTTI_REPLICA_LOCAL_FENCE") == "1"
+_REPLICA_NO_ACK = os.environ.get("TUTTI_REPLICA_NO_ACK") == "1"
 
 
 def owner_index(key, size):
@@ -324,6 +325,8 @@ class _ReplicaReadTask:
             and not state.get("finished", False)
             for state in self.states
         )
+        if _REPLICA_NO_ACK:
+            ack_pending = 0
         while self.produced < len(backend._entity_sequence) and active < window:
             if _REPLICA_LOCAL_FENCE and ack_pending >= 2 * window:
                 break
@@ -963,15 +966,19 @@ class TuttiReplicaDirectBackend(TuttiLayerwiseDirectBackend):
                         with nvtx_range(f"tutti.replica.scatter|layer={physical}|rank={self._rank}|op={self._read_direction}|mode=direct_pages"):
                             scatter_plan.launch()
                         free = self._retain_device_work(scatter_plan)
-                    self._signals.ack(physical, free.ipc_handle())
+                    if not _REPLICA_NO_ACK:
+                        self._signals.ack(physical, free.ipc_handle())
                     state["phase"] = "ack"
                     state["deadline"] = time.monotonic() + _POLL_SECONDS
-                    if _REPLICA_LOCAL_FENCE:
+                    if _REPLICA_LOCAL_FENCE or _REPLICA_NO_ACK:
                         state["ready"] = free
                         state["local_fence_published"] = True
                         with self._read_event_lock:
                             self._entity_fences[physical] = free
                         self._next_entity += 1
+                    if _REPLICA_NO_ACK:
+                        state["phase"] = "fence"
+                        return
             if not self._peer_phase_ready(state, "ack"):
                 return
             with self._read_event_lock, self._store.stream_context(self._read_direction):
