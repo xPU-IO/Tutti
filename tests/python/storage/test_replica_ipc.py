@@ -191,6 +191,7 @@ def _nvme_worker(rank, world, port, output):
     import torch.distributed as dist
     import tutti.storage.tutti_nvme.replica_direct as replica
     from tutti.storage.tutti_nvme.store import TuttiKVStore
+    from tutti.engine.read_service import ReadService
 
     replica._POLL_SECONDS = 15.0
     torch.cuda.set_device(rank)
@@ -234,6 +235,7 @@ def _nvme_worker(rank, world, port, output):
         backend.register_paged_caches(caches, num_layers=3, blocks_per_chunk=2,
                                        chunk_tokens=256, segment_bytes=16384,
                                        max_chunks_per_wave=140)
+        store._read_service = ReadService(store)
         for layer, tensor in enumerate(logical_views):
             head = rank // 2 if layer != 2 else 0
             for i, blocks in enumerate(tables):
@@ -248,11 +250,13 @@ def _nvme_worker(rank, world, port, output):
         rendezvous.set(f"written/{rank}", b"1")
         rendezvous.wait([f"written/{r}" for r in range(world)], timedelta(seconds=20))
 
-        submit = store._submit_retry
+        submit = backend._advance_submit
         reads = []
-        def checked_submit(requests, direction, stream_direction=None, **kwargs):
-            if stream_direction == "read_copy":
-                physical = len(reads)
+        def checked_submit(state):
+            physical = state["physical"]
+            if physical == len(reads):
+                requests = [request for segment in reversed(state["submit"].segments)
+                            for _, request in segment]
                 assert physical < 3, "cache entity was split into extra submits"
                 members = store._replica_groups[physical]
                 expected = [block * pages[physical] for key, blocks in zip(keys, tables)
@@ -264,8 +268,8 @@ def _nvme_worker(rank, world, port, output):
                 reads.append(len(requests))
                 if epoch == 3 and rank == world - 1 and physical == 2:
                     raise RuntimeError("injected NVMe read failure before submit")
-            return submit(requests, direction, stream_direction=stream_direction, **kwargs)
-        store._submit_retry = checked_submit
+            return submit(state)
+        backend._advance_submit = checked_submit
         for epoch in range(1, 4):
             reads.clear()
             for tensor in caches.values():
@@ -274,7 +278,7 @@ def _nvme_worker(rank, world, port, output):
             try:
                 backend.begin_target_plan(keys, "read")
                 if epoch == 2:
-                    with store.stream_context("read_copy"):
+                    with store.stream_context("read"):
                         torch.cuda._sleep(4_000_000_000)
                 backend.begin_prefetch(keys, tables, (0, 1, 2))
                 for layer, tensor in enumerate(logical_views):
@@ -300,6 +304,7 @@ def _nvme_worker(rank, world, port, output):
             finally:
                 backend.end_target_plan("read")
         assert verified >= 6
+        store._read_service.close()
         store.close()
         dist.destroy_process_group()
         output.put((rank, verified, True, None))

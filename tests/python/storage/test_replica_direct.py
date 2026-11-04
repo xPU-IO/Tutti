@@ -1765,6 +1765,60 @@ def test_replica_no_ack_releases_local_fence_without_peer_ack(monkeypatch):
     assert state["local_fence_published"] is True
     assert calls.count("launch") == 1
     assert not any(key.startswith("1/ack/") for key in backend._signals.store.data)
+    assert backend._stats["gather_bytes"] == 4
+    assert backend._entity_fences[2] is state["ready"]
+    assert backend._scatter_plans[2] in backend._retained
+    assert backend._pending_events and backend._ipc_events
+    assert set(backend._peer_events) == {("ready", 2, 1)}
+    completion = backend.get_paged_batch(items, 2, tables)
+    completion.fence_event.ready = False
+    assert completion.poll() is None
+    completion.fence_event.ready = True
+    assert completion.poll() is True
+
+
+def test_replica_no_ack_still_gates_scatter_on_owned_cq_success(monkeypatch):
+    import tutti.storage.tutti_nvme.replica_direct as module
+    import tutti.storage.tutti_nvme.store as store_module
+
+    backend, items, tables, calls = _recovery_backend(monkeypatch)
+    monkeypatch.setattr(module, "_REPLICA_NO_ACK", True)
+    monkeypatch.setattr(store_module, "_ASYNC_COMPLETION", True)
+    state = dict(physical=2, members=(0, 1), phase="ready",
+                 io_done=backend._test_events[0], deadline=float("inf"))
+    backend._advance_scatter(state)
+    assert calls == []
+    assert backend._entity_fences == {} and backend._next_entity == 0
+    state["cq_done"] = True
+    backend._advance_scatter(state)
+    assert calls.count("launch") == 1
+    assert state["phase"] == "fence"
+    assert backend._stats["gather_bytes"] == 4
+
+
+def test_replica_no_ack_keeps_backing_until_request_quiescence(monkeypatch):
+    import tutti.storage.tutti_nvme.replica_direct as module
+
+    backend, items, tables, calls = _recovery_backend(monkeypatch)
+    monkeypatch.setattr(module, "_REPLICA_NO_ACK", True)
+    _advance_test_scatter(backend)
+    backend._prefetch_job = None
+    backend._store._deferred_completions = []
+    retained = tuple(backend._retained)
+    events = tuple(backend._ipc_events)
+    def delayed_peer():
+        raise TimeoutError("peer still reading source pages")
+    backend._signals.quiescent = delayed_peer
+    with pytest.raises(TimeoutError, match="peer still reading"):
+        backend._quiesce()
+    assert not backend._quiesced
+    assert tuple(backend._retained) == retained
+    assert tuple(backend._ipc_events) == events
+    assert backend._prefetch_task is not None
+    backend._signals.quiescent = lambda: None
+    backend._quiesce()
+    assert backend._quiesced
+    assert not backend._retained and not backend._ipc_events
 
 
 def test_background_task_finishes_batch_cq_and_fence_before_next_window(monkeypatch):

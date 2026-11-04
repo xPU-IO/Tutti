@@ -205,6 +205,7 @@ def test_bench_passes_minimax_model_options(bench_runner, baseline):
     flags = ["--enable-expert-parallel", "--enable-ep-weight-filter",
              "--language-model-only"]
     values = {"--kv-cache-dtype": "fp8", "--indexer-kv-dtype": "bf16",
+              "--max-tokens": "1",
               "--max-model-len": "131072", "--gpu-memory-utilization": "0.8",
               "--max-num-seqs": "8", "--max-num-batched-tokens": "8192"}
     args = ["--baseline"] if baseline else ["--capacity", "8 GiB"]
@@ -238,6 +239,7 @@ def test_bench_default_keeps_model_options_unset(bench_runner):
                    "--max-num-seqs", "--max-num-batched-tokens"):
         assert option not in arguments
     assert arguments[arguments.index("--load-format") + 1] == "auto"
+    assert arguments[arguments.index("--max-tokens") + 1] == "8"
     assert "PAYLOAD_TAG=\n" in result.stdout
 
 

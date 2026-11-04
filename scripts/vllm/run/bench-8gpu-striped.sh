@@ -24,6 +24,7 @@
 #   --tokens N        prompt length, default 10000
 #   --reuse-pct N     shared prefix percentage, default 80
 #   --rounds N        rounds of (A,B), default 2
+#   --max-tokens N    output token limit, default 8; use 1 for prefill timing
 #   --capacity SIZE   per-rank KV payload budget, e.g. "1 TiB"; required for Tutti
 #   --block-size N    backend KV block tokens; MiniMax M3 uses 128
 #   --kv-load-mode M  sync/async/auto; sync forces external-read validation
@@ -56,6 +57,7 @@ BASELINE=0
 TOKENS=10000
 REUSE_PCT=80
 ROUNDS=2
+MAX_TOKENS=8
 TAG=""
 POOL_TAG="${POOL_TAG:-v1}"
 # 盘组部署，与 serve-8gpu-striped.sh 一致（默认：两个 RAID0，各一个 daemon）：
@@ -88,6 +90,7 @@ while [[ $# -gt 0 ]]; do
         --tokens)      TOKENS="$2"; shift 2 ;;
         --reuse-pct)   REUSE_PCT="$2"; shift 2 ;;
         --rounds)      ROUNDS="$2"; shift 2 ;;
+        --max-tokens)  MAX_TOKENS="$2"; shift 2 ;;
         --tag)         TAG="$2"; shift 2 ;;
         --pool-tag)    POOL_TAG="$2"; shift 2 ;;
         --model)       MODEL="$2"; shift 2 ;;
@@ -152,7 +155,7 @@ ARGS=(
     --tokens "$TOKENS"
     --reuse-pct "$REUSE_PCT"
     --rounds "$ROUNDS"
-    --max-tokens 8
+    --max-tokens "$MAX_TOKENS"
     # 轮与轮之间重置：让下一轮的 A 仍是冷请求。
     --reset-local-prefix-between-rounds
     # The installed flashinfer predates the set_autotune_process_group symbol

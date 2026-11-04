@@ -1,7 +1,7 @@
 """Replica-group NVMe IO directly into final KV pages, without payload staging.
 
-Main KV uses rank-local IO; index owners read into final paged index KV.
-Consumers pull remote index pages with one kernel per entity. Epoch-scoped notifications
+Owners read main KV and index shards into final paged KV. Consumers pull
+remote pages with one kernel per entity. Epoch-scoped notifications
 protect readiness and the final source pages until all consumers finish.
 """
 from contextlib import nullcontext
@@ -966,6 +966,12 @@ class TuttiReplicaDirectBackend(TuttiLayerwiseDirectBackend):
                         with nvtx_range(f"tutti.replica.scatter|layer={physical}|rank={self._rank}|op={self._read_direction}|mode=direct_pages"):
                             scatter_plan.launch()
                         free = self._retain_device_work(scatter_plan)
+                    # Logical peer-copy bytes, accounted once at launch in
+                    # both protocols; ack publication is not DMA completion.
+                    self._stats["gather_bytes"] += sum(
+                        owner_index(key, len(members)) != members.index(self._rank)
+                        for key in self._prefetch_keys
+                    ) * self.geometry.blocks_per_chunk * self._layer_pages[physical].page_bytes
                     if not _REPLICA_NO_ACK:
                         self._signals.ack(physical, free.ipc_handle())
                     state["phase"] = "ack"
@@ -977,6 +983,9 @@ class TuttiReplicaDirectBackend(TuttiLayerwiseDirectBackend):
                             self._entity_fences[physical] = free
                         self._next_entity += 1
                     if _REPLICA_NO_ACK:
+                        # Source pages and IPC backing stay leased until
+                        # _quiesce drains every rank at the request boundary.
+                        # The local fence only releases this layer's compute.
                         state["phase"] = "fence"
                         return
             if not self._peer_phase_ready(state, "ack"):
@@ -986,10 +995,6 @@ class TuttiReplicaDirectBackend(TuttiLayerwiseDirectBackend):
                 record = (self._store.record_read_async_event if self._parent is not None
                           else self._store.record_read_event)
                 ready = state.get("ready") if state.get("local_fence_published") else record()
-            self._stats["gather_bytes"] += sum(
-                owner_index(key, len(members)) != members.index(self._rank)
-                for key in self._prefetch_keys
-            ) * self.geometry.blocks_per_chunk * self._layer_pages[physical].page_bytes
         state["ready"] = ready
         state["phase"] = "fence"
         if not state.get("local_fence_published"):
