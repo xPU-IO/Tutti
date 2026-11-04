@@ -1736,6 +1736,24 @@ def test_foreground_task_submits_every_entity_while_owned_cq_is_pending(monkeypa
     assert backend._stats["read_bytes"] == 3 * 4096
 
 
+def test_foreground_replica_feed_window_caps_layers_waiting_for_peer_fence(monkeypatch):
+    import tutti.storage.tutti_nvme.replica_direct as module
+
+    monkeypatch.setattr(module, "_REPLICA_FEED_WINDOW", 2)
+    backend, task, calls, cq, window = _service_task_backend(monkeypatch)
+    backend._entity_sequence = (2, 0, 1, 2, 0, 1)
+
+    assert task.advance() is False
+    assert task.produced == 2
+    assert len(task.states) == 2
+    assert all(state["phase"] == "fence" for state in task.states)
+    assert task.advance() is False
+    assert task.produced == 2
+    assert len(task.states) == 2
+    backend._prefetch_stop.set()
+    assert task.advance() is True
+
+
 def test_background_task_finishes_batch_cq_and_fence_before_next_window(monkeypatch):
     backend, task, calls, cq, window = _service_task_backend(monkeypatch, background=True)
     assert task.advance() is False

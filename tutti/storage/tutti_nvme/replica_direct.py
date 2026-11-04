@@ -8,6 +8,7 @@ from contextlib import nullcontext
 import hashlib
 import json
 import logging
+import os
 import struct
 import threading
 import time
@@ -32,6 +33,9 @@ _SLOW_POLL_SECONDS = 0.0005
 # Failure propagation is rare; probing the terminal key on every iteration
 # doubles the store traffic of every wait.
 _FAILURE_PROBE_SECONDS = 0.005
+_REPLICA_FEED_WINDOW = max(
+    1, int(os.environ.get("TUTTI_REPLICA_FEED_WINDOW", "4"))
+)
 
 
 def owner_index(key, size):
@@ -294,12 +298,52 @@ class _ReplicaReadTask:
             backend._advance_owned(state)
         if backend._initializing and not backend._advance_plan_init():
             return False
+        if backend._parent is not None:
+            return self._advance_background()
+        for state in self.states:
+            if state["phase"] not in ("submit", "fence"):
+                backend._advance_scatter(state)
+        self._retire_ready_states()
+        for state in self.states:
+            if state["phase"] == "submit":
+                with backend._cancel_lock, backend._background_scope() as allowed:
+                    if allowed and backend._admit_background_entity(state["physical"]):
+                        backend._advance_submit(state)
+            if state["phase"] != "submit" and not state.get("counted_produced"):
+                state["counted_produced"] = True
+                self.produced += 1
+        window = 1 if backend._parent is not None else _REPLICA_FEED_WINDOW
+        active = sum(not state.get("finished", False) for state in self.states)
+        while self.produced < len(backend._entity_sequence) and active < window:
+            physical = backend._entity_sequence[self.produced]
+            with backend._cancel_lock, backend._background_scope() as allowed:
+                if not allowed or not backend._admit_background_entity(physical):
+                    break
+                state = backend._new_entity(self.plan, physical)
+                self.states.append(state)
+                active += 1
+                backend._advance_submit(state)
+            if state["phase"] == "submit":
+                break
+            state["counted_produced"] = True
+            self.produced += 1
+        for state in self.states:
+            backend._advance_owned(state)
+        for state in self.states:
+            if state["phase"] not in ("submit", "fence"):
+                backend._advance_scatter(state)
+        self._retire_ready_states()
+        return (self.produced == len(backend._entity_sequence) and
+                all(state.get("finished", False) for state in self.states))
+
+    def _advance_background(self):
+        backend = self.backend
         if self.produced < len(backend._entity_sequence):
-            state = self.states[-1] if self.states and self.states[-1]["phase"] == "submit" else None
+            state = (self.states[-1] if self.states and
+                     self.states[-1]["phase"] == "submit" else None)
             if state is None:
-                background_busy = (backend._parent is not None and self.states and
-                                   not self.states[-1].get("finished", False))
-                if not background_busy:
+                busy = self.states and not self.states[-1].get("finished", False)
+                if not busy:
                     physical = backend._entity_sequence[self.produced]
                     with backend._cancel_lock, backend._background_scope() as allowed:
                         if allowed and backend._admit_background_entity(physical):
@@ -319,15 +363,18 @@ class _ReplicaReadTask:
                 break
             if state["phase"] != "fence":
                 backend._advance_scatter(state)
-                if state["phase"] != "fence":
-                    break
+                break
+        self._retire_ready_states()
+        return (self.produced == len(backend._entity_sequence) and
+                all(state.get("finished", False) for state in self.states))
+
+    def _retire_ready_states(self):
+        backend = self.backend
         for state in self.states:
             if (state["phase"] == "fence" and state.get("cq_done")
                     and not state.get("finished", False)):
                 if backend._parent is None or state["ready"].query():
                     state["finished"] = True
-        return (self.produced == len(backend._entity_sequence) and
-                all(state.get("finished", False) for state in self.states))
 
 
 class TuttiReplicaDirectBackend(TuttiLayerwiseDirectBackend):
@@ -878,8 +925,6 @@ class TuttiReplicaDirectBackend(TuttiLayerwiseDirectBackend):
 
     def _advance_scatter(self, state):
         physical, members = state["physical"], state["members"]
-        if physical != self._entity_sequence[self._next_entity]:
-            raise RuntimeError("replica prefetch entity order differs")
         from .store import _ASYNC_COMPLETION
         # Replica consumers must not read an owner page until its async
         # completion has been observed as terminal-success.  This gate is
