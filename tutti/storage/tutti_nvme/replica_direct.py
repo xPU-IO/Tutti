@@ -36,6 +36,7 @@ _FAILURE_PROBE_SECONDS = 0.005
 _REPLICA_FEED_WINDOW = max(
     1, int(os.environ.get("TUTTI_REPLICA_FEED_WINDOW", "4"))
 )
+_REPLICA_LOCAL_FENCE = os.environ.get("TUTTI_REPLICA_LOCAL_FENCE") == "1"
 
 
 def owner_index(key, size):
@@ -313,8 +314,19 @@ class _ReplicaReadTask:
                 state["counted_produced"] = True
                 self.produced += 1
         window = 1 if backend._parent is not None else _REPLICA_FEED_WINDOW
-        active = sum(not state.get("finished", False) for state in self.states)
+        active = sum(
+            not state.get("finished", False)
+            and not state.get("local_fence_published", False)
+            for state in self.states
+        )
+        ack_pending = sum(
+            state.get("local_fence_published", False)
+            and not state.get("finished", False)
+            for state in self.states
+        )
         while self.produced < len(backend._entity_sequence) and active < window:
+            if _REPLICA_LOCAL_FENCE and ack_pending >= 2 * window:
+                break
             physical = backend._entity_sequence[self.produced]
             with backend._cancel_lock, backend._background_scope() as allowed:
                 if not allowed or not backend._admit_background_entity(physical):
@@ -322,6 +334,8 @@ class _ReplicaReadTask:
                 state = backend._new_entity(self.plan, physical)
                 self.states.append(state)
                 active += 1
+                if _REPLICA_LOCAL_FENCE:
+                    ack_pending += 1
                 backend._advance_submit(state)
             if state["phase"] == "submit":
                 break
@@ -952,22 +966,29 @@ class TuttiReplicaDirectBackend(TuttiLayerwiseDirectBackend):
                     self._signals.ack(physical, free.ipc_handle())
                     state["phase"] = "ack"
                     state["deadline"] = time.monotonic() + _POLL_SECONDS
+                    if _REPLICA_LOCAL_FENCE:
+                        state["ready"] = free
+                        state["local_fence_published"] = True
+                        with self._read_event_lock:
+                            self._entity_fences[physical] = free
+                        self._next_entity += 1
             if not self._peer_phase_ready(state, "ack"):
                 return
             with self._read_event_lock, self._store.stream_context(self._read_direction):
                 self._wait_peer_events(physical, members, "ack")
                 record = (self._store.record_read_async_event if self._parent is not None
                           else self._store.record_read_event)
-                ready = record()
+                ready = state.get("ready") if state.get("local_fence_published") else record()
             self._stats["gather_bytes"] += sum(
                 owner_index(key, len(members)) != members.index(self._rank)
                 for key in self._prefetch_keys
             ) * self.geometry.blocks_per_chunk * self._layer_pages[physical].page_bytes
         state["ready"] = ready
         state["phase"] = "fence"
-        with self._read_event_lock:
-            self._entity_fences[physical] = ready
-        self._next_entity += 1
+        if not state.get("local_fence_published"):
+            with self._read_event_lock:
+                self._entity_fences[physical] = ready
+            self._next_entity += 1
 
     def join_prefetch(self):
         if self._prefetch_job is not None:
